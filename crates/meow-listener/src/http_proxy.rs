@@ -59,6 +59,7 @@ async fn handle_http_inner(
     const MAX_HEADERS: usize = 8192;
     let mut request_buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; CHUNK];
+    let mut validated = 0usize;
     let read_headers = async {
         loop {
             let n = stream.read(&mut chunk).await?;
@@ -75,12 +76,19 @@ async fn handle_http_inner(
             let header_end = find_crlf_crlf(&request_buf[search_start..])
                 .map(|relative| search_start + relative + 4);
             let bytes_to_validate = header_end.unwrap_or(request_buf.len());
-            if has_bare_line_ending(&request_buf[..bytes_to_validate]) {
+            // Resume one byte back: the only byte a previous pass could leave
+            // undecided is a trailing CR waiting for its LF. Rescanning from 0
+            // would make a dribbled head quadratic.
+            if bare_line_ending_from(
+                &request_buf[..bytes_to_validate],
+                validated.saturating_sub(1),
+            ) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "bare CR or LF in request headers",
                 ));
             }
+            validated = bytes_to_validate;
             if let Some(header_end) = header_end {
                 if header_end > MAX_HEADERS {
                     return Err(io::Error::new(
@@ -388,10 +396,24 @@ fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
 /// Return true once a CR or LF can no longer be part of a CRLF pair. A final
 /// CR is left undecided because its LF may arrive in the next socket read.
 fn has_bare_line_ending(buf: &[u8]) -> bool {
-    buf.iter().enumerate().any(|(index, byte)| match *byte {
-        b'\n' => index == 0 || buf[index - 1] != b'\r',
-        b'\r' => index + 1 < buf.len() && buf[index + 1] != b'\n',
-        _ => false,
+    bare_line_ending_from(buf, 0)
+}
+
+/// [`has_bare_line_ending`] resuming at `start`. Bytes before `start` are still
+/// read as context — the predicate for index `i` inspects `buf[i - 1]` and
+/// `buf[i + 1]` — so a caller that already scanned a prefix passes the index of
+/// its last (possibly undecided) byte rather than 0.
+fn bare_line_ending_from(buf: &[u8], start: usize) -> bool {
+    if start >= buf.len() {
+        return false;
+    }
+    buf[start..].iter().enumerate().any(|(offset, byte)| {
+        let index = start + offset;
+        match *byte {
+            b'\n' => index == 0 || buf[index - 1] != b'\r',
+            b'\r' => index + 1 < buf.len() && buf[index + 1] != b'\n',
+            _ => false,
+        }
     })
 }
 
@@ -402,12 +424,43 @@ struct HeaderField<'a> {
     raw: &'a [u8],
 }
 
+/// Header fields stay heap-backed on purpose. `RequestHead` is held across the
+/// dial await, so it sits in the per-connection future frame — inlining 32
+/// fields would add ~1.5 KiB there for every connection, CONNECT included,
+/// which costs more than the one allocation it saves (ADR-0011).
 #[derive(Debug)]
 struct RequestHead<'a> {
     method: &'a str,
     target: &'a str,
     version: &'a str,
     headers: Vec<HeaderField<'a>>,
+    /// The single agreed-upon `Content-Length`, if the request declared one.
+    /// Forwarded as one canonical field so the next hop never sees the
+    /// list-form or duplicated spelling this parser accepts.
+    content_length: Option<u64>,
+}
+
+/// Split a header block on CRLF without allocating a line vector.
+struct CrlfLines<'a> {
+    remaining: Option<&'a [u8]>,
+}
+
+impl<'a> Iterator for CrlfLines<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let remaining = self.remaining?;
+        match remaining.windows(2).position(|window| window == b"\r\n") {
+            Some(end) => {
+                self.remaining = Some(&remaining[end + 2..]);
+                Some(&remaining[..end])
+            }
+            None => {
+                self.remaining = None;
+                Some(remaining)
+            }
+        }
+    }
 }
 
 fn parse_request_head(head: &[u8]) -> Result<RequestHead<'_>, &'static str> {
@@ -415,18 +468,10 @@ fn parse_request_head(head: &[u8]) -> Result<RequestHead<'_>, &'static str> {
         return Err("invalid HTTP line ending");
     }
 
-    let mut lines = Vec::new();
-    let mut remaining = &head[..head.len() - 4];
-    loop {
-        if let Some(end) = remaining.windows(2).position(|window| window == b"\r\n") {
-            lines.push(&remaining[..end]);
-            remaining = &remaining[end + 2..];
-        } else {
-            lines.push(remaining);
-            break;
-        }
-    }
-    let (request_line, header_lines) = lines.split_first().ok_or("empty HTTP request")?;
+    let mut lines = CrlfLines {
+        remaining: Some(&head[..head.len() - 4]),
+    };
+    let request_line = lines.next().ok_or("empty HTTP request")?;
     let request_line =
         std::str::from_utf8(request_line).map_err(|_| "non-ASCII HTTP request line")?;
     if !request_line.is_ascii() {
@@ -447,8 +492,8 @@ fn parse_request_head(head: &[u8]) -> Result<RequestHead<'_>, &'static str> {
         return Err("invalid HTTP request line");
     }
 
-    let mut headers = Vec::with_capacity(header_lines.len());
-    for &line in header_lines {
+    let mut headers = Vec::new();
+    for line in lines {
         let colon = line
             .iter()
             .position(|byte| *byte == b':')
@@ -470,17 +515,22 @@ fn parse_request_head(head: &[u8]) -> Result<RequestHead<'_>, &'static str> {
             raw: line,
         });
     }
-    validate_message_framing(&headers)?;
+    let content_length = validate_message_framing(&headers, version)?;
 
     Ok(RequestHead {
         method,
         target,
         version,
         headers,
+        content_length,
     })
 }
 
-fn validate_message_framing(headers: &[HeaderField<'_>]) -> Result<(), &'static str> {
+/// Validate request framing and return the single agreed `Content-Length`.
+fn validate_message_framing(
+    headers: &[HeaderField<'_>],
+    version: &str,
+) -> Result<Option<u64>, &'static str> {
     let mut content_length = None;
     let mut has_content_length = false;
     let mut transfer_codings = Vec::new();
@@ -513,6 +563,12 @@ fn validate_message_framing(headers: &[HeaderField<'_>]) -> Result<(), &'static 
         return Err("Transfer-Encoding with Content-Length is ambiguous");
     }
     if !transfer_codings.is_empty() {
+        // RFC 9112 §6.1: Transfer-Encoding must not be sent on an HTTP/1.0
+        // message. Recipients that ignore it there read no body at all and
+        // treat the chunked payload as a new request — a desync primitive.
+        if version == "HTTP/1.0" {
+            return Err("Transfer-Encoding on an HTTP/1.0 request");
+        }
         let chunked_count = transfer_codings
             .iter()
             .filter(|coding| coding.name.eq_ignore_ascii_case(b"chunked"))
@@ -525,7 +581,7 @@ fn validate_message_framing(headers: &[HeaderField<'_>]) -> Result<(), &'static 
             return Err("invalid request Transfer-Encoding");
         }
     }
-    Ok(())
+    Ok(content_length)
 }
 
 #[derive(Debug)]
@@ -636,8 +692,16 @@ fn skip_ows(value: &[u8], cursor: &mut usize) {
 }
 
 fn rewrite_plain_request(request: &RequestHead<'_>, path: &str) -> Vec<u8> {
+    // Exact hint: request line + every forwarded field with its CRLF + the
+    // canonical Content-Length + the terminating CRLF. Over-counting the few
+    // dropped fields beats the reallocations an under-sized hint costs.
+    let headers_len: usize = request
+        .headers
+        .iter()
+        .map(|header| header.raw.len() + 2)
+        .sum();
     let mut rewritten = Vec::with_capacity(
-        request.method.len() + path.len() + request.version.len() + 4 + request.headers.len() * 2,
+        request.method.len() + path.len() + request.version.len() + 4 + headers_len + 32,
     );
     rewritten.extend_from_slice(request.method.as_bytes());
     rewritten.push(b' ');
@@ -648,11 +712,20 @@ fn rewrite_plain_request(request: &RequestHead<'_>, path: &str) -> Vec<u8> {
     for header in &request.headers {
         if header.name.eq_ignore_ascii_case(b"proxy-connection")
             || header.name.eq_ignore_ascii_case(b"proxy-authorization")
+            // Re-emitted below in canonical form.
+            || header.name.eq_ignore_ascii_case(b"content-length")
         {
             continue;
         }
         rewritten.extend_from_slice(header.raw);
         rewritten.extend_from_slice(b"\r\n");
+    }
+    // RFC 9112 §6.3.5: a recipient forwarding a message whose Content-Length
+    // was duplicated or list-form must replace it with one valid field, so the
+    // next hop cannot read a different length than this one did.
+    if let Some(content_length) = request.content_length {
+        use std::io::Write as _;
+        let _ = write!(rewritten, "Content-Length: {content_length}\r\n");
     }
     rewritten.extend_from_slice(b"\r\n");
     rewritten
@@ -854,6 +927,75 @@ mod tests {
             b"POST http://example.com/ HTTP/1.1\r\nContent-Length: 5, 5\r\nContent-Length: 5\r\n\r\n"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn transfer_encoding_is_rejected_on_http_1_0() {
+        assert!(parse_request_head(
+            b"POST http://example.com/ HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        .is_err());
+        assert!(parse_request_head(
+            b"POST http://example.com/ HTTP/1.0\r\nTransfer-Encoding: gzip; level=1, chunked\r\n\r\n"
+        )
+        .is_err());
+        // The same request is legitimate on HTTP/1.1, and an HTTP/1.0 request
+        // without a transfer coding is untouched.
+        assert!(parse_request_head(
+            b"POST http://example.com/ HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        .is_ok());
+        assert!(parse_request_head(
+            b"POST http://example.com/ HTTP/1.0\r\nContent-Length: 3\r\n\r\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn duplicated_content_length_is_forwarded_canonically() {
+        let request = parse_request_head(
+            b"POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5, 5\r\nX-Tail: 1\r\nContent-Length: 5\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(request.content_length, Some(5));
+        assert_eq!(
+            rewrite_plain_request(&request, "/"),
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nX-Tail: 1\r\nContent-Length: 5\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn bodyless_request_forwards_no_content_length() {
+        let request =
+            parse_request_head(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .unwrap();
+        assert_eq!(request.content_length, None);
+        assert_eq!(
+            rewrite_plain_request(&request, "/"),
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn resumed_bare_line_ending_scan_matches_a_full_scan() {
+        // A trailing CR is the only byte a pass can leave undecided, so a scan
+        // resumed at `len - 1` must reach the same verdict as scanning from 0.
+        for head in [
+            b"GET / HTTP/1.1\r\nX-A: 1\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nX-A: 1\n\r\n",
+            b"GET / HTTP/1.1\r\nX-A: 1\r\r\n",
+            b"\nGET / HTTP/1.1\r\n\r\n",
+        ] {
+            for split in 0..head.len() {
+                let first = has_bare_line_ending(&head[..split]);
+                let resumed = first || bare_line_ending_from(head, split.saturating_sub(1));
+                assert_eq!(
+                    resumed,
+                    has_bare_line_ending(head),
+                    "split {split} disagreed for {head:?}"
+                );
+            }
+        }
     }
 
     #[test]
