@@ -17,6 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::Mutex as AsyncMutex;
 
 #[cfg(feature = "encrypted")]
 use {rustls::pki_types::ServerName, std::convert::TryFrom, tokio_rustls::TlsConnector};
@@ -109,6 +110,11 @@ pub struct DnsClient {
     timeout: Duration,
     proxy: Option<DnsProxy>,
     label: Option<Arc<str>>,
+    /// Idle TCP connection reused across queries to avoid the connect +
+    /// protect JNI overhead on every DNS exchange.  Held under the mutex for
+    /// the whole exchange so concurrent callers serialise on the single
+    /// keep-alive connection (simple, correct, no connection loss).
+    tcp_pool: AsyncMutex<Option<TcpStream>>,
 }
 
 enum Transport {
@@ -144,6 +150,7 @@ impl DnsClient {
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
             label: None,
+            tcp_pool: AsyncMutex::new(None),
         }
     }
 
@@ -154,6 +161,7 @@ impl DnsClient {
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
             label: None,
+            tcp_pool: AsyncMutex::new(None),
         }
     }
 
@@ -164,6 +172,7 @@ impl DnsClient {
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
             label: None,
+            tcp_pool: AsyncMutex::new(None),
         }
     }
 
@@ -179,6 +188,7 @@ impl DnsClient {
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
             label: None,
+            tcp_pool: AsyncMutex::new(None),
         }
     }
 
@@ -195,6 +205,7 @@ impl DnsClient {
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
             label: None,
+            tcp_pool: AsyncMutex::new(None),
         }
     }
 
@@ -306,33 +317,110 @@ impl DnsClient {
     /// (addrs, min_ttl).  Empty answer set returns `Ok((vec![], _))`; upstream
     /// SERVFAIL surfaces as `ClientError::Rcode`.
     pub async fn lookup_ip(&self, name: &str) -> Result<(Vec<IpAddr>, Duration), ClientError> {
-        let (a, aaaa) = tokio::join!(
-            self.query(name, RecordType::A),
-            self.query(name, RecordType::AAAA),
-        );
+        // Prefer IPv4: query A first and return it when it yields any
+        // address; fall back to AAAA only when A is empty.  This mirrors the
+        // `prefer-ipv4: true` mihomo option and keeps the common v4-capable
+        // case at a *single* query instead of fanning out A + AAAA in
+        // parallel.  That matters because the resolver races two upstreams,
+        // so a parallel A+AAAA lookup is 4 TCP DNS queries per host — all
+        // serialised on one keep-alive connection per upstream, which under a
+        // page-load burst starves the proxy server's own resolution and can
+        // take the whole tunnel down.
+        //
+        // v6-only domains (A empty) still resolve via the AAAA fallback, so
+        // IPv6 remains *supported*; we just prefer IPv4.  When the app has
+        // fully disabled IPv6 (crate::ipv6_disabled), skip AAAA entirely —
+        // the VPN has no IPv6 route, so AAAA addresses only cause connect
+        // failures and waste a round-trip.
         let mut addrs = Vec::new();
         let mut min_ttl: Option<u32> = None;
         let mut had_any_ok = false;
         let mut last_err: Option<ClientError> = None;
-        for r in [a, aaaa] {
-            match r {
-                Ok(msg) => {
-                    had_any_ok = true;
-                    let (response_addrs, response_ttl) = relevant_ip_answers(&msg);
-                    addrs.extend(response_addrs);
-                    if let Some(ttl) = response_ttl {
-                        min_ttl = Some(min_ttl.map_or(ttl, |current| current.min(ttl)));
+
+        macro_rules! absorb {
+            ($r:expr) => {
+                match $r {
+                    Ok(msg) => {
+                        had_any_ok = true;
+                        let (response_addrs, response_ttl) = relevant_ip_answers(&msg);
+                        addrs.extend(response_addrs);
+                        if let Some(ttl) = response_ttl {
+                            min_ttl = Some(min_ttl.map_or(ttl, |current| current.min(ttl)));
+                        }
                     }
+                    Err(e) => last_err = Some(e),
                 }
-                Err(e) => {
-                    last_err = Some(e);
-                }
-            }
+            };
         }
+
+        // Query A first (IPv4-preferred). Track whether it returned any
+        // usable address so we can decide whether the AAAA fallback is
+        // needed.
+        let got_v4 = match self.query(name, RecordType::A).await {
+            Ok(msg) => {
+                had_any_ok = true;
+                let (response_addrs, response_ttl) = relevant_ip_answers(&msg);
+                let non_empty = !response_addrs.is_empty();
+                addrs.extend(response_addrs);
+                if let Some(ttl) = response_ttl {
+                    min_ttl = Some(min_ttl.map_or(ttl, |current| current.min(ttl)));
+                }
+                non_empty
+            }
+            Err(e) => {
+                last_err = Some(e);
+                false
+            }
+        };
+
+        // No IPv4 answer (empty A, or A failed): fall back to AAAA unless the
+        // user has disabled IPv6 entirely.
+        if !got_v4 && !crate::ipv6_disabled() {
+            absorb!(self.query(name, RecordType::AAAA).await);
+        }
+
         if !had_any_ok {
             return Err(last_err.unwrap_or(ClientError::Protocol("no response")));
         }
         Ok((addrs, Duration::from_secs(u64::from(min_ttl.unwrap_or(0)))))
+    }
+
+    /// Send a DNS query over TCP, reusing a single persistent connection
+    /// when possible.  Avoids the TCP handshake + JNI protect(fd) on every
+    /// query — the root cause of intermittent timeouts on Android where
+    /// each tcp_exchange opened a fresh connection.
+    ///
+    /// The mutex is held for the entire exchange so concurrent callers
+    /// serialise on the one keep-alive connection.  This is deliberately
+    /// simple and correct (no connection loss / no stale-slot races) at the
+    /// cost of throughput — a fair trade for DNS, which is low-volume.
+    async fn tcp_exchange_pooled(
+        &self,
+        addr: SocketAddr,
+        wire: &[u8],
+    ) -> Result<Vec<u8>, ClientError> {
+        let query_id = u16::from_be_bytes([wire[0], wire[1]]);
+
+        // Hold the pool lock for the whole exchange so concurrent callers
+        // serialise on the single keep-alive connection (no connection loss).
+        let mut guard = self.tcp_pool.lock().await;
+        if let Some(stream) = guard.as_mut() {
+            if write_lp(stream, wire).await.is_ok() {
+                if let Ok(response) = read_lp(stream).await {
+                    if u16::from_be_bytes([response[0], response[1]]) == query_id {
+                        return Ok(response);
+                    }
+                }
+            }
+        }
+        // No idle connection, or it was broken/stale — drop it and open a
+        // fresh one (still under the lock so the slot stays consistent).
+        *guard = None;
+        let mut stream = factory().connect_tcp(addr).await?;
+        write_lp(&mut stream, wire).await?;
+        let response = read_lp(&mut stream).await?;
+        *guard = Some(stream);
+        Ok(response)
     }
 
     async fn exchange(
@@ -369,7 +457,7 @@ impl DnsClient {
         match &self.transport {
             Transport::Udp { addr } => udp_exchange(*addr, wire, expected).await,
             Transport::Tcp { addr } => {
-                let response = tcp_exchange(*addr, wire).await?;
+                let response = self.tcp_exchange_pooled(*addr, wire).await?;
                 decode_validated_response(&response, expected)
             }
             Transport::RCode { .. } => Err(ClientError::Protocol(
