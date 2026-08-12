@@ -154,21 +154,21 @@ Built-in web UI served at `http://<api-addr>/ui` with:
 
 ## Benchmarks
 
-Side-by-side against upstream Go mihomo v1.19.27 on the same host (Apple Silicon arm64, macOS 26.4.1, loopback `127.0.0.1`). Both binaries use identical config: `mode: direct`, SOCKS5 listener on port 17890, DNS disabled. Reproduce with `bash bench.sh` (auto-downloads the latest Go mihomo release).
+Side-by-side against upstream Go mihomo v1.19.29 on the same host (Apple M4 arm64, macOS 26.5.2, loopback `127.0.0.1`). Both binaries use identical config: `mode: direct`, SOCKS5 listener on port 17890, DNS disabled. Reproduce with `bash bench.sh` (auto-downloads the latest Go mihomo release).
 
-| Metric | mihomo (Go) | meow-rs v0.14.0 | Delta |
+| Metric | mihomo (Go) v1.19.29 | meow-rs v0.20.1 | Delta |
 |--------|-------------|--------------------|-------|
-| Binary size (stripped) | 40.7 MB | **7.2 MB** | **−82%** |
-| RSS idle | 30.8 MB | **9.7 MB** | **−69%** |
-| RSS under load (peak) | 30.8 MB | **9.7 MB** | **−69%** |
-| TCP throughput, 64 MB×1 | 5.15 Gbps | **5.23 Gbps** | **+2%** |
-| TCP throughput, 1 MB×10 | 4.62 Gbps | 4.15 Gbps | −10% |
-| TCP throughput, 4 KB×10000 | 0.92 Gbps | 0.90 Gbps | −2% |
-| Latency p50 (connect + 1 B echo) | 257 µs | 258 µs | ±0% |
-| Latency p99 | 332 µs | 354 µs | +7% |
-| Connections/sec (10 s, concurrency 64) | 709 /s | 710 /s | ±0% |
+| Binary size (stripped) | 41.2 MB | **8.6 MB** | **−79%** |
+| RSS idle | 29.6 MB | **9.9 MB** | **−67%** |
+| RSS under load (peak) | 41.0 MB | **13.5 MB** | **−67%** |
+| TCP throughput, 64 MB×1 | 31.30 Gbps | 19.07 Gbps | −39% |
+| TCP throughput, 1 MB×10 | 35.77 Gbps | 18.86 Gbps | −47% |
+| TCP throughput, 4 KB×10000 | 2.14 Gbps | 1.99 Gbps | −7% |
+| Latency p50 (connect + 1 B echo) | 135 µs | **130 µs** | **−4%** |
+| Latency p99 | 198 µs | 232 µs | +17% |
+| Connections/sec (10 s, concurrency 64) | 711 /s | 714 /s | ±0% |
 
-Single-run results from `bash bench.sh`; numbers will vary with host load. For the full methodology, three-run-median protocol, and workload definitions (W1–W5), see [ADR-0006](docs/adr/0006-m2-benchmark-methodology.md) and [docs/benchmarks/index.md](docs/benchmarks/index.md).
+Per-metric medians of three `bash bench.sh` runs; numbers will vary with host load. Loopback bulk-transfer throughput measures per-proxy CPU overhead, not real-network throughput — both kernels saturate multi-Gbps links with headroom. For the full methodology, three-run-median protocol, and workload definitions (W1–W5), see [ADR-0006](docs/adr/0006-m2-benchmark-methodology.md) and [docs/benchmarks/index.md](docs/benchmarks/index.md).
 
 ## Architecture
 
