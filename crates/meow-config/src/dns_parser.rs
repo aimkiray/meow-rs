@@ -28,15 +28,16 @@ pub async fn parse_dns(
         _ => {
             let hosts = build_hosts_trie(raw.hosts.as_ref())?;
             let use_hosts = raw.dns.as_ref().and_then(|d| d.use_hosts).unwrap_or(true);
-            let resolver = Arc::new(Resolver::new(
+            let mut resolver = Resolver::new(
                 vec!["8.8.8.8:53".parse().unwrap()],
                 vec![],
                 DnsMode::Normal,
                 hosts,
                 use_hosts,
-            ));
+            );
+            resolver.set_ipv6(raw.ipv6.unwrap_or(false));
             return Ok(DnsConfig {
-                resolver,
+                resolver: Arc::new(resolver),
                 listen_addr: None,
             });
         }
@@ -111,6 +112,8 @@ pub async fn parse_dns(
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    resolver.set_ipv6(raw.ipv6.unwrap_or(false));
 
     // Fake-IP wiring: only when enhanced-mode == fake-ip. Errors here are
     // fatal (Class A per ADR-0002) — a misconfigured fake-IP range would

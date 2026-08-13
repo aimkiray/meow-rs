@@ -49,6 +49,41 @@ bind-address: "0.0.0.0"
 }
 
 #[tokio::test]
+async fn test_top_level_ipv6_controls_dns_resolver() {
+    let config = load_config_from_str(
+        r#"
+ipv6: false
+hosts:
+  example.test:
+    - "::1"
+    - "192.0.2.1"
+"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        config.dns.resolver.resolve_ips("example.test").await,
+        Some(vec!["192.0.2.1".parse().unwrap()])
+    );
+
+    let config = load_config_from_str(
+        r#"
+ipv6: true
+hosts:
+  example.test:
+    - "::1"
+    - "192.0.2.1"
+"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        config.dns.resolver.resolve_ips("example.test").await,
+        Some(vec!["::1".parse().unwrap(), "192.0.2.1".parse().unwrap()])
+    );
+}
+
+#[tokio::test]
 async fn test_direct_mode_config() {
     let yaml = r#"
 mode: direct

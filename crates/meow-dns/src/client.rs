@@ -317,6 +317,14 @@ impl DnsClient {
     /// (addrs, min_ttl).  Empty answer set returns `Ok((vec![], _))`; upstream
     /// SERVFAIL surfaces as `ClientError::Rcode`.
     pub async fn lookup_ip(&self, name: &str) -> Result<(Vec<IpAddr>, Duration), ClientError> {
+        self.lookup_ip_with_ipv6(name, true).await
+    }
+
+    pub(crate) async fn lookup_ip_with_ipv6(
+        &self,
+        name: &str,
+        ipv6_enabled: bool,
+    ) -> Result<(Vec<IpAddr>, Duration), ClientError> {
         // Prefer IPv4: query A first and return it when it yields any
         // address; fall back to AAAA only when A is empty.  This mirrors the
         // `prefer-ipv4: true` mihomo option and keeps the common v4-capable
@@ -329,7 +337,7 @@ impl DnsClient {
         //
         // v6-only domains (A empty) still resolve via the AAAA fallback, so
         // IPv6 remains *supported*; we just prefer IPv4.  When the app has
-        // fully disabled IPv6 (crate::ipv6_disabled), skip AAAA entirely —
+        // fully disabled IPv6 (ipv6_enabled == false), skip AAAA entirely —
         // the VPN has no IPv6 route, so AAAA addresses only cause connect
         // failures and waste a round-trip.
         let mut addrs = Vec::new();
@@ -375,7 +383,7 @@ impl DnsClient {
 
         // No IPv4 answer (empty A, or A failed): fall back to AAAA unless the
         // user has disabled IPv6 entirely.
-        if !got_v4 && !crate::ipv6_disabled() {
+        if !got_v4 && ipv6_enabled {
             absorb!(self.query(name, RecordType::AAAA).await);
         }
 

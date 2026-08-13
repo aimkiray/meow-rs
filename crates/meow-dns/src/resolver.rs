@@ -181,6 +181,9 @@ pub struct Resolver {
     /// TTL stamped on synthesised A/AAAA responses. Short by design so
     /// clients re-query rather than caching a fake IP after pool eviction.
     fakeip_ttl: Duration,
+    /// Whether IPv6 resolution is enabled. Driven by the top-level `ipv6`
+    /// config flag; set via [`Self::set_ipv6`].
+    ipv6: bool,
 }
 
 struct InflightGuard<'a> {
@@ -340,10 +343,14 @@ fn authority_label(addr: &HostOrIp, port: u16, default_port: u16) -> String {
     }
 }
 
-async fn query_pool(clients: &[Arc<DnsClient>], host: &str) -> Option<PoolLookupResult> {
+async fn query_pool(
+    clients: &[Arc<DnsClient>],
+    host: &str,
+    ipv6_enabled: bool,
+) -> Option<PoolLookupResult> {
     match clients.len() {
         0 => None,
-        1 => match clients[0].lookup_ip(host).await {
+        1 => match clients[0].lookup_ip_with_ipv6(host, ipv6_enabled).await {
             Ok((ips, ttl)) if !ips.is_empty() => Some(PoolLookupResult {
                 ips,
                 ttl: clamp_ttl(ttl),
@@ -355,8 +362,8 @@ async fn query_pool(clients: &[Arc<DnsClient>], host: &str) -> Option<PoolLookup
             // Common case: borrow `host` instead of String-cloning it per
             // future, and stack-pin the two futures instead of going through
             // Vec<Pin<Box<…>>>.
-            let f1 = clients[0].lookup_ip(host);
-            let f2 = clients[1].lookup_ip(host);
+            let f1 = clients[0].lookup_ip_with_ipv6(host, ipv6_enabled);
+            let f2 = clients[1].lookup_ip_with_ipv6(host, ipv6_enabled);
             tokio::pin!(f1);
             tokio::pin!(f2);
             tokio::select! {
@@ -404,7 +411,10 @@ async fn query_pool(clients: &[Arc<DnsClient>], host: &str) -> Option<PoolLookup
                 .enumerate()
                 .map(|(idx, c)| {
                     Box::pin(async move {
-                        let (ips, ttl) = c.lookup_ip(host).await.map_err(|_| LookupFailed)?;
+                        let (ips, ttl) = c
+                            .lookup_ip_with_ipv6(host, ipv6_enabled)
+                            .await
+                            .map_err(|_| LookupFailed)?;
                         if ips.is_empty() {
                             return Err(LookupFailed);
                         }
@@ -488,6 +498,7 @@ impl Resolver {
             fakeip_v6: None,
             fakeip_skipper: None,
             fakeip_ttl: DEFAULT_FAKE_IP_TTL,
+            ipv6: true,
         }
     }
 
@@ -665,7 +676,7 @@ impl Resolver {
             // Resolve sequentially — fail-fast on first failure.
             let mut map = HashMap::new();
             for host in &hostnames_needing_bootstrap {
-                match query_pool(&bootstrap_clients, host).await {
+                match query_pool(&bootstrap_clients, host, true).await {
                     Some(result) if !result.ips.is_empty() => {
                         map.insert(host.clone(), result.ips[0]);
                     }
@@ -714,7 +725,17 @@ impl Resolver {
             fakeip_v6: None,
             fakeip_skipper: None,
             fakeip_ttl: DEFAULT_FAKE_IP_TTL,
+            ipv6: true,
         })
+    }
+
+    /// Configure whether IPv6 addresses may be resolved.
+    pub fn set_ipv6(&mut self, enabled: bool) {
+        self.ipv6 = enabled;
+    }
+
+    pub(crate) fn ipv6_enabled(&self) -> bool {
+        self.ipv6
     }
 
     /// Build a single `DnsClient` for one `NameServerUrl`, using `resolved`
@@ -801,14 +822,12 @@ impl Resolver {
     pub async fn resolve_ips(&self, host: &str) -> Option<Vec<IpAddr>> {
         if self.use_hosts {
             if let Some(ips) = self.hosts.search(host) {
-                if !ips.is_empty() {
-                    return Some(ips.clone());
-                }
+                return self.filter_enabled_ips(ips);
             }
         }
         if let Some(ips) = self.cache.get(host) {
-            if !ips.is_empty() {
-                return Some(ips.to_vec());
+            if let Some(ips) = self.filter_enabled_ips(&ips) {
+                return Some(ips);
             }
         }
         self.lookup_actual_all(host).await
@@ -858,6 +877,9 @@ impl Resolver {
 
     /// AAAA counterpart of [`Self::lookup_ipv4_with_ttl`] — same TTL contract.
     pub async fn lookup_ipv6_with_ttl(&self, host: &str) -> Option<(IpAddr, Duration)> {
+        if !self.ipv6 {
+            return None;
+        }
         if self.use_hosts {
             if let Some(ips) = self.hosts.search(host) {
                 let ip = ips.iter().find(|ip| ip.is_ipv6()).copied()?;
@@ -910,6 +932,15 @@ impl Resolver {
         self.fakeip_skipper
             .as_ref()
             .is_some_and(|s| s.should_skip(host))
+    }
+
+    fn filter_enabled_ips(&self, ips: &[IpAddr]) -> Option<Vec<IpAddr>> {
+        let ips: Vec<_> = ips
+            .iter()
+            .copied()
+            .filter(|ip| self.ipv6 || ip.is_ipv4())
+            .collect();
+        (!ips.is_empty()).then_some(ips)
     }
 
     /// Returns all IPs for `host` from the hosts trie (respecting `use_hosts`),
@@ -971,7 +1002,7 @@ impl Resolver {
         // Nameserver-policy lookup.
         if let Some(policy) = &self.policy {
             if let Some(entry) = policy.lookup(host) {
-                if let Some(result) = query_pool(&entry.nameservers, host).await {
+                if let Some(result) = query_pool(&entry.nameservers, host, self.ipv6).await {
                     if let Some(ff) = &self.fallback_filter {
                         if ff.ip_gated(&result.ips) {
                             return self.try_fallback(host).await;
@@ -986,7 +1017,7 @@ impl Resolver {
         }
 
         // Global nameservers (parallel, first-response wins).
-        if let Some(result) = query_pool(&self.main, host).await {
+        if let Some(result) = query_pool(&self.main, host, self.ipv6).await {
             if let Some(ff) = &self.fallback_filter {
                 if ff.ip_gated(&result.ips) {
                     return self.try_fallback(host).await;
@@ -1033,7 +1064,7 @@ impl Resolver {
 
     async fn try_fallback(&self, host: &str) -> Option<Vec<IpAddr>> {
         let fallback = self.fallback.as_deref()?;
-        if let Some(result) = query_pool(fallback, host).await {
+        if let Some(result) = query_pool(fallback, host, self.ipv6).await {
             self.cache
                 .put_with_source(host, &result.ips, result.ttl, Some(&result.source));
             return Some(result.ips);
@@ -1280,6 +1311,18 @@ mod tests {
             resolver.resolve_ip("example.test").await,
             Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
         );
+    }
+
+    #[tokio::test]
+    async fn ipv6_disabled_filters_hosts_and_aaaa_lookup() {
+        let mut hosts: DomainTrie<Vec<IpAddr>> = DomainTrie::new();
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        hosts.insert("example.test", vec![IpAddr::V6(Ipv6Addr::LOCALHOST), ipv4]);
+        let mut resolver = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true);
+        resolver.set_ipv6(false);
+
+        assert_eq!(resolver.resolve_ips("example.test").await, Some(vec![ipv4]));
+        assert_eq!(resolver.lookup_ipv6("example.test").await, None);
     }
 
     #[tokio::test]
