@@ -23,15 +23,14 @@ use meow_common::{
 use smol_str::SmolStr;
 use tracing::debug;
 
+use crate::mux::{MuxClient, MuxOptions};
 use crate::stream_conn::StreamConn;
 use crate::transport_chain::TransportChain;
 use crate::vless::{addr_from_metadata, Cmd, VlessConn, VlessPacketConn};
+use std::sync::Arc;
 
 #[cfg(feature = "vless-vision")]
 use crate::vless::VisionConn;
-
-#[cfg(feature = "vless-encryption")]
-use std::sync::Arc;
 
 #[cfg(feature = "vless-encryption")]
 use crate::vless::encryption::ClientInstance;
@@ -57,7 +56,9 @@ pub struct VlessAdapter {
     uuid_bytes: [u8; 16],
     flow: Option<VlessFlow>,
     udp: bool,
-    transport: TransportChain,
+    transport: Arc<TransportChain>,
+    /// sing-mux compatible connection multiplexing (optional).
+    mux: Option<Arc<MuxClient>>,
     /// VLESS post-quantum Encryption (`mlkem768x25519plus`), applied below the
     /// VLESS header exchange once per dial. `None` for plain VLESS.
     #[cfg(feature = "vless-encryption")]
@@ -88,11 +89,69 @@ impl VlessAdapter {
             uuid_bytes,
             flow,
             udp,
-            transport,
+            transport: Arc::new(transport),
+            mux: None,
             #[cfg(feature = "vless-encryption")]
             encryption: None,
             health: ProxyHealth::new(),
         }
+    }
+
+    /// Enable sing-mux compatible connection multiplexing.  Streams opened
+    /// via the mux client ride a shared VLESS connection whose first request
+    /// targets the reserved mux destination
+    /// (\`sp.mux.sing-box.arpa:444\`).
+    pub fn with_mux(mut self, options: MuxOptions) -> Self {
+        use crate::mux::{MuxClient, MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
+        use crate::vless::header::VlessAddr;
+        use std::sync::Arc as StdArc;
+
+        let server = self.server.clone();
+        let port = self.port;
+        let uuid_bytes = self.uuid_bytes;
+        let transport = StdArc::clone(&self.transport);
+        let flow = self.flow;
+        #[cfg(feature = "vless-encryption")]
+        let encryption = self.encryption.clone();
+
+        let dial: crate::mux::DialFn = StdArc::new(move || {
+            let server = server.clone();
+            let transport = StdArc::clone(&transport);
+            #[cfg(feature = "vless-encryption")]
+            let encryption = encryption.clone();
+            Box::pin(async move {
+                let tcp = meow_common::connect_tcp_host(&server, port)
+                    .await
+                    .map_err(MeowError::Io)?;
+                let stream = transport.connect(Box::new(tcp)).await?;
+                #[cfg(feature = "vless-encryption")]
+                let stream = match &encryption {
+                    Some(encryption) => encryption.handshake(stream).await?,
+                    None => stream,
+                };
+                let flow_str = match flow {
+                    #[cfg(feature = "vless-vision")]
+                    Some(VlessFlow::XtlsRprxVision) => Some("xtls-rprx-vision"),
+                    _ => None,
+                };
+                let conn = VlessConn::new(
+                    stream,
+                    &uuid_bytes,
+                    flow_str,
+                    Cmd::Tcp,
+                    MUX_DESTINATION_PORT,
+                    &VlessAddr::domain(MUX_DESTINATION_FQDN).expect("static mux fqdn"),
+                )
+                .await?;
+                #[cfg(feature = "vless-vision")]
+                if flow.is_some() {
+                    return Ok(Box::new(VisionConn::new(conn, uuid_bytes)) as Box<dyn ProxyConn>);
+                }
+                Ok(Box::new(StreamConn(Box::new(conn))) as Box<dyn ProxyConn>)
+            })
+        });
+        self.mux = Some(MuxClient::new(dial, options));
+        self
     }
 
     /// Attach a VLESS Encryption client (`encryption: mlkem768x25519plus…`).
@@ -145,6 +204,20 @@ impl ProxyAdapter for VlessAdapter {
             self.addr_str,
             self.flow
         );
+
+        if let Some(mux) = &self.mux {
+            let host = if !metadata.host.is_empty() {
+                metadata.host.to_string()
+            } else if let Some(ip) = metadata.dst_ip {
+                ip.to_string()
+            } else {
+                return Err(MeowError::Proxy(
+                    "vless mux: metadata has no destination host".into(),
+                ));
+            };
+            let conn = mux.open_stream(&host, metadata.dst_port).await?;
+            return Ok(Box::new(conn));
+        }
 
         let stream = self.dial_stream().await?;
         let addr = addr_from_metadata(metadata);

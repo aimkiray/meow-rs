@@ -24,8 +24,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
 use tracing::debug;
 
+use crate::mux::{MuxClient, MuxOptions};
 use crate::stream_conn::StreamConn;
 use crate::transport_to_proxy_err;
+use std::sync::Arc;
 
 /// SOCKS5-style command bytes used inside the Trojan request header.
 const CMD_CONNECT: u8 = 0x01;
@@ -46,7 +48,9 @@ pub struct TrojanAdapter {
     hex_password: SmolStr,
     support_udp: bool,
     health: ProxyHealth,
-    tls_layer: TlsLayer,
+    tls_layer: Arc<TlsLayer>,
+    /// sing-mux compatible connection multiplexing (optional).
+    mux: Option<Arc<MuxClient>>,
 }
 
 impl TrojanAdapter {
@@ -87,8 +91,64 @@ impl TrojanAdapter {
             hex_password: SmolStr::from(hex_password),
             support_udp: udp,
             health: ProxyHealth::new(),
-            tls_layer,
+            tls_layer: Arc::new(tls_layer),
+            mux: None,
         }
+    }
+
+    /// Enable sing-mux compatible connection multiplexing.  The Trojan
+    /// request header on the shared connection targets the reserved mux
+    /// destination (\`sp.mux.sing-box.arpa:444\`); the server switches the
+    /// connection into mux mode on seeing it.
+    pub fn with_mux(mut self, options: MuxOptions) -> Self {
+        use crate::mux::{MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
+
+        let server = self.server.clone();
+        let port = self.port;
+        let hex_password = self.hex_password.clone();
+        let tls_layer = Arc::clone(&self.tls_layer);
+
+        let dial: crate::mux::DialFn = Arc::new(move || {
+            let server = server.clone();
+            let hex_password = hex_password.clone();
+            let tls_layer = Arc::clone(&tls_layer);
+            Box::pin(async move {
+                // Build the mux-destination request header.
+                let mut hdr_buf = [0u8; TROJAN_HEADER_BUF_SIZE];
+                let pw = hex_password.as_bytes();
+                let mut pos = 0;
+                hdr_buf[..pw.len()].copy_from_slice(pw);
+                pos += pw.len();
+                hdr_buf[pos..pos + 2].copy_from_slice(b"\r\n");
+                pos += 2;
+                hdr_buf[pos] = CMD_CONNECT;
+                pos += 1;
+                hdr_buf[pos] = ATYP_DOMAIN;
+                pos += 1;
+                let fqdn = MUX_DESTINATION_FQDN.as_bytes();
+                hdr_buf[pos] = u8::try_from(fqdn.len()).expect("static mux fqdn fits u8");
+                pos += 1;
+                hdr_buf[pos..pos + fqdn.len()].copy_from_slice(fqdn);
+                pos += fqdn.len();
+                hdr_buf[pos..pos + 2].copy_from_slice(&MUX_DESTINATION_PORT.to_be_bytes());
+                pos += 2;
+                hdr_buf[pos..pos + 2].copy_from_slice(b"\r\n");
+                pos += 2;
+                let header = &hdr_buf[..pos];
+
+                let tcp = meow_common::connect_tcp_host(&server, port)
+                    .await
+                    .map_err(MeowError::Io)?;
+                let mut stream = tls_layer
+                    .connect(Box::new(tcp))
+                    .await
+                    .map_err(transport_to_proxy_err)?;
+                stream.write_all(header).await.map_err(MeowError::Io)?;
+                Ok(Box::new(StreamConn(stream)) as Box<dyn ProxyConn>)
+            })
+        });
+        self.mux = Some(MuxClient::new(dial, options));
+        self
     }
 
     fn build_header<'a>(
@@ -393,6 +453,19 @@ impl ProxyAdapter for TrojanAdapter {
             metadata.remote_address(),
             self.addr_str
         );
+        if let Some(mux) = &self.mux {
+            let host = if !metadata.host.is_empty() {
+                metadata.host.to_string()
+            } else if let Some(ip) = metadata.dst_ip {
+                ip.to_string()
+            } else {
+                return Err(MeowError::Proxy(
+                    "trojan mux: metadata has no destination host".into(),
+                ));
+            };
+            let conn = mux.open_stream(&host, metadata.dst_port).await?;
+            return Ok(Box::new(conn));
+        }
         let stream = self.open_tls_with_header(metadata, CMD_CONNECT).await?;
         Ok(Box::new(StreamConn(stream)))
     }

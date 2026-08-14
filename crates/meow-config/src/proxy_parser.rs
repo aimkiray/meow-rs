@@ -163,7 +163,11 @@ pub fn parse_proxy(
                 .and_then(serde_yaml::Value::as_bool)
                 .unwrap_or(false);
 
-            let adapter = TrojanAdapter::new(name, server, port, password, sni, skip_verify, udp);
+            let mut adapter =
+                TrojanAdapter::new(name, server, port, password, sni, skip_verify, udp);
+            if let Some(mux_options) = parse_mux_options(name, config)? {
+                adapter = adapter.with_mux(mux_options);
+            }
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "vless")]
@@ -1048,7 +1052,7 @@ fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, 
 /// # Warn-once (Class B per ADR-0002)
 ///
 /// - `tls: false` with plain VLESS — plaintext, but correct destination
-/// - `mux: { enabled: true }` — Mux.Cool not implemented; warn and ignore
+/// - `mux: { enabled: true }` — sing-mux multiplexing (server must be sing-box/mihomo)
 /// - `flow: xtls-rprx-vision` + `udp: true` — Vision is TCP-only; UDP uses plain VLESS
 #[cfg(feature = "vless")]
 fn parse_vless(
@@ -1201,21 +1205,8 @@ fn parse_vless(
         );
     }
 
-    // ── Warn: mux enabled (Class B) ───────────────────────────────────────
-    if let Some(mux) = config.get("mux") {
-        let mux_enabled = mux
-            .get("enabled")
-            .and_then(serde_yaml::Value::as_bool)
-            .unwrap_or(false);
-        if mux_enabled {
-            tracing::warn!(
-                proxy = %name,
-                "vless: mux is not implemented (Mux.Cool); \
-                 the `mux` option is ignored. \
-                 (Class B divergence — upstream runs Mux.Cool)"
-            );
-        }
-    }
+    // ── mux: sing-mux compatible connection multiplexing ─────────────────
+    // Parsed after adapter construction below — see the `with_mux` call.
 
     // ── Warn: Vision + UDP (Class B) ─────────────────────────────────────
     if flow == Some(VlessFlow::XtlsRprxVision) && udp {
@@ -1410,7 +1401,65 @@ fn parse_vless(
     let mut adapter = VlessAdapter::new(name, server, port, uuid_bytes, flow, udp, chain);
     #[cfg(feature = "vless-encryption")]
     adapter.set_encryption(vless_encryption);
+
+    if let Some(mux_options) = parse_mux_options(name, config)? {
+        adapter = adapter.with_mux(mux_options);
+    }
+
     Ok(adapter)
+}
+
+/// Parse the optional sing-mux `mux:` block shared by VLESS/Trojan.
+///
+/// Wire-compatible with mihomo's sing-mux outbound wrapper: the first proxy
+/// request targets the reserved mux destination and streams carry a
+/// sing-encoded Socksaddr prefix.  Server must be sing-box / mihomo based
+/// (Xray-only servers speak Mux.Cool, not this protocol).
+///
+/// Returns \`None\` when the block is absent or disabled; \`Err\` for
+/// malformed values.
+fn parse_mux_options(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+) -> std::result::Result<Option<meow_proxy::mux::MuxOptions>, String> {
+    let Some(mux_cfg) = config.get("mux") else {
+        return Ok(None);
+    };
+    let enabled = mux_cfg
+        .get("enabled")
+        .and_then(serde_yaml::Value::as_bool)
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(None);
+    }
+    // Empty protocol maps to h2mux, matching mihomo's default.
+    let protocol_str = mux_cfg
+        .get("protocol")
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or("h2mux");
+    let Some(protocol) = meow_proxy::mux::Protocol::parse(protocol_str) else {
+        // mihomo hard-errors on unknown protocols; do the same so a typo
+        // cannot silently speak the wrong wire protocol to the server.
+        return Err(format!(
+            "{name}: unknown mux protocol '{protocol_str}'; valid values: smux, yamux, h2mux"
+        ));
+    };
+    let get_usize = |key: &str, default: usize| {
+        mux_cfg
+            .get(key)
+            .and_then(serde_yaml::Value::as_u64)
+            .map_or(default, |v| v as usize)
+    };
+    Ok(Some(meow_proxy::mux::MuxOptions {
+        protocol,
+        padding: mux_cfg
+            .get("padding")
+            .and_then(serde_yaml::Value::as_bool)
+            .unwrap_or(false),
+        max_connections: get_usize("max-connections", 4),
+        min_streams: get_usize("min-streams", 4),
+        max_streams: get_usize("max-streams", 4),
+    }))
 }
 
 /// Parse the VLESS `encryption` field.

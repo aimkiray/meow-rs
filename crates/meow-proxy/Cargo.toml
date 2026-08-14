@@ -50,6 +50,9 @@ meow-common = { workspace = true }
 meow-dns = { workspace = true }
 meow-transport = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+yamux = { workspace = true }
+h2 = "0.4"
 meow-anytls = { workspace = true, optional = true }
 quinn = { workspace = true, optional = true }
 h3 = { workspace = true, optional = true }

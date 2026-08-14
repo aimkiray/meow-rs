@@ -50,7 +50,7 @@ divergence. ADR-0002 Class cite (A or B) per `feedback_adr_0002_class_cite.md`.
 | 3 | `reality-opts` present — upstream routes Reality | A | Not implemented; silent ignore = plain-TLS to Reality-expecting server, no diagnostic. Hard-error with roadmap pointer. |
 | 4 | Unknown `flow` value — upstream ignores | A | Unknown flow may skip expected security processing. Hard-error. |
 | 5 | `encryption: <non-none>` — upstream hard-errors too | — | Match (both hard-error). Not a divergence. |
-| 6 | `mux: { enabled: true }` — upstream runs Mux.Cool | B | Not implemented; warn-once, ignore. Same destination. |
+| 6 | `mux: { enabled: true }` — sing-mux multiplexing | B | Implemented (default h2mux; smux/yamux also supported). Server must be sing-box/mihomo. |
 | 7 | `flow: xtls-rprx-vision` + `udp: true` — upstream UDP uses plain VLESS silently | B | Warn-once at load; UDP still routes same destination with outer-TLS. Not Class A (crypto unchanged). |
 
 ---

@@ -73,6 +73,7 @@ missing_panics_doc = "allow"
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
@@ -187,6 +188,10 @@ socket2 = { version = "0.5", features = ["all"] }
 
 # Futures
 futures = "0.3"
+
+# Multiplexing (sing-mux yamux protocol; libp2p yamux is wire-compatible
+# with hashicorp/go-yamux used by sing-mux)
+yamux = "0.14"
 futures-util = "0.3"
 
 # WebSocket

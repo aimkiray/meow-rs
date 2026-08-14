@@ -352,6 +352,39 @@ proxies:
 }
 
 #[tokio::test]
+async fn test_proxy_parsing_trojan_mux_enabled() {
+    let yaml = r#"
+proxies:
+  - name: "trojan-mux"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "password123"
+    mux:
+      enabled: true
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(config.proxies.contains_key("trojan-mux"));
+}
+
+#[tokio::test]
+async fn test_proxy_parsing_trojan_mux_h2mux_accepted() {
+    let yaml = r#"
+proxies:
+  - name: "trojan-mux-h2"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "password123"
+    mux:
+      enabled: true
+      protocol: h2mux
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(config.proxies.contains_key("trojan-mux-h2"));
+}
+
+#[tokio::test]
 async fn test_unsupported_proxy_type_skipped() {
     let yaml = r#"
 proxies:
