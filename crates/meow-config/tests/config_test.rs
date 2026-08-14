@@ -351,6 +351,7 @@ proxies:
     assert!(config.proxies.contains_key("trojan-server"));
 }
 
+#[cfg(feature = "mux")]
 #[tokio::test]
 async fn test_proxy_parsing_trojan_mux_enabled() {
     let yaml = r#"
@@ -367,6 +368,7 @@ proxies:
     assert!(config.proxies.contains_key("trojan-mux"));
 }
 
+#[cfg(feature = "mux")]
 #[tokio::test]
 async fn test_proxy_parsing_trojan_mux_h2mux_accepted() {
     let yaml = r#"

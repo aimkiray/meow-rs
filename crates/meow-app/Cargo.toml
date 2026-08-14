@@ -41,6 +41,8 @@ ech-tls-tunnel = [
     "meow-config/ech-tls-tunnel",
     "meow-proxy/ech-tls-tunnel",
 ]
+# sing-mux multiplexing (in `full`; excluded from `minimal` per ADR-0007).
+mux = ["meow-config/mux", "meow-proxy/mux"]
 
 # DNS
 dns-server = ["meow-dns/dns-server"]
@@ -58,7 +60,7 @@ listener-tun = ["meow-listener/listener-tun", "meow-api/listener-tun"]
 # Convenience bundles
 minimal = ["ss", "trojan", "dns-server", "listener-mixed"]
 full = [
-    "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel",
+    "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel", "mux",
     "dns-server", "dns-encrypted",
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
 ]

@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2"]
+default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux"]
 ss = ["meow-proxy/ss"]
 trojan = ["meow-proxy/trojan"]
 # `meow-transport/reality` rides along with vless: `reality-opts` is only
@@ -26,6 +26,8 @@ snell = ["meow-proxy/snell"]
 boring-tls = ["meow-transport/boring-tls"]
 ech = ["meow-transport/ech"]
 ech-tls-tunnel = ["ss", "meow-proxy/ech-tls-tunnel"]
+# sing-mux multiplexing (forwarded to meow-proxy; opt-out in `minimal`).
+mux = ["meow-proxy/mux"]
 # Auto-download + unzip a third-party dashboard from `external-ui-url` (issue
 # #223). Off by default: pulls in the `zip` crate, which grows the binary
 # against the ADR-0007 size caps. Even when enabled, the code path is

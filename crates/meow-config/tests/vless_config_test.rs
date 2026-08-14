@@ -696,6 +696,7 @@ proxies:
 /// warn is emitted — the feature is implemented.
 /// Interop note: server must be sing-box / mihomo based (Xray-only servers
 /// speak Mux.Cool, not this protocol).
+#[cfg(feature = "mux")]
 #[tokio::test]
 async fn parse_vless_mux_enabled_loads_with_sing_mux() {
     let yaml = r#"
@@ -721,6 +722,7 @@ proxies:
 }
 
 /// D16b: explicit `protocol: h2mux` → accepted without warn.
+#[cfg(feature = "mux")]
 #[tokio::test]
 async fn parse_vless_mux_h2mux_accepted() {
     let yaml = r#"
@@ -748,6 +750,7 @@ proxies:
 
 /// D16e: unknown mux protocol → proxy rejected with a loud warn (meow's
 /// warn+skip parse semantics; mihomo hard-errors on the same input).
+#[cfg(feature = "mux")]
 #[tokio::test]
 async fn parse_vless_mux_unknown_protocol_rejects_proxy() {
     let yaml = r#"
@@ -778,6 +781,7 @@ proxies:
 }
 
 /// D16f: `only-tcp: true` → accepted (UDP stays on the plain proxy path).
+#[cfg(feature = "mux")]
 #[tokio::test]
 async fn parse_vless_mux_only_tcp_accepted() {
     let yaml = r#"
@@ -802,6 +806,7 @@ proxies:
 
 /// D16g: `statistic` / `brutal-opts` → accepted with a warn each
 /// (upstream fields meow-rs does not implement).
+#[cfg(feature = "mux")]
 #[tokio::test]
 async fn parse_vless_mux_unsupported_fields_warn_and_ignore() {
     let yaml = r#"
@@ -838,6 +843,7 @@ proxies:
 }
 
 /// D16c: explicit `protocol: yamux` → accepted without warn.
+#[cfg(feature = "mux")]
 #[tokio::test]
 async fn parse_vless_mux_yamux_accepted() {
     let yaml = r#"
@@ -864,6 +870,7 @@ proxies:
 }
 
 /// D16d: `mux: { enabled: false }` → plain VLESS, no mux, no warn.
+#[cfg(feature = "mux")]
 #[tokio::test]
 async fn parse_vless_mux_disabled_loads_plain() {
     let yaml = r#"

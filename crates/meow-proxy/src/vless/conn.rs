@@ -57,10 +57,13 @@ impl VlessConn {
         })
     }
 
+    // Called only from the Vision wrapper (vless-vision feature).
+    #[cfg_attr(not(feature = "vless-vision"), allow(dead_code))]
     pub(crate) fn enable_raw_read_passthrough(&mut self) -> bool {
         meow_transport::enable_raw_read_passthrough(&mut *self.inner)
     }
 
+    #[cfg_attr(not(feature = "vless-vision"), allow(dead_code))]
     pub(crate) fn enable_raw_write_passthrough(&mut self) -> bool {
         meow_transport::enable_raw_write_passthrough(&mut *self.inner)
     }

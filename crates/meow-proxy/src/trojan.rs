@@ -24,6 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
 use tracing::debug;
 
+#[cfg(feature = "mux")]
 use crate::mux::{MuxClient, MuxOptions};
 use crate::stream_conn::StreamConn;
 use crate::transport_to_proxy_err;
@@ -50,9 +51,11 @@ pub struct TrojanAdapter {
     health: ProxyHealth,
     tls_layer: Arc<TlsLayer>,
     /// sing-mux compatible connection multiplexing (optional).
+    #[cfg(feature = "mux")]
     mux: Option<Arc<MuxClient>>,
     /// When mux is enabled, route UDP through the plain proxy path instead
     /// of mux streams (mihomo `only-tcp`).
+    #[cfg(feature = "mux")]
     mux_only_tcp: bool,
 }
 
@@ -95,7 +98,9 @@ impl TrojanAdapter {
             support_udp: udp,
             health: ProxyHealth::new(),
             tls_layer: Arc::new(tls_layer),
+            #[cfg(feature = "mux")]
             mux: None,
+            #[cfg(feature = "mux")]
             mux_only_tcp: false,
         }
     }
@@ -104,6 +109,7 @@ impl TrojanAdapter {
     /// request header on the shared connection targets the reserved mux
     /// destination (\`sp.mux.sing-box.arpa:444\`); the server switches the
     /// connection into mux mode on seeing it.
+    #[cfg(feature = "mux")]
     pub fn with_mux(mut self, options: MuxOptions) -> Self {
         use crate::mux::{MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
 
@@ -452,7 +458,16 @@ impl ProxyAdapter for TrojanAdapter {
         // With mux enabled, UDP rides the mux TCP session (unless
         // `only-tcp` forces the plain path) — mirrors mihomo's
         // SingMux.SupportUDP.
-        self.support_udp || (self.mux.is_some() && !self.mux_only_tcp)
+        self.support_udp || {
+            #[cfg(feature = "mux")]
+            {
+                self.mux.is_some() && !self.mux_only_tcp
+            }
+            #[cfg(not(feature = "mux"))]
+            {
+                false
+            }
+        }
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
@@ -461,6 +476,7 @@ impl ProxyAdapter for TrojanAdapter {
             metadata.remote_address(),
             self.addr_str
         );
+        #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
             let host = if !metadata.host.is_empty() {
                 metadata.host.to_string()
@@ -481,6 +497,7 @@ impl ProxyAdapter for TrojanAdapter {
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         // Mux UDP rides the mux TCP session and does not depend on the
         // node's `udp:` flag — check it before the plain-path gate.
+        #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
             if !self.mux_only_tcp {
                 let host = if !metadata.host.is_empty() {

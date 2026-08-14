@@ -107,11 +107,15 @@ impl Session {
             dead: AtomicBool::new(false),
         });
 
-        // Writer task: drain frames, write full wire frames in order.
+        // Writer task: drain frames, write full wire frames in order.  The
+        // encode buffer is reused across frames (hot path — avoid one
+        // allocation per frame).
         let writer_inner = Arc::clone(&inner);
         tokio::spawn(async move {
+            let mut buf = BytesMut::new();
             while let Some(frame) = writer_rx.recv().await {
-                let mut buf = BytesMut::with_capacity(FRAME_HEADER_LEN + frame.data.len());
+                buf.clear();
+                buf.reserve(FRAME_HEADER_LEN + frame.data.len());
                 frame.encode_into(&mut buf);
                 if writer.write_all(&buf).await.is_err() {
                     break;

@@ -23,6 +23,7 @@ use meow_common::{
 use smol_str::SmolStr;
 use tracing::debug;
 
+#[cfg(feature = "mux")]
 use crate::mux::{MuxClient, MuxOptions};
 use crate::stream_conn::StreamConn;
 use crate::transport_chain::TransportChain;
@@ -58,9 +59,11 @@ pub struct VlessAdapter {
     udp: bool,
     transport: Arc<TransportChain>,
     /// sing-mux compatible connection multiplexing (optional).
+    #[cfg(feature = "mux")]
     mux: Option<Arc<MuxClient>>,
     /// When mux is enabled, route UDP through the plain proxy path instead
     /// of mux streams (mihomo `only-tcp`).
+    #[cfg(feature = "mux")]
     mux_only_tcp: bool,
     /// VLESS post-quantum Encryption (`mlkem768x25519plus`), applied below the
     /// VLESS header exchange once per dial. `None` for plain VLESS.
@@ -93,7 +96,9 @@ impl VlessAdapter {
             flow,
             udp,
             transport: Arc::new(transport),
+            #[cfg(feature = "mux")]
             mux: None,
+            #[cfg(feature = "mux")]
             mux_only_tcp: false,
             #[cfg(feature = "vless-encryption")]
             encryption: None,
@@ -105,6 +110,7 @@ impl VlessAdapter {
     /// via the mux client ride a shared VLESS connection whose first request
     /// targets the reserved mux destination
     /// (\`sp.mux.sing-box.arpa:444\`).
+    #[cfg(feature = "mux")]
     pub fn with_mux(mut self, options: MuxOptions) -> Self {
         use crate::mux::{MuxClient, MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
         use crate::vless::header::VlessAddr;
@@ -202,7 +208,16 @@ impl ProxyAdapter for VlessAdapter {
         // With mux enabled, UDP rides the mux TCP session (unless
         // `only-tcp` forces the plain path) — mirrors mihomo's
         // SingMux.SupportUDP.
-        self.udp || (self.mux.is_some() && !self.mux_only_tcp)
+        self.udp || {
+            #[cfg(feature = "mux")]
+            {
+                self.mux.is_some() && !self.mux_only_tcp
+            }
+            #[cfg(not(feature = "mux"))]
+            {
+                false
+            }
+        }
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
@@ -213,6 +228,7 @@ impl ProxyAdapter for VlessAdapter {
             self.flow
         );
 
+        #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
             let host = if !metadata.host.is_empty() {
                 metadata.host.to_string()
@@ -263,6 +279,7 @@ impl ProxyAdapter for VlessAdapter {
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+        #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
             if !self.mux_only_tcp {
                 let host = if !metadata.host.is_empty() {

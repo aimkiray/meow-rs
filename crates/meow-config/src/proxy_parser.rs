@@ -163,8 +163,10 @@ pub fn parse_proxy(
                 .and_then(serde_yaml::Value::as_bool)
                 .unwrap_or(false);
 
+            #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
             let mut adapter =
                 TrojanAdapter::new(name, server, port, password, sni, skip_verify, udp);
+            #[cfg(feature = "mux")]
             if let Some(mux_options) = parse_mux_options(name, config)? {
                 adapter = adapter.with_mux(mux_options);
             }
@@ -1402,6 +1404,7 @@ fn parse_vless(
     #[cfg(feature = "vless-encryption")]
     adapter.set_encryption(vless_encryption);
 
+    #[cfg(feature = "mux")]
     if let Some(mux_options) = parse_mux_options(name, config)? {
         adapter = adapter.with_mux(mux_options);
     }
@@ -1418,6 +1421,7 @@ fn parse_vless(
 ///
 /// Returns \`None\` when the block is absent or disabled; \`Err\` for
 /// malformed values.
+#[cfg(feature = "mux")]
 fn parse_mux_options(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
