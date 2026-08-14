@@ -6,6 +6,7 @@
 //! the configured connection/stream bounds are reached.
 
 use super::h2mux;
+use super::packet::MuxPacketConn;
 use super::request::Request;
 use super::smux;
 use super::stream::MuxStreamConn;
@@ -15,6 +16,7 @@ use meow_common::{MeowError, ProxyConn, Result};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -40,6 +42,9 @@ pub struct MuxOptions {
     pub max_connections: usize,
     pub min_streams: usize,
     pub max_streams: usize,
+    /// Route UDP through the plain proxy path instead of mux streams
+    /// (mihomo SingMuxOption.OnlyTcp).
+    pub only_tcp: bool,
 }
 
 impl Default for MuxOptions {
@@ -51,6 +56,7 @@ impl Default for MuxOptions {
             max_connections: 4,
             min_streams: 4,
             max_streams: 4,
+            only_tcp: false,
         }
     }
 }
@@ -131,7 +137,7 @@ impl AsyncRead for MuxStreamKind {
 }
 
 impl MuxStream {
-    fn new(kind: MuxStreamKind) -> Self {
+    pub(crate) fn new(kind: MuxStreamKind) -> Self {
         Self {
             kind,
             response_pending: true,
@@ -217,7 +223,7 @@ impl AsyncWrite for MuxStream {
 pub(crate) struct MuxSession {
     pub(crate) kind: SessionKind,
     pub(crate) streams: AtomicUsize,
-    last_used_ms: AtomicU64,
+    pub(crate) last_used_ms: AtomicU64,
 }
 
 /// Shared mux client used by an adapter's dial path.
@@ -236,10 +242,38 @@ impl MuxClient {
         })
     }
 
-    /// Open one multiplexed stream to `host:port`.  Writes the sing
-    /// Socksaddr destination prefix before returning, matching sing-mux's
-    /// per-stream addressing.
+    /// Open one multiplexed TCP stream to `host:port`.  Writes the sing
+    /// stream request (flags + Socksaddr destination) before returning,
+    /// matching sing-mux's per-stream addressing.
     pub async fn open_stream(self: &Arc<Self>, host: &str, port: u16) -> Result<MuxStreamConn> {
+        let (stream, session) = self.open_stream_flags(host, port, 0).await?;
+        Ok(MuxStreamConn::new(stream, session))
+    }
+
+    /// Open one multiplexed UDP flow to `host:port`: the stream request
+    /// carries flagUDP and datagrams are `[len u16 BE][data]` framed.
+    pub async fn open_packet_stream(
+        self: &Arc<Self>,
+        host: &str,
+        port: u16,
+    ) -> Result<MuxPacketConn> {
+        let (stream, session) = self.open_stream_flags(host, port, 1).await?;
+        let destination = host.parse::<std::net::IpAddr>().ok().map_or_else(
+            || "0.0.0.0:0".parse().expect("static placeholder"),
+            |ip| SocketAddr::new(ip, port),
+        );
+        Ok(MuxPacketConn::new(stream, session, destination))
+    }
+
+    /// Open a stream and write its stream request (flags + Socksaddr),
+    /// retrying once on a dead session — the shared core of the TCP and
+    /// UDP open paths.
+    async fn open_stream_flags(
+        self: &Arc<Self>,
+        host: &str,
+        port: u16,
+        flags: u16,
+    ) -> Result<(MuxStream, Arc<MuxSession>)> {
         let mut last_err = None;
         for _ in 0..2 {
             let session = match self.offer().await {
@@ -248,7 +282,7 @@ impl MuxClient {
             };
             match session.kind.open_stream().await {
                 Ok(mut stream) => {
-                    let prefix = address::encode_stream_request(host, port);
+                    let prefix = address::encode_stream_request_with_flags(host, port, flags);
                     if let Err(e) = stream.write_all(&prefix).await {
                         last_err = Some(MeowError::Io(e));
                         continue;
@@ -264,7 +298,7 @@ impl MuxClient {
                     // and zero-stream sessions idle past IDLE_TIMEOUT are
                     // evicted on the next offer.
                     session.last_used_ms.store(now_ms(), Ordering::SeqCst);
-                    return Ok(MuxStreamConn::new(stream, session));
+                    return Ok((stream, session));
                 }
                 Err(e) => {
                     last_err = Some(MeowError::Io(e));

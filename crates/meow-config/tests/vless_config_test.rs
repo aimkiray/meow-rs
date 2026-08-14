@@ -777,6 +777,66 @@ proxies:
     );
 }
 
+/// D16f: `only-tcp: true` → accepted (UDP stays on the plain proxy path).
+#[tokio::test]
+async fn parse_vless_mux_only_tcp_accepted() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    mux:
+      enabled: true
+      only-tcp: true
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    result.expect("only-tcp mux must load");
+    let mux_warns = lines
+        .iter()
+        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
+        .count();
+    assert_eq!(mux_warns, 0, "no warn expected; captured lines: {lines:?}");
+}
+
+/// D16g: `statistic` / `brutal-opts` → accepted with a warn each
+/// (upstream fields meow-rs does not implement).
+#[tokio::test]
+async fn parse_vless_mux_unsupported_fields_warn_and_ignore() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    mux:
+      enabled: true
+      statistic: true
+      brutal-opts:
+        enabled: true
+        up: 100
+        down: 100
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    result.expect("unsupported mux fields must not be a hard error");
+    // The config may be parsed more than once during load; assert each
+    // unsupported field warned at least once.
+    let statistic = lines
+        .iter()
+        .filter(|l| l.contains("mux option 'statistic'"))
+        .count();
+    let brutal = lines
+        .iter()
+        .filter(|l| l.contains("mux option 'brutal-opts'"))
+        .count();
+    assert!(
+        statistic >= 1 && brutal >= 1,
+        "expected one warn per unsupported field; {lines:?}"
+    );
+}
+
 /// D16c: explicit `protocol: yamux` → accepted without warn.
 #[tokio::test]
 async fn parse_vless_mux_yamux_accepted() {

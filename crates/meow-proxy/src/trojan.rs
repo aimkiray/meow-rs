@@ -51,6 +51,9 @@ pub struct TrojanAdapter {
     tls_layer: Arc<TlsLayer>,
     /// sing-mux compatible connection multiplexing (optional).
     mux: Option<Arc<MuxClient>>,
+    /// When mux is enabled, route UDP through the plain proxy path instead
+    /// of mux streams (mihomo `only-tcp`).
+    mux_only_tcp: bool,
 }
 
 impl TrojanAdapter {
@@ -93,6 +96,7 @@ impl TrojanAdapter {
             health: ProxyHealth::new(),
             tls_layer: Arc::new(tls_layer),
             mux: None,
+            mux_only_tcp: false,
         }
     }
 
@@ -147,6 +151,7 @@ impl TrojanAdapter {
                 Ok(Box::new(StreamConn(stream)) as Box<dyn ProxyConn>)
             })
         });
+        self.mux_only_tcp = options.only_tcp;
         self.mux = Some(MuxClient::new(dial, options));
         self
     }
@@ -444,7 +449,10 @@ impl ProxyAdapter for TrojanAdapter {
     }
 
     fn support_udp(&self) -> bool {
-        self.support_udp
+        // With mux enabled, UDP rides the mux TCP session (unless
+        // `only-tcp` forces the plain path) — mirrors mihomo's
+        // SingMux.SupportUDP.
+        self.support_udp || (self.mux.is_some() && !self.mux_only_tcp)
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
@@ -475,6 +483,27 @@ impl ProxyAdapter for TrojanAdapter {
             return Err(MeowError::NotSupported(
                 "Trojan UDP is disabled for this proxy (set `udp: true`)".into(),
             ));
+        }
+        if let Some(mux) = &self.mux {
+            if !self.mux_only_tcp {
+                let host = if !metadata.host.is_empty() {
+                    metadata.host.to_string()
+                } else if let Some(ip) = metadata.dst_ip {
+                    ip.to_string()
+                } else {
+                    return Err(MeowError::Proxy(
+                        "trojan mux udp: metadata has no destination host".into(),
+                    ));
+                };
+                debug!(
+                    "Trojan mux UDP connecting to {} via {}",
+                    metadata.remote_address(),
+                    self.addr_str
+                );
+                return Ok(Box::new(
+                    mux.open_packet_stream(&host, metadata.dst_port).await?,
+                ));
+            }
         }
         debug!(
             "Trojan UDP-associating for {} via {}",

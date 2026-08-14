@@ -59,6 +59,9 @@ pub struct VlessAdapter {
     transport: Arc<TransportChain>,
     /// sing-mux compatible connection multiplexing (optional).
     mux: Option<Arc<MuxClient>>,
+    /// When mux is enabled, route UDP through the plain proxy path instead
+    /// of mux streams (mihomo `only-tcp`).
+    mux_only_tcp: bool,
     /// VLESS post-quantum Encryption (`mlkem768x25519plus`), applied below the
     /// VLESS header exchange once per dial. `None` for plain VLESS.
     #[cfg(feature = "vless-encryption")]
@@ -91,6 +94,7 @@ impl VlessAdapter {
             udp,
             transport: Arc::new(transport),
             mux: None,
+            mux_only_tcp: false,
             #[cfg(feature = "vless-encryption")]
             encryption: None,
             health: ProxyHealth::new(),
@@ -150,6 +154,7 @@ impl VlessAdapter {
                 Ok(Box::new(StreamConn(Box::new(conn))) as Box<dyn ProxyConn>)
             })
         });
+        self.mux_only_tcp = options.only_tcp;
         self.mux = Some(MuxClient::new(dial, options));
         self
     }
@@ -194,7 +199,10 @@ impl ProxyAdapter for VlessAdapter {
     }
 
     fn support_udp(&self) -> bool {
-        self.udp
+        // With mux enabled, UDP rides the mux TCP session (unless
+        // `only-tcp` forces the plain path) — mirrors mihomo's
+        // SingMux.SupportUDP.
+        self.udp || (self.mux.is_some() && !self.mux_only_tcp)
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
@@ -255,6 +263,28 @@ impl ProxyAdapter for VlessAdapter {
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+        if let Some(mux) = &self.mux {
+            if !self.mux_only_tcp {
+                let host = if !metadata.host.is_empty() {
+                    metadata.host.to_string()
+                } else if let Some(ip) = metadata.dst_ip {
+                    ip.to_string()
+                } else {
+                    return Err(MeowError::Proxy(
+                        "vless mux udp: metadata has no destination host".into(),
+                    ));
+                };
+                debug!(
+                    "VLESS mux UDP connecting to {} via {}",
+                    metadata.remote_address(),
+                    self.addr_str
+                );
+                return Ok(Box::new(
+                    mux.open_packet_stream(&host, metadata.dst_port).await?,
+                ));
+            }
+        }
+
         // Vision is TCP-only; UDP always uses plain VlessConn regardless of flow.
         debug!(
             "VLESS UDP connecting to {} via {}",

@@ -15,9 +15,13 @@ const TYPE_FQDN: u8 = 0x03;
 
 /// Encode the full TCP stream request: `[flags u16 = 0][socksaddr]`.
 pub fn encode_stream_request(host: &str, port: u16) -> Vec<u8> {
+    encode_stream_request_with_flags(host, port, 0)
+}
+
+/// Encode a stream request with explicit flags (sing-mux flagUDP = 1).
+pub fn encode_stream_request_with_flags(host: &str, port: u16, flags: u16) -> Vec<u8> {
     let mut out = BytesMut::new();
-    // StreamRequest flags — 0 = TCP (sing-mux flagUDP is 1).
-    out.put_u16(0);
+    out.put_u16(flags);
     out.put_slice(&encode_address(host, port));
     out.to_vec()
 }
@@ -68,6 +72,14 @@ mod tests {
     fn stream_request_tcp_flags_then_socksaddr() {
         let bytes = encode_stream_request("10.0.2.2", 18081);
         assert_eq!(bytes, [0x00, 0x00, 0x01, 10, 0, 2, 2, 0x46, 0xa1]);
+    }
+
+    #[test]
+    fn stream_request_udp_flag_matches_sing_mux() {
+        // flagUDP = 1 (sing-mux protocol.go).
+        let bytes = encode_stream_request_with_flags("10.0.2.2", 18081, 1);
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[1], 0x01);
     }
 
     #[test]

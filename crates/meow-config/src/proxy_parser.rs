@@ -1450,6 +1450,18 @@ fn parse_mux_options(
             .and_then(serde_yaml::Value::as_u64)
             .map_or(default, |v| v as usize)
     };
+    // Parsed but unsupported upstream fields: `statistic` (per-connection
+    // traffic attribution in mihomo's dialer) and `brutal-opts` (TCP Brutal,
+    // Linux-only upstream).  Warn once so operators know the divergence.
+    for unsupported in ["statistic", "brutal-opts"] {
+        if mux_cfg.get(unsupported).is_some() {
+            tracing::warn!(
+                proxy = %name,
+                "mux option '{}' is not supported in meow-rs and will be ignored",
+                unsupported
+            );
+        }
+    }
     Ok(Some(meow_proxy::mux::MuxOptions {
         protocol,
         padding: mux_cfg
@@ -1459,6 +1471,10 @@ fn parse_mux_options(
         max_connections: get_usize("max-connections", 4),
         min_streams: get_usize("min-streams", 4),
         max_streams: get_usize("max-streams", 4),
+        only_tcp: mux_cfg
+            .get("only-tcp")
+            .and_then(serde_yaml::Value::as_bool)
+            .unwrap_or(false),
     }))
 }
 

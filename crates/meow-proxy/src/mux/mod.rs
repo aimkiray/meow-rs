@@ -16,12 +16,14 @@
 pub mod address;
 pub mod client;
 pub mod h2mux;
+pub mod packet;
 pub mod request;
 pub mod smux;
 pub mod stream;
 pub mod yamux;
 
 pub use client::{DialFn, MuxClient, MuxOptions};
+pub use packet::MuxPacketConn;
 pub use stream::MuxStreamConn;
 
 /// Reserved destination used in the proxy handshake to open a mux session.

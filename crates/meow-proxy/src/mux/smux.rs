@@ -282,20 +282,18 @@ impl AsyncRead for SmuxStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        loop {
-            // Serve the stashed remainder first.
-            if !this.pending.is_empty() {
-                let n = this.pending.len().min(buf.remaining());
-                buf.put_slice(&this.pending[..n]);
-                this.pending.advance(n);
-                if !this.pending.is_empty() {
-                    return Poll::Ready(Ok(()));
-                }
-                continue;
-            }
-            if this.eof.load(Ordering::SeqCst) {
-                return Poll::Ready(Ok(()));
-            }
+        // Every progress path returns Ready immediately: returning Pending
+        // after writing into the caller's ReadBuf would lose those bytes
+        // (the buffer is recreated on the next poll), violating the
+        // AsyncRead contract.
+        if !this.pending.is_empty() {
+            let n = this.pending.len().min(buf.remaining());
+            buf.put_slice(&this.pending[..n]);
+            this.pending.advance(n);
+            Poll::Ready(Ok(()))
+        } else if this.eof.load(Ordering::SeqCst) {
+            Poll::Ready(Ok(()))
+        } else {
             match this.rx.poll_recv(cx) {
                 Poll::Ready(Some(chunk)) => {
                     let n = chunk.len().min(buf.remaining());
@@ -303,13 +301,13 @@ impl AsyncRead for SmuxStream {
                     if n < chunk.len() {
                         this.pending = chunk.slice(n..);
                     }
-                    return Poll::Ready(Ok(()));
+                    Poll::Ready(Ok(()))
                 }
                 Poll::Ready(None) => {
                     this.eof.store(true, Ordering::SeqCst);
-                    return Poll::Ready(Ok(()));
+                    Poll::Ready(Ok(()))
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => Poll::Pending,
             }
         }
     }

@@ -64,6 +64,13 @@ metacubex/sing v0.5.7（地址编解码）
 状态字节（sing-mux clientConn.readResponse）；meow-rs 在 MuxStream 层统一
 处理（三种协议一致）。
 
+**UDP 流**：flags 置 flagUDP(1) 的流是 UDP 流，绑定流请求中的目标地址；
+之后双向都是 [len u16 BE][data] 数据报帧（与 meow VLESS UDP-over-TCP
+同款帧），无逐包地址。服务端以 serverPacketConn 处理。meow-rs 的
+`MuxPacketConn` 实现该封装；`only-tcp: true` 时 UDP 走原明文路径。
+`statistic`/`brutal-opts` 字段暂不支持（解析时各打一条 warn 忽略，
+brutal 上游仅 Linux）。
+
 ### 5. 客户端会话管理（对齐 sing-mux client.go）
 - `openStream`：从现存会话中选 `CanTakeNewRequest && NumStreams 最小` 的会话开流；
   无可用会话 → `offerNew`（新物理连接 + 握手 + 会话）。
@@ -82,6 +89,7 @@ crates/meow-proxy/src/mux/
   smux.rs       smux 会话 + 流（sagernet fork 帧格式，自实现）
   yamux.rs      yamux 封装（依赖 libp2p 的 yamux crate）
   h2mux.rs      h2mux 会话 + 流（h2 crate：CONNECT 流 = 请求体/响应体双向）
+  packet.rs     MuxPacketConn：UDP 流（flagUDP + [len u16 BE][data] 数据报帧）
   stream.rs     MuxStreamConn: ProxyConn 封装（!Unpin 内流的 pin-projection，
                 参考 anytls AnytlsConn 的模式）
 ```
