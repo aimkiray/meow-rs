@@ -144,6 +144,22 @@ impl VlessAdapter {
                     Some(VlessFlow::XtlsRprxVision) => Some("xtls-rprx-vision"),
                     _ => None,
                 };
+                // Vision wraps before the header: the mux dialer's first
+                // write (mux request header) carries the VLESS request
+                // inside the same Vision record, matching mihomo/xray.
+                #[cfg(feature = "vless-vision")]
+                if flow.is_some() {
+                    let vless = VlessConn::new_deferred(
+                        stream,
+                        &uuid_bytes,
+                        flow_str,
+                        Cmd::Tcp,
+                        MUX_DESTINATION_PORT,
+                        &VlessAddr::domain(MUX_DESTINATION_FQDN).expect("static mux fqdn"),
+                    )
+                    .await?;
+                    return Ok(Box::new(VisionConn::new(vless, uuid_bytes)) as Box<dyn ProxyConn>);
+                }
                 let conn = VlessConn::new(
                     stream,
                     &uuid_bytes,
@@ -261,21 +277,39 @@ impl ProxyAdapter for VlessAdapter {
             }
         };
 
-        let conn = VlessConn::new(
-            stream,
-            &self.uuid_bytes,
-            flow_str,
-            Cmd::Tcp,
-            metadata.dst_port,
-            &addr,
-        )
-        .await?;
-
-        match self.flow {
+        let conn = match self.flow {
+            // Vision must wrap the connection BEFORE the request header is
+            // sent: xray expects the VLESS request inside the first
+            // Vision-padded record (mihomo wires it the same way), so the
+            // header is deferred to the first write through the Vision
+            // layer.
             #[cfg(feature = "vless-vision")]
-            Some(VlessFlow::XtlsRprxVision) => Ok(Box::new(VisionConn::new(conn, self.uuid_bytes))),
-            _ => Ok(Box::new(StreamConn(Box::new(conn)))),
-        }
+            Some(VlessFlow::XtlsRprxVision) => {
+                let vless = VlessConn::new_deferred(
+                    stream,
+                    &self.uuid_bytes,
+                    flow_str,
+                    Cmd::Tcp,
+                    metadata.dst_port,
+                    &addr,
+                )
+                .await?;
+                Box::new(VisionConn::new(vless, self.uuid_bytes)) as Box<dyn ProxyConn>
+            }
+            _ => {
+                let conn = VlessConn::new(
+                    stream,
+                    &self.uuid_bytes,
+                    flow_str,
+                    Cmd::Tcp,
+                    metadata.dst_port,
+                    &addr,
+                )
+                .await?;
+                Box::new(StreamConn(Box::new(conn)))
+            }
+        };
+        Ok(conn)
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
