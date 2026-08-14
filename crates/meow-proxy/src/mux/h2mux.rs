@@ -243,7 +243,10 @@ impl AsyncWrite for Stream {
         let this = self.get_mut();
         // Stash the payload exactly once per logical write: if pending_write
         // is set, a previous poll returned Pending and capacity has been
-        // reserved — do not encode or reserve again.
+        // reserved — do not encode or reserve again.  This relies on the
+        // AsyncWrite contract that a Pending poll is retried with the same
+        // buffer (tokio's write/write_all always do); same pattern as
+        // meow-transport's h2 transport.
         if this.pending_write.is_none() {
             let data = Bytes::copy_from_slice(buf);
             this.send.reserve_capacity(data.len());

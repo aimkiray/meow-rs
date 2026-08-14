@@ -227,6 +227,93 @@ mod tests {
         assert_eq!(&buf[..n], b"hello-udp");
         assert_eq!(src, "127.0.0.1:53".parse::<SocketAddr>().unwrap());
     }
+    /// UDP round trip over a yamux session (parity with the smux test;
+    /// the review flagged yamux UDP as untested).
+    #[tokio::test]
+    async fn udp_datagram_round_trip_over_yamux() {
+        use super::super::yamux;
+        use ::yamux::{Config, Connection, Mode};
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let config = Config::default();
+            let io = server_io.compat();
+            let mut connection = Connection::new(io, config, Mode::Server);
+            while let Some(result) =
+                std::future::poll_fn(|cx| connection.poll_next_inbound(cx)).await
+            {
+                let stream = match result {
+                    Ok(stream) => stream,
+                    Err(_) => return,
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    use tokio_util::compat::FuturesAsyncReadCompatExt;
+                    let mut stream = stream.compat();
+                    // Stream request: flags(2) + IPv4 socksaddr(7).
+                    let mut req = [0u8; 9];
+                    if stream.read_exact(&mut req).await.is_err() {
+                        return;
+                    }
+                    assert_eq!(
+                        u16::from_be_bytes([req[0], req[1]]),
+                        1,
+                        "stream request must carry flagUDP"
+                    );
+                    if stream.write_all(&[0x00]).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        let mut len_buf = [0u8; 2];
+                        if stream.read_exact(&mut len_buf).await.is_err() {
+                            return;
+                        }
+                        let len = u16::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; len];
+                        if stream.read_exact(&mut payload).await.is_err() {
+                            return;
+                        }
+                        let mut out = bytes::BytesMut::with_capacity(2 + len);
+                        bytes::BufMut::put_u16(&mut out, len as u16);
+                        out.extend_from_slice(&payload);
+                        if stream.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let session = Arc::new(yamux::Session::client(client_io).unwrap());
+        let yamux_stream = session.open_stream().await.unwrap();
+        let mut stream = MuxStream::new(MuxStreamKind::Yamux(yamux_stream));
+        stream
+            .write_all(&address::encode_stream_request_with_flags(
+                "127.0.0.1",
+                53,
+                1,
+            ))
+            .await
+            .unwrap();
+        let session_arc = Arc::new(MuxSession {
+            kind: SessionKind::Yamux(session),
+            streams: AtomicUsize::new(1),
+            last_used_ms: AtomicU64::new(0),
+        });
+        let conn = MuxPacketConn::new(
+            stream,
+            session_arc,
+            "127.0.0.1:53".parse::<SocketAddr>().unwrap(),
+        );
+        conn.write_packet(b"yamux-udp", &"127.0.0.1:53".parse().unwrap())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 32];
+        let (n, _src) = conn.read_packet(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"yamux-udp");
+        drop(server);
+    }
     /// Regression: a pending read (no upstream datagram yet) must not
     /// head-of-line block writes — the SOCKS5 UDP relay reads on a
     /// separate task while the client keeps sending.

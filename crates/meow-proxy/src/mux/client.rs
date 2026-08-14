@@ -114,6 +114,10 @@ impl SessionKind {
 pub(crate) struct MuxStream {
     kind: MuxStreamKind,
     response_pending: bool,
+    /// Sticky: set once the per-stream response status reported a remote
+    /// error; subsequent polls repeat the error instead of reading stray
+    /// varbin message bytes as data.
+    response_failed: bool,
 }
 
 pub(crate) enum MuxStreamKind {
@@ -141,11 +145,15 @@ impl MuxStream {
         Self {
             kind,
             response_pending: true,
+            response_failed: false,
         }
     }
 
     /// Consume the per-stream response status byte on first read.
     fn poll_response(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.response_failed {
+            return Poll::Ready(Err(io::Error::other("mux: remote stream error")));
+        }
         if !self.response_pending {
             return Poll::Ready(Ok(()));
         }
@@ -166,7 +174,10 @@ impl MuxStream {
                     Poll::Ready(Ok(()))
                 } else {
                     // Remote error: a varbin message follows, but the stream
-                    // is dead either way — surface the failure immediately.
+                    // is dead either way — surface the failure immediately
+                    // and stick to it so the stray message bytes are never
+                    // read as data.
+                    self.response_failed = true;
                     Poll::Ready(Err(io::Error::other("mux: remote stream error")))
                 }
             }
