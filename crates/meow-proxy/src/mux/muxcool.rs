@@ -81,6 +81,10 @@ const STREAM_QUEUE: usize = 32;
 /// servers drop status-4 frames silently on both sides.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Meta length cap — xray FrameMetadata::Unmarshal rejects meta_len > 512;
+/// capping also bounds the per-frame allocation on garbage input.
+const MAX_META: usize = 512;
+
 // --- Frame codec (pure, no I/O - byte-tested below) -------------------------
 
 /// Append [port u16 BE][atype u8][address] (VMess layout: port first).
@@ -193,6 +197,15 @@ pub(crate) fn decode_meta(meta: &[u8]) -> io::Result<FrameMeta> {
     let has_dest = status == STATUS_NEW
         || (status == STATUS_KEEP && !rest.is_empty() && rest[0] == NETWORK_UDP);
     let dest = if has_dest {
+        // New frames MUST carry a destination (xray: insufficient buffer) —
+        // guard before indexing rest[0] so a malformed frame errors instead
+        // of panicking the reader task.
+        if rest.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mux.cool: New frame without destination",
+            ));
+        }
         let network = rest[0];
         if network != NETWORK_TCP && network != NETWORK_UDP {
             return Err(io::Error::new(
@@ -464,18 +477,23 @@ async fn read_loop(
         _ = done.notified() => Err(io::Error::other("mux.cool session closed")),
         result = read_loop_inner(&mut reader, &streams) => result,
     };
+    // Mark the abort before delivery: consumers observing a closed channel
+    // must see aborted() == true so they surface an error, not a clean EOF.
+    closed.store(true, Ordering::SeqCst);
     if let Err(e) = &result {
-        // Push the failure to every live stream so consumers surface the
-        // lost data instead of seeing a clean EOF.
-        let map = streams.lock().await;
+        // Push the failure to every live stream, then clear the map —
+        // dropping every sender closes the channels, so consumers parked on
+        // a full queue observe the abort instead of hanging forever (the
+        // session itself keeps the map alive).
+        let mut map = streams.lock().await;
         for (_, tx) in map.iter() {
             let _ = tx.try_send(Event::Error(io::Error::new(
                 e.kind(),
                 format!("mux.cool session aborted: {e}"),
             )));
         }
+        map.clear();
     }
-    closed.store(true, Ordering::SeqCst);
 }
 
 async fn read_loop_inner(
@@ -484,6 +502,12 @@ async fn read_loop_inner(
 ) -> io::Result<()> {
     loop {
         let meta_len = read_u16(reader).await?;
+        if meta_len as usize > MAX_META {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("mux.cool: meta length {meta_len} exceeds {MAX_META}"),
+            ));
+        }
         let mut meta = BytesMut::with_capacity(meta_len as usize);
         meta.resize(meta_len as usize, 0);
         reader.read_exact(&mut meta).await?;
@@ -521,6 +545,18 @@ async fn read_loop_inner(
                     let map = streams.lock().await;
                     map.get(&frame.session_id).cloned()
                 };
+                // Read the payload whenever it is present BEFORE delivering
+                // an error: an Error|Data frame still carries data_len +
+                // payload, and skipping it would desync the frame stream.
+                let payload = if frame.option & OPTION_DATA != 0 {
+                    let data_len = read_u16(reader).await?;
+                    let mut data = BytesMut::with_capacity(data_len as usize);
+                    data.resize(data_len as usize, 0);
+                    reader.read_exact(&mut data).await?;
+                    Some(data.freeze())
+                } else {
+                    None
+                };
                 if frame.option & OPTION_ERROR != 0 {
                     if let Some(tx) = &tx {
                         let _ = tx
@@ -531,17 +567,10 @@ async fn read_loop_inner(
                     }
                     continue;
                 }
-                if frame.option & OPTION_DATA == 0 {
-                    continue; // meta-only keep frame
-                }
-                let data_len = read_u16(reader).await?;
-                let mut data = BytesMut::with_capacity(data_len as usize);
-                data.resize(data_len as usize, 0);
-                reader.read_exact(&mut data).await?;
-                if let Some(tx) = &tx {
+                if let (Some(tx), Some(bytes)) = (&tx, payload) {
                     let _ = tx
                         .send(Event::Data {
-                            bytes: data.freeze(),
+                            bytes,
                             dest: frame.dest,
                         })
                         .await;
@@ -1153,6 +1182,13 @@ mod tests {
     }
 
     #[test]
+    fn decode_meta_rejects_new_without_destination() {
+        // New frame with meta_len 4 (no network/address) — must error, not
+        // panic the reader task on rest[0].
+        assert!(decode_meta(&[0x00, 0x01, 0x01, 0x00]).is_err());
+    }
+
+    #[test]
     fn decode_meta_ignores_trailing_meta_bytes() {
         // xray may append optional fullcone/GlobalID metadata after the
         // address - trailing bytes must be ignored, not misparsed.
@@ -1251,6 +1287,75 @@ mod tests {
         assert_eq!(received, payload);
         // 20 KiB at 8 KiB per frame = 3 data frames.
         assert_eq!(log.lock().unwrap().data_frames, 3);
+    }
+
+    #[tokio::test]
+    async fn keep_error_frame_drains_payload_and_keeps_framing() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut io = server_io;
+            // Consume the two New frames.
+            let mut sids = Vec::new();
+            for _ in 0..2 {
+                let meta_len = read_u16(&mut io).await.unwrap();
+                let mut meta = vec![0u8; meta_len as usize];
+                io.read_exact(&mut meta).await.unwrap();
+                sids.push(u16::from_be_bytes([meta[0], meta[1]]));
+            }
+            // Error|Data keep frame for stream 1: the payload must be
+            // drained (framing), and the stream must see an error.
+            let mut err = BytesMut::new();
+            err.put_u16(4);
+            err.put_u16(sids[0]);
+            err.put_u8(STATUS_KEEP);
+            err.put_u8(OPTION_DATA | OPTION_ERROR);
+            err.put_u16(1);
+            err.put_u8(0xAA);
+            io.write_all(&err).await.unwrap();
+            // ...followed by a normal data frame for stream 2.
+            let echo = encode_data_frame(sids[1], b"ok", None).unwrap();
+            io.write_all(&echo).await.unwrap();
+        });
+        let session = MuxCoolSession::client(Box::new(TestConn(client_io)))
+            .await
+            .unwrap();
+        let mut s1 = session.open_stream("a.example", 80, false).await.unwrap();
+        let mut s2 = session.open_stream("b.example", 81, false).await.unwrap();
+        let mut buf = [0u8; 8];
+        let n = s2.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"ok",
+            "stream 2 framing must survive the error frame"
+        );
+        let result = s1.read(&mut buf).await;
+        assert!(result.is_err(), "stream 1 must surface the remote error");
+    }
+
+    #[tokio::test]
+    async fn oversized_meta_aborts_session_with_error() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut io = server_io;
+            // Consume the New frame, then send an oversized meta length.
+            let meta_len = read_u16(&mut io).await.unwrap();
+            let mut meta = vec![0u8; meta_len as usize];
+            io.read_exact(&mut meta).await.unwrap();
+            let mut bad = BytesMut::with_capacity(2);
+            bad.put_u16(MAX_META as u16 + 1);
+            io.write_all(&bad).await.unwrap();
+        });
+        let session = MuxCoolSession::client(Box::new(TestConn(client_io)))
+            .await
+            .unwrap();
+        let mut stream = session.open_stream("a.example", 80, false).await.unwrap();
+        stream.write_all(b"x").await.unwrap();
+        let mut buf = [0u8; 8];
+        let result = stream.read(&mut buf).await;
+        assert!(
+            result.is_err(),
+            "oversized meta must abort the session with an error"
+        );
     }
 
     #[tokio::test]
