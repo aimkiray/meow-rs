@@ -124,9 +124,15 @@ UDP GlobalID）我们不发送，两端服务端都会丢弃多余 meta 字节�
 - UDP 流：New 帧 network=UDP 开流；双向 Keep 帧 meta 携带**逐包目标地址**
   （与 sing-vmess serverMuxPacketConn 对齐），读侧解析回源地址，无地址的
   帧回退到流的绑定目标。
-- 会话：读任务解复用（每流 32 深度有界通道，慢消费者反压整个会话——对齐
-  xray 的阻塞 session buffer）；写侧单锁串行；30s KeepAlive（sid=0）保活；
-  读任务/保活任务持 Weak 引用，池淘汰零流会话即整体回收。
+- 会话：**单驱动任务**独占连接、同任务轮询读写两个方向（与 h2mux 的 h2 驱动
+  同一纪律）——出站帧经有界通道（PollSender 轮询式背压）交给驱动写，入站帧由
+  驱动状态机读入并解复用（每流 32 深度有界通道，慢消费者反压整个会话——对齐
+  xray 的阻塞 session buffer）。30s KeepAlive（sid=0）保活。
+  **关键教训**：早期实现用 tokio split 让读任务与流写任务并发轮询同一分层连接
+  （VlessConn/Vision/Reality TLS），并发流下 TLS 层状态被交错损坏（端到端 TLS
+  大量 schannel 校验失败，协议层零报错、HTTP 明文却完好——极隐蔽）；h2mux 因
+  单驱动而幸免。重构为单驱动后 12 并发压测 0 失败。分层连接切勿 split 并发
+  轮询。
 
 **服务端兼容性**：Xray-core VLESS inbound（原生）；sing-box / mihomo 的
 VLESS inbound（sing-vmess HandleMuxConnection，帧格式同源）。VMess 不支持

@@ -37,7 +37,6 @@ use super::client::MuxSession;
 use bytes::{BufMut, Bytes, BytesMut};
 use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
 use std::collections::HashMap;
-use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -47,6 +46,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, Mutex, Notify};
+use tokio_util::sync::PollSender;
 
 // --- Wire constants (xray common/mux/frame.go) ------------------------------
 
@@ -300,15 +300,23 @@ pub(crate) enum Event {
 
 // --- Session ----------------------------------------------------------------
 
+/// Outbound frame queue depth per session (frames, not bytes); a slow
+/// server applies backpressure to stream writes via the bounded channel.
+const OUTBOUND_QUEUE: usize = 64;
+
 /// One Mux.Cool session multiplexing streams over one VLESS connection.
 ///
-/// The connection is split into halves: a reader task demuxes inbound
-/// frames to per-stream channels, writes serialize behind the writer lock.
-/// Both background tasks hold only Weak refs, so dropping the last external
-/// Arc (pool eviction of a zero-stream session) tears the session down:
-/// Drop fires the Notify, the reader exits and releases its read half.
+/// A single driver task owns the connection and polls BOTH directions —
+/// the same single-task discipline h2mux uses.  Splitting a layered
+/// conn (VlessConn / Vision / TLS) into concurrent read and write pollers
+/// corrupted the stream state under parallel streams, so outbound frames
+/// are handed to the driver over a bounded channel (backpressure via
+/// PollSender) and inbound frames are demuxed by the driver itself.
+///
+/// Dropping the last external Arc (pool eviction of a zero-stream session)
+/// tears the session down: Drop fires the Notify, the driver exits.
 pub(crate) struct MuxCoolSession {
-    writer: Mutex<tokio::io::WriteHalf<Box<dyn ProxyConn>>>,
+    driver_tx: mpsc::Sender<Bytes>,
     streams: Arc<Mutex<HashMap<u16, mpsc::Sender<Event>>>>,
     next_sid: AtomicU32,
     closed: Arc<AtomicBool>,
@@ -318,21 +326,22 @@ pub(crate) struct MuxCoolSession {
 impl MuxCoolSession {
     /// Start a session over conn - a VLESS connection whose request carried
     /// CommandMux.  The VLESS response header is consumed lazily by the
-    /// reader task's first read (VlessConn semantics).
+    /// driver's first read (VlessConn semantics).
     pub(crate) async fn client(conn: Box<dyn ProxyConn>) -> io::Result<Arc<Self>> {
-        let (reader, writer) = tokio::io::split(conn);
+        let (driver_tx, out_rx) = mpsc::channel(OUTBOUND_QUEUE);
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
         let done = Arc::new(Notify::new());
         let session = Arc::new(Self {
-            writer: Mutex::new(writer),
+            driver_tx,
             streams: Arc::clone(&streams),
             next_sid: AtomicU32::new(1),
             closed: Arc::clone(&closed),
             done: Arc::clone(&done),
         });
-        tokio::spawn(read_loop(
-            reader,
+        tokio::spawn(driver_loop(
+            conn,
+            out_rx,
             Arc::clone(&streams),
             Arc::clone(&closed),
             Arc::clone(&done),
@@ -340,14 +349,24 @@ impl MuxCoolSession {
         tokio::spawn(keepalive_loop(
             Arc::downgrade(&session),
             Arc::clone(&closed),
-            Arc::clone(&done),
         ));
         Ok(session)
     }
 
-    /// True once the session is unusable (reader died or a write failed).
+    /// True once the session is unusable (driver died).
     pub(crate) fn aborted(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Queue one outbound frame to the driver task (async contexts).
+    async fn send_frame(&self, frame: Bytes) -> io::Result<()> {
+        if self.aborted() {
+            return Err(io::Error::other("mux.cool session closed"));
+        }
+        self.driver_tx
+            .send(frame)
+            .await
+            .map_err(|_| io::Error::other("mux.cool session closed"))
     }
 
     /// Open one stream and write its New frame carrying host:port.
@@ -366,17 +385,9 @@ impl MuxCoolSession {
         let frame = encode_new_frame(sid, udp, host, port)?;
         let (tx, rx) = mpsc::channel(STREAM_QUEUE);
         self.streams.lock().await.insert(sid, tx);
-        {
-            let mut w = self.writer.lock().await;
-            let result = async {
-                w.write_all(&frame).await?;
-                w.flush().await
-            }
-            .await;
-            if let Err(e) = result {
-                self.streams.lock().await.remove(&sid);
-                return Err(e);
-            }
+        if let Err(e) = self.send_frame(frame).await {
+            self.streams.lock().await.remove(&sid);
+            return Err(e);
         }
         Ok(StreamParts {
             sid,
@@ -405,23 +416,6 @@ impl MuxCoolSession {
             return Err(io::Error::other("mux.cool session id space exhausted"));
         }
         Ok(sid)
-    }
-
-    /// Write one End frame under the writer lock (best effort).
-    async fn send_end(&self, sid: u16) {
-        if self.aborted() {
-            return;
-        }
-        let mut w = self.writer.lock().await;
-        let _ = w.write_all(&encode_end_frame(sid, false)).await;
-        let _ = w.flush().await;
-    }
-
-    /// Write one KeepAlive frame under the writer lock.
-    async fn send_keepalive(&self) -> io::Result<()> {
-        let mut w = self.writer.lock().await;
-        w.write_all(&encode_keepalive_frame()).await?;
-        w.flush().await
     }
 }
 
@@ -464,27 +458,249 @@ impl Drop for EndGuard {
         if !self.ended.swap(true, Ordering::SeqCst) && !self.session.aborted() {
             let session = Arc::clone(&self.session);
             let sid = self.sid;
-            // Detached: End must queue behind any in-flight data frame, and
-            // drop cannot await the writer lock.
+            // Detached: the End frame queues behind any in-flight data
+            // frames in the driver's channel; drop cannot await the send.
             tokio::spawn(async move {
-                session.send_end(sid).await;
+                let _ = session.send_frame(encode_end_frame(sid, false)).await;
             });
         }
     }
 }
 
-// --- Reader task ------------------------------------------------------------
+// --- Driver task -------------------------------------------------------------
 
-async fn read_loop(
-    mut reader: tokio::io::ReadHalf<Box<dyn ProxyConn>>,
+/// Frame read phase.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadPhase {
+    MetaLen,
+    Meta,
+    DataLen,
+    Data,
+}
+
+/// Frame read state machine.  It lives in the driver task (not inside a
+/// recreated future), so a select! cancellation — an outbound frame
+/// arriving mid-read — loses nothing: partial bytes persist in the buffer
+/// and the read resumes exactly where it left off.
+struct ReadState {
+    phase: ReadPhase,
+    buf: BytesMut,
+    pos: usize,
+    sid: u16,
+    option: u8,
+    dest: Option<(Vec<u8>, u16)>,
+}
+
+impl ReadState {
+    fn fresh() -> Self {
+        Self {
+            phase: ReadPhase::MetaLen,
+            buf: BytesMut::zeroed(2),
+            pos: 0,
+            sid: 0,
+            option: 0,
+            dest: None,
+        }
+    }
+
+    /// Start reading a fresh frame header.
+    fn reset_header(&mut self) {
+        self.phase = ReadPhase::MetaLen;
+        self.buf = BytesMut::zeroed(2);
+        self.pos = 0;
+    }
+}
+
+/// Read until the current phase holds the requested byte count.
+async fn read_into(
+    conn: &mut Box<dyn ProxyConn>,
+    state: &mut ReadState,
+    need: usize,
+) -> io::Result<()> {
+    while state.pos < need {
+        let n = conn.read(&mut state.buf[state.pos..need]).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "mux.cool session closed",
+            ));
+        }
+        state.pos += n;
+    }
+    Ok(())
+}
+
+/// Advance the read state machine by one phase: the phase changes only on
+/// completion, so cancellation mid-phase is safe.
+async fn read_step(
+    conn: &mut Box<dyn ProxyConn>,
+    state: &mut ReadState,
+    streams: &Arc<Mutex<HashMap<u16, mpsc::Sender<Event>>>>,
+) -> io::Result<()> {
+    match state.phase {
+        ReadPhase::MetaLen => {
+            read_into(conn, state, 2).await?;
+            let meta_len = u16::from_be_bytes([state.buf[0], state.buf[1]]);
+            if meta_len as usize > MAX_META {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("mux.cool: meta length {meta_len} exceeds {MAX_META}"),
+                ));
+            }
+            state.buf = BytesMut::zeroed(meta_len as usize);
+            state.pos = 0;
+            state.phase = ReadPhase::Meta;
+            Ok(())
+        }
+        ReadPhase::Meta => {
+            let need = state.buf.len();
+            read_into(conn, state, need).await?;
+            let frame = decode_meta(&state.buf)?;
+            state.sid = frame.session_id;
+            state.option = frame.option;
+            state.dest = frame.dest;
+            match frame.status {
+                STATUS_NEW => {
+                    // The server never opens streams on a client session.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "mux.cool: server-initiated stream",
+                    ));
+                }
+                STATUS_KEEPALIVE => state.reset_header(),
+                STATUS_END => {
+                    let event = if state.option & OPTION_ERROR != 0 {
+                        Event::Error(io::Error::other(
+                            "mux.cool: remote stream closed with error",
+                        ))
+                    } else {
+                        Event::Eof
+                    };
+                    let tx = {
+                        let map = streams.lock().await;
+                        map.get(&state.sid).cloned()
+                    };
+                    if let Some(tx) = tx {
+                        // Ordered behind any queued data; fails fast once
+                        // the consumer is gone.
+                        let _ = tx.send(event).await;
+                        streams.lock().await.remove(&state.sid);
+                    }
+                    state.reset_header();
+                }
+                STATUS_KEEP if state.option & OPTION_DATA != 0 => {
+                    state.buf = BytesMut::zeroed(2);
+                    state.pos = 0;
+                    state.phase = ReadPhase::DataLen;
+                }
+                STATUS_KEEP => {
+                    if state.option & OPTION_ERROR != 0 {
+                        let tx = {
+                            let map = streams.lock().await;
+                            map.get(&state.sid).cloned()
+                        };
+                        if let Some(tx) = tx {
+                            let _ = tx
+                                .send(Event::Error(io::Error::other(
+                                    "mux.cool: remote stream error",
+                                )))
+                                .await;
+                        }
+                    }
+                    state.reset_header();
+                }
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("mux.cool: unknown frame status {other}"),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        ReadPhase::DataLen => {
+            read_into(conn, state, 2).await?;
+            let data_len = u16::from_be_bytes([state.buf[0], state.buf[1]]) as usize;
+            state.buf = BytesMut::zeroed(data_len);
+            state.pos = 0;
+            state.phase = ReadPhase::Data;
+            Ok(())
+        }
+        ReadPhase::Data => {
+            let need = state.buf.len();
+            read_into(conn, state, need).await?;
+            // Read the payload before delivering an error: an Error|Data
+            // frame still carries data_len + payload, and skipping it would
+            // desync the frame stream.
+            let tx = {
+                let map = streams.lock().await;
+                map.get(&state.sid).cloned()
+            };
+            if state.option & OPTION_ERROR != 0 {
+                if let Some(tx) = tx {
+                    let _ = tx
+                        .send(Event::Error(io::Error::other(
+                            "mux.cool: remote stream error",
+                        )))
+                        .await;
+                }
+            } else if let Some(tx) = tx {
+                let bytes = std::mem::take(&mut state.buf).freeze();
+                let _ = tx
+                    .send(Event::Data {
+                        bytes,
+                        dest: state.dest.clone(),
+                    })
+                    .await;
+            }
+            state.reset_header();
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+async fn read_u16(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<u16> {
+    let mut b = [0u8; 2];
+    reader.read_exact(&mut b).await?;
+    Ok(u16::from_be_bytes(b))
+}
+
+/// Owns the connection and polls BOTH directions from this single task —
+/// the same discipline h2mux's h2 driver uses.  Concurrent read/write
+/// polling of a layered conn (VlessConn / Vision / TLS) corrupted the
+/// stream state under parallel streams, so writes arrive via the outbound
+/// channel instead.
+async fn driver_loop(
+    mut conn: Box<dyn ProxyConn>,
+    mut out_rx: mpsc::Receiver<Bytes>,
     streams: Arc<Mutex<HashMap<u16, mpsc::Sender<Event>>>>,
     closed: Arc<AtomicBool>,
     done: Arc<Notify>,
 ) {
-    let result = tokio::select! {
-        _ = done.notified() => Err(io::Error::other("mux.cool session closed")),
-        result = read_loop_inner(&mut reader, &streams) => result,
-    };
+    let mut state = ReadState::fresh();
+
+    let result: io::Result<()> = async {
+        loop {
+            tokio::select! {
+                _ = done.notified() => {
+                    return Err(io::Error::other("mux.cool session closed"));
+                }
+                frame = out_rx.recv() => {
+                    let Some(frame) = frame else {
+                        return Err(io::Error::other("mux.cool outbound channel closed"));
+                    };
+                    conn.write_all(&frame).await?;
+                    conn.flush().await?;
+                }
+                step = read_step(&mut conn, &mut state, &streams) => {
+                    step?;
+                }
+            }
+        }
+    }
+    .await;
+
     // Mark the abort before delivery: consumers observing a closed channel
     // must see aborted() == true so they surface an error, not a clean EOF.
     closed.store(true, Ordering::SeqCst);
@@ -504,103 +720,7 @@ async fn read_loop(
     }
 }
 
-async fn read_loop_inner(
-    reader: &mut (impl AsyncRead + Unpin),
-    streams: &Arc<Mutex<HashMap<u16, mpsc::Sender<Event>>>>,
-) -> io::Result<()> {
-    loop {
-        let meta_len = read_u16(reader).await?;
-        if meta_len as usize > MAX_META {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("mux.cool: meta length {meta_len} exceeds {MAX_META}"),
-            ));
-        }
-        let mut meta = BytesMut::with_capacity(meta_len as usize);
-        meta.resize(meta_len as usize, 0);
-        reader.read_exact(&mut meta).await?;
-        let frame = decode_meta(&meta)?;
-        match frame.status {
-            STATUS_NEW => {
-                // The server never opens streams on a client session.
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "mux.cool: server-initiated stream",
-                ));
-            }
-            STATUS_KEEPALIVE => {}
-            STATUS_END => {
-                let event = if frame.option & OPTION_ERROR != 0 {
-                    Event::Error(io::Error::other(
-                        "mux.cool: remote stream closed with error",
-                    ))
-                } else {
-                    Event::Eof
-                };
-                let tx = {
-                    let map = streams.lock().await;
-                    map.get(&frame.session_id).cloned()
-                };
-                if let Some(tx) = tx {
-                    // Ordered behind any queued data; fails fast once the
-                    // consumer is gone.
-                    let _ = tx.send(event).await;
-                    streams.lock().await.remove(&frame.session_id);
-                }
-            }
-            STATUS_KEEP => {
-                let tx = {
-                    let map = streams.lock().await;
-                    map.get(&frame.session_id).cloned()
-                };
-                // Read the payload whenever it is present BEFORE delivering
-                // an error: an Error|Data frame still carries data_len +
-                // payload, and skipping it would desync the frame stream.
-                let payload = if frame.option & OPTION_DATA != 0 {
-                    let data_len = read_u16(reader).await?;
-                    let mut data = BytesMut::with_capacity(data_len as usize);
-                    data.resize(data_len as usize, 0);
-                    reader.read_exact(&mut data).await?;
-                    Some(data.freeze())
-                } else {
-                    None
-                };
-                if frame.option & OPTION_ERROR != 0 {
-                    if let Some(tx) = &tx {
-                        let _ = tx
-                            .send(Event::Error(io::Error::other(
-                                "mux.cool: remote stream error",
-                            )))
-                            .await;
-                    }
-                    continue;
-                }
-                if let (Some(tx), Some(bytes)) = (&tx, payload) {
-                    let _ = tx
-                        .send(Event::Data {
-                            bytes,
-                            dest: frame.dest,
-                        })
-                        .await;
-                }
-            }
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("mux.cool: unknown frame status {other}"),
-                ));
-            }
-        }
-    }
-}
-
-async fn read_u16(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<u16> {
-    let mut b = [0u8; 2];
-    reader.read_exact(&mut b).await?;
-    Ok(u16::from_be_bytes(b))
-}
-
-async fn keepalive_loop(session: Weak<MuxCoolSession>, closed: Arc<AtomicBool>, done: Arc<Notify>) {
+async fn keepalive_loop(session: Weak<MuxCoolSession>, closed: Arc<AtomicBool>) {
     loop {
         tokio::time::sleep(KEEPALIVE_INTERVAL).await;
         let Some(session) = session.upgrade() else {
@@ -609,11 +729,9 @@ async fn keepalive_loop(session: Weak<MuxCoolSession>, closed: Arc<AtomicBool>, 
         if closed.load(Ordering::SeqCst) {
             return;
         }
-        if session.send_keepalive().await.is_err() {
-            // The write half is dead: abort the reader so pending streams
-            // error out instead of hanging on a half-open connection.
-            closed.store(true, Ordering::SeqCst);
-            done.notify_waiters();
+        // The driver detects physical write failures; a send error here
+        // just means the session is already going away.
+        if session.send_frame(encode_keepalive_frame()).await.is_err() {
             return;
         }
     }
@@ -621,34 +739,31 @@ async fn keepalive_loop(session: Weak<MuxCoolSession>, closed: Arc<AtomicBool>, 
 
 // --- TCP stream -------------------------------------------------------------
 
-type IoBoxFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
-
-/// One multiplexed TCP stream.  Writes are framed Keep frames and sent
-/// under the session writer lock through a stored future (real backpressure,
-/// no unbounded buffering); reads come from the stream's demux channel.
-///
-/// The in-flight futures live behind std mutexes: ProxyConn requires Sync,
-/// and a stored future holding the session lock across awaits is not Sync.
-/// The tunnel polls both directions from one relay task, so the mutex is
-/// never contended.
+/// One multiplexed TCP stream.  Writes are framed Keep frames and queued
+/// to the session driver over a bounded channel — PollSender applies real
+/// backpressure when the driver falls behind; reads come from the stream's
+/// demux channel.
 ///
 /// Dropping it sends the stream's End frame via the EndGuard.
 pub(crate) struct Stream {
     pub(crate) parts: StreamParts,
+    poll_sender: PollSender<Bytes>,
     pending: Option<(Bytes, usize)>,
     eof: bool,
-    write_fut: std::sync::Mutex<Option<IoBoxFuture>>,
-    shutdown_fut: std::sync::Mutex<Option<IoBoxFuture>>,
+    /// End frame waiting for outbound channel capacity (shutdown is poll
+    /// based; the frame survives Pending instead of being rebuilt).
+    shutdown_frame: Option<Bytes>,
 }
 
 impl Stream {
     pub(crate) fn from_parts(parts: StreamParts) -> Self {
+        let poll_sender = PollSender::new(parts.session.driver_tx.clone());
         Self {
             parts,
+            poll_sender,
             pending: None,
             eof: false,
-            write_fut: std::sync::Mutex::new(None),
-            shutdown_fut: std::sync::Mutex::new(None),
+            shutdown_frame: None,
         }
     }
 }
@@ -719,20 +834,6 @@ impl AsyncWrite for Stream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        // Drive an in-flight frame to completion first.
-        {
-            let mut slot = this.write_fut.lock().unwrap();
-            if let Some(fut) = slot.as_mut() {
-                match fut.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(e)) => {
-                        *slot = None;
-                        return Poll::Ready(Err(e));
-                    }
-                    Poll::Ready(Ok(())) => *slot = None,
-                }
-            }
-        }
         if this.parts.guard.ended.load(Ordering::SeqCst) {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -744,87 +845,46 @@ impl AsyncWrite for Stream {
             Ok(frame) => frame,
             Err(e) => return Poll::Ready(Err(e)),
         };
-        let session = Arc::clone(&this.parts.session);
-        let fut = Box::pin(async move {
-            let mut w = session.writer.lock().await;
-            w.write_all(&frame).await?;
-            w.flush().await
-        });
-        let mut slot = this.write_fut.lock().unwrap();
-        *slot = Some(fut);
-        match slot.as_mut().expect("just set").as_mut().poll(cx) {
+        match this.poll_sender.poll_reserve(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
             Poll::Ready(Ok(())) => {
-                *slot = None;
+                if let Err(e) = this.poll_sender.send_item(frame) {
+                    return Poll::Ready(Err(io::Error::other(e.to_string())));
+                }
                 Poll::Ready(Ok(n))
             }
-            Poll::Ready(Err(e)) => {
-                *slot = None;
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => Poll::Pending,
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let mut slot = this.write_fut.lock().unwrap();
-        match slot.as_mut() {
-            Some(fut) => match fut.as_mut().poll(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Err(e)) => {
-                    *slot = None;
-                    Poll::Ready(Err(e))
-                }
-                Poll::Ready(Ok(())) => {
-                    *slot = None;
-                    Poll::Ready(Ok(()))
-                }
-            },
-            None => Poll::Ready(Ok(())),
-        }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // The driver flushes the connection after every frame, so there is
+        // nothing buffered at the stream layer.
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if !this.parts.guard.ended.swap(true, Ordering::SeqCst) {
-            let frame = encode_end_frame(this.parts.sid, false);
-            let session = Arc::clone(&this.parts.session);
-            *this.shutdown_fut.lock().unwrap() = Some(Box::pin(async move {
-                let mut w = session.writer.lock().await;
-                w.write_all(&frame).await?;
-                w.flush().await
-            }));
+            this.shutdown_frame = Some(encode_end_frame(this.parts.sid, false));
         }
-        // Drain any in-flight data frame first: the End frame must follow
-        // the data (the writer lock enforces the same order anyway).
-        {
-            let mut slot = this.write_fut.lock().unwrap();
-            if let Some(fut) = slot.as_mut() {
-                match fut.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(e)) => {
-                        *slot = None;
-                        return Poll::Ready(Err(e));
-                    }
-                    Poll::Ready(Ok(())) => *slot = None,
+        if let Some(frame) = this.shutdown_frame.take() {
+            match this.poll_sender.poll_reserve(cx) {
+                Poll::Pending => {
+                    this.shutdown_frame = Some(frame);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(io::Error::other(e.to_string())));
+                }
+                Poll::Ready(Ok(())) => {
+                    // The End frame queues behind any data frames already
+                    // in the driver channel (FIFO order preserved).
+                    let _ = this.poll_sender.send_item(frame);
                 }
             }
         }
-        let mut slot = this.shutdown_fut.lock().unwrap();
-        match slot.as_mut() {
-            None => Poll::Ready(Ok(())),
-            Some(fut) => match fut.as_mut().poll(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Err(e)) => {
-                    *slot = None;
-                    Poll::Ready(Err(e))
-                }
-                Poll::Ready(Ok(())) => {
-                    *slot = None;
-                    Poll::Ready(Ok(()))
-                }
-            },
-        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -930,9 +990,10 @@ impl ProxyPacketConn for PacketConn {
         // datagram, consistent with the rest of the UDP path).
         let frame = encode_data_frame(self.sid, buf, Some((&addr.ip().to_string(), addr.port())))
             .map_err(MeowError::Io)?;
-        let mut w = self.session.writer.lock().await;
-        w.write_all(&frame).await.map_err(MeowError::Io)?;
-        w.flush().await.map_err(MeowError::Io)?;
+        self.session
+            .send_frame(frame)
+            .await
+            .map_err(MeowError::Io)?;
         Ok(buf.len())
     }
 
@@ -1220,6 +1281,23 @@ mod tests {
         // New frame with meta_len 4 (no network/address) — must error, not
         // panic the reader task on rest[0].
         assert!(decode_meta(&[0x00, 0x01, 0x01, 0x00]).is_err());
+    }
+
+    /// Deterministic pseudo-random garbage through the decoder: it is the
+    /// untrusted-input surface, and must error — never panic — on any input.
+    #[test]
+    fn decode_meta_never_panics_on_garbage() {
+        let mut state = 0x9E37_79B9u32;
+        for len in 0..64 {
+            for _ in 0..256 {
+                let mut meta = Vec::with_capacity(len);
+                for _ in 0..len {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    meta.push((state >> 24) as u8);
+                }
+                let _ = decode_meta(&meta);
+            }
+        }
     }
 
     #[test]

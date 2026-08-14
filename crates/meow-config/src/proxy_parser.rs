@@ -1470,6 +1470,18 @@ fn parse_mux_options(
             .and_then(serde_yaml::Value::as_u64)
             .map_or(default, |v| v as usize)
     };
+    // max-connections=0 AND max-streams=0 means one physical connection
+    // per stream (mirrors mihomo/sing-mux exactly) — almost never what an
+    // operator wants, so say so.
+    let max_connections = get_usize("max-connections", 4);
+    let max_streams = get_usize("max-streams", 4);
+    if max_connections == 0 && max_streams == 0 {
+        tracing::warn!(
+            proxy = %name,
+            "mux: max-connections and max-streams are both 0 — every stream dials its own \
+             physical connection (mirrors mihomo); consider the 4/4/4 defaults"
+        );
+    }
     // Parsed but unsupported upstream fields: `statistic` (per-connection
     // traffic attribution in mihomo's dialer) and `brutal-opts` (TCP Brutal,
     // Linux-only upstream).  Warn once so operators know the divergence.
@@ -1488,9 +1500,9 @@ fn parse_mux_options(
             .get("padding")
             .and_then(serde_yaml::Value::as_bool)
             .unwrap_or(false),
-        max_connections: get_usize("max-connections", 4),
+        max_connections,
         min_streams: get_usize("min-streams", 4),
-        max_streams: get_usize("max-streams", 4),
+        max_streams,
         only_tcp: mux_cfg
             .get("only-tcp")
             .and_then(serde_yaml::Value::as_bool)

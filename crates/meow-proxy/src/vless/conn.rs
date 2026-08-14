@@ -30,6 +30,13 @@ pub struct VlessConn {
     pub(crate) inner: Box<dyn Stream>,
     /// `true` until the 2-byte response header has been consumed.
     pub(crate) response_pending: bool,
+    /// Partial response-header read progress.  Cancel-safe: a Pending
+    /// between the two header bytes must not lose the byte already
+    /// consumed (a local buffer would shift the whole stream by one byte).
+    pub(crate) response_buf: [u8; 2],
+    pub(crate) response_pos: usize,
+    /// Scratch buffer for the response addon bytes (usually empty).
+    pub(crate) response_addon: Vec<u8>,
     /// Pre-encoded request header, written ahead of the first payload.
     /// `Some` only for deferred-header connections (Vision): the request
     /// must ride inside the first Vision-padded record, matching
@@ -64,6 +71,9 @@ impl VlessConn {
         Ok(Self {
             inner: stream,
             response_pending: true,
+            response_buf: [0; 2],
+            response_pos: 0,
+            response_addon: Vec::new(),
             header_pending: None,
             write_pending: None,
         })
@@ -85,6 +95,9 @@ impl VlessConn {
         Ok(Self {
             inner: stream,
             response_pending: true,
+            response_buf: [0; 2],
+            response_pos: 0,
+            response_addon: Vec::new(),
             header_pending: Some(buf.freeze()),
             write_pending: None,
         })
@@ -110,6 +123,9 @@ impl VlessConn {
         Ok(Self {
             inner: stream,
             response_pending: true,
+            response_buf: [0; 2],
+            response_pos: 0,
+            response_addon: Vec::new(),
             header_pending: None,
             write_pending: None,
         })
@@ -128,6 +144,9 @@ impl VlessConn {
         Ok(Self {
             inner: stream,
             response_pending: true,
+            response_buf: [0; 2],
+            response_pos: 0,
+            response_addon: Vec::new(),
             header_pending: Some(buf.freeze()),
             write_pending: None,
         })
@@ -153,21 +172,16 @@ impl AsyncRead for VlessConn {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // Lazily consume the response header on first read.
-        if self.response_pending {
-            // Use a pinned future to read the 2-byte response header.
-            let inner = &mut self.inner;
-            // We need to read version(1) + addon_length(1).
-            // For simplicity, we do a synchronous-style poll loop here.
-            // Read the two header bytes using poll_read directly.
-            let mut hdr_buf = [0u8; 2];
-            let mut hdr_read = 0;
-            loop {
-                if hdr_read >= 2 {
-                    break;
-                }
-                let mut tmp = ReadBuf::new(&mut hdr_buf[hdr_read..]);
-                match Pin::new(&mut *inner).poll_read(cx, &mut tmp) {
+        // Lazily consume the response header on first read.  Progress lives
+        // in self (response_buf/response_pos): a Pending between the two
+        // header bytes must keep the byte already consumed — a local buffer
+        // would lose it and shift the whole stream by one byte.
+        let this = &mut *self;
+        if this.response_pending {
+            while this.response_pos < 2 {
+                let pos = this.response_pos;
+                let mut tmp = ReadBuf::new(&mut this.response_buf[pos..]);
+                match Pin::new(&mut *this.inner).poll_read(cx, &mut tmp) {
                     Poll::Ready(Ok(())) => {
                         let n = tmp.filled().len();
                         if n == 0 {
@@ -176,30 +190,31 @@ impl AsyncRead for VlessConn {
                                 "vless: server closed before response header",
                             )));
                         }
-                        hdr_read += n;
+                        this.response_pos += n;
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => return Poll::Pending,
                 }
             }
-            let version = hdr_buf[0];
-            let addon_length = hdr_buf[1] as usize;
+            let version = this.response_buf[0];
+            let addon_length = this.response_buf[1] as usize;
             if version != 0x00 {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("vless: version mismatch: expected 0x00, got {version:#04x}"),
                 )));
             }
-            // Discard addon bytes if any
+            // Discard addon bytes if any — also cancel-safe: progress
+            // counts against the persistent response_pos, and the scratch
+            // buffer survives Pending.
             if addon_length > 0 {
-                let mut discard = vec![0u8; addon_length];
-                let mut disc_read = 0;
-                loop {
-                    if disc_read >= addon_length {
-                        break;
-                    }
-                    let mut tmp = ReadBuf::new(&mut discard[disc_read..]);
-                    match Pin::new(&mut *inner).poll_read(cx, &mut tmp) {
+                if this.response_addon.len() != addon_length {
+                    this.response_addon = vec![0u8; addon_length];
+                }
+                while this.response_pos - 2 < addon_length {
+                    let pos = this.response_pos - 2;
+                    let mut tmp = ReadBuf::new(&mut this.response_addon[pos..]);
+                    match Pin::new(&mut *this.inner).poll_read(cx, &mut tmp) {
                         Poll::Ready(Ok(())) => {
                             let n = tmp.filled().len();
                             if n == 0 {
@@ -208,14 +223,15 @@ impl AsyncRead for VlessConn {
                                     "vless: EOF during addon discard",
                                 )));
                             }
-                            disc_read += n;
+                            this.response_pos += n;
                         }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => return Poll::Pending,
                     }
                 }
             }
-            self.response_pending = false;
+            this.response_pending = false;
+            this.response_addon = Vec::new();
             tracing::debug!("VLESS: response header consumed lazily");
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)
