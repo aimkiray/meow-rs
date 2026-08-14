@@ -19,7 +19,8 @@ use tokio::sync::Mutex;
 /// One UDP flow multiplexed over a mux stream.  Dropping it half-closes
 /// the stream and decrements the session's stream count.
 pub struct MuxPacketConn {
-    stream: Arc<Mutex<MuxStream>>,
+    reader: Mutex<tokio::io::ReadHalf<MuxStream>>,
+    writer: Mutex<tokio::io::WriteHalf<MuxStream>>,
     session: Arc<MuxSession>,
     /// The destination bound in the stream request; every read reports this
     /// as the datagram source (no per-packet addressing in sing-mux UDP).
@@ -32,8 +33,14 @@ impl MuxPacketConn {
         session: Arc<MuxSession>,
         destination: SocketAddr,
     ) -> Self {
+        // Split so a blocked read (no upstream datagram yet) cannot
+        // head-of-line block writes — the SOCKS5 UDP relay runs the
+        // server→client reader on a separate task from client→server
+        // writes, and QUIC-style flows write while waiting for reads.
+        let (reader, writer) = tokio::io::split(stream);
         Self {
-            stream: Arc::new(Mutex::new(stream)),
+            reader: Mutex::new(reader),
+            writer: Mutex::new(writer),
             session,
             destination,
         }
@@ -55,33 +62,40 @@ impl MuxPacketConn {
                 data.len()
             )));
         }
-        let mut stream = self.stream.lock().await;
+        let mut writer = self.writer.lock().await;
         let mut frame = BytesMut::with_capacity(2 + data.len());
         frame.put_u16(data.len() as u16);
         frame.put_slice(data);
-        stream.write_all(&frame).await.map_err(MeowError::Io)?;
-        stream.flush().await.map_err(MeowError::Io)?;
+        writer.write_all(&frame).await.map_err(MeowError::Io)?;
+        writer.flush().await.map_err(MeowError::Io)?;
         Ok(data.len())
     }
 
     /// Read one datagram: `[len u16 BE][data]`.  The stream response status
     /// byte is consumed lazily on the first read by `MuxStream`.
     pub async fn read_datagram(&self, buf: &mut [u8]) -> Result<usize> {
-        let mut stream = self.stream.lock().await;
+        let mut reader = self.reader.lock().await;
         let mut len_buf = [0u8; 2];
-        stream
+        reader
             .read_exact(&mut len_buf)
             .await
             .map_err(MeowError::Io)?;
         let pkt_len = u16::from_be_bytes(len_buf) as usize;
         if pkt_len > buf.len() {
+            // Drain the oversized payload before erroring so the stream
+            // framing stays aligned for the next read.
+            let mut discard = vec![0u8; pkt_len];
+            reader
+                .read_exact(&mut discard)
+                .await
+                .map_err(MeowError::Io)?;
             return Err(MeowError::Proxy(format!(
                 "mux: UDP packet ({} bytes) exceeds read buffer ({} bytes)",
                 pkt_len,
                 buf.len()
             )));
         }
-        stream
+        reader
             .read_exact(&mut buf[..pkt_len])
             .await
             .map_err(MeowError::Io)?;
@@ -155,7 +169,7 @@ mod tests {
                 match cmd {
                     0 => {
                         let _ = sid;
-                    } // SYN
+                    } // SYN (no response)
                     2 => {
                         // PSH
                         if first_psh {
@@ -212,6 +226,98 @@ mod tests {
         let (n, src) = conn.read_packet(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello-udp");
         assert_eq!(src, "127.0.0.1:53".parse::<SocketAddr>().unwrap());
+    }
+    /// Regression: a pending read (no upstream datagram yet) must not
+    /// head-of-line block writes — the SOCKS5 UDP relay reads on a
+    /// separate task while the client keeps sending.
+    #[tokio::test]
+    async fn write_not_blocked_by_pending_read() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut io = server_io;
+            let mut header = [0u8; 8];
+            let mut sid = 0u32;
+            let mut psh_count = 0u32;
+            loop {
+                if io.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let cmd = header[1];
+                let length = u16::from_le_bytes([header[2], header[3]]) as usize;
+                let frame_sid = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+                let mut payload = vec![0u8; length];
+                if !payload.is_empty() && io.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                let mut send = async |cmd: u8, data: &[u8]| {
+                    let mut buf = bytes::BytesMut::with_capacity(8 + data.len());
+                    bytes::BufMut::put_u8(&mut buf, 0x01);
+                    bytes::BufMut::put_u8(&mut buf, cmd);
+                    bytes::BufMut::put_u16_le(&mut buf, data.len() as u16);
+                    bytes::BufMut::put_u32_le(&mut buf, sid);
+                    buf.extend_from_slice(data);
+                    io.write_all(&buf).await
+                };
+                match cmd {
+                    0 => {
+                        sid = frame_sid;
+                    }
+                    2 => {
+                        psh_count += 1;
+                        if psh_count == 2 {
+                            // Datagram arrived: status + echo.
+                            let _ = send(2, &[0x00]).await;
+                            let _ = send(2, &payload).await;
+                        }
+                        // First PSH (stream request): stay silent so the
+                        // client's read blocks.
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let session = Arc::new(smux::Session::client(client_io).unwrap());
+        let smux_stream = session.open_stream().await.unwrap();
+        let mut stream = MuxStream::new(MuxStreamKind::Smux(smux_stream));
+        stream
+            .write_all(&address::encode_stream_request_with_flags(
+                "127.0.0.1",
+                53,
+                1,
+            ))
+            .await
+            .unwrap();
+        let session_arc = Arc::new(MuxSession {
+            kind: SessionKind::Smux(session),
+            streams: AtomicUsize::new(1),
+            last_used_ms: AtomicU64::new(0),
+        });
+        let conn = Arc::new(MuxPacketConn::new(
+            stream,
+            session_arc,
+            "127.0.0.1:53".parse::<SocketAddr>().unwrap(),
+        ));
+        let reader = Arc::clone(&conn);
+        let read_task = tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            reader.read_packet(&mut buf).await.map(|(n, _)| n)
+        });
+        // Let the reader grab its half and park on the empty stream.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            conn.write_packet(b"x", &"127.0.0.1:53".parse().unwrap())
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("write must not block behind a pending read");
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), read_task)
+            .await
+            .expect("read must complete after the server responds")
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 1);
+        drop(server);
     }
 
     /// Live interop probe against a running sing-box VLESS mux inbound

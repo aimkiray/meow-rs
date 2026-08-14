@@ -479,11 +479,8 @@ impl ProxyAdapter for TrojanAdapter {
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-        if !self.support_udp {
-            return Err(MeowError::NotSupported(
-                "Trojan UDP is disabled for this proxy (set `udp: true`)".into(),
-            ));
-        }
+        // Mux UDP rides the mux TCP session and does not depend on the
+        // node's `udp:` flag — check it before the plain-path gate.
         if let Some(mux) = &self.mux {
             if !self.mux_only_tcp {
                 let host = if !metadata.host.is_empty() {
@@ -504,6 +501,11 @@ impl ProxyAdapter for TrojanAdapter {
                     mux.open_packet_stream(&host, metadata.dst_port).await?,
                 ));
             }
+        }
+        if !self.support_udp {
+            return Err(MeowError::NotSupported(
+                "Trojan UDP is disabled for this proxy (set `udp: true`)".into(),
+            ));
         }
         debug!(
             "Trojan UDP-associating for {} via {}",

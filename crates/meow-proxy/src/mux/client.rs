@@ -258,6 +258,9 @@ impl MuxClient {
         port: u16,
     ) -> Result<MuxPacketConn> {
         let (stream, session) = self.open_stream_flags(host, port, 1).await?;
+        // The conn is bound to the stream request's destination; reads
+        // report it as the datagram source.  Non-IP hosts (domains) get a
+        // placeholder — same convention as the plain VLESS UDP path.
         let destination = host.parse::<std::net::IpAddr>().ok().map_or_else(
             || "0.0.0.0:0".parse().expect("static placeholder"),
             |ip| SocketAddr::new(ip, port),
