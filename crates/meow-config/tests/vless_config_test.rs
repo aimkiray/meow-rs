@@ -780,6 +780,30 @@ proxies:
     );
 }
 
+/// No-mux builds: an enabled `mux:` block must warn loudly instead of
+/// being silently ignored.
+#[cfg(not(feature = "mux"))]
+#[tokio::test]
+async fn parse_vless_mux_enabled_without_feature_warns() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    mux:
+      enabled: true
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    result.expect("mux config must still load without the feature");
+    let warns = lines
+        .iter()
+        .filter(|l| l.contains("compiled without the `mux` feature"))
+        .count();
+    assert!(warns >= 1, "expected a no-mux warn; {lines:?}");
+}
+
 /// D16f: `only-tcp: true` → accepted (UDP stays on the plain proxy path).
 #[cfg(feature = "mux")]
 #[tokio::test]

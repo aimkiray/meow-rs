@@ -101,6 +101,8 @@ crates/meow-proxy/src/mux/
 - 配置解析：解析完整 mux 块，默认 protocol=h2mux 与 mihomo 对齐；
   smux/yamux/h2mux 均实现；未知 protocol 按 meow 的 warn+skip 语义拒绝该
   节点（mihomo 对同样输入是硬错误）。
+- 构建门控：`mux` Cargo feature（meow-proxy/meow-config/meow-app，默认开启，
+  `minimal` 排除）。无 mux 构建读到 enabled mux 块会打 warn 提示已忽略。
 - 健康检查/URLTest：走 mux 流的延迟探测天然复用同一会话。
 
 ## 互操作边界（重要）

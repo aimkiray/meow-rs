@@ -399,7 +399,6 @@ mod tests {
                     return;
                 }
                 match cmd {
-                    CMD_SYN => {}
                     CMD_PSH => {
                         let echoed = payload.clone();
                         let mut buf = BytesMut::with_capacity(FRAME_HEADER_LEN + echoed.len());

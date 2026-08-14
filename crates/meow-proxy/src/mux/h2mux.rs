@@ -299,17 +299,15 @@ mod tests {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         tokio::spawn(async move {
-            let mut connection = match h2::server::handshake(io).await {
-                Ok(connection) => connection,
-                Err(_) => return,
+            let Ok(mut connection) = h2::server::handshake(io).await else {
+                return;
             };
             // Keep polling accept(): only the connection's poll drives the
             // codec, so the buffered response frames need it to keep being
             // polled while per-stream handlers await request data.
             while let Some(result) = connection.accept().await {
-                let (request, mut respond) = match result {
-                    Ok(pair) => pair,
-                    Err(_) => return,
+                let Ok((request, mut respond)) = result else {
+                    return;
                 };
                 tokio::spawn(async move {
                     let mut body = request.into_body();
@@ -317,14 +315,12 @@ mod tests {
                         .status(StatusCode::OK)
                         .body(())
                         .expect("static response");
-                    let mut send = match respond.send_response(response, false) {
-                        Ok(send) => send,
-                        Err(_) => return,
+                    let Ok(mut send) = respond.send_response(response, false) else {
+                        return;
                     };
                     while let Some(chunk) = body.data().await {
-                        let chunk = match chunk {
-                            Ok(chunk) => chunk,
-                            Err(_) => break,
+                        let Ok(chunk) = chunk else {
+                            break;
                         };
                         let _ = body.flow_control().release_capacity(chunk.len());
                         if send.send_data(chunk, false).is_err() {
@@ -399,6 +395,7 @@ mod tests {
     /// stream-request flags + Socksaddr → response status byte → relay.
     #[tokio::test]
     #[ignore]
+    #[cfg(all(feature = "mux", feature = "vless"))]
     async fn live_singbox_vless_probe() {
         use crate::mux::{DialFn, MuxClient, MuxOptions, Protocol};
         use crate::vless::header::{Cmd, VlessAddr};

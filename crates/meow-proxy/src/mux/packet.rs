@@ -243,9 +243,8 @@ mod tests {
             while let Some(result) =
                 std::future::poll_fn(|cx| connection.poll_next_inbound(cx)).await
             {
-                let stream = match result {
-                    Ok(stream) => stream,
-                    Err(_) => return,
+                let Ok(stream) = result else {
+                    return;
                 };
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -415,6 +414,7 @@ mod tests {
     /// datagram framing → sing-box direct UDP relay → echo.
     #[tokio::test]
     #[ignore]
+    #[cfg(all(feature = "mux", feature = "vless"))]
     async fn live_singbox_vless_udp_probe() {
         use crate::mux::{DialFn, MuxClient, MuxOptions, Protocol};
         use crate::vless::header::{Cmd, VlessAddr};

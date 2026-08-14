@@ -170,6 +170,8 @@ pub fn parse_proxy(
             if let Some(mux_options) = parse_mux_options(name, config)? {
                 adapter = adapter.with_mux(mux_options);
             }
+            #[cfg(not(feature = "mux"))]
+            let _ = parse_mux_options(name, config)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "vless")]
@@ -1408,6 +1410,8 @@ fn parse_vless(
     if let Some(mux_options) = parse_mux_options(name, config)? {
         adapter = adapter.with_mux(mux_options);
     }
+    #[cfg(not(feature = "mux"))]
+    let _ = parse_mux_options(name, config)?;
 
     Ok(adapter)
 }
@@ -1480,6 +1484,28 @@ fn parse_mux_options(
             .and_then(serde_yaml::Value::as_bool)
             .unwrap_or(false),
     }))
+}
+
+/// No-mux builds: warn loudly instead of silently ignoring an enabled
+/// `mux:` block (operators would otherwise think the node is multiplexed).
+#[cfg(not(feature = "mux"))]
+fn parse_mux_options(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+) -> std::result::Result<Option<()>, String> {
+    if let Some(mux_cfg) = config.get("mux") {
+        let enabled = mux_cfg
+            .get("enabled")
+            .and_then(serde_yaml::Value::as_bool)
+            .unwrap_or(false);
+        if enabled {
+            tracing::warn!(
+                proxy = %name,
+                "mux is enabled in config but this build was compiled without the `mux` feature; the option is ignored"
+            );
+        }
+    }
+    Ok(None)
 }
 
 /// Parse the VLESS `encryption` field.
