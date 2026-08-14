@@ -9,6 +9,7 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -297,7 +298,11 @@ impl ProxyConn for VlessConn {}
 /// A VLESS UDP connection over TCP.
 ///
 /// Each datagram is framed as `u16_be(length) + data`.  The VLESS request
-/// header (cmd=0x02) is sent on construction; the response header is consumed.
+/// header (cmd=0x02) is sent on construction; the response header is
+/// consumed **lazily** on the first read — xray/sing-vmess only write it
+/// together with the first reply datagram, so eager consumption during
+/// construction would deadlock (server waits for the first datagram before
+/// answering, client waits for the answer before sending it).
 ///
 /// The stream is split into independent read/write halves, each behind its
 /// own `Mutex`, so a `read_packet` parked waiting for a server datagram never
@@ -308,6 +313,8 @@ impl ProxyConn for VlessConn {}
 pub struct VlessPacketConn {
     reader: tokio::sync::Mutex<tokio::io::ReadHalf<Box<dyn Stream>>>,
     writer: tokio::sync::Mutex<tokio::io::WriteHalf<Box<dyn Stream>>>,
+    /// True until the 2-byte VLESS response header has been consumed.
+    response_pending: AtomicBool,
 }
 
 impl VlessPacketConn {
@@ -324,13 +331,11 @@ impl VlessPacketConn {
         stream.write_all(&buf).await.map_err(MeowError::Io)?;
         stream.flush().await.map_err(MeowError::Io)?;
 
-        // Read and discard the response header.
-        decode_response(&mut stream).await?;
-
         let (reader, writer) = tokio::io::split(stream);
         Ok(Self {
             reader: tokio::sync::Mutex::new(reader),
             writer: tokio::sync::Mutex::new(writer),
+            response_pending: AtomicBool::new(true),
         })
     }
 }
@@ -348,10 +353,16 @@ impl ProxyPacketConn for VlessPacketConn {
         Ok(buf.len())
     }
 
-    /// Read a UDP packet: consume `u16_be(len)` then `len` bytes.
+    /// Read a UDP packet: consume `u16_be(len)` then `len` bytes.  The
+    /// VLESS response header is consumed lazily on the first read (it rides
+    /// with the first reply datagram).
     async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, std::net::SocketAddr)> {
         use tokio::io::AsyncReadExt;
         let mut reader = self.reader.lock().await;
+        if self.response_pending.load(Ordering::SeqCst) {
+            decode_response(&mut *reader).await?;
+            self.response_pending.store(false, Ordering::SeqCst);
+        }
         let mut len_buf = [0u8; 2];
         reader
             .read_exact(&mut len_buf)
@@ -706,6 +717,50 @@ mod tests {
             .expect("reader task")
             .expect("read_packet");
         assert_eq!(echoed, b"ping");
+    }
+
+    // ─── F8b: lazy response header (xray/sing-vmess semantics) ───────────────
+
+    /// The server answers the VLESS response header only together with the
+    /// first reply datagram.  `VlessPacketConn::new` must return without
+    /// waiting for it (eager consumption deadlocks: the server waits for the
+    /// first datagram before answering, the client waits for the answer
+    /// before sending that datagram).
+    #[tokio::test]
+    async fn vless_packet_conn_handles_lazy_response_header() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, server) = duplex(4096);
+        tokio::spawn(async move {
+            let mut s = server;
+            let mut hdr = vec![0u8; 26];
+            s.read_exact(&mut hdr).await.unwrap();
+            // NO response header yet — wait for the first datagram frame.
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).await.unwrap();
+            let n = u16::from_be_bytes(len) as usize;
+            let mut payload = vec![0u8; n];
+            s.read_exact(&mut payload).await.unwrap();
+            // First server write = response header + echoed datagram frame.
+            s.write_all(&[0x00, 0x00]).await.unwrap();
+            s.write_all(&len).await.unwrap();
+            s.write_all(&payload).await.unwrap();
+        });
+
+        let conn = VlessPacketConn::new(
+            Box::new(client),
+            &TEST_UUID,
+            53,
+            &VlessAddr::Ipv4([8, 8, 8, 8]),
+        )
+        .await
+        .expect("VlessPacketConn::new");
+
+        let dst = "8.8.8.8:53".parse().unwrap();
+        conn.write_packet(b"ping", &dst).await.unwrap();
+        let mut buf = [0u8; 8];
+        let (n, _src) = conn.read_packet(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
     }
 
     // ─── F7: UDP cmd byte is 0x02 ─────────────────────────────────────────────

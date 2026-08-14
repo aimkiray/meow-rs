@@ -987,6 +987,7 @@ mod tests {
         new_frames: Vec<NewFrameLog>,
         end_frames: Vec<u16>,
         data_frames: usize,
+        keepalives: usize,
     }
 
     /// Minimal Mux.Cool server: parses frames with the production decoder,
@@ -1015,6 +1016,9 @@ mod tests {
                 }
                 STATUS_END => {
                     log.lock().unwrap().end_frames.push(frame.session_id);
+                }
+                STATUS_KEEPALIVE => {
+                    log.lock().unwrap().keepalives += 1;
                 }
                 STATUS_KEEP => {
                     if frame.option & OPTION_DATA == 0 {
@@ -1109,6 +1113,23 @@ mod tests {
         let frame = encode_new_frame(3, true, "8.8.8.8", 53).unwrap();
         assert_eq!(frame[4], STATUS_NEW);
         assert_eq!(frame[6], NETWORK_UDP);
+    }
+
+    #[test]
+    fn new_frame_ipv6_layout_and_decode() {
+        let frame = encode_new_frame(2, false, "2001:db8::1", 443).unwrap();
+        // meta_len = 4 + network(1) + port(2) + atype(1) + ipv6(16) = 24
+        assert_eq!(u16::from_be_bytes([frame[0], frame[1]]), 24);
+        assert_eq!(frame[4], STATUS_NEW);
+        assert_eq!(frame[6], NETWORK_TCP);
+        assert_eq!(u16::from_be_bytes([frame[7], frame[8]]), 443);
+        assert_eq!(frame[9], ATYPE_IPV6);
+        let ip: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert_eq!(&frame[10..26], &ip.octets());
+        let decoded = decode_meta(&frame[2..]).unwrap();
+        let (host, port) = decoded.dest.expect("New frame must carry a destination");
+        assert_eq!(host, b"2001:db8::1");
+        assert_eq!(port, 443);
     }
 
     #[test]
@@ -1249,6 +1270,31 @@ mod tests {
         let stream = session.open_stream("a.example", 80, false).await.unwrap();
         drop(stream);
         wait_for(&log, "End frame after drop", |l| !l.end_frames.is_empty()).await;
+    }
+
+    /// The client must emit KeepAlive frames (sid 0) while a session sits
+    /// idle so NAT bindings stay alive — verified with paused virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn client_sends_keepalive_frames_while_idle() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let log = Arc::new(StdMutex::new(ServerLog::default()));
+        tokio::spawn(run_mock_server(server_io, Arc::clone(&log), vec![]));
+        let session = MuxCoolSession::client(Box::new(TestConn(client_io)))
+            .await
+            .unwrap();
+        let stream = session.open_stream("a.example", 80, false).await.unwrap();
+        drop(stream); // zero-stream idle session: keepalive must still run
+        for _ in 0..200 {
+            if log.lock().unwrap().keepalives > 0 {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(200)).await;
+        }
+        assert!(
+            log.lock().unwrap().keepalives > 0,
+            "expected at least one keepalive frame after {}s of idle",
+            KEEPALIVE_INTERVAL.as_secs()
+        );
     }
 
     #[tokio::test]
