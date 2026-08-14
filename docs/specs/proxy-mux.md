@@ -128,11 +128,15 @@ UDP GlobalID）我们不发送，两端服务端都会丢弃多余 meta 字节�
   同一纪律）——出站帧经有界通道（PollSender 轮询式背压）交给驱动写，入站帧由
   驱动状态机读入并解复用（每流 32 深度有界通道，慢消费者反压整个会话——对齐
   xray 的阻塞 session buffer）。30s KeepAlive（sid=0）保活。
-  **关键教训**：早期实现用 tokio split 让读任务与流写任务并发轮询同一分层连接
-  （VlessConn/Vision/Reality TLS），并发流下 TLS 层状态被交错损坏（端到端 TLS
-  大量 schannel 校验失败，协议层零报错、HTTP 明文却完好——极隐蔽）；h2mux 因
-  单驱动而幸免。重构为单驱动后 12 并发压测 0 失败。分层连接切勿 split 并发
-  轮询。
+  **关键教训（已定位到精确机制）**：早期实现的流写路径用 stored-future——
+  poll_write 在写 future 在途时返回 Pending，future 完成后又下落重新打包**当前
+  缓冲**（relay 的 HalfCopy 在 Pending 时 pos 不前进、重轮询传入同一缓冲区）→
+  同一数据块被写两次 → 流内字节重复 → 端到端 TLS 记录错位（schannel 大量
+  校验失败，协议层零报错、HTTP 小响应却完好——极隐蔽）。明文回环写极少
+  Pending 故不触发；TLS 大突发写常 Pending，单会话 12 流锁争用最烈（100% 复现）。
+  修复：流写改为向会话驱动任务入队（PollSender 轮询式背压，无 stored-future，
+  结构上不可能重复）；另将 VlessConn 惰性响应头消费改为持久状态（同类取消安全
+  隐患）。12 并发压测修复后 0 失败（本地 780/780、真实 Xray 612/612）。
 
 **服务端兼容性**：Xray-core VLESS inbound（原生）；sing-box / mihomo 的
 VLESS inbound（sing-vmess HandleMuxConnection，帧格式同源）。VMess 不支持

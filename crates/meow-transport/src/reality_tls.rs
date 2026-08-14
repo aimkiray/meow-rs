@@ -1438,6 +1438,140 @@ mod tests {
         assert!(extract_ed25519_spki(&spki[2..]).is_none());
     }
 
+    // ─── Split + concurrent direction polling (mux regression) ───────────────
+
+    /// Deterministic chunk bytes for a (seq, len) pair.
+    fn chunk(seq: u32, len: usize) -> Vec<u8> {
+        let mut state = seq.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.push((state >> 24) as u8);
+        }
+        out
+    }
+
+    /// Invariant test backing the mux corruption investigation: the REALITY
+    /// record layer, driven through tokio split (read and write halves
+    /// polled from two tasks concurrently), must preserve data byte-exact.
+    /// The stress-era corruption was traced to the mux layer's stored-future
+    /// write (a Pending re-poll re-framed the same chunk, duplicating it),
+    /// NOT to this layer — this test locks that conclusion in: if split
+    /// driving ever corrupts here, the layer needs its own fix.
+    /// (see proxy-mux.md §6)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn split_concurrent_read_write_preserves_data() {
+        let (client_io, server_io) = tokio::io::duplex(512 * 1024);
+        let secret = [0x5Au8; 32];
+
+        let client_stream = RealityTlsStream {
+            inner: Box::new(client_io),
+            read_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            write_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            read_raw_passthrough: false,
+            write_raw_passthrough: false,
+            read_plain: VecDeque::new(),
+            read_state: StreamReadState::Header {
+                buf: [0; 5],
+                pos: 0,
+            },
+            write_pending: None,
+        };
+        let server_stream = RealityTlsStream {
+            inner: Box::new(server_io),
+            read_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            write_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            read_raw_passthrough: false,
+            write_raw_passthrough: false,
+            read_plain: VecDeque::new(),
+            read_state: StreamReadState::Header {
+                buf: [0; 5],
+                pos: 0,
+            },
+            write_pending: None,
+        };
+
+        // Server: read [u32 LE len][data] plaintext frames, echo them back.
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut s = server_stream;
+            loop {
+                let mut len_b = [0u8; 4];
+                if s.read_exact(&mut len_b).await.is_err() {
+                    return;
+                }
+                let len = u32::from_le_bytes(len_b) as usize;
+                if len == 0 {
+                    return;
+                }
+                let mut data = vec![0u8; len];
+                if s.read_exact(&mut data).await.is_err() {
+                    return;
+                }
+                if s.write_all(&len_b).await.is_err()
+                    || s.write_all(&data).await.is_err()
+                    || s.flush().await.is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        let (rd, wr) = tokio::io::split(Box::new(client_stream) as Box<dyn Stream>);
+
+        // Reader task: verify every echoed chunk against the deterministic
+        // generator — any corruption shows up as a mismatch.
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut rd = rd;
+            let mut seq = 0u32;
+            let mut bad = 0u32;
+            let mut count = 0u32;
+            loop {
+                let mut len_b = [0u8; 4];
+                if rd.read_exact(&mut len_b).await.is_err() {
+                    return (count, bad);
+                }
+                let len = u32::from_le_bytes(len_b) as usize;
+                if len == 0 {
+                    return (count, bad);
+                }
+                let mut data = vec![0u8; len];
+                if rd.read_exact(&mut data).await.is_err() {
+                    return (count, bad);
+                }
+                if data != chunk(seq, len) {
+                    bad += 1;
+                }
+                count += 1;
+                seq += 1;
+            }
+        });
+
+        // Writer task: full-duplex pressure against the parked reader.
+        let write_task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut wr = wr;
+            for seq in 0..2000u32 {
+                let len = 1 + ((seq.wrapping_mul(2_654_435_761)) % 8192) as usize;
+                let data = chunk(seq, len);
+                let mut frame = Vec::with_capacity(4 + len);
+                frame.extend_from_slice(&(len as u32).to_le_bytes());
+                frame.extend_from_slice(&data);
+                if wr.write_all(&frame).await.is_err() || wr.flush().await.is_err() {
+                    return;
+                }
+            }
+            let _ = wr.write_all(&[0u8; 4]).await;
+            let _ = wr.flush().await;
+        });
+        write_task.await.unwrap();
+
+        let (count, bad) = reader.await.unwrap();
+        assert_eq!(bad, 0, "corrupted echoes under concurrent split polling");
+        assert_eq!(count, 2000, "all chunks must be echoed");
+    }
+
     // ─── Reality ClientHello session_id seal ──────────────────────────────────
 
     /// The 32-byte session_id must decrypt, under the key/nonce/AAD a real
@@ -1482,7 +1616,10 @@ mod tests {
             .decrypt_in_place_detached(nonce, &aad, &mut buf, Tag::from_slice(tag))
             .expect("session_id must decrypt under the server-derived key");
 
-        assert_eq!(&buf[0..4], &[1, 8, 2, 0], "reality auth header");
+        // auth_len = 1 (sing-box v1.13.18 reality client layout; the 2->1
+        // fix in dae71ec — xray tolerates either, sing-box's utls fork
+        // validates the exact value).
+        assert_eq!(&buf[0..4], &[1, 8, 1, 0], "reality auth header");
         assert_eq!(&buf[8..16], &reality.short_id, "short_id echoed");
     }
 
