@@ -16,7 +16,7 @@ use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
 use meow_transport::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use super::header::{decode_response, encode_request, Cmd, VlessAddr};
+use super::header::{decode_response, encode_mux_request, encode_request, Cmd, VlessAddr};
 
 // ─── VlessConn ────────────────────────────────────────────────────────────────
 
@@ -81,6 +81,49 @@ impl VlessConn {
     ) -> Result<Self> {
         let mut buf = BytesMut::new();
         encode_request(&mut buf, uuid_bytes, flow, cmd, dst_port, addr);
+        Ok(Self {
+            inner: stream,
+            response_pending: true,
+            header_pending: Some(buf.freeze()),
+            write_pending: None,
+        })
+    }
+
+    /// Establish a VLESS Mux.Cool session connection: the request header
+    /// carries `Cmd::Mux` (0x03) and no address — the per-stream targets
+    /// ride Mux.Cool frames.  The response header is consumed lazily on the
+    /// first read, exactly like `Self::new`: the server still answers
+    /// `[version][addon_length]` before the first mux frame.
+    ///
+    /// Used by the Mux.Cool session dialer
+    /// (`VlessAdapter::with_mux` with `protocol: muxcool`).
+    pub async fn new_mux(
+        mut stream: Box<dyn Stream>,
+        uuid_bytes: &[u8; 16],
+        flow: Option<&str>,
+    ) -> Result<Self> {
+        let mut buf = BytesMut::new();
+        encode_mux_request(&mut buf, uuid_bytes, flow);
+        stream.write_all(&buf).await.map_err(MeowError::Io)?;
+        stream.flush().await.map_err(MeowError::Io)?;
+        Ok(Self {
+            inner: stream,
+            response_pending: true,
+            header_pending: None,
+            write_pending: None,
+        })
+    }
+
+    /// Deferred variant of `Self::new_mux` for Vision: the Mux request
+    /// header rides inside the first Vision record together with the first
+    /// Mux.Cool frame (xray expects the request inside the first record).
+    pub async fn new_mux_deferred(
+        stream: Box<dyn Stream>,
+        uuid_bytes: &[u8; 16],
+        flow: Option<&str>,
+    ) -> Result<Self> {
+        let mut buf = BytesMut::new();
+        encode_mux_request(&mut buf, uuid_bytes, flow);
         Ok(Self {
             inner: stream,
             response_pending: true,
@@ -696,5 +739,39 @@ mod tests {
         let hdr = rx.await.expect("header");
         // cmd byte at offset 18 (version=1 + uuid=16 + addon_length=1)
         assert_eq!(hdr[18], 0x02, "UDP cmd must be 0x02, not 0x01");
+    }
+
+    // ─── F8: Mux request (CommandMux=0x03) omits port/address ─────────────────
+
+    /// The Mux.Cool session request is exactly
+    /// `version(1) + uuid(16) + addon_length(1) + cmd(1)` = 19 bytes — no
+    /// port or address follow (xray encoding.go::EncodeRequestHeader skips
+    /// them for `RequestCommandMux`; sing-vmess skips the parse likewise).
+    #[tokio::test]
+    async fn vless_mux_request_omits_port_and_address() {
+        let (client, server) = duplex(1024);
+        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            let mut s = server;
+            let mut hdr = vec![0u8; 19];
+            s.read_exact(&mut hdr).await.unwrap();
+            let _ = tx.send(hdr);
+            s.write_all(&[0x00, 0x00]).await.unwrap();
+            // Drain anything further (there must be nothing after 19 bytes
+            // until the client's first mux frame — covered by mux tests).
+            let mut buf = [0u8; 64];
+            while s.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+
+        let _conn = VlessConn::new_mux(Box::new(client), &TEST_UUID, None)
+            .await
+            .expect("VlessConn::new_mux");
+
+        let hdr = rx.await.expect("header");
+        assert_eq!(hdr.len(), 19, "mux request must be exactly 19 bytes");
+        assert_eq!(hdr[0], 0x00, "version must be 0x00");
+        assert_eq!(&hdr[1..17], &TEST_UUID, "uuid must match");
+        assert_eq!(hdr[17], 0x00, "no flow addon");
+        assert_eq!(hdr[18], 0x03, "command must be CommandMux (0x03)");
     }
 }

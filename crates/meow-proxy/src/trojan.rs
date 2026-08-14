@@ -514,9 +514,7 @@ impl ProxyAdapter for TrojanAdapter {
                     metadata.remote_address(),
                     self.addr_str
                 );
-                return Ok(Box::new(
-                    mux.open_packet_stream(&host, metadata.dst_port).await?,
-                ));
+                return mux.open_packet_stream(&host, metadata.dst_port).await;
             }
         }
         if !self.support_udp {

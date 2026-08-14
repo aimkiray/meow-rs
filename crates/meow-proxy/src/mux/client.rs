@@ -6,13 +6,14 @@
 //! the configured connection/stream bounds are reached.
 
 use super::h2mux;
+use super::muxcool;
 use super::packet::MuxPacketConn;
 use super::request::Request;
 use super::smux;
 use super::stream::MuxStreamConn;
 use super::yamux;
 use super::{address, Protocol};
-use meow_common::{MeowError, ProxyConn, Result};
+use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
@@ -73,25 +74,61 @@ pub(crate) enum SessionKind {
     Smux(Arc<smux::Session>),
     Yamux(Arc<yamux::Session>),
     H2Mux(Arc<h2mux::Session>),
+    MuxCool(Arc<muxcool::MuxCoolSession>),
+}
+
+/// Write the sing-mux per-stream request prefix (flags + Socksaddr
+/// destination).  Mux.Cool has no prefix — its New frame already carries
+/// the destination.
+async fn write_request_prefix<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    host: &str,
+    port: u16,
+    udp: bool,
+) -> io::Result<()> {
+    stream
+        .write_all(&address::encode_stream_request_with_flags(
+            host,
+            port,
+            u16::from(udp),
+        ))
+        .await?;
+    stream.flush().await
 }
 
 impl SessionKind {
-    pub(crate) async fn open_stream(&self) -> io::Result<MuxStream> {
+    /// Open one stream to host:port.  sing-mux sessions write their
+    /// per-stream request prefix here; Mux.Cool encodes the destination
+    /// into the stream's New frame instead.
+    pub(crate) async fn open_stream(
+        &self,
+        host: &str,
+        port: u16,
+        udp: bool,
+    ) -> io::Result<MuxStream> {
         match self {
-            SessionKind::Smux(session) => session
-                .open_stream()
+            SessionKind::Smux(session) => {
+                let mut stream =
+                    MuxStream::new(session.open_stream().await.map(MuxStreamKind::Smux)?);
+                write_request_prefix(&mut stream, host, port, udp).await?;
+                Ok(stream)
+            }
+            SessionKind::Yamux(session) => {
+                let mut stream =
+                    MuxStream::new(session.open_stream().await.map(MuxStreamKind::Yamux)?);
+                write_request_prefix(&mut stream, host, port, udp).await?;
+                Ok(stream)
+            }
+            SessionKind::H2Mux(session) => {
+                let mut stream =
+                    MuxStream::new(session.open_stream().await.map(MuxStreamKind::H2Mux)?);
+                write_request_prefix(&mut stream, host, port, udp).await?;
+                Ok(stream)
+            }
+            SessionKind::MuxCool(session) => session
+                .open_stream(host, port, udp)
                 .await
-                .map(MuxStreamKind::Smux)
-                .map(MuxStream::new),
-            SessionKind::Yamux(session) => session
-                .open_stream()
-                .await
-                .map(MuxStreamKind::Yamux)
-                .map(MuxStream::new),
-            SessionKind::H2Mux(session) => session
-                .open_stream()
-                .await
-                .map(MuxStreamKind::H2Mux)
+                .map(MuxStreamKind::MuxCool)
                 .map(MuxStream::new),
         }
     }
@@ -101,6 +138,7 @@ impl SessionKind {
             SessionKind::Smux(session) => session.is_dead(),
             SessionKind::Yamux(session) => session.is_dead(),
             SessionKind::H2Mux(session) => session.is_dead(),
+            SessionKind::MuxCool(session) => session.aborted(),
         }
     }
 }
@@ -124,6 +162,15 @@ pub(crate) enum MuxStreamKind {
     Smux(smux::SmuxStream),
     Yamux(yamux::Stream),
     H2Mux(h2mux::Stream),
+    MuxCool(muxcool::Stream),
+}
+
+impl MuxStreamKind {
+    /// sing-mux prefixes every stream with a response status byte;
+    /// Mux.Cool has no per-stream preamble (server Keep frames are data).
+    fn requires_response(&self) -> bool {
+        !matches!(self, MuxStreamKind::MuxCool(_))
+    }
 }
 
 impl AsyncRead for MuxStreamKind {
@@ -136,6 +183,7 @@ impl AsyncRead for MuxStreamKind {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_read(cx, buf),
             MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_read(cx, buf),
             MuxStreamKind::H2Mux(stream) => Pin::new(stream).poll_read(cx, buf),
+            MuxStreamKind::MuxCool(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -143,8 +191,8 @@ impl AsyncRead for MuxStreamKind {
 impl MuxStream {
     pub(crate) fn new(kind: MuxStreamKind) -> Self {
         Self {
+            response_pending: kind.requires_response(),
             kind,
-            response_pending: true,
             response_failed: false,
         }
     }
@@ -211,6 +259,7 @@ impl AsyncWrite for MuxStream {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_write(cx, buf),
             MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_write(cx, buf),
             MuxStreamKind::H2Mux(stream) => Pin::new(stream).poll_write(cx, buf),
+            MuxStreamKind::MuxCool(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
@@ -219,6 +268,7 @@ impl AsyncWrite for MuxStream {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_flush(cx),
             MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_flush(cx),
             MuxStreamKind::H2Mux(stream) => Pin::new(stream).poll_flush(cx),
+            MuxStreamKind::MuxCool(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
@@ -227,6 +277,7 @@ impl AsyncWrite for MuxStream {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_shutdown(cx),
             MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_shutdown(cx),
             MuxStreamKind::H2Mux(stream) => Pin::new(stream).poll_shutdown(cx),
+            MuxStreamKind::MuxCool(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -253,22 +304,23 @@ impl MuxClient {
         })
     }
 
-    /// Open one multiplexed TCP stream to `host:port`.  Writes the sing
-    /// stream request (flags + Socksaddr destination) before returning,
-    /// matching sing-mux's per-stream addressing.
+    /// Open one multiplexed TCP stream to host:port.  sing-mux writes the
+    /// stream request (flags + Socksaddr destination) before returning;
+    /// Mux.Cool encodes the destination into the stream's New frame.
     pub async fn open_stream(self: &Arc<Self>, host: &str, port: u16) -> Result<MuxStreamConn> {
-        let (stream, session) = self.open_stream_flags(host, port, 0).await?;
+        let (stream, session) = self.open_stream_flags(host, port, false).await?;
         Ok(MuxStreamConn::new(stream, session))
     }
 
-    /// Open one multiplexed UDP flow to `host:port`: the stream request
-    /// carries flagUDP and datagrams are `[len u16 BE][data]` framed.
+    /// Open one multiplexed UDP flow to host:port.  sing-mux carries
+    /// flagUDP and frames datagrams as [len u16 BE][data]; Mux.Cool carries
+    /// a per-datagram destination in the frame meta.
     pub async fn open_packet_stream(
         self: &Arc<Self>,
         host: &str,
         port: u16,
-    ) -> Result<MuxPacketConn> {
-        let (stream, session) = self.open_stream_flags(host, port, 1).await?;
+    ) -> Result<Box<dyn ProxyPacketConn>> {
+        let (stream, session) = self.open_stream_flags(host, port, true).await?;
         // The conn is bound to the stream request's destination; reads
         // report it as the datagram source.  Non-IP hosts (domains) get a
         // placeholder — same convention as the plain VLESS UDP path.
@@ -276,17 +328,31 @@ impl MuxClient {
             || "0.0.0.0:0".parse().expect("static placeholder"),
             |ip| SocketAddr::new(ip, port),
         );
-        Ok(MuxPacketConn::new(stream, session, destination))
+        match stream.kind {
+            MuxStreamKind::MuxCool(stream) => {
+                let muxcool::Stream { parts, .. } = stream;
+                Ok(Box::new(muxcool::PacketConn::new(
+                    parts,
+                    session,
+                    destination,
+                )))
+            }
+            kind => Ok(Box::new(MuxPacketConn::new(
+                MuxStream::new(kind),
+                session,
+                destination,
+            ))),
+        }
     }
 
-    /// Open a stream and write its stream request (flags + Socksaddr),
-    /// retrying once on a dead session — the shared core of the TCP and
-    /// UDP open paths.
+    /// Open a stream (writing its per-stream request: sing-mux prefix or
+    /// Mux.Cool New frame), retrying once on a dead session — the shared
+    /// core of the TCP and UDP open paths.
     async fn open_stream_flags(
         self: &Arc<Self>,
         host: &str,
         port: u16,
-        flags: u16,
+        udp: bool,
     ) -> Result<(MuxStream, Arc<MuxSession>)> {
         let mut last_err = None;
         for _ in 0..2 {
@@ -294,17 +360,8 @@ impl MuxClient {
                 Ok(session) => session,
                 Err(e) => return Err(e),
             };
-            match session.kind.open_stream().await {
-                Ok(mut stream) => {
-                    let prefix = address::encode_stream_request_with_flags(host, port, flags);
-                    if let Err(e) = stream.write_all(&prefix).await {
-                        last_err = Some(MeowError::Io(e));
-                        continue;
-                    }
-                    if let Err(e) = stream.flush().await {
-                        last_err = Some(MeowError::Io(e));
-                        continue;
-                    }
+            match session.kind.open_stream(host, port, udp).await {
+                Ok(stream) => {
                     session.streams.fetch_add(1, Ordering::SeqCst);
                     // Idle eviction is measured from the last successful open
                     // (not the last activity): conservative — a long-lived
@@ -360,31 +417,43 @@ impl MuxClient {
         self.offer_new_locked(&mut sessions).await
     }
 
-    /// Dial a fresh physical connection, write the mux request header, and
-    /// start a new session.  Callers must hold the sessions lock.
+    /// Dial a fresh physical connection and start a new session.  sing-mux
+    /// sessions write the mux request header on top; Mux.Cool needs none —
+    /// the dialer's VLESS CommandMux request already marks the connection.
+    /// Callers must hold the sessions lock.
     async fn offer_new_locked(
         self: &Arc<Self>,
         sessions: &mut VecDeque<Arc<MuxSession>>,
     ) -> Result<Arc<MuxSession>> {
         let mut conn = (self.dial)().await?;
-        let header = Request::new(
-            if self.options.padding { 1 } else { 0 },
-            self.options.protocol as u8,
-            self.options.padding,
-        )
-        .encode();
-        conn.write_all(&header).await.map_err(MeowError::Io)?;
-        conn.flush().await.map_err(MeowError::Io)?;
         let kind = match self.options.protocol {
-            Protocol::Smux => SessionKind::Smux(Arc::new(
-                smux::Session::client(conn).map_err(MeowError::Io)?,
-            )),
-            Protocol::Yamux => SessionKind::Yamux(Arc::new(
-                yamux::Session::client(conn).map_err(MeowError::Io)?,
-            )),
-            Protocol::H2Mux => SessionKind::H2Mux(Arc::new(
-                h2mux::Session::client(conn).await.map_err(MeowError::Io)?,
-            )),
+            Protocol::Smux | Protocol::Yamux | Protocol::H2Mux => {
+                let header = Request::new(
+                    if self.options.padding { 1 } else { 0 },
+                    self.options.protocol as u8,
+                    self.options.padding,
+                )
+                .encode();
+                conn.write_all(&header).await.map_err(MeowError::Io)?;
+                conn.flush().await.map_err(MeowError::Io)?;
+                match self.options.protocol {
+                    Protocol::Smux => SessionKind::Smux(Arc::new(
+                        smux::Session::client(conn).map_err(MeowError::Io)?,
+                    )),
+                    Protocol::Yamux => SessionKind::Yamux(Arc::new(
+                        yamux::Session::client(conn).map_err(MeowError::Io)?,
+                    )),
+                    Protocol::H2Mux => SessionKind::H2Mux(Arc::new(
+                        h2mux::Session::client(conn).await.map_err(MeowError::Io)?,
+                    )),
+                    Protocol::MuxCool => unreachable!("handled above"),
+                }
+            }
+            Protocol::MuxCool => SessionKind::MuxCool(
+                muxcool::MuxCoolSession::client(conn)
+                    .await
+                    .map_err(MeowError::Io)?,
+            ),
         };
         let session = Arc::new(MuxSession {
             kind,

@@ -780,6 +780,64 @@ proxies:
     );
 }
 
+/// D16f: `protocol: muxcool` on VLESS → accepted (Xray Mux.Cool).
+#[cfg(feature = "mux")]
+#[tokio::test]
+async fn parse_vless_mux_muxcool_accepted() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    mux:
+      enabled: true
+      protocol: muxcool
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    let config = result.expect("muxcool mux must load");
+    assert!(
+        config.proxies.contains_key("v"),
+        "muxcool proxy must be kept"
+    );
+    let mux_warns = lines
+        .iter()
+        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
+        .count();
+    assert_eq!(mux_warns, 0, "muxcool is implemented: no warn expected");
+}
+
+/// D16g: `protocol: muxcool` on Trojan → rejected (VLESS-only protocol;
+/// trojan's CommandMux is smux, not Mux.Cool frames).
+#[cfg(all(feature = "mux", feature = "trojan"))]
+#[tokio::test]
+async fn parse_trojan_mux_muxcool_rejected() {
+    let yaml = r#"
+proxies:
+  - name: t
+    type: trojan
+    server: example.com
+    port: 443
+    password: pw
+    mux:
+      enabled: true
+      protocol: muxcool
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    let config = result.expect("invalid proxy must not fail the whole config");
+    assert!(
+        !config.proxies.contains_key("t"),
+        "trojan node with muxcool must be skipped"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("muxcool") && l.contains("VLESS")),
+        "expected a VLESS-only warn; {lines:?}"
+    );
+}
+
 /// No-mux builds: an enabled `mux:` block must warn loudly instead of
 /// being silently ignored.
 #[cfg(not(feature = "mux"))]

@@ -168,6 +168,15 @@ pub fn parse_proxy(
                 TrojanAdapter::new(name, server, port, password, sni, skip_verify, udp);
             #[cfg(feature = "mux")]
             if let Some(mux_options) = parse_mux_options(name, config)? {
+                // muxcool rides VLESS CommandMux; trojan has no equivalent
+                // signaling (its CommandMux=0x7f is smux) — reject loudly
+                // instead of speaking garbage frames to the server.
+                if mux_options.protocol == meow_proxy::mux::Protocol::MuxCool {
+                    return Err(format!(
+                        "{name}: mux protocol 'muxcool' is VLESS-only; \
+                         use smux/yamux/h2mux for trojan nodes"
+                    ));
+                }
                 adapter = adapter.with_mux(mux_options);
             }
             #[cfg(not(feature = "mux"))]
@@ -1416,12 +1425,15 @@ fn parse_vless(
     Ok(adapter)
 }
 
-/// Parse the optional sing-mux `mux:` block shared by VLESS/Trojan.
+/// Parse the optional `mux:` block shared by VLESS/Trojan.
 ///
-/// Wire-compatible with mihomo's sing-mux outbound wrapper: the first proxy
-/// request targets the reserved mux destination and streams carry a
-/// sing-encoded Socksaddr prefix.  Server must be sing-box / mihomo based
-/// (Xray-only servers speak Mux.Cool, not this protocol).
+/// Two wire protocols are available, picked by `protocol`:
+///
+/// * sing-mux (smux/yamux/h2mux, default h2mux) — the first proxy request
+///   targets the reserved mux destination and streams carry a sing-encoded
+///   Socksaddr prefix.  Server must be sing-box / mihomo based.
+/// * muxcool — Xray's Mux.Cool (VLESS CommandMux, frame mux).  Server must
+///   be Xray / sing-box based; VLESS-only (Trojan ignores it).
 ///
 /// Returns \`None\` when the block is absent or disabled; \`Err\` for
 /// malformed values.
@@ -1449,7 +1461,7 @@ fn parse_mux_options(
         // mihomo hard-errors on unknown protocols; do the same so a typo
         // cannot silently speak the wrong wire protocol to the server.
         return Err(format!(
-            "{name}: unknown mux protocol '{protocol_str}'; valid values: smux, yamux, h2mux"
+            "{name}: unknown mux protocol '{protocol_str}'; valid values: smux, yamux, h2mux, muxcool"
         ));
     };
     let get_usize = |key: &str, default: usize| {

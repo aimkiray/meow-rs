@@ -16,6 +16,7 @@
 pub mod address;
 pub mod client;
 pub mod h2mux;
+pub mod muxcool;
 pub mod packet;
 pub mod request;
 pub mod smux;
@@ -30,12 +31,18 @@ pub use stream::MuxStreamConn;
 pub const MUX_DESTINATION_FQDN: &str = "sp.mux.sing-box.arpa";
 pub const MUX_DESTINATION_PORT: u16 = 444;
 
-/// Mux protocol identifiers (match sing-mux's byte values).
+/// Mux protocol identifiers.
+///
+/// `Smux`/`Yamux`/`H2Mux` match sing-mux's request-header byte values.
+/// `MuxCool` is Xray's frame mux: it has **no** request-header byte — the
+/// VLESS `CommandMux` request (cmd 0x03) written by the session dialer is
+/// the signaling, and the value 3 is only a config-side discriminator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     Smux = 0,
     Yamux = 1,
     H2Mux = 2,
+    MuxCool = 3,
 }
 
 impl Protocol {
@@ -44,6 +51,8 @@ impl Protocol {
             "" | "h2mux" => Some(Protocol::H2Mux),
             "smux" => Some(Protocol::Smux),
             "yamux" => Some(Protocol::Yamux),
+            // VLESS-only: speaks Xray's Mux.Cool frames (CommandMux=0x03).
+            "muxcool" => Some(Protocol::MuxCool),
             _ => None,
         }
     }
