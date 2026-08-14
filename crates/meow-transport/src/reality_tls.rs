@@ -553,9 +553,12 @@ fn build_reality_client_hello(
         .duration_since(UNIX_EPOCH)
         .map_err(|e| TransportError::Tls(format!("system clock before UNIX_EPOCH: {e}")))?
         .as_secs() as u32;
+    // Auth payload layout must match the server's expectation (sing-box
+    // v1.13.18 reality client writes auth_len = 1; xray servers tolerate
+    // this byte's exact value but sing-box's utls fork validates it).
     reality_plain[0] = 1;
     reality_plain[1] = 8;
-    reality_plain[2] = 2;
+    reality_plain[2] = 1;
     reality_plain[3] = 0;
     reality_plain[4..8].copy_from_slice(&unix.to_be_bytes());
     reality_plain[8..16].copy_from_slice(&reality.short_id);
