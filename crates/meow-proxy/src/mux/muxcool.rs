@@ -259,6 +259,14 @@ fn parse_address(b: &[u8]) -> io::Result<(Vec<u8>, u16)> {
                 .into_bytes()
         }
         ATYPE_DOMAIN => {
+            // Guard b[3] before reading it: a 3-byte block (port + atype
+            // only) must error, not panic the reader task.
+            if b.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "mux.cool: truncated domain address",
+                ));
+            }
             let len = b[3] as usize;
             if b.len() < 4 + len {
                 return Err(io::Error::new(
@@ -652,6 +660,11 @@ impl AsyncRead for Stream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        // AsyncRead contract: a full buffer must yield Pending — returning
+        // Ready(Ok(())) here would busy-loop generic consumers.
+        if buf.remaining() == 0 {
+            return Poll::Pending;
+        }
         if this.eof {
             return Poll::Ready(Ok(()));
         }
@@ -1210,6 +1223,24 @@ mod tests {
     }
 
     #[test]
+    fn decode_meta_rejects_truncated_domain_address() {
+        // New frame whose address block stops after the atype byte
+        // (port + atype, no length byte) — must error, not panic on the
+        // missing b[3] in the domain arm.
+        let meta = [
+            0x00,
+            0x01, // sid 1
+            STATUS_NEW,
+            0x00, // option none
+            NETWORK_TCP,
+            0x00,
+            0x50,         // port 80
+            ATYPE_DOMAIN, // ...and nothing else
+        ];
+        assert!(decode_meta(&meta).is_err());
+    }
+
+    #[test]
     fn decode_meta_ignores_trailing_meta_bytes() {
         // xray may append optional fullcone/GlobalID metadata after the
         // address - trailing bytes must be ignored, not misparsed.
@@ -1226,6 +1257,37 @@ mod tests {
     }
 
     // --- Session round trips -------------------------------------------------
+
+    /// AsyncRead contract: polling with a full buffer must yield Pending
+    /// (Ready would busy-loop generic consumers), and the pending bytes must
+    /// survive for the next read.
+    #[tokio::test]
+    async fn poll_read_with_full_buffer_returns_pending() {
+        let (session, _log) = session_pair(vec![]).await;
+        let mut stream = session.open_stream("a.example", 80, false).await.unwrap();
+        stream.write_all(b"hello").await.unwrap();
+        // Consume one byte so the demux channel holds pending data.
+        let mut one = [0u8; 1];
+        let n = stream.read(&mut one).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(one[0], b'h');
+
+        let poll = std::future::poll_fn(|cx| {
+            let mut empty = [0u8; 0];
+            let mut rb = ReadBuf::new(&mut empty);
+            Pin::new(&mut stream).poll_read(cx, &mut rb)
+        });
+        let res = tokio::time::timeout(Duration::from_millis(100), poll).await;
+        assert!(
+            res.is_err(),
+            "poll_read with a full buffer must stay Pending"
+        );
+
+        // The pending bytes survive intact.
+        let mut rest = [0u8; 8];
+        let n = stream.read(&mut rest).await.unwrap();
+        assert_eq!(&rest[..n], b"ello");
+    }
 
     #[tokio::test]
     async fn tcp_stream_echo_round_trip() {
