@@ -348,6 +348,7 @@ mod tests {
             DnsMode::Normal,
             DomainTrie::new(),
             false,
+            true,
         ));
         let tunnel = Tunnel::new(resolver);
 

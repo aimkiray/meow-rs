@@ -96,6 +96,7 @@ impl Proxy for WrappedProxy {
 
 pub fn parse_proxy(
     config: &HashMap<String, serde_yaml::Value>,
+    ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let name = config
         .get("name")
@@ -180,7 +181,7 @@ pub fn parse_proxy(
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         "direct" => {
-            let adapter = parse_direct(name, config)?;
+            let adapter = parse_direct(name, config, ipv6)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "anytls")]
@@ -449,6 +450,7 @@ fn parse_socks5(
 fn parse_direct(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
+    ipv6: bool,
 ) -> std::result::Result<DirectAdapter, String> {
     use meow_common::DnsMode;
     use meow_dns::Resolver;
@@ -500,6 +502,7 @@ fn parse_direct(
             DnsMode::Normal,
             DomainTrie::<Vec<IpAddr>>::new(),
             false,
+            ipv6,
         ));
         adapter = adapter.with_resolver(resolver);
     }
@@ -1958,6 +1961,17 @@ fn parse_relay_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::op::{Message, MessageType, OpCode};
+    use hickory_proto::rr::rdata::AAAA;
+    use hickory_proto::rr::{RData, Record, RecordType};
+    use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+    use std::net::Ipv6Addr;
+
+    fn parse_proxy(
+        config: &HashMap<String, serde_yaml::Value>,
+    ) -> std::result::Result<Arc<dyn Proxy>, String> {
+        super::parse_proxy(config, true)
+    }
 
     fn proxy_config(yaml: &str) -> HashMap<String, serde_yaml::Value> {
         serde_yaml::from_str(yaml).unwrap()
@@ -2090,6 +2104,46 @@ tls: true
     fn parse_direct_with_dns_list_and_explicit_port() {
         let cfg = direct_config("name: lan\ntype: direct\ndns:\n  - 192.168.1.1\n  - 8.8.8.8:53\n");
         assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    #[tokio::test]
+    async fn direct_dns_inherits_disabled_ipv6_policy() {
+        let dns = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns_addr = dns.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for _ in 0..2 {
+                let (len, peer) = dns.recv_from(&mut buf).await.unwrap();
+                let request = Message::from_bytes(&buf[..len]).unwrap();
+                let query = request.queries[0].clone();
+                let mut response =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                response.add_query(query.clone());
+                if query.query_type == RecordType::AAAA {
+                    response.add_answer(Record::from_rdata(
+                        query.name,
+                        60,
+                        RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
+                    ));
+                }
+                dns.send_to(&response.to_bytes().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let target = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let cfg = proxy_config(&format!(
+            "name: direct-v6\ntype: direct\ndns: '{dns_addr}'\n"
+        ));
+        let proxy = super::parse_proxy(&cfg, false).unwrap();
+        let metadata = Metadata {
+            host: "v6-only.example".into(),
+            dst_port: target.local_addr().unwrap().port(),
+            ..Default::default()
+        };
+
+        assert!(proxy.dial_tcp(&metadata).await.is_err());
     }
 
     #[test]
@@ -2545,7 +2599,8 @@ tls: true
             health_check: None,
             header: None,
         };
-        let provider = crate::proxy_provider::ProxyProvider::new("airport", &raw, None).unwrap();
+        let provider =
+            crate::proxy_provider::ProxyProvider::new("airport", &raw, None, true).unwrap();
         provider.refresh().await.unwrap();
         let mut providers = HashMap::new();
         providers.insert("airport".to_string(), Arc::new(provider));

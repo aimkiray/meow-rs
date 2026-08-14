@@ -1,8 +1,7 @@
-use crate::resolver::Resolver;
+use crate::resolver::{AddressLookupResult, Resolver};
 use futures::FutureExt;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{Record, RecordType};
-use meow_common::DnsMode;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Weak};
@@ -155,26 +154,22 @@ impl DnsServer {
         // in cache — for everything else, so redir-host / normal-mode clients
         // expire their own caches on the upstream's schedule instead of a
         // synthetic constant.
-        let ip = if qtype == 1 {
-            resolver.lookup_ipv4_with_ttl(&domain).await
+        let lookup = if qtype == 1 {
+            resolver.lookup_ipv4_result(&domain).await
         } else {
-            resolver.lookup_ipv6_with_ttl(&domain).await
+            resolver.lookup_ipv6_result(&domain).await
         };
 
-        Ok(match ip {
-            Some((addr, ttl)) => {
+        Ok(match lookup {
+            AddressLookupResult::Answer(addr, ttl) => {
                 // Sub-second remainders round up to 1 — a 0-TTL answer means
                 // "never cache", which is stricter than the entry deserves.
                 let ttl_secs = ttl.as_secs().clamp(1, u64::from(u32::MAX)) as u32;
                 Self::build_response(id, data, flags, question_len, qtype, addr, ttl_secs)
             }
-            // Fake-IP mode AAAA when only v4 pool is configured: return
-            // NOERROR-empty so clients fall back to IPv4 cleanly. NXDOMAIN
-            // would tell them "no such host" — wrong signal.
-            None if qtype == 28 && resolver.mode() == DnsMode::FakeIp => {
-                Self::build_noerror_empty(id, data, flags, question_len)
-            }
-            None => Self::build_nxdomain(id, data, flags, question_len),
+            AddressLookupResult::NoData => Self::build_noerror_empty(id, data, flags, question_len),
+            AddressLookupResult::NxDomain => Self::build_nxdomain(id, data, flags, question_len),
+            AddressLookupResult::Failed => Self::build_servfail(id, data, flags, question_len),
         })
     }
 
@@ -477,6 +472,12 @@ impl DnsServer {
 
         response
     }
+
+    fn build_servfail(id: u16, query: &[u8], flags: u16, question_len: usize) -> Vec<u8> {
+        let mut response = Self::build_noerror_empty(id, query, flags, question_len);
+        response[3] = (response[3] & 0xF0) | 0x02;
+        response
+    }
 }
 
 /// A [`DnsServer`] whose listen socket is already bound. Produced by
@@ -661,6 +662,8 @@ pub fn hex_prefix(data: &[u8], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+    use meow_common::DnsMode;
     use std::net::Ipv4Addr;
 
     /// Build a minimal valid DNS query: header + single QNAME (`example.com`)
@@ -950,6 +953,33 @@ mod tests {
             DnsMode::Normal,
             meow_trie::DomainTrie::new(),
             false,
+            true,
+        )
+    }
+
+    async fn resolver_with_upstream_rcode(code: ResponseCode) -> crate::resolver::Resolver {
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = upstream.recv_from(&mut buf).await.unwrap();
+            let request = Message::from_bytes(&buf[..len]).unwrap();
+            let mut response =
+                Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+            response.metadata.response_code = code;
+            response.add_queries(request.queries.iter().cloned());
+            upstream
+                .send_to(&response.to_bytes().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        crate::resolver::Resolver::new(
+            vec![addr],
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
         )
     }
 
@@ -991,6 +1021,22 @@ mod tests {
             "all header counts zero — no body follows"
         );
         assert_eq!(resp.len(), 12, "header-only response");
+    }
+
+    #[tokio::test]
+    async fn handle_query_distinguishes_nodata_nxdomain_and_failure() {
+        for (upstream, expected) in [
+            (ResponseCode::NoError, ResponseCode::NoError),
+            (ResponseCode::NXDomain, ResponseCode::NXDomain),
+            (ResponseCode::ServFail, ResponseCode::ServFail),
+        ] {
+            let resolver = resolver_with_upstream_rcode(upstream).await;
+            let response = DnsServer::handle_query(&sample_query(7, 1), &resolver)
+                .await
+                .unwrap();
+            assert_eq!(response[3] & 0x0f, expected.low());
+            assert_eq!(&response[6..8], &[0, 0]);
+        }
     }
 
     #[test]
@@ -1038,6 +1084,7 @@ mod tests {
             DnsMode::Normal,
             meow_trie::DomainTrie::new(),
             false,
+            true,
         ));
         let server = DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap());
         let bound = server.bind().await.unwrap();

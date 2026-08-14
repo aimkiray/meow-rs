@@ -5,6 +5,7 @@
 //! `protect()` before the socket is used. This is the reason the project
 //! ships its own DNS client instead of relying on `hickory-resolver`.
 
+use crate::cache::QueryFamilies;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
@@ -17,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 #[cfg(feature = "encrypted")]
 use {rustls::pki_types::ServerName, std::convert::TryFrom, tokio_rustls::TlsConnector};
@@ -25,6 +26,7 @@ use {rustls::pki_types::ServerName, std::convert::TryFrom, tokio_rustls::TlsConn
 /// Default per-query timeout (matches the hickory-resolver value previously
 /// used in `Resolver::build_*`).
 pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const TCP_POOL_CAPACITY: usize = 4;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -110,11 +112,34 @@ pub struct DnsClient {
     timeout: Duration,
     proxy: Option<DnsProxy>,
     label: Option<Arc<str>>,
-    /// Idle TCP connection reused across queries to avoid the connect +
-    /// protect JNI overhead on every DNS exchange.  Held under the mutex for
-    /// the whole exchange so concurrent callers serialise on the single
-    /// keep-alive connection (simple, correct, no connection loss).
-    tcp_pool: AsyncMutex<Option<TcpStream>>,
+    /// Idle direct `tcp://` connections. Streams are checked out for the whole
+    /// exchange and returned only after the DNS response is fully validated.
+    tcp_pool: TcpPool,
+}
+
+pub(crate) struct IpLookupResult {
+    pub(crate) ips: Vec<IpAddr>,
+    pub(crate) ttl: Duration,
+    pub(crate) queried: QueryFamilies,
+}
+
+pub(crate) enum FamilyLookupResult {
+    Response(IpLookupResult),
+    NxDomain,
+}
+
+struct TcpPool {
+    idle: AsyncMutex<Vec<TcpStream>>,
+    permits: Semaphore,
+}
+
+impl TcpPool {
+    fn new() -> Self {
+        Self {
+            idle: AsyncMutex::new(Vec::with_capacity(TCP_POOL_CAPACITY)),
+            permits: Semaphore::new(TCP_POOL_CAPACITY),
+        }
+    }
 }
 
 enum Transport {
@@ -150,7 +175,7 @@ impl DnsClient {
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
             label: None,
-            tcp_pool: AsyncMutex::new(None),
+            tcp_pool: TcpPool::new(),
         }
     }
 
@@ -161,7 +186,7 @@ impl DnsClient {
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
             label: None,
-            tcp_pool: AsyncMutex::new(None),
+            tcp_pool: TcpPool::new(),
         }
     }
 
@@ -172,7 +197,7 @@ impl DnsClient {
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
             label: None,
-            tcp_pool: AsyncMutex::new(None),
+            tcp_pool: TcpPool::new(),
         }
     }
 
@@ -188,7 +213,7 @@ impl DnsClient {
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
             label: None,
-            tcp_pool: AsyncMutex::new(None),
+            tcp_pool: TcpPool::new(),
         }
     }
 
@@ -205,7 +230,7 @@ impl DnsClient {
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
             label: None,
-            tcp_pool: AsyncMutex::new(None),
+            tcp_pool: TcpPool::new(),
         }
     }
 
@@ -290,6 +315,16 @@ impl DnsClient {
     /// question must match the request before any response flags or records
     /// are used.
     pub async fn query(&self, name: &str, record_type: RecordType) -> Result<Message, ClientError> {
+        tokio::time::timeout(self.timeout, self.query_inner(name, record_type))
+            .await
+            .map_err(|_| ClientError::Timeout(self.timeout))?
+    }
+
+    async fn query_inner(
+        &self,
+        name: &str,
+        record_type: RecordType,
+    ) -> Result<Message, ClientError> {
         let id: u16 = rand::random();
         let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
         msg.metadata.recursion_desired = true;
@@ -308,23 +343,62 @@ impl DnsClient {
         msg.add_query(query.clone());
         let wire = msg.to_bytes()?;
         let expected = ExpectedResponse { id, query };
-        tokio::time::timeout(self.timeout, self.exchange(&wire, &expected))
-            .await
-            .map_err(|_| ClientError::Timeout(self.timeout))?
+        self.exchange(&wire, &expected).await
     }
 
-    /// Convenience: query `A` and `AAAA` in parallel, merge addresses, return
-    /// (addrs, min_ttl).  Empty answer set returns `Ok((vec![], _))`; upstream
-    /// SERVFAIL surfaces as `ClientError::Rcode`.
+    /// Convenience: query `A` first and fall back to `AAAA` when needed.
+    /// Returns the addresses and minimum answer TTL.
     pub async fn lookup_ip(&self, name: &str) -> Result<(Vec<IpAddr>, Duration), ClientError> {
-        self.lookup_ip_with_ipv6(name, true).await
+        let result = self.lookup_ip_with_ipv6(name, true).await?;
+        Ok((result.ips, result.ttl))
     }
 
     pub(crate) async fn lookup_ip_with_ipv6(
         &self,
         name: &str,
         ipv6_enabled: bool,
-    ) -> Result<(Vec<IpAddr>, Duration), ClientError> {
+    ) -> Result<IpLookupResult, ClientError> {
+        tokio::time::timeout(
+            self.timeout,
+            self.lookup_ip_with_ipv6_inner(name, ipv6_enabled),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout(self.timeout))?
+    }
+
+    pub(crate) async fn lookup_family(
+        &self,
+        name: &str,
+        record_type: RecordType,
+    ) -> Result<FamilyLookupResult, ClientError> {
+        let queried = match record_type {
+            RecordType::A => QueryFamilies::IPV4,
+            RecordType::AAAA => QueryFamilies::IPV6,
+            _ => {
+                return Err(ClientError::Protocol(
+                    "address family query must be A or AAAA",
+                ))
+            }
+        };
+        let message = self.query(name, record_type).await?;
+        match message.metadata.response_code {
+            ResponseCode::NoError => {}
+            ResponseCode::NXDomain => return Ok(FamilyLookupResult::NxDomain),
+            code => return Err(ClientError::Rcode(code)),
+        }
+        let (ips, ttl) = relevant_ip_answers(&message);
+        Ok(FamilyLookupResult::Response(IpLookupResult {
+            ips,
+            ttl: Duration::from_secs(u64::from(ttl.unwrap_or(0))),
+            queried,
+        }))
+    }
+
+    async fn lookup_ip_with_ipv6_inner(
+        &self,
+        name: &str,
+        ipv6_enabled: bool,
+    ) -> Result<IpLookupResult, ClientError> {
         // Prefer IPv4: query A first and return it when it yields any
         // address; fall back to AAAA only when A is empty.  This mirrors the
         // `prefer-ipv4: true` mihomo option and keeps the common v4-capable
@@ -343,40 +417,20 @@ impl DnsClient {
         let mut addrs = Vec::new();
         let mut min_ttl: Option<u32> = None;
         let mut had_any_ok = false;
-        let mut last_err: Option<ClientError> = None;
-
-        macro_rules! absorb {
-            ($r:expr) => {
-                match $r {
-                    Ok(msg) => {
-                        had_any_ok = true;
-                        let (response_addrs, response_ttl) = relevant_ip_answers(&msg);
-                        addrs.extend(response_addrs);
-                        if let Some(ttl) = response_ttl {
-                            min_ttl = Some(min_ttl.map_or(ttl, |current| current.min(ttl)));
-                        }
-                    }
-                    Err(e) => last_err = Some(e),
-                }
-            };
-        }
+        let mut first_err: Option<ClientError> = None;
+        let mut queried = QueryFamilies::NONE;
 
         // Query A first (IPv4-preferred). Track whether it returned any
         // usable address so we can decide whether the AAAA fallback is
         // needed.
-        let got_v4 = match self.query(name, RecordType::A).await {
+        let got_v4 = match self.query_inner(name, RecordType::A).await {
             Ok(msg) => {
                 had_any_ok = true;
-                let (response_addrs, response_ttl) = relevant_ip_answers(&msg);
-                let non_empty = !response_addrs.is_empty();
-                addrs.extend(response_addrs);
-                if let Some(ttl) = response_ttl {
-                    min_ttl = Some(min_ttl.map_or(ttl, |current| current.min(ttl)));
-                }
-                non_empty
+                queried = queried.union(QueryFamilies::IPV4);
+                absorb_ip_response(&msg, &mut addrs, &mut min_ttl)
             }
             Err(e) => {
-                last_err = Some(e);
+                first_err = Some(e);
                 false
             }
         };
@@ -384,50 +438,57 @@ impl DnsClient {
         // No IPv4 answer (empty A, or A failed): fall back to AAAA unless the
         // user has disabled IPv6 entirely.
         if !got_v4 && ipv6_enabled {
-            absorb!(self.query(name, RecordType::AAAA).await);
-        }
-
-        if !had_any_ok {
-            return Err(last_err.unwrap_or(ClientError::Protocol("no response")));
-        }
-        Ok((addrs, Duration::from_secs(u64::from(min_ttl.unwrap_or(0)))))
-    }
-
-    /// Send a DNS query over TCP, reusing a single persistent connection
-    /// when possible.  Avoids the TCP handshake + JNI protect(fd) on every
-    /// query — the root cause of intermittent timeouts on Android where
-    /// each tcp_exchange opened a fresh connection.
-    ///
-    /// The mutex is held for the entire exchange so concurrent callers
-    /// serialise on the one keep-alive connection.  This is deliberately
-    /// simple and correct (no connection loss / no stale-slot races) at the
-    /// cost of throughput — a fair trade for DNS, which is low-volume.
-    async fn tcp_exchange_pooled(
-        &self,
-        addr: SocketAddr,
-        wire: &[u8],
-    ) -> Result<Vec<u8>, ClientError> {
-        let query_id = u16::from_be_bytes([wire[0], wire[1]]);
-
-        // Hold the pool lock for the whole exchange so concurrent callers
-        // serialise on the single keep-alive connection (no connection loss).
-        let mut guard = self.tcp_pool.lock().await;
-        if let Some(stream) = guard.as_mut() {
-            if write_lp(stream, wire).await.is_ok() {
-                if let Ok(response) = read_lp(stream).await {
-                    if u16::from_be_bytes([response[0], response[1]]) == query_id {
-                        return Ok(response);
+            match self.query_inner(name, RecordType::AAAA).await {
+                Ok(msg) => {
+                    had_any_ok = true;
+                    queried = queried.union(QueryFamilies::IPV6);
+                    absorb_ip_response(&msg, &mut addrs, &mut min_ttl);
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
                     }
                 }
             }
         }
-        // No idle connection, or it was broken/stale — drop it and open a
-        // fresh one (still under the lock so the slot stays consistent).
-        *guard = None;
+
+        if !had_any_ok {
+            return Err(first_err.unwrap_or(ClientError::Protocol("no response")));
+        }
+        Ok(IpLookupResult {
+            ips: addrs,
+            ttl: Duration::from_secs(u64::from(min_ttl.unwrap_or(0))),
+            queried,
+        })
+    }
+
+    /// Send a direct `tcp://` query through a bounded keep-alive pool.
+    /// Checked-out streams stay local to this future, so cancellation drops a
+    /// partially consumed stream instead of returning it to the pool.
+    async fn tcp_exchange_pooled(
+        &self,
+        addr: SocketAddr,
+        wire: &[u8],
+        expected: &ExpectedResponse,
+    ) -> Result<Message, ClientError> {
+        let _permit = self
+            .tcp_pool
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| ClientError::Protocol("TCP pool closed"))?;
+        let pooled = self.tcp_pool.idle.lock().await.pop();
+
+        if let Some(mut stream) = pooled {
+            if let Ok(response) = tcp_message_exchange(&mut stream, wire, expected).await {
+                self.tcp_pool.idle.lock().await.push(stream);
+                return Ok(response);
+            }
+        }
+
         let mut stream = factory().connect_tcp(addr).await?;
-        write_lp(&mut stream, wire).await?;
-        let response = read_lp(&mut stream).await?;
-        *guard = Some(stream);
+        let response = tcp_message_exchange(&mut stream, wire, expected).await?;
+        self.tcp_pool.idle.lock().await.push(stream);
         Ok(response)
     }
 
@@ -464,10 +525,7 @@ impl DnsClient {
         }
         match &self.transport {
             Transport::Udp { addr } => udp_exchange(*addr, wire, expected).await,
-            Transport::Tcp { addr } => {
-                let response = self.tcp_exchange_pooled(*addr, wire).await?;
-                decode_validated_response(&response, expected)
-            }
+            Transport::Tcp { addr } => self.tcp_exchange_pooled(*addr, wire, expected).await,
             Transport::RCode { .. } => Err(ClientError::Protocol(
                 "rcode transport should not perform network exchange",
             )),
@@ -502,6 +560,16 @@ fn decode_validated_response(
     let response = Message::from_bytes(wire)?;
     validate_response(&response, expected)?;
     Ok(response)
+}
+
+async fn tcp_message_exchange(
+    stream: &mut TcpStream,
+    wire: &[u8],
+    expected: &ExpectedResponse,
+) -> Result<Message, ClientError> {
+    write_lp(stream, wire).await?;
+    let response = read_lp(stream).await?;
+    decode_validated_response(&response, expected)
 }
 
 fn validate_response(response: &Message, expected: &ExpectedResponse) -> Result<(), ClientError> {
@@ -657,6 +725,20 @@ fn relevant_ip_answers(message: &Message) -> (Vec<IpAddr>, Option<u32>) {
         }
     }
     (addrs, min_ttl)
+}
+
+fn absorb_ip_response(
+    message: &Message,
+    addrs: &mut Vec<IpAddr>,
+    min_ttl: &mut Option<u32>,
+) -> bool {
+    let (response_addrs, response_ttl) = relevant_ip_answers(message);
+    let non_empty = !response_addrs.is_empty();
+    addrs.extend(response_addrs);
+    if let Some(ttl) = response_ttl {
+        *min_ttl = Some(min_ttl.map_or(ttl, |current| current.min(ttl)));
+    }
+    non_empty
 }
 
 async fn udp_exchange(
@@ -828,6 +910,7 @@ mod tests {
     use hickory_proto::rr::rdata::{A, CNAME};
     use hickory_proto::rr::DNSClass;
     use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn expected(name: &str, record_type: RecordType, id: u16) -> ExpectedResponse {
         ExpectedResponse {
@@ -868,9 +951,9 @@ mod tests {
 
     #[tokio::test]
     async fn udp_client_times_out_on_unroutable() {
-        // 192.0.2.1/24 is TEST-NET-1, guaranteed not to respond.
-        let client = DnsClient::udp("192.0.2.1:53".parse().unwrap())
-            .with_timeout(Duration::from_millis(200));
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            DnsClient::udp(sink.local_addr().unwrap()).with_timeout(Duration::from_millis(200));
         let r = client.query("example.test", RecordType::A).await;
         assert!(matches!(r, Err(ClientError::Timeout(_))));
     }
@@ -1073,6 +1156,196 @@ mod tests {
             result,
             Err(ClientError::Protocol("response ID mismatch"))
         ));
+    }
+
+    #[tokio::test]
+    async fn tcp_short_frames_never_panic_or_return_to_pool() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let server_connections = Arc::clone(&connections);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let index = server_connections.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    while read_lp(&mut stream).await.is_ok() {
+                        // First connection answers with a zero-length frame,
+                        // the second with a one-byte frame — both are
+                        // malformed and must surface as `ClientError` instead
+                        // of panicking or being returned to the pool.
+                        let frame: &[u8] = if index == 0 { &[0, 0] } else { &[0, 1, 0] };
+                        if stream.write_all(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = DnsClient::tcp(addr).with_timeout(Duration::from_secs(1));
+        for _ in 0..2 {
+            assert!(client.query("victim.example", RecordType::A).await.is_err());
+        }
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_tcp_exchange_discards_partial_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let server_accepted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let connection = server_accepted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if connection == 0 {
+                        let request = read_lp(&mut stream).await.unwrap();
+                        let request = Message::from_bytes(&request).unwrap();
+                        let response = response_for(&request, request.metadata.id);
+                        write_lp(&mut stream, &response.to_bytes().unwrap())
+                            .await
+                            .unwrap();
+                        read_lp(&mut stream).await.unwrap();
+                        stream.write_all(&[0, 64, 0]).await.unwrap();
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        return;
+                    }
+                    let request = read_lp(&mut stream).await.unwrap();
+                    let request = Message::from_bytes(&request).unwrap();
+                    let response = response_for(&request, request.metadata.id);
+                    write_lp(&mut stream, &response.to_bytes().unwrap())
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let client = DnsClient::tcp(addr).with_timeout(Duration::from_millis(200));
+        client
+            .query("warm.example", RecordType::A)
+            .await
+            .expect("the first query primes the pool");
+        assert!(matches!(
+            client.query("partial.example", RecordType::A).await,
+            Err(ClientError::Timeout(_))
+        ));
+        client
+            .query("after-cancel.example", RecordType::A)
+            .await
+            .expect("the cancelled partial stream must not be reused");
+        assert!(accepted.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_bounds_concurrency_and_reuses_connections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let server_accepted = Arc::clone(&accepted);
+        let server_active = Arc::clone(&active);
+        let server_released = Arc::clone(&released);
+        let server_gate = Arc::clone(&gate);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                server_accepted.fetch_add(1, Ordering::SeqCst);
+                let active = Arc::clone(&server_active);
+                let released = Arc::clone(&server_released);
+                let gate = Arc::clone(&server_gate);
+                tokio::spawn(async move {
+                    while let Ok(request) = read_lp(&mut stream).await {
+                        let request = Message::from_bytes(&request).unwrap();
+                        active.fetch_add(1, Ordering::SeqCst);
+                        if !released.load(Ordering::SeqCst) {
+                            gate.acquire().await.unwrap().forget();
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        let response = response_for(&request, request.metadata.id);
+                        if write_lp(&mut stream, &response.to_bytes().unwrap())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = Arc::new(DnsClient::tcp(addr).with_timeout(Duration::from_secs(2)));
+        let queries: Vec<_> = (0..6)
+            .map(|index| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move {
+                    client
+                        .query(&format!("pool-{index}.example"), RecordType::A)
+                        .await
+                })
+            })
+            .collect();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::SeqCst) < TCP_POOL_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("four TCP exchanges should run concurrently");
+        assert_eq!(accepted.load(Ordering::SeqCst), TCP_POOL_CAPACITY);
+
+        released.store(true, Ordering::SeqCst);
+        gate.add_permits(TCP_POOL_CAPACITY);
+        for query in queries {
+            query.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            TCP_POOL_CAPACITY,
+            "queued queries should reuse the four established connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_ip_shares_one_timeout_across_a_and_aaaa() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_lp(&mut stream).await.unwrap();
+            let request = Message::from_bytes(&request).unwrap();
+            assert_eq!(request.queries[0].query_type, RecordType::A);
+            server_requests.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let response = response_for(&request, request.metadata.id);
+            write_lp(&mut stream, &response.to_bytes().unwrap())
+                .await
+                .unwrap();
+
+            let request = read_lp(&mut stream).await.unwrap();
+            let request = Message::from_bytes(&request).unwrap();
+            assert_eq!(request.queries[0].query_type, RecordType::AAAA);
+            server_requests.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let client = DnsClient::tcp(addr).with_timeout(Duration::from_millis(400));
+        let result = tokio::time::timeout(
+            Duration::from_millis(550),
+            client.lookup_ip_with_ipv6("dual.example", true),
+        )
+        .await
+        .expect("A and AAAA must share the client's overall timeout");
+        assert!(matches!(result, Err(ClientError::Timeout(_))));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(feature = "encrypted")]

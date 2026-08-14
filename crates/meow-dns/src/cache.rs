@@ -36,6 +36,40 @@ struct CacheEntry {
     ips: Box<[IpAddr]>,
     expire_at: Instant,
     source: Option<Arc<str>>,
+    queried: QueryFamilies,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct QueryFamilies(u8);
+
+impl QueryFamilies {
+    pub(crate) const NONE: Self = Self(0);
+    pub(crate) const IPV4: Self = Self(1);
+    pub(crate) const IPV6: Self = Self(2);
+
+    pub(crate) fn from_ips(ips: &[IpAddr]) -> Self {
+        ips.iter().fold(Self::NONE, |families, ip| {
+            families.union(if ip.is_ipv4() { Self::IPV4 } else { Self::IPV6 })
+        })
+    }
+
+    pub(crate) fn contains(self, family: Self) -> bool {
+        self.0 & family.0 == family.0
+    }
+
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    fn contains_ip(self, ip: IpAddr) -> bool {
+        self.contains(if ip.is_ipv4() { Self::IPV4 } else { Self::IPV6 })
+    }
+}
+
+pub(crate) struct CacheLookup {
+    pub(crate) ips: IpList,
+    pub(crate) ttl: Duration,
+    pub(crate) queried: QueryFamilies,
 }
 
 struct ReverseEntry {
@@ -154,6 +188,10 @@ impl DnsCache {
     /// answers served from cache can carry the upstream's real TTL (decayed by
     /// time already spent in cache) instead of a synthetic constant.
     pub fn get_with_ttl(&self, domain: &str) -> Option<(IpList, Duration)> {
+        self.get_lookup(domain).map(|entry| (entry.ips, entry.ttl))
+    }
+
+    pub(crate) fn get_lookup(&self, domain: &str) -> Option<CacheLookup> {
         let domain = normalize_domain(domain);
         let shard = &self.cache[shard_str(&domain)];
         let mut cache = shard.lock();
@@ -161,10 +199,11 @@ impl DnsCache {
         if let Some(entry) = cache.get(domain.as_ref()) {
             let now = Instant::now();
             if entry.expire_at > now {
-                return Some((
-                    SmallVec::from_slice(&entry.ips),
-                    entry.expire_at.saturating_duration_since(now),
-                ));
+                return Some(CacheLookup {
+                    ips: SmallVec::from_slice(&entry.ips),
+                    ttl: entry.expire_at.saturating_duration_since(now),
+                    queried: entry.queried,
+                });
             }
             // Expired — flag for eviction; can't pop while `entry` borrows.
             expired = true;
@@ -189,6 +228,17 @@ impl DnsCache {
         ips: &[IpAddr],
         ttl: Duration,
         source: Option<&str>,
+    ) {
+        self.put_replacing(domain, ips, ttl, source, QueryFamilies::from_ips(ips));
+    }
+
+    fn put_replacing(
+        &self,
+        domain: &str,
+        ips: &[IpAddr],
+        ttl: Duration,
+        source: Option<&str>,
+        queried: QueryFamilies,
     ) {
         let now = Instant::now();
         let expire_at = now + ttl;
@@ -223,9 +273,76 @@ impl DnsCache {
             ips: ips.into(),
             expire_at,
             source: source.map(Arc::from),
+            queried,
         };
         let mut cache = self.cache[shard_str(&domain)].lock();
         cache.put(key, entry);
+        if cache.len() > self.fwd_shard_cap {
+            cache.pop_lru();
+        }
+    }
+
+    pub(crate) fn merge_lookup(
+        &self,
+        domain: &str,
+        ips: &[IpAddr],
+        ttl: Duration,
+        source: Option<&str>,
+        queried: QueryFamilies,
+    ) {
+        let now = Instant::now();
+        let incoming_expire_at = now + ttl;
+        let reverse_expire_at = now + ttl.max(REVERSE_TTL_FLOOR);
+        let domain = normalize_domain(domain);
+        let key: Arc<str> = Arc::from(domain.as_ref());
+
+        for &ip in ips {
+            let mut reverse = self.reverse[shard_ip(ip)].lock();
+            reverse.put(
+                ip,
+                ReverseEntry {
+                    domain: Arc::clone(&key),
+                    expire_at: reverse_expire_at,
+                },
+            );
+            if reverse.len() > self.rev_shard_cap {
+                reverse.pop_lru();
+            }
+        }
+
+        let mut cache = self.cache[shard_str(&domain)].lock();
+        let mut merged = Vec::new();
+        let mut merged_queried = queried;
+        let mut expire_at = incoming_expire_at;
+        let mut merged_source = source.map(Arc::from);
+        if let Some(existing) = cache.get(domain.as_ref()) {
+            if existing.expire_at > now {
+                merged.extend(
+                    existing
+                        .ips
+                        .iter()
+                        .copied()
+                        .filter(|ip| !queried.contains_ip(*ip)),
+                );
+                merged_queried = existing.queried.union(queried);
+                expire_at = existing.expire_at.min(incoming_expire_at);
+                if merged_source.is_none() {
+                    merged_source = existing.source.clone();
+                }
+            }
+        }
+        merged.extend_from_slice(ips);
+        merged.sort_unstable();
+        merged.dedup();
+        cache.put(
+            key,
+            CacheEntry {
+                ips: merged.into(),
+                expire_at,
+                source: merged_source,
+                queried: merged_queried,
+            },
+        );
         if cache.len() > self.fwd_shard_cap {
             cache.pop_lru();
         }
@@ -603,6 +720,43 @@ mod tests {
         c.put("nx.example", &[], Duration::from_secs(30));
         assert_eq!(c.get("nx.example").as_deref(), Some(&[][..]));
         assert_eq!(c.reverse_len(), 0);
+    }
+
+    #[test]
+    fn merge_lookup_tracks_empty_families_without_dropping_other_answers() {
+        let c = DnsCache::new(64);
+        let v4 = ipv4(192, 0, 2, 1);
+        let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
+        c.merge_lookup(
+            "dual.example",
+            &[v4],
+            Duration::from_secs(60),
+            None,
+            QueryFamilies::IPV4,
+        );
+        c.merge_lookup(
+            "dual.example",
+            &[],
+            Duration::from_secs(30),
+            None,
+            QueryFamilies::IPV6,
+        );
+        let no_v6 = c.get_lookup("dual.example").unwrap();
+        assert_eq!(no_v6.ips.as_slice(), &[v4]);
+        assert!(no_v6.queried.contains(QueryFamilies::IPV4));
+        assert!(no_v6.queried.contains(QueryFamilies::IPV6));
+
+        c.merge_lookup(
+            "dual.example",
+            &[v6],
+            Duration::from_secs(30),
+            None,
+            QueryFamilies::IPV6,
+        );
+        let dual = c.get_lookup("dual.example").unwrap();
+        assert!(dual.ips.contains(&v4));
+        assert!(dual.ips.contains(&v6));
     }
 
     #[test]
