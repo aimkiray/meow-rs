@@ -2,7 +2,7 @@
 //! client side.
 //!
 //! This is NOT the upstream xtaci layout: sing-mux/sing-box use the
-//! sagernet fork whose frames are [ver=1][cmd][len u16 LE][stream_id u32 LE][data]
+//! sagernet fork whose frames are: ver=1, cmd, len u16 LE, stream_id u32 LE, data
 //! (8-byte header, little-endian) and whose version 1 has no window-update
 //! (UPD) flow control — a v1 write just splits into MaxFrameSize frames.
 //! Commands: SYN=0, FIN=1, PSH=2, NOP=3; client stream IDs are odd

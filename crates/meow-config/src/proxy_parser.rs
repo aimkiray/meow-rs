@@ -180,7 +180,7 @@ pub fn parse_proxy(
                 adapter = adapter.with_mux(mux_options);
             }
             #[cfg(not(feature = "mux"))]
-            let _ = parse_mux_options(name, config)?;
+            parse_mux_options(name, config);
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "vless")]
@@ -1420,7 +1420,7 @@ fn parse_vless(
         adapter = adapter.with_mux(mux_options);
     }
     #[cfg(not(feature = "mux"))]
-    let _ = parse_mux_options(name, config)?;
+    parse_mux_options(name, config);
 
     Ok(adapter)
 }
@@ -1435,9 +1435,10 @@ fn parse_vless(
 /// * muxcool — Xray's Mux.Cool (VLESS CommandMux, frame mux).  Server must
 ///   be Xray / sing-box based; VLESS-only (Trojan ignores it).
 ///
-/// Returns \`None\` when the block is absent or disabled; \`Err\` for
-/// malformed values.
-#[cfg(feature = "mux")]
+/// Returns `None` when the block is absent or disabled; `Err` for
+/// malformed values.  Only compiled when one of its call sites
+/// (trojan / vless parsing) exists.
+#[cfg(all(feature = "mux", any(feature = "trojan", feature = "vless")))]
 fn parse_mux_options(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
@@ -1512,11 +1513,9 @@ fn parse_mux_options(
 
 /// No-mux builds: warn loudly instead of silently ignoring an enabled
 /// `mux:` block (operators would otherwise think the node is multiplexed).
-#[cfg(not(feature = "mux"))]
-fn parse_mux_options(
-    name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
-) -> std::result::Result<Option<()>, String> {
+/// Only compiled when one of its call sites (trojan / vless parsing) exists.
+#[cfg(all(not(feature = "mux"), any(feature = "trojan", feature = "vless")))]
+fn parse_mux_options(name: &str, config: &HashMap<String, serde_yaml::Value>) {
     if let Some(mux_cfg) = config.get("mux") {
         let enabled = mux_cfg
             .get("enabled")
@@ -1529,7 +1528,6 @@ fn parse_mux_options(
             );
         }
     }
-    Ok(None)
 }
 
 /// Parse the VLESS `encryption` field.

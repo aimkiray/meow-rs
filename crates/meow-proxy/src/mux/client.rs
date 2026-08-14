@@ -313,7 +313,7 @@ impl MuxClient {
     }
 
     /// Open one multiplexed UDP flow to host:port.  sing-mux carries
-    /// flagUDP and frames datagrams as [len u16 BE][data]; Mux.Cool carries
+    /// flagUDP and frames datagrams as `[len u16 BE][data]`; Mux.Cool carries
     /// a per-datagram destination in the frame meta.
     pub async fn open_packet_stream(
         self: &Arc<Self>,

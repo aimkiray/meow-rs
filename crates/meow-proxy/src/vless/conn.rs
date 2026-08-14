@@ -386,6 +386,14 @@ impl ProxyPacketConn for VlessPacketConn {
             .map_err(MeowError::Io)?;
         let pkt_len = u16::from_be_bytes(len_buf) as usize;
         if pkt_len > buf.len() {
+            // Drain the oversized payload before erroring so the stream
+            // framing stays aligned for the next read (mirrors the mux
+            // packet conn).
+            let mut discard = vec![0u8; pkt_len];
+            reader
+                .read_exact(&mut discard)
+                .await
+                .map_err(MeowError::Io)?;
             return Err(MeowError::Proxy(format!(
                 "vless: UDP packet ({} bytes) exceeds read buffer ({} bytes)",
                 pkt_len,
