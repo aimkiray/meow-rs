@@ -453,10 +453,19 @@ impl MuxCoolSession {
         let frame = encode_new_frame(sid, udp, host, port)?;
         let (tx, rx) = mpsc::channel(STREAM_QUEUE);
         self.streams.lock().await.insert(sid, tx);
+        // The guard removes the map entry if this future is cancelled
+        // while waiting for outbound capacity — otherwise the id stays
+        // consumed and the entry lingers until a server End echo.
+        let mut guard = StreamMapGuard {
+            streams: Arc::clone(&self.streams),
+            sid,
+            armed: true,
+        };
         if let Err(e) = self.send_frame(frame).await {
-            self.streams.lock().await.remove(&sid);
+            drop(guard);
             return Err(e);
         }
+        guard.disarm();
         Ok(StreamParts {
             sid,
             session: Arc::clone(self),
@@ -495,6 +504,35 @@ impl Drop for MuxCoolSession {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::SeqCst);
         self.done.notify_waiters();
+    }
+}
+
+/// Removes the stream-map entry for `sid` when dropped while armed — the
+/// cancellation-safe counterpart of `open_stream_parts`'s insert-then-send.
+struct StreamMapGuard {
+    streams: Arc<Mutex<HashMap<u16, mpsc::Sender<Event>>>>,
+    sid: u16,
+    armed: bool,
+}
+
+impl StreamMapGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StreamMapGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let streams = Arc::clone(&self.streams);
+            let sid = self.sid;
+            // Detached: drop cannot await the map lock.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    streams.lock().await.remove(&sid);
+                });
+            }
+        }
     }
 }
 
@@ -545,9 +583,13 @@ impl Drop for EndGuard {
             let sid = self.sid;
             // Detached: the End frame queues behind any in-flight data
             // frames in the driver's channel; drop cannot await the send.
-            tokio::spawn(async move {
-                let _ = session.send_frame(encode_end_frame(sid, false)).await;
-            });
+            // Skip when no runtime exists (teardown): the session is
+            // going away anyway.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = session.send_frame(encode_end_frame(sid, false)).await;
+                });
+            }
         }
     }
 }
@@ -968,10 +1010,11 @@ impl AsyncRead for Stream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        // AsyncRead contract: a full buffer must yield Pending — returning
-        // Ready(Ok(())) here would busy-loop generic consumers.
+        // A zero-capacity buffer yields Ready(Ok(())) per the tokio
+        // AsyncRead docs (a Pending here would leave `read(&mut [])`
+        // parked forever).
         if buf.remaining() == 0 {
-            return Poll::Pending;
+            return Poll::Ready(Ok(()));
         }
         if this.eof {
             return Poll::Ready(Ok(()));
@@ -1070,23 +1113,33 @@ impl AsyncWrite for Stream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if !this.parts.guard.ended.swap(true, Ordering::SeqCst) {
+        if this.parts.guard.ended.load(Ordering::SeqCst) {
+            return Poll::Ready(Ok(()));
+        }
+        if this.shutdown_frame.is_none() {
             this.shutdown_frame = Some(encode_end_frame(this.parts.sid, false));
         }
-        if let Some(frame) = this.shutdown_frame.take() {
-            match this.poll_sender.poll_reserve(cx) {
-                Poll::Pending => {
-                    this.shutdown_frame = Some(frame);
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(e)) => {
-                    return Poll::Ready(Err(io::Error::other(e.to_string())));
-                }
-                Poll::Ready(Ok(())) => {
-                    // The End frame queues behind any data frames already
-                    // in the driver channel (FIFO order preserved).
-                    let _ = this.poll_sender.send_item(frame);
-                }
+        let Some(frame) = this.shutdown_frame.take() else {
+            return Poll::Ready(Ok(()));
+        };
+        match this.poll_sender.poll_reserve(cx) {
+            Poll::Pending => {
+                this.shutdown_frame = Some(frame);
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(e)) => {
+                return Poll::Ready(Err(io::Error::other(e.to_string())));
+            }
+            Poll::Ready(Ok(())) => {
+                // The End frame queues behind any data frames already
+                // in the driver channel (FIFO order preserved).
+                this.poll_sender
+                    .send_item(frame)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                // Claim the End only once it is enqueued: if this future
+                // is cancelled while the reserve is Pending, the
+                // EndGuard re-sends the End on drop.
+                this.parts.guard.ended.store(true, Ordering::SeqCst);
             }
         }
         Poll::Ready(Ok(()))
@@ -1238,7 +1291,7 @@ impl ProxyPacketConn for PacketConn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::Mutex as StdMutex;
     use std::task::Poll as TaskPoll;
     use tokio::io::DuplexStream;
@@ -1594,11 +1647,11 @@ mod tests {
 
     // --- Session round trips -------------------------------------------------
 
-    /// AsyncRead contract: polling with a full buffer must yield Pending
-    /// (Ready would busy-loop generic consumers), and the pending bytes must
-    /// survive for the next read.
+    /// AsyncRead contract: polling with a zero-capacity buffer yields
+    /// Ready(Ok(())) per the tokio docs (a Pending here would park
+    /// `read(&mut [])` forever), and the pending bytes survive intact.
     #[tokio::test]
-    async fn poll_read_with_full_buffer_returns_pending() {
+    async fn poll_read_with_full_buffer_returns_ready_empty() {
         let (session, _log) = session_pair(vec![]).await;
         let mut stream = session.open_stream("a.example", 80, false).await.unwrap();
         stream.write_all(b"hello").await.unwrap();
@@ -1615,14 +1668,209 @@ mod tests {
         });
         let res = tokio::time::timeout(Duration::from_millis(100), poll).await;
         assert!(
-            res.is_err(),
-            "poll_read with a full buffer must stay Pending"
+            res.is_ok(),
+            "poll_read with a zero-capacity buffer must return Ready(Ok(()))"
         );
 
         // The pending bytes survive intact.
         let mut rest = [0u8; 8];
         let n = stream.read(&mut rest).await.unwrap();
         assert_eq!(&rest[..n], b"ello");
+    }
+
+    /// IO whose write half stays Pending until the test releases it —
+    /// parks the driver deterministically so the bounded outbound
+    /// channel can be filled (a plain small duplex cannot: the driver
+    /// drains it too fast, and duplex(0) reads EOF instantly).
+    /// `polled` records that the write half parked, so tests can top
+    /// the channel up AFTER the driver stopped consuming; the stored
+    /// waker lets the test wake the parked write on release (a fresh
+    /// `Notify::notified()` future would drop its registration between
+    /// polls and miss `notify_waiters`).
+    struct GatedConn {
+        inner: DuplexStream,
+        open: Arc<AtomicBool>,
+        waker: Arc<StdMutex<Option<std::task::Waker>>>,
+        polled: Arc<AtomicBool>,
+    }
+
+    impl ProxyConn for GatedConn {}
+
+    impl AsyncRead for GatedConn {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> TaskPoll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for GatedConn {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> TaskPoll<io::Result<usize>> {
+            let this = self.get_mut();
+            if this.open.load(Ordering::SeqCst) {
+                return Pin::new(&mut this.inner).poll_write(cx, buf);
+            }
+            this.polled.store(true, Ordering::SeqCst);
+            *this.waker.lock().unwrap() = Some(cx.waker().clone());
+            TaskPoll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Regression: a shutdown cancelled while the outbound channel is
+    /// full must not claim the End — the EndGuard re-sends it on drop.
+    #[tokio::test]
+    async fn cancelled_shutdown_still_sends_end_on_drop() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let log = Arc::new(StdMutex::new(ServerLog::default()));
+        tokio::spawn(run_mock_server(server_io, Arc::clone(&log), vec![]));
+        let open = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(StdMutex::new(None));
+        let polled = Arc::new(AtomicBool::new(false));
+        let session = MuxCoolSession::client(Box::new(GatedConn {
+            inner: client_io,
+            open: Arc::clone(&open),
+            waker: Arc::clone(&waker),
+            polled: Arc::clone(&polled),
+        }))
+        .await
+        .unwrap();
+        let mut stream = session.open_stream("a.example", 80, false).await.unwrap();
+        // The driver drains the New frame and parks writing it (gate
+        // closed): keep the channel topped up so the shutdown's reserve
+        // must stay Pending.
+        // Fillers must be well-formed frames: zero-length frames would
+        // desynchronise the mock server's decoder.
+        while session.driver_tx.capacity() > 0 {
+            session
+                .driver_tx
+                .try_send(encode_keepalive_frame())
+                .unwrap();
+        }
+        loop {
+            while session.driver_tx.capacity() > 0 {
+                session
+                    .driver_tx
+                    .try_send(encode_keepalive_frame())
+                    .unwrap();
+            }
+            if polled.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // One poll of shutdown stashes the End frame without claiming it
+        // (the reserve is Pending); the timeout then cancels the future.
+        let poll = std::future::poll_fn(|cx| -> TaskPoll<io::Result<()>> {
+            let _ = Pin::new(&mut stream).poll_shutdown(cx);
+            TaskPoll::Pending
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), poll)
+                .await
+                .is_err(),
+            "shutdown must stay Pending on a full channel"
+        );
+        drop(stream); // cancelled shutdown: EndGuard must resend the End
+                      // Open the gate: the driver writes the queued frames, then the
+                      // re-sent End, which the mock server logs.
+        open.store(true, Ordering::SeqCst);
+        if let Some(w) = waker.lock().unwrap().take() {
+            w.wake();
+        }
+        wait_for(&log, "End frame after cancelled shutdown", |l| {
+            !l.end_frames.is_empty()
+        })
+        .await;
+        assert_eq!(log.lock().unwrap().end_frames[0], 1);
+    }
+
+    /// Regression: an open cancelled while the outbound channel is full
+    /// must not leave its stream-map entry (and consumed sid) behind.
+    #[tokio::test]
+    async fn cancelled_open_removes_stream_map_entry() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let open = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(StdMutex::new(None));
+        let polled = Arc::new(AtomicBool::new(false));
+        let session = MuxCoolSession::client(Box::new(GatedConn {
+            inner: client_io,
+            open: Arc::clone(&open),
+            waker: Arc::clone(&waker),
+            polled: Arc::clone(&polled),
+        }))
+        .await
+        .unwrap();
+        // Park the driver writing a keepalive frame, then keep the queue
+        // topped up so the open's send must stay Pending.
+        session
+            .driver_tx
+            .try_send(encode_keepalive_frame())
+            .unwrap();
+        // Fillers must be well-formed frames: zero-length frames would
+        // desynchronise the mock server's decoder.
+        while session.driver_tx.capacity() > 0 {
+            session
+                .driver_tx
+                .try_send(encode_keepalive_frame())
+                .unwrap();
+        }
+        loop {
+            while session.driver_tx.capacity() > 0 {
+                session
+                    .driver_tx
+                    .try_send(encode_keepalive_frame())
+                    .unwrap();
+            }
+            if polled.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let opened = tokio::time::timeout(
+            Duration::from_millis(50),
+            session.open_stream("a.example", 80, false),
+        )
+        .await;
+        assert!(opened.is_err(), "open must wait for outbound capacity");
+        // The cancellation guard removes the entry asynchronously.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            session.streams.lock().await.is_empty(),
+            "the cancelled open must not leave its stream-map entry"
+        );
+        assert_eq!(session.next_sid.load(Ordering::SeqCst), 2);
+        // Release the parked write and drain so the session can shut
+        // down cleanly.
+        open.store(true, Ordering::SeqCst);
+        if let Some(w) = waker.lock().unwrap().take() {
+            w.wake();
+        }
+        let drain = tokio::spawn(async move {
+            let mut io = server_io;
+            let mut buf = [0u8; 64];
+            loop {
+                match io.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        });
+        drop(session);
+        drain.await.unwrap();
     }
 
     #[tokio::test]
@@ -2112,6 +2360,7 @@ mod tests {
         let pool_session = Arc::new(MuxSession {
             kind: super::super::client::SessionKind::MuxCool(Arc::clone(&session)),
             streams: AtomicUsize::new(1),
+            pending: AtomicUsize::new(0),
             last_used_ms: std::sync::atomic::AtomicU64::new(0),
         });
         let parts = session

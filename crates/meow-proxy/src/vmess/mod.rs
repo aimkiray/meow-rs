@@ -208,6 +208,7 @@ impl ProxyAdapter for VmessAdapter {
         self.dial_to(metadata).await
     }
 
+    #[cfg_attr(not(feature = "mux"), allow(unused_variables))]
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {

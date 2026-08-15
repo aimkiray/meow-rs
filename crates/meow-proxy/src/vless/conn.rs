@@ -9,7 +9,6 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{ready, Context, Poll};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -17,7 +16,9 @@ use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
 use meow_transport::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use super::header::{decode_response, encode_mux_request, encode_request, Cmd, VlessAddr};
+#[cfg(feature = "mux")]
+use super::header::encode_mux_request;
+use super::header::{encode_request, Cmd, VlessAddr};
 
 // ─── VlessConn ────────────────────────────────────────────────────────────────
 
@@ -83,6 +84,7 @@ impl VlessConn {
     /// Like [`Self::new`], but defers the request header to the first
     /// write so a wrapping Vision layer can pad it together with the first
     /// payload (xray expects the request inside the first Vision record).
+    #[cfg(any(feature = "mux", feature = "vless-vision"))]
     pub async fn new_deferred(
         stream: Box<dyn Stream>,
         uuid_bytes: &[u8; 16],
@@ -112,6 +114,7 @@ impl VlessConn {
     ///
     /// Used by the Mux.Cool session dialer
     /// (`VlessAdapter::with_mux` with `protocol: muxcool`).
+    #[cfg(feature = "mux")]
     pub async fn new_mux(
         mut stream: Box<dyn Stream>,
         uuid_bytes: &[u8; 16],
@@ -135,6 +138,7 @@ impl VlessConn {
     /// Deferred variant of `Self::new_mux` for Vision: the Mux request
     /// header rides inside the first Vision record together with the first
     /// Mux.Cool frame (xray expects the request inside the first record).
+    #[cfg(feature = "mux")]
     pub async fn new_mux_deferred(
         stream: Box<dyn Stream>,
         uuid_bytes: &[u8; 16],
@@ -340,10 +344,162 @@ impl ProxyConn for VlessConn {}
 /// lock any flow needing interleaved sends while a recv is pending (QUIC,
 /// WireGuard, games) stalled after the first packet.
 pub struct VlessPacketConn {
-    reader: tokio::sync::Mutex<tokio::io::ReadHalf<Box<dyn Stream>>>,
+    reader: tokio::sync::Mutex<VlessUdpReader>,
     writer: tokio::sync::Mutex<tokio::io::WriteHalf<Box<dyn Stream>>>,
-    /// True until the 2-byte VLESS response header has been consumed.
-    response_pending: AtomicBool,
+}
+
+/// Cancel-safe UDP reader.  The response header, the per-datagram length
+/// prefix and the payload all persist their read progress across dropped
+/// `read_packet` futures — the TUN pump recreates its read inside
+/// `select!`, and a lost half-read would desynchronise the UDP-over-TCP
+/// framing forever.
+struct VlessUdpReader {
+    stream: tokio::io::ReadHalf<Box<dyn Stream>>,
+    /// VLESS response header `[version][addon_length]`; `hdr_pos < 2`
+    /// means the response phase is still active.
+    hdr: [u8; 2],
+    hdr_pos: usize,
+    /// True once the response header (and any addon bytes) were consumed.
+    header_done: bool,
+    /// Per-datagram length prefix, big-endian.
+    len: [u8; 2],
+    len_pos: usize,
+    /// Datagram payload (or the response addon bytes mid-discard).
+    payload: Vec<u8>,
+    payload_pos: usize,
+}
+
+impl VlessUdpReader {
+    fn new(stream: tokio::io::ReadHalf<Box<dyn Stream>>) -> Self {
+        Self {
+            stream,
+            hdr: [0; 2],
+            hdr_pos: 0,
+            header_done: false,
+            len: [0; 2],
+            len_pos: 0,
+            payload: Vec::new(),
+            payload_pos: 0,
+        }
+    }
+
+    /// Reset the per-datagram state for the next packet (the response
+    /// header is read exactly once and stays consumed).
+    fn reset_datagram(&mut self) {
+        self.len_pos = 0;
+        self.payload.clear();
+        self.payload_pos = 0;
+    }
+
+    async fn read_packet(&mut self, buf: &mut [u8]) -> Result<(usize, std::net::SocketAddr)> {
+        use tokio::io::AsyncReadExt;
+        // Phase 1: response header [version][addon_length], consumed
+        // lazily on the first read (it rides with the first reply
+        // datagram).  Progress persists so a cancelled read resumes
+        // instead of shifting the stream by the lost bytes.
+        if !self.header_done {
+            while self.hdr_pos < self.hdr.len() {
+                let n = self
+                    .stream
+                    .read(&mut self.hdr[self.hdr_pos..])
+                    .await
+                    .map_err(MeowError::Io)?;
+                if n == 0 {
+                    return Err(MeowError::Proxy(
+                        "vless: server closed after header — check UUID and server config".into(),
+                    ));
+                }
+                self.hdr_pos += n;
+            }
+            let version = self.hdr[0];
+            let addon_length = self.hdr[1] as usize;
+            if version != 0x00 {
+                // upstream: closes silently. NOT silent — we surface the reason.
+                tracing::warn!(
+                    version = %format!("{:#04x}", version),
+                    "vless: response version mismatch (expected 0x00) — \
+                     check UUID and whether a TLS layer is required"
+                );
+                return Err(MeowError::Proxy(format!(
+                    "vless: version mismatch: expected 0x00, got {version:#04x}"
+                )));
+            }
+            if addon_length > 0 {
+                // Discard the addon bytes (UDP sends none; keep the same
+                // tolerance as the TCP path) with persistent progress.
+                self.payload.resize(addon_length, 0);
+                self.payload_pos = 0;
+                while self.payload_pos < self.payload.len() {
+                    let n = self
+                        .stream
+                        .read(&mut self.payload[self.payload_pos..])
+                        .await
+                        .map_err(MeowError::Io)?;
+                    if n == 0 {
+                        return Err(MeowError::Proxy(
+                            "vless: server closed mid response-header addon".into(),
+                        ));
+                    }
+                    self.payload_pos += n;
+                }
+                self.payload.clear();
+                self.payload_pos = 0;
+            }
+            self.header_done = true;
+        }
+        // Phase 2: per-datagram `u16_be(len)`.
+        while self.len_pos < self.len.len() {
+            let n = self
+                .stream
+                .read(&mut self.len[self.len_pos..])
+                .await
+                .map_err(MeowError::Io)?;
+            if n == 0 {
+                return Err(MeowError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "vless: EOF while reading UDP packet length",
+                )));
+            }
+            self.len_pos += n;
+        }
+        // Phase 3: payload (sized once per datagram; partial progress
+        // survives cancellation).
+        if self.payload.is_empty() && self.payload_pos == 0 {
+            self.payload
+                .resize(u16::from_be_bytes(self.len) as usize, 0);
+        }
+        while self.payload_pos < self.payload.len() {
+            let n = self
+                .stream
+                .read(&mut self.payload[self.payload_pos..])
+                .await
+                .map_err(MeowError::Io)?;
+            if n == 0 {
+                return Err(MeowError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "vless: EOF while reading UDP packet payload",
+                )));
+            }
+            self.payload_pos += n;
+        }
+        let packet_len = self.payload.len();
+        if packet_len > buf.len() {
+            // The oversized payload was fully drained into the internal
+            // buffer, so the stream framing stays aligned for the next
+            // read — surface the error only after the drain.
+            self.reset_datagram();
+            return Err(MeowError::Proxy(format!(
+                "vless: UDP packet ({packet_len} bytes) exceeds read buffer ({} bytes)",
+                buf.len()
+            )));
+        }
+        buf[..packet_len].copy_from_slice(&self.payload);
+        self.reset_datagram();
+        // Return a placeholder source address (connection-oriented
+        // UDP-over-TCP has no per-datagram source addr).
+        let placeholder: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+        Ok((packet_len, placeholder))
+    }
 }
 
 impl VlessPacketConn {
@@ -362,9 +518,8 @@ impl VlessPacketConn {
 
         let (reader, writer) = tokio::io::split(stream);
         Ok(Self {
-            reader: tokio::sync::Mutex::new(reader),
+            reader: tokio::sync::Mutex::new(VlessUdpReader::new(reader)),
             writer: tokio::sync::Mutex::new(writer),
-            response_pending: AtomicBool::new(true),
         })
     }
 }
@@ -384,43 +539,11 @@ impl ProxyPacketConn for VlessPacketConn {
 
     /// Read a UDP packet: consume `u16_be(len)` then `len` bytes.  The
     /// VLESS response header is consumed lazily on the first read (it rides
-    /// with the first reply datagram).
+    /// with the first reply datagram).  All progress is persistent, so a
+    /// cancelled future resumes from where it stopped.
     async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, std::net::SocketAddr)> {
-        use tokio::io::AsyncReadExt;
         let mut reader = self.reader.lock().await;
-        if self.response_pending.load(Ordering::SeqCst) {
-            decode_response(&mut *reader).await?;
-            self.response_pending.store(false, Ordering::SeqCst);
-        }
-        let mut len_buf = [0u8; 2];
-        reader
-            .read_exact(&mut len_buf)
-            .await
-            .map_err(MeowError::Io)?;
-        let pkt_len = u16::from_be_bytes(len_buf) as usize;
-        if pkt_len > buf.len() {
-            // Drain the oversized payload before erroring so the stream
-            // framing stays aligned for the next read (mirrors the mux
-            // packet conn).
-            let mut discard = vec![0u8; pkt_len];
-            reader
-                .read_exact(&mut discard)
-                .await
-                .map_err(MeowError::Io)?;
-            return Err(MeowError::Proxy(format!(
-                "vless: UDP packet ({} bytes) exceeds read buffer ({} bytes)",
-                pkt_len,
-                buf.len()
-            )));
-        }
-        reader
-            .read_exact(&mut buf[..pkt_len])
-            .await
-            .map_err(MeowError::Io)?;
-        // Return a placeholder source address (connection-oriented UDP-over-TCP
-        // has no per-datagram source addr).
-        let placeholder: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-        Ok((pkt_len, placeholder))
+        reader.read_packet(buf).await
     }
 
     fn local_addr(&self) -> Result<std::net::SocketAddr> {
@@ -549,6 +672,7 @@ mod tests {
         assert_eq!(&hdr[1..17], &TEST_UUID, "uuid must match");
     }
 
+    #[cfg(any(feature = "mux", feature = "vless-vision"))]
     #[tokio::test]
     async fn deferred_header_handles_one_byte_partial_writes() {
         let (client, mut server) = duplex(1024);
@@ -578,6 +702,7 @@ mod tests {
         assert_eq!(response, [b'!']);
     }
 
+    #[cfg(any(feature = "mux", feature = "vless-vision"))]
     #[tokio::test]
     async fn deferred_header_is_flushed_before_server_first_read() {
         let (client, mut server) = duplex(1024);
@@ -930,6 +1055,7 @@ mod tests {
     /// `version(1) + uuid(16) + addon_length(1) + cmd(1)` = 19 bytes — no
     /// port or address follow (xray encoding.go::EncodeRequestHeader skips
     /// them for `RequestCommandMux`; sing-vmess skips the parse likewise).
+    #[cfg(feature = "mux")]
     #[tokio::test]
     async fn vless_mux_request_omits_port_and_address() {
         let (client, server) = duplex(1024);
@@ -956,5 +1082,179 @@ mod tests {
         assert_eq!(&hdr[1..17], &TEST_UUID, "uuid must match");
         assert_eq!(hdr[17], 0x00, "no flow addon");
         assert_eq!(hdr[18], 0x03, "command must be CommandMux (0x03)");
+    }
+
+    // ─── F6: UDP reader cancellation safety ─────────────────────────────────
+
+    /// A read cancelled halfway through the response header must resume
+    /// instead of shifting the stream: the next read sees the full
+    /// datagram.
+    #[tokio::test]
+    async fn udp_read_survives_cancellation_mid_response() {
+        let (client, mut server) = duplex(1024);
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_task = tokio::spawn(async move {
+            let mut request = vec![0u8; 26];
+            server.read_exact(&mut request).await.unwrap();
+            server.write_all(&[0x00]).await.unwrap(); // first header byte only
+            let _ = go_rx.await;
+            server
+                .write_all(&[0x00, 0x00, 0x04, b'p', b'o', b'n', b'g'])
+                .await
+                .unwrap();
+        });
+        let conn = VlessPacketConn::new(
+            Box::new(client),
+            &TEST_UUID,
+            53,
+            &VlessAddr::Ipv4([8, 8, 8, 8]),
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 16];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                conn.read_packet(&mut buf)
+            )
+            .await
+            .is_err(),
+            "the read must wait for the second response byte"
+        );
+        go_tx.send(()).unwrap();
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            conn.read_packet(&mut buf),
+        )
+        .await
+        .expect("the resumed read must complete")
+        .unwrap();
+        assert_eq!(&buf[..n], b"pong");
+        server_task.await.unwrap();
+    }
+
+    /// A read cancelled halfway through a datagram payload must resume
+    /// the same datagram.
+    #[tokio::test]
+    async fn udp_read_survives_cancellation_mid_payload() {
+        let (client, mut server) = duplex(1024);
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_task = tokio::spawn(async move {
+            let mut request = vec![0u8; 26];
+            server.read_exact(&mut request).await.unwrap();
+            // Full response + length prefix + half the payload.
+            server
+                .write_all(&[0x00, 0x00, 0x00, 0x04, b'p', b'o'])
+                .await
+                .unwrap();
+            let _ = go_rx.await;
+            server.write_all(b"ng").await.unwrap();
+        });
+        let conn = VlessPacketConn::new(
+            Box::new(client),
+            &TEST_UUID,
+            53,
+            &VlessAddr::Ipv4([8, 8, 8, 8]),
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 16];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                conn.read_packet(&mut buf)
+            )
+            .await
+            .is_err(),
+            "the read must wait for the rest of the payload"
+        );
+        go_tx.send(()).unwrap();
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            conn.read_packet(&mut buf),
+        )
+        .await
+        .expect("the resumed read must complete")
+        .unwrap();
+        assert_eq!(&buf[..n], b"pong");
+        server_task.await.unwrap();
+    }
+
+    /// Response version mismatch → hard error naming the problem (the
+    /// shared decode_response behavior, now owned by the UDP reader).
+    #[tokio::test]
+    async fn udp_response_version_mismatch_errors() {
+        let (client, mut server) = duplex(1024);
+        let server_task = tokio::spawn(async move {
+            let mut request = vec![0u8; 26];
+            server.read_exact(&mut request).await.unwrap();
+            server.write_all(&[0x01, 0x00]).await.unwrap();
+        });
+        let conn = VlessPacketConn::new(
+            Box::new(client),
+            &TEST_UUID,
+            53,
+            &VlessAddr::Ipv4([8, 8, 8, 8]),
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 16];
+        let err = conn.read_packet(&mut buf).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("version mismatch"),
+            "error must mention the version mismatch, got: {msg}"
+        );
+        server_task.await.unwrap();
+    }
+
+    /// Non-zero addon_length: the addon bytes are discarded and the next
+    /// datagram reads aligned.
+    #[tokio::test]
+    async fn udp_response_addon_is_discarded() {
+        let (client, mut server) = duplex(1024);
+        let server_task = tokio::spawn(async move {
+            let mut request = vec![0u8; 26];
+            server.read_exact(&mut request).await.unwrap();
+            server
+                .write_all(&[0x00, 0x02, 0xAA, 0xBB, 0x00, 0x04, b'p', b'o', b'n', b'g'])
+                .await
+                .unwrap();
+        });
+        let conn = VlessPacketConn::new(
+            Box::new(client),
+            &TEST_UUID,
+            53,
+            &VlessAddr::Ipv4([8, 8, 8, 8]),
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 16];
+        let (n, _) = conn.read_packet(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pong");
+        server_task.await.unwrap();
+    }
+
+    /// A response truncated mid-header must error cleanly, not panic.
+    #[tokio::test]
+    async fn udp_truncated_response_errors() {
+        let (client, mut server) = duplex(1024);
+        let server_task = tokio::spawn(async move {
+            let mut request = vec![0u8; 26];
+            server.read_exact(&mut request).await.unwrap();
+            server.write_all(&[0x00]).await.unwrap();
+            drop(server);
+        });
+        let conn = VlessPacketConn::new(
+            Box::new(client),
+            &TEST_UUID,
+            53,
+            &VlessAddr::Ipv4([8, 8, 8, 8]),
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 16];
+        assert!(conn.read_packet(&mut buf).await.is_err());
+        server_task.await.unwrap();
     }
 }

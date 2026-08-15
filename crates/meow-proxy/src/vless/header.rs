@@ -31,8 +31,7 @@
 // upstream SHA: xray-core/xray-core (2024) — pin on first Vision integration
 
 use bytes::{BufMut, BytesMut};
-use meow_common::{MeowError, Metadata, Result};
-use tokio::io::AsyncReadExt;
+use meow_common::Metadata;
 
 // ─── Address type ─────────────────────────────────────────────────────────────
 
@@ -88,6 +87,7 @@ pub(crate) enum Cmd {
     Udp = 0x02,
     /// `0x03` — Mux.Cool session (Xray `CommandMux`): the request carries
     /// no port/address; per-stream targets ride mux frames on the stream.
+    #[cfg(feature = "mux")]
     Mux = 0x03,
 }
 
@@ -165,6 +165,7 @@ fn put_flow_addon(dst: &mut BytesMut, flow: Option<&str>) {
 /// are omitted (the `if command != ...Mux` guard); sing-vmess
 /// vless/protocol.go::ReadRequest mirrors it by skipping the address parse
 /// for `CommandMux`.
+#[cfg(feature = "mux")]
 pub(crate) fn encode_mux_request(dst: &mut BytesMut, uuid_bytes: &[u8; 16], flow: Option<&str>) {
     dst.put_u8(0x00); // version
     dst.put_slice(uuid_bytes);
@@ -172,55 +173,9 @@ pub(crate) fn encode_mux_request(dst: &mut BytesMut, uuid_bytes: &[u8; 16], flow
     dst.put_u8(Cmd::Mux as u8); // command — signals the Mux.Cool session
 }
 
-// ─── Response decoder ─────────────────────────────────────────────────────────
-
-/// Read and discard the VLESS response header from `stream`.
-///
-/// Returns `Err` if version != 0x00 (logs `warn!` before returning).
-///
-/// upstream: transport/vless/conn.go::ReadResponseHeader
-pub(crate) async fn decode_response<S>(stream: &mut S) -> Result<()>
-where
-    S: AsyncReadExt + Unpin,
-{
-    let mut hdr = [0u8; 2]; // version + addon_length
-    stream.read_exact(&mut hdr).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            MeowError::Proxy(
-                "vless: server closed after header — check UUID and server config".into(),
-            )
-        } else {
-            MeowError::Io(e)
-        }
-    })?;
-
-    let version = hdr[0];
-    let addon_length = hdr[1] as usize;
-
-    if version != 0x00 {
-        // upstream: closes silently. NOT silent — we surface the reason.
-        // Class B per ADR-0002: connection goes to same destination, but user
-        // may be missing TLS or have the wrong UUID.
-        tracing::warn!(
-            version = %format!("{:#04x}", version),
-            "vless: response version mismatch (expected 0x00) — \
-             check UUID and whether a TLS layer is required"
-        );
-        return Err(MeowError::Proxy(format!(
-            "vless: version mismatch: expected 0x00, got {version:#04x}"
-        )));
-    }
-
-    if addon_length > 0 {
-        let mut discard = vec![0u8; addon_length];
-        stream
-            .read_exact(&mut discard)
-            .await
-            .map_err(MeowError::Io)?;
-    }
-
-    Ok(())
-}
+// The VLESS response header `[version][addon_length][addon…]` is consumed
+// by `VlessConn::poll_read` (TCP) and `VlessUdpReader::read_packet` (UDP)
+// with persistent, cancellation-safe progress in `vless/conn.rs`.
 
 // ─── Unit tests (§A, §B) ─────────────────────────────────────────────────────
 
@@ -473,144 +428,15 @@ mod tests {
         // Send a valid response header back.
         server.write_all(&[0x00, 0x00]).await.unwrap();
 
-        // decode_response must succeed.
-        decode_response(&mut client)
+        // The response header round-trips as [version=0][addon_length=0].
+        let mut resp = [0u8; 2];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut resp)
             .await
             .expect("round-trip decode ok");
+        assert_eq!(resp, [0x00, 0x00]);
     }
 
-    // ─── B1: response version 0 ok ───────────────────────────────────────────
-
-    #[tokio::test]
-    async fn response_decode_version_zero_ok() {
-        use tokio::io::duplex;
-        use tokio::io::AsyncWriteExt;
-
-        let (mut client, mut server) = duplex(64);
-        server.write_all(&[0x00, 0x00]).await.unwrap();
-        decode_response(&mut client)
-            .await
-            .expect("version 0 must succeed");
-    }
-
-    // ─── B2: response with non-zero addon_length ──────────────────────────────
-
-    /// version=0, addon_length=2, addon bytes read+discarded.
-    /// Guards against ignoring addon_length and misaligning subsequent reads.
-    #[tokio::test]
-    async fn response_decode_version_zero_with_addon() {
-        use tokio::io::duplex;
-        use tokio::io::AsyncWriteExt;
-
-        let (mut client, mut server) = duplex(64);
-        server.write_all(&[0x00, 0x02, 0xAA, 0xBB]).await.unwrap();
-        decode_response(&mut client)
-            .await
-            .expect("version 0 with addon must succeed");
-
-        // Confirm the stream is now aligned: next byte (if any) is payload, not addon.
-        // No further bytes queued, so just assert decode succeeded.
-    }
-
-    // ─── B3: version mismatch warns + errors ─────────────────────────────────
-
-    /// Input [0x01, 0x00] → Err; tracing shows a warn with "version" or "mismatch".
-    /// upstream: transport/vless/conn.go closes silently.
-    /// NOT silent — we surface the reason for debugging.
-    #[test]
-    fn response_decode_version_mismatch_warns_and_errors() {
-        use std::sync::{Arc, Mutex};
-        use tokio::io::duplex;
-        use tracing_subscriber::fmt::MakeWriter;
-
-        // Capture warnings.
-        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let line_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-
-        #[derive(Clone)]
-        struct CapWriter(Arc<Mutex<Vec<String>>>, Arc<Mutex<String>>);
-        impl std::io::Write for CapWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                let s = String::from_utf8_lossy(buf).to_string();
-                let mut lb = self.1.lock().unwrap();
-                lb.push_str(&s);
-                if lb.contains('\n') {
-                    let mut log = self.0.lock().unwrap();
-                    for line in lb.split('\n') {
-                        let t = line.trim();
-                        if !t.is_empty() {
-                            log.push(t.to_string());
-                        }
-                    }
-                    lb.clear();
-                }
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for CapWriter {
-            type Writer = Self;
-            fn make_writer(&'a self) -> Self {
-                self.clone()
-            }
-        }
-
-        let cap = CapWriter(Arc::clone(&captured), line_buf);
-        let sub = tracing_subscriber::fmt()
-            .with_writer(cap)
-            .with_ansi(false)
-            .with_level(true)
-            .finish();
-
-        let result = tracing::subscriber::with_default(sub, || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap();
-            rt.block_on(async {
-                let (mut client, mut server) = duplex(64);
-                tokio::io::AsyncWriteExt::write_all(&mut server, &[0x01, 0x00])
-                    .await
-                    .unwrap();
-                decode_response(&mut client).await
-            })
-        });
-
-        assert!(result.is_err(), "version mismatch must return Err");
-        let err_str = result.unwrap_err().to_string();
-        assert!(
-            err_str.contains("version") || err_str.contains("mismatch"),
-            "error must mention version mismatch, got: {err_str}"
-        );
-
-        let logs = captured.lock().unwrap();
-        let warn_count = logs
-            .iter()
-            .filter(|l| l.contains("WARN") && (l.contains("version") || l.contains("mismatch")))
-            .count();
-        assert_eq!(
-            warn_count, 1,
-            "exactly one warn must be emitted; got: {:?}",
-            *logs
-        );
-    }
-
-    // ─── B4: truncated buffer → clean Err, no panic ──────────────────────────
-
-    #[tokio::test]
-    async fn response_decode_truncated_buffer_errors() {
-        use tokio::io::duplex;
-        use tokio::io::AsyncWriteExt;
-
-        let (mut client, mut server) = duplex(64);
-        // Only send version byte, close before addon_length.
-        server.write_all(&[0x00]).await.unwrap();
-        drop(server); // EOF after 1 byte
-        let result = decode_response(&mut client).await;
-        assert!(
-            result.is_err(),
-            "truncated response must return Err, not panic"
-        );
-    }
+    // Response-header decode coverage (B1-B4) lives with the consumers
+    // now: `vless/conn.rs` tests `VlessUdpReader` for version mismatch,
+    // addon discard and truncated-header errors.
 }

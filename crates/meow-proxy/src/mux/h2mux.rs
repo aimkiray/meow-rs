@@ -68,9 +68,12 @@ impl Session {
             .version(Version::HTTP_2)
             .body(())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let (response_future, send_stream) = self
-            .send_request
-            .clone()
+        let mut send_request = self.send_request.clone();
+        // h2 requires poll_ready/ready before send_request: sending
+        // without readiness violates the documented contract and is
+        // rejected once MAX_CONCURRENT_STREAMS is exhausted.
+        send_request = send_request.ready().await.map_err(io::Error::other)?;
+        let (response_future, send_stream) = send_request
             .send_request(request, false)
             .map_err(io::Error::other)?;
         Ok(Stream::new(
@@ -87,6 +90,16 @@ impl Session {
 
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Aborting the driver task drops the h2 connection and the
+        // underlying socket immediately.  Without this, an evicted idle
+        // session could keep the physical connection (and its fd) alive
+        // until the peer closes it.
+        self._task.abort();
     }
 }
 

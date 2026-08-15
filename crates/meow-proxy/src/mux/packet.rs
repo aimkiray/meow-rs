@@ -266,16 +266,13 @@ mod tests {
         let smux_stream = session.open_stream().await.unwrap();
         let mut stream = MuxStream::new(MuxStreamKind::Smux(smux_stream));
         stream
-            .write_all(&address::encode_stream_request_with_flags(
-                "127.0.0.1",
-                53,
-                1,
-            ))
+            .write_all(&address::encode_stream_request_with_flags("127.0.0.1", 53, 1).unwrap())
             .await
             .unwrap();
         let session_arc = Arc::new(MuxSession {
             kind: SessionKind::Smux(session),
             streams: AtomicUsize::new(1),
+            pending: AtomicUsize::new(0),
             last_used_ms: AtomicU64::new(0),
         });
         let conn = MuxPacketConn::new(
@@ -353,16 +350,13 @@ mod tests {
         let yamux_stream = session.open_stream().await.unwrap();
         let mut stream = MuxStream::new(MuxStreamKind::Yamux(yamux_stream));
         stream
-            .write_all(&address::encode_stream_request_with_flags(
-                "127.0.0.1",
-                53,
-                1,
-            ))
+            .write_all(&address::encode_stream_request_with_flags("127.0.0.1", 53, 1).unwrap())
             .await
             .unwrap();
         let session_arc = Arc::new(MuxSession {
             kind: SessionKind::Yamux(session),
             streams: AtomicUsize::new(1),
+            pending: AtomicUsize::new(0),
             last_used_ms: AtomicU64::new(0),
         });
         let conn = MuxPacketConn::new(
@@ -437,16 +431,13 @@ mod tests {
         let smux_stream = session.open_stream().await.unwrap();
         let mut stream = MuxStream::new(MuxStreamKind::Smux(smux_stream));
         stream
-            .write_all(&address::encode_stream_request_with_flags(
-                "127.0.0.1",
-                53,
-                1,
-            ))
+            .write_all(&address::encode_stream_request_with_flags("127.0.0.1", 53, 1).unwrap())
             .await
             .unwrap();
         let session_arc = Arc::new(MuxSession {
             kind: SessionKind::Smux(session),
             streams: AtomicUsize::new(1),
+            pending: AtomicUsize::new(0),
             last_used_ms: AtomicU64::new(0),
         });
         let conn = Arc::new(MuxPacketConn::new(
@@ -516,16 +507,13 @@ mod tests {
         let smux_stream = session.open_stream().await.unwrap();
         let mut stream = MuxStream::new(MuxStreamKind::Smux(smux_stream));
         stream
-            .write_all(&address::encode_stream_request_with_flags(
-                "127.0.0.1",
-                53,
-                1,
-            ))
+            .write_all(&address::encode_stream_request_with_flags("127.0.0.1", 53, 1).unwrap())
             .await
             .unwrap();
         let session_arc = Arc::new(MuxSession {
             kind: SessionKind::Smux(session),
             streams: AtomicUsize::new(1),
+            pending: AtomicUsize::new(0),
             last_used_ms: AtomicU64::new(0),
         });
         let conn = MuxPacketConn::new(

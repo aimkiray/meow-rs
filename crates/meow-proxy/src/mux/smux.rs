@@ -12,13 +12,14 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::{CancellationToken, PollSender};
 
 const CMD_SYN: u8 = 0;
@@ -94,6 +95,18 @@ struct InboundChunk {
     _permit: Option<OwnedSemaphorePermit>,
 }
 
+/// One outbound writer request.  Flush requests travel the SAME bounded
+/// channel as data frames so a flush can never overtake frames the
+/// requesting stream queued earlier (FIFO guarantee).  `Clone` keeps
+/// `PollSender<OutMsg>` usable (its item type must be `Clone`).
+#[derive(Clone)]
+enum OutMsg {
+    Frame(Bytes),
+    /// Acknowledge after the physical transport's buffered data reached
+    /// the wire.  `Arc` keeps the item `Clone` for `PollSender`.
+    Flush(Arc<oneshot::Sender<()>>),
+}
+
 struct SessionState {
     /// Streams keyed by stream ID; dropping the sender EOFs the stream.
     streams: Mutex<HashMap<u32, mpsc::Sender<InboundChunk>>>,
@@ -103,7 +116,7 @@ struct SessionState {
 /// smux session over one physical connection (client role).
 pub struct Session {
     state: Arc<SessionState>,
-    writer_tx: mpsc::Sender<Bytes>,
+    writer_tx: mpsc::Sender<OutMsg>,
     cancel: CancellationToken,
     next_stream_id: AtomicU32,
 }
@@ -122,7 +135,7 @@ impl Session {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (mut reader, mut writer) = tokio::io::split(io);
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Bytes>(OUTBOUND_QUEUE);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<OutMsg>(OUTBOUND_QUEUE);
         let state = Arc::new(SessionState {
             streams: Mutex::new(HashMap::new()),
             dead: AtomicBool::new(false),
@@ -136,19 +149,43 @@ impl Session {
         let writer_cancel = cancel.clone();
         tokio::spawn(async move {
             loop {
-                let frame = tokio::select! {
+                let msg = tokio::select! {
                     _ = writer_cancel.cancelled() => break,
-                    frame = writer_rx.recv() => match frame {
-                        Some(frame) => frame,
+                    msg = writer_rx.recv() => match msg {
+                        Some(msg) => msg,
                         None => break,
                     },
                 };
-                let result = tokio::select! {
-                    _ = writer_cancel.cancelled() => break,
-                    result = writer.write_all(&frame) => result,
-                };
-                if result.is_err() {
-                    break;
+                match msg {
+                    OutMsg::Frame(frame) => {
+                        let result = tokio::select! {
+                            _ = writer_cancel.cancelled() => break,
+                            result = writer.write_all(&frame) => result,
+                        };
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                    OutMsg::Flush(ack) => {
+                        // FIFO: every frame queued before this request
+                        // was received first (same channel) and is
+                        // already written — flush the transport now.
+                        // Cancellation must break out even of a stalled
+                        // flush, otherwise a dropped session could keep
+                        // the writer task (and the socket) alive.
+                        let result = tokio::select! {
+                            _ = writer_cancel.cancelled() => break,
+                            result = writer.flush() => result,
+                        };
+                        if result.is_err() {
+                            break;
+                        }
+                        // The channel delivered the sole Arc reference;
+                        // unwrap and ack.  A stray clone would still
+                        // resolve the receiver (with an error) when
+                        // this one drops, never hanging the stream.
+                        let _ = Arc::try_unwrap(ack).map(|sender| sender.send(()));
+                    }
                 }
             }
             writer_state.mark_dead().await;
@@ -232,18 +269,27 @@ impl Session {
         let id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(STREAM_QUEUE);
         self.state.streams.lock().await.insert(id, tx);
+        // The guard removes the map entry if this future is cancelled
+        // while waiting for outbound capacity — otherwise the id stays
+        // consumed and the entry lingers until a server FIN.
+        let mut guard = MapEntryGuard {
+            state: Arc::clone(&self.state),
+            id,
+            armed: true,
+        };
         if self
             .writer_tx
-            .send(encode_frame(CMD_SYN, id, &[]))
+            .send(OutMsg::Frame(encode_frame(CMD_SYN, id, &[])))
             .await
             .is_err()
         {
-            self.state.streams.lock().await.remove(&id);
+            drop(guard);
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "smux writer gone",
             ));
         }
+        guard.disarm();
         Ok(SmuxStream {
             id,
             session: Arc::clone(self),
@@ -253,7 +299,37 @@ impl Session {
             eof: false,
             fin_sent: false,
             shutdown_frame: None,
+            flush_rx: None,
         })
+    }
+}
+
+/// Removes a stream-map entry when dropped while armed — the
+/// cancellation-safe counterpart of `open_stream`'s insert-then-send.
+struct MapEntryGuard {
+    state: Arc<SessionState>,
+    id: u32,
+    armed: bool,
+}
+
+impl MapEntryGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for MapEntryGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let state = Arc::clone(&self.state);
+            let id = self.id;
+            // Detached: drop cannot await the map lock.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    state.streams.lock().await.remove(&id);
+                });
+            }
+        }
     }
 }
 
@@ -327,23 +403,25 @@ impl SessionState {
 pub struct SmuxStream {
     id: u32,
     session: Arc<Session>,
-    poll_sender: PollSender<Bytes>,
+    poll_sender: PollSender<OutMsg>,
     rx: mpsc::Receiver<InboundChunk>,
     /// Unread remainder of the last chunk handed to poll_read.
     pending: Option<InboundChunk>,
     eof: bool,
     fin_sent: bool,
     shutdown_frame: Option<Bytes>,
+    /// Pending flush acknowledgement; see `poll_flush`.
+    flush_rx: Option<oneshot::Receiver<()>>,
 }
 
 impl SmuxStream {
     fn best_effort_fin(&mut self) {
         if !self.fin_sent {
             self.fin_sent = true;
-            let _ = self
-                .session
-                .writer_tx
-                .try_send(encode_frame(CMD_FIN, self.id, &[]));
+            let _ =
+                self.session
+                    .writer_tx
+                    .try_send(OutMsg::Frame(encode_frame(CMD_FIN, self.id, &[])));
         }
     }
 }
@@ -364,9 +442,11 @@ impl AsyncRead for SmuxStream {
         // Every progress path returns Ready immediately: returning Pending
         // after writing into the caller's ReadBuf would lose those bytes
         // (the buffer is recreated on the next poll), violating the
-        // AsyncRead contract.
+        // AsyncRead contract.  A zero-capacity buffer yields Ready(Ok(()))
+        // per the tokio AsyncRead docs (a Pending here would leave
+        // `read(&mut [])` parked forever).
         if buf.remaining() == 0 {
-            return Poll::Pending;
+            return Poll::Ready(Ok(()));
         }
         if let Some(mut chunk) = this.pending.take() {
             let n = chunk.data.len().min(buf.remaining());
@@ -429,17 +509,59 @@ impl AsyncWrite for SmuxStream {
             Poll::Ready(Ok(())) => {
                 let frame = encode_frame(CMD_PSH, this.id, &buf[..written]);
                 this.poll_sender
-                    .send_item(frame)
+                    .send_item(OutMsg::Frame(frame))
                     .map_err(|error| io::Error::other(error.to_string()))?;
                 Poll::Ready(Ok(written))
             }
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Frames are written by the writer task as soon as they are enqueued;
-        // there is no additional local buffering to flush.
-        Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // A flush request travels the writer channel behind every frame
+        // this stream queued earlier, so the acknowledgement means those
+        // bytes reached the physical transport (matters for buffered
+        // outer transports like WebSocket).
+        if let Some(rx) = &mut this.flush_rx {
+            return match Pin::new(rx).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(_)) => {
+                    this.flush_rx = None;
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "smux writer gone",
+                    )))
+                }
+                Poll::Ready(Ok(())) => {
+                    this.flush_rx = None;
+                    Poll::Ready(Ok(()))
+                }
+            };
+        }
+        match this.poll_sender.poll_reserve(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(io::Error::other(error.to_string()))),
+            Poll::Ready(Ok(())) => {
+                let (tx, rx) = oneshot::channel();
+                this.poll_sender
+                    .send_item(OutMsg::Flush(Arc::new(tx)))
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                // Poll the fresh receiver once to register the waker
+                // before parking.
+                let mut rx = rx;
+                match Pin::new(&mut rx).poll(cx) {
+                    Poll::Pending => {
+                        this.flush_rx = Some(rx);
+                        Poll::Pending
+                    }
+                    Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "smux writer gone",
+                    ))),
+                    Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                }
+            }
+        }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -459,7 +581,7 @@ impl AsyncWrite for SmuxStream {
             Poll::Ready(Err(error)) => Poll::Ready(Err(io::Error::other(error.to_string()))),
             Poll::Ready(Ok(())) => {
                 this.poll_sender
-                    .send_item(frame)
+                    .send_item(OutMsg::Frame(frame))
                     .map_err(|error| io::Error::other(error.to_string()))?;
                 this.fin_sent = true;
                 Poll::Ready(Ok(()))
@@ -629,6 +751,139 @@ mod tests {
             .expect("physical EOF must wake the stream")
             .expect_err("physical EOF must not look like a clean FIN");
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn poll_flush_round_trips_through_writer() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut io = server_io;
+            let mut buf = [0u8; 64];
+            let _ = io.read(&mut buf).await;
+        });
+        let session = Arc::new(Session::client(client_io).unwrap());
+        let mut stream = session.open_stream().await.unwrap();
+        stream.write_all(b"abc").await.unwrap();
+        // The flush request travels the writer channel behind the data
+        // frames and is acknowledged only after the transport flushed.
+        tokio::time::timeout(std::time::Duration::from_secs(1), stream.flush())
+            .await
+            .expect("flush must complete")
+            .unwrap();
+        drop(stream);
+        drop(session);
+        server.await.unwrap();
+    }
+
+    /// IO whose write half stays Pending until the test releases it —
+    /// parks the session writer deterministically so the bounded
+    /// outbound channel can be filled (a plain small duplex cannot: the
+    /// writer drains it too fast, and duplex(0) reads EOF instantly).
+    /// `polled` records that the write half parked, so tests can top
+    /// the channel up AFTER the writer stopped consuming; the stored
+    /// waker lets the test wake the parked write on release.
+    struct GatedIo {
+        inner: tokio::io::DuplexStream,
+        open: Arc<AtomicBool>,
+        waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+        polled: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for GatedIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for GatedIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if this.open.load(Ordering::SeqCst) {
+                return Pin::new(&mut this.inner).poll_write(cx, buf);
+            }
+            this.polled.store(true, Ordering::SeqCst);
+            *this.waker.lock().unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Regression: an open cancelled while the outbound channel is full
+    /// must not leave its stream-map entry behind.
+    #[tokio::test]
+    async fn cancelled_open_removes_stream_map_entry() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let open = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(std::sync::Mutex::new(None));
+        let polled = Arc::new(AtomicBool::new(false));
+        let session = Arc::new(
+            Session::client(GatedIo {
+                inner: client_io,
+                open: Arc::clone(&open),
+                waker: Arc::clone(&waker),
+                polled: Arc::clone(&polled),
+            })
+            .unwrap(),
+        );
+        // Park the writer on a first frame (gate closed), then keep the
+        // queue topped up: the parked write consumed one slot that must
+        // be refilled for the SYN send to stay Pending.
+        let filler = OutMsg::Frame(encode_frame(CMD_PSH, 0xFFFF, &[1]));
+        session.writer_tx.try_send(filler.clone()).unwrap();
+        while session.writer_tx.capacity() > 0 {
+            session.writer_tx.try_send(filler.clone()).unwrap();
+        }
+        loop {
+            while session.writer_tx.capacity() > 0 {
+                session.writer_tx.try_send(filler.clone()).unwrap();
+            }
+            if polled.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let opened =
+            tokio::time::timeout(std::time::Duration::from_millis(50), session.open_stream()).await;
+        assert!(opened.is_err(), "open must wait for outbound capacity");
+        // The cancellation guard removes the entry asynchronously.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            session.state.streams.lock().await.is_empty(),
+            "the cancelled open must not leave its stream-map entry"
+        );
+        // Release the parked write and drain so the session can shut
+        // down cleanly.
+        open.store(true, Ordering::SeqCst);
+        if let Some(w) = waker.lock().unwrap().take() {
+            w.wake();
+        }
+        let drain = tokio::spawn(async move {
+            let mut io = server_io;
+            let mut buf = [0u8; 64];
+            loop {
+                match io.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        });
+        drop(session);
+        drain.await.unwrap();
     }
 
     #[tokio::test]

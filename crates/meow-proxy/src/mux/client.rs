@@ -94,7 +94,7 @@ async fn write_request_prefix<S: AsyncWrite + Unpin>(
             host,
             port,
             u16::from(udp),
-        ))
+        )?)
         .await?;
     stream.flush().await
 }
@@ -288,7 +288,22 @@ impl AsyncWrite for MuxStream {
 pub(crate) struct MuxSession {
     pub(crate) kind: SessionKind,
     pub(crate) streams: AtomicUsize,
+    /// Streams whose open is in flight: reserved under the pool lock
+    /// before the (async) open, released when the open settles or the
+    /// future is cancelled.  Selection counts both counters so
+    /// concurrent opens cannot overshoot max-streams / min-streams.
+    pub(crate) pending: AtomicUsize,
     pub(crate) last_used_ms: AtomicU64,
+}
+
+/// Releases a [`MuxSession`] pending slot when dropped — the
+/// cancellation-safe counterpart of the reservation `offer()` made.
+struct Reservation(Arc<MuxSession>);
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.0.pending.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Shared mux client used by an adapter's dial path.
@@ -406,8 +421,15 @@ impl MuxClient {
                 Ok(session) => session,
                 Err(e) => return Err(e),
             };
+            // offer() reserved one pending slot for this open.  The
+            // guard releases it if the open future is cancelled or the
+            // session rejects the stream.
+            let reservation = Reservation(Arc::clone(&session));
             match session.kind.open_stream(host, port, udp).await {
                 Ok(stream) => {
+                    // Slot converted from pending to established.
+                    session.pending.fetch_sub(1, Ordering::SeqCst);
+                    std::mem::forget(reservation);
                     session.streams.fetch_add(1, Ordering::SeqCst);
                     // Idle eviction is measured from the last successful open
                     // (not the last activity): conservative — a long-lived
@@ -418,6 +440,7 @@ impl MuxClient {
                     return Ok((stream, session));
                 }
                 Err(e) => {
+                    // reservation drops here → pending released
                     last_err = Some(MeowError::Io(e));
                     continue;
                 }
@@ -428,7 +451,8 @@ impl MuxClient {
 
     /// Pick an existing session that can take a new request, or dial a new
     /// one.  Dead sessions are pruned and zero-stream sessions idle past
-    /// `IDLE_TIMEOUT` are evicted.
+    /// `IDLE_TIMEOUT` are evicted.  The returned session has one pending
+    /// slot reserved for the caller (see [`MuxSession::pending`]).
     async fn offer(self: &Arc<Self>) -> Result<Arc<MuxSession>> {
         let mut sessions = self.sessions.lock().await;
         let now = now_ms();
@@ -437,22 +461,29 @@ impl MuxClient {
                 return false;
             }
             let idle = now.saturating_sub(s.last_used_ms.load(Ordering::SeqCst));
-            s.streams.load(Ordering::SeqCst) > 0 || idle < IDLE_TIMEOUT.as_millis() as u64
+            s.streams.load(Ordering::SeqCst) + s.pending.load(Ordering::SeqCst) > 0
+                || idle < IDLE_TIMEOUT.as_millis() as u64
         });
         let options = &self.options;
         let best = sessions
             .iter()
-            .min_by_key(|s| s.streams.load(Ordering::SeqCst));
+            .min_by_key(|s| s.streams.load(Ordering::SeqCst) + s.pending.load(Ordering::SeqCst));
         if let Some(session) = best {
-            let num_streams = session.streams.load(Ordering::SeqCst);
-            if num_streams == 0 {
-                return Ok(Arc::clone(session));
-            }
-            if options.max_connections > 0 {
-                if sessions.len() >= options.max_connections || num_streams < options.min_streams {
-                    return Ok(Arc::clone(session));
-                }
-            } else if options.max_streams > 0 && num_streams < options.max_streams {
+            let load =
+                session.streams.load(Ordering::SeqCst) + session.pending.load(Ordering::SeqCst);
+            let reuse = if load == 0 {
+                // An idle session always takes the next stream — never
+                // dial a fresh connection while one is free.
+                true
+            } else if options.max_connections > 0 {
+                sessions.len() >= options.max_connections || load < options.min_streams
+            } else {
+                // max-connections=0 with max-streams=0 keeps the mihomo
+                // semantics: one physical connection per stream.
+                options.max_streams > 0 && load < options.max_streams
+            };
+            if reuse {
+                session.pending.fetch_add(1, Ordering::SeqCst);
                 return Ok(Arc::clone(session));
             }
         }
@@ -482,9 +513,13 @@ impl MuxClient {
         let session = Arc::new(MuxSession {
             kind,
             streams: AtomicUsize::new(0),
+            pending: AtomicUsize::new(0),
             last_used_ms: AtomicU64::new(now_ms()),
         });
         sessions.push_back(Arc::clone(&session));
+        // Reserve the caller's stream: the pool lock is held, so the
+        // pending count participates in every concurrent selection.
+        session.pending.fetch_add(1, Ordering::SeqCst);
         Ok(session)
     }
 
@@ -624,6 +659,75 @@ mod tests {
         // Fifth stream exceeds max_streams → second connection.
         streams.push(client.open_stream("a.example", 80).await.unwrap());
         assert_eq!(dials.load(Ordering::SeqCst), 2);
+    }
+
+    /// max-connections=0 with max-streams=0 keeps the mihomo semantics:
+    /// every stream dials its own physical connection.
+    #[tokio::test]
+    async fn zero_bounds_dial_one_connection_per_stream() {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let options = MuxOptions {
+            protocol: Protocol::Smux,
+            max_connections: 0,
+            max_streams: 0,
+            ..MuxOptions::default()
+        };
+        let client = mock_mux_client_with(Arc::clone(&dials), options).await;
+        let mut streams = Vec::new();
+        for _ in 0..3 {
+            streams.push(client.open_stream("a.example", 80).await.unwrap());
+        }
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            3,
+            "max-connections=0 + max-streams=0 must dial one connection per stream"
+        );
+        drop(streams);
+    }
+
+    /// Concurrent opens reserve their slots under the pool lock, so the
+    /// per-session stream cap is never overshot by racing offers.
+    #[tokio::test]
+    async fn concurrent_opens_respect_max_streams() {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let options = MuxOptions {
+            protocol: Protocol::Smux,
+            max_connections: 0,
+            min_streams: 4,
+            max_streams: 4,
+            ..MuxOptions::default()
+        };
+        let client = mock_mux_client_with(Arc::clone(&dials), options).await;
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move {
+                    client
+                        .open_stream(format!("h{i}.example").as_str(), 80)
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+        let mut streams = Vec::new();
+        for handle in handles {
+            streams.push(handle.await.unwrap());
+        }
+        let sessions = client.sessions.lock().await;
+        assert_eq!(
+            sessions.len(),
+            2,
+            "8 concurrent streams at max-streams=4 need 2 sessions"
+        );
+        for session in sessions.iter() {
+            assert_eq!(session.streams.load(Ordering::SeqCst), 4);
+            assert_eq!(
+                session.pending.load(Ordering::SeqCst),
+                0,
+                "every reservation must have settled"
+            );
+        }
+        drop(streams);
     }
 
     #[tokio::test]
