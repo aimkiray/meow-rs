@@ -1448,8 +1448,9 @@ fn parse_vless(
 /// * sing-mux (smux/yamux/h2mux, default h2mux) — the first proxy request
 ///   targets the reserved mux destination and streams carry a sing-encoded
 ///   Socksaddr prefix.  Server must be sing-box / mihomo based.
-/// * muxcool — Xray's Mux.Cool (VLESS CommandMux, frame mux).  Server must
-///   be Xray / sing-box based; VLESS-only (Trojan/Shadowsocks/VMess reject it).
+/// * muxcool — Xray's Mux.Cool (CommandMux 0x03 in the VLESS/VMess request
+///   header, frame mux).  Server must be Xray / sing-box based; VLESS and
+///   VMess support it (Trojan/Shadowsocks reject it).
 ///
 /// Returns `None` when the block is absent or disabled; `Err` for
 /// malformed values.  Only compiled when one of its call sites
@@ -1905,15 +1906,6 @@ fn parse_vmess(
         meow_proxy::VmessAdapter::new(name, server, port, uuid_bytes, security, udp, chain);
     #[cfg(feature = "mux")]
     if let Some(mux_options) = parse_mux_options(name, config)? {
-        // muxcool rides VLESS CommandMux; vmess has no equivalent
-        // signaling — reject loudly instead of speaking garbage frames to
-        // the server.
-        if mux_options.protocol == meow_proxy::mux::Protocol::MuxCool {
-            return Err(format!(
-                "{name}: mux protocol 'muxcool' is VLESS-only; \
-                 use smux/yamux/h2mux for vmess nodes"
-            ));
-        }
         adapter = adapter.with_mux(mux_options);
     }
     #[cfg(not(feature = "mux"))]

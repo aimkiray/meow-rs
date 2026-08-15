@@ -921,10 +921,12 @@ proxies:
     );
 }
 
-/// D16k: `protocol: muxcool` on VMess → rejected (VLESS-only).
+/// D16k: `protocol: muxcool` on VMess → accepted (CommandMux 0x03 is the
+/// VMess request header's native mux signaling; sing-vmess routes it to
+/// HandleMuxConnection).
 #[cfg(all(feature = "mux", feature = "vmess"))]
 #[tokio::test]
-async fn parse_vmess_mux_muxcool_rejected() {
+async fn parse_vmess_mux_muxcool_accepted() {
     let yaml = r#"
 proxies:
   - name: m
@@ -938,16 +940,15 @@ proxies:
       protocol: muxcool
 "#;
     let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
-    let config = result.expect("invalid proxy must not fail the whole config");
-    assert!(
-        !config.proxies.contains_key("m"),
-        "vmess node with muxcool must be skipped"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("muxcool") && l.contains("VLESS")),
-        "expected a VLESS-only warn; {lines:?}"
+    let config = result.expect("vmess muxcool must load");
+    assert!(config.proxies.contains_key("m"), "vmess proxy must be kept");
+    let mux_warns = lines
+        .iter()
+        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
+        .count();
+    assert_eq!(
+        mux_warns, 0,
+        "vmess muxcool is implemented: no warn expected"
     );
 }
 

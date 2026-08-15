@@ -78,11 +78,10 @@ pub struct SealedHeader {
 ///
 /// Returns (encrypted_header_bytes, req_key, req_iv, resp_v) for the caller
 /// to derive body cipher keys.
-pub fn seal_request_header(
+fn seal_header(
     cmd_key: &[u8; 16],
     security: Security,
-    metadata: &Metadata,
-    is_udp: bool,
+    cmd: HeaderCmd<'_>,
 ) -> Result<SealedHeader, String> {
     let mut rng = rand::rng();
 
@@ -101,9 +100,7 @@ pub fn seal_request_header(
     let auth_id = build_auth_id(cmd_key, &mut rng);
 
     // 2) Build plaintext header
-    let plaintext = build_header_plaintext(
-        &req_key, &req_iv, resp_v, security, metadata, is_udp, &mut rng,
-    )?;
+    let plaintext = build_header_plaintext(&req_key, &req_iv, resp_v, security, cmd, &mut rng)?;
 
     // 3) Derive header encryption keys
     let header_key = kdf16(cmd_key, &[b"VMess Header AEAD Key", &auth_id, &conn_nonce]);
@@ -168,6 +165,32 @@ pub fn seal_request_header(
         req_iv,
         resp_v,
     })
+}
+
+/// Seal a VMess request header carrying the given destination and the TCP
+/// or UDP command byte.
+pub fn seal_request_header(
+    cmd_key: &[u8; 16],
+    security: Security,
+    metadata: &Metadata,
+    is_udp: bool,
+) -> Result<SealedHeader, String> {
+    let cmd = if is_udp {
+        HeaderCmd::Udp(metadata)
+    } else {
+        HeaderCmd::Tcp(metadata)
+    };
+    seal_header(cmd_key, security, cmd)
+}
+
+/// Seal a VMess request header carrying CommandMux (0x03) and no
+/// destination — the Mux.Cool-over-VMess session signaling (server:
+/// sing-vmess service.go `case CommandMux: return HandleMuxConnection`).
+pub fn seal_mux_request_header(
+    cmd_key: &[u8; 16],
+    security: Security,
+) -> Result<SealedHeader, String> {
+    seal_header(cmd_key, security, HeaderCmd::Mux)
 }
 
 /// Response body key/iv for AEAD VMess, derived from the request body
@@ -252,17 +275,35 @@ fn build_auth_id(cmd_key: &[u8; 16], rng: &mut impl RngCore) -> [u8; 16] {
     block
 }
 
+/// Request command byte (xray `RequestCommand*`).  Mux.Cool-over-VMess
+/// signals the session with CommandMux (0x03) and no destination — the
+/// server (sing-vmess `service.go`, present since 2022) routes it straight
+/// into `HandleMuxConnection`.
+const CMD_MUX: u8 = 0x03;
+
+/// The header destination: `None` for CommandMux (no port/address follows
+/// the command byte — mirrors sing-vmess `if command != CommandMux`).
+#[derive(Clone, Copy)]
+enum HeaderCmd<'a> {
+    Tcp(&'a Metadata),
+    Udp(&'a Metadata),
+    Mux,
+}
+
 fn build_header_plaintext(
     req_key: &[u8; 16],
     req_iv: &[u8; 16],
     resp_v: u8,
     security: Security,
-    metadata: &Metadata,
-    is_udp: bool,
+    cmd: HeaderCmd<'_>,
     rng: &mut impl RngCore,
 ) -> Result<Vec<u8>, String> {
     let padding_len = (rng.next_u32() % 16) as u8;
-    let cmd = if is_udp { CMD_UDP } else { CMD_TCP };
+    let (cmd_byte, metadata) = match cmd {
+        HeaderCmd::Tcp(m) => (CMD_TCP, Some(m)),
+        HeaderCmd::Udp(m) => (CMD_UDP, Some(m)),
+        HeaderCmd::Mux => (CMD_MUX, None),
+    };
 
     let mut buf = Vec::with_capacity(64);
     buf.push(0x01); // version
@@ -272,13 +313,15 @@ fn build_header_plaintext(
     buf.push(OPT_STANDARD); // opts: S=1
     buf.push((padding_len << 4) | security.to_nibble()); // p(4) || sec(4)
     buf.push(0x00); // reserved
-    buf.push(cmd);
+    buf.push(cmd_byte);
 
-    // Port (big-endian, BEFORE addr_type)
-    buf.extend_from_slice(&metadata.dst_port.to_be_bytes());
+    if let Some(metadata) = metadata {
+        // Port (big-endian, BEFORE addr_type)
+        buf.extend_from_slice(&metadata.dst_port.to_be_bytes());
 
-    // Address encoding
-    encode_address(&mut buf, metadata)?;
+        // Address encoding
+        encode_address(&mut buf, metadata)?;
+    }
 
     // Padding
     if padding_len > 0 {
@@ -582,8 +625,7 @@ mod tests {
             &req_iv,
             0x42,
             Security::Aes128Gcm,
-            &meta,
-            false,
+            HeaderCmd::Tcp(&meta),
             &mut rng,
         )
         .unwrap();

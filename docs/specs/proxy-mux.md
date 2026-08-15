@@ -1,9 +1,10 @@
 # proxy-mux: Connection Multiplexing (sing-mux + Xray Mux.Cool)
 
 Status: sing-mux (smux / yamux / h2mux) and **Xray Mux.Cool**
-(`protocol: muxcool`, VLESS-only) are fully implemented, unit-tested.
-sing-mux applies to VLESS / Trojan / Shadowsocks / VMess outbounds;
-muxcool applies to VLESS only. Interop matrix:
+(`protocol: muxcool`) are fully implemented, unit-tested. sing-mux
+applies to VLESS / Trojan / Shadowsocks / VMess outbounds; muxcool
+applies to VLESS and VMess (CommandMux signaling in both request
+headers). Interop matrix:
 
 - sing-mux ↔ sing-box v1.13.18 (VLESS plaintext / Trojan+TLS / Reality /
   Reality+Vision inbounds with multiplex enabled) works both ways;
@@ -116,7 +117,7 @@ on parse; brutal is Linux-only upstream).
   IdleTimeout).
 - padding mode uses version=1; TCPTimeout=5s caps connection setup.
 
-### 6. Xray Mux.Cool (`protocol: muxcool`, VLESS-only)
+### 6. Xray Mux.Cool (`protocol: muxcool`, VLESS + VMess)
 
 Mux.Cool is Xray's frame multiplexing protocol (same lineage as
 v2ray-plugin's mux) and is **completely unrelated** to sing-mux: there is
@@ -201,10 +202,13 @@ unknown trailing meta bytes.
   concurrent stress after the fix: 0 failures (local 780/780, real Xray
   612/612).
 
-**Server compatibility**: Xray-core VLESS inbound (native); sing-box /
-mihomo VLESS inbound (sing-vmess HandleMuxConnection, same frame lineage).
-VMess is not supported (Xray VMess uses the `v1.mux.cool` magic-domain
-signaling, which differs from sing-vmess's CommandMux signaling).
+**Server compatibility**: Xray-core VLESS and VMess inbounds (native);
+sing-box / mihomo VLESS and VMess inbounds (sing-vmess
+HandleMuxConnection on CommandMux, same frame lineage, no inbound config
+needed). Note: the `v1.mux.cool` magic destination (port 666) is the
+legacy v2ray address trick — sing-vmess defines it (`MuxDestination`) but
+never uses it; modern signaling is the CommandMux byte in the request
+header, which is what meow-rs sends.
 
 ## meow-rs Architecture Mapping
 
@@ -246,11 +250,11 @@ crates/meow-proxy/src/mux/
   Trojan / Shadowsocks / VMess. The server must be sing-box / mihomo
   based with `multiplex` enabled on the matching inbound (a plain
   ss-server does not speak sing-mux). **Xray servers are incompatible** —
-  Xray only speaks Mux.Cool; use `protocol: muxcool` (VLESS) there.
-- `protocol: muxcool` (VLESS-only): the server is Xray-core, or a
-  sing-box / mihomo VLESS inbound (whose sing-vmess server handles
-  CommandMux natively, no inbound config needed). Do not use on Trojan
-  nodes.
+  Xray only speaks Mux.Cool; use `protocol: muxcool` (VLESS/VMess) there.
+- `protocol: muxcool` (VLESS / VMess): the server is Xray-core, or a
+  sing-box / mihomo VLESS / VMess inbound (whose sing-vmess server handles
+  CommandMux natively, no inbound config needed). Do not use on Trojan or
+  Shadowsocks nodes.
 - Both protocol families share one MuxClient pool and the same min/max
   bounds; all protocol differences are contained in the SessionKind arms
   and the with_mux dial closure — zero branching in the adapter layer.

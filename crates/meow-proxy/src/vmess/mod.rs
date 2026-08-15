@@ -60,11 +60,17 @@ impl VmessAdapter {
         }
     }
 
-    /// Enable sing-mux compatible connection multiplexing.  The session's
-    /// VMess request targets the reserved mux destination and a mux request
-    /// header follows; the server must be a sing-box / mihomo VMess inbound
-    /// with multiplex enabled (Xray Mux.Cool is VLESS-only and not used
-    /// here).
+    /// Enable connection multiplexing.  Two wire protocols share one
+    /// connection pool (protocol picked by the `protocol` mux option):
+    ///
+    /// * sing-mux (smux/yamux/h2mux) — the session's VMess request targets
+    ///   the reserved mux destination (sp.mux.sing-box.arpa:444) and a mux
+    ///   request header follows; server must be sing-box / mihomo with
+    ///   multiplex enabled on the VMess inbound.
+    /// * muxcool — the session's VMess request itself is the signaling
+    ///   (CommandMux 0x03, no address); server must be Xray, or sing-box /
+    ///   mihomo (sing-vmess routes CommandMux to HandleMuxConnection, no
+    ///   inbound config needed).
     #[cfg(feature = "mux")]
     pub fn with_mux(mut self, options: crate::mux::MuxOptions) -> Self {
         use crate::mux::{MuxClient, MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
@@ -75,17 +81,27 @@ impl VmessAdapter {
         let cmd_key = self.cmd_key;
         let security = self.security;
         let port = self.port;
+        let protocol = options.protocol;
 
         let dial: crate::mux::DialFn = StdArc::new(move || {
             let transport = Arc::clone(&transport);
             let server = server.clone();
             Box::pin(async move {
-                let metadata = Metadata {
-                    host: MUX_DESTINATION_FQDN.into(),
-                    dst_port: MUX_DESTINATION_PORT,
-                    ..Default::default()
-                };
-                dial_vmess(&transport, &server, port, cmd_key, security, &metadata).await
+                let sealed = match protocol {
+                    crate::mux::Protocol::MuxCool => {
+                        header::seal_mux_request_header(&cmd_key, security)
+                    }
+                    _ => {
+                        let metadata = Metadata {
+                            host: MUX_DESTINATION_FQDN.into(),
+                            dst_port: MUX_DESTINATION_PORT,
+                            ..Default::default()
+                        };
+                        header::seal_request_header(&cmd_key, security, &metadata, false)
+                    }
+                }
+                .map_err(MeowError::Proxy)?;
+                dial_vmess(&transport, &server, port, sealed, security).await
             })
         });
         self.mux_only_tcp = options.only_tcp;
@@ -97,17 +113,17 @@ impl VmessAdapter {
     /// VMess request header exchange for the given destination, and return
     /// the encrypted duplex.
     async fn dial_to(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        let sealed = header::seal_request_header(&self.cmd_key, self.security, metadata, false)
+            .map_err(MeowError::Proxy)?;
         dial_vmess(
             &self.transport,
             &self.server,
             self.port,
-            self.cmd_key,
+            sealed,
             self.security,
-            metadata,
         )
         .await
     }
-
 }
 
 /// Dial a raw TCP + transport-chain stream to the VMess server, run the
@@ -118,9 +134,8 @@ async fn dial_vmess(
     transport: &TransportChain,
     server: &str,
     port: u16,
-    cmd_key: [u8; 16],
+    sealed: header::SealedHeader,
     security: Security,
-    metadata: &Metadata,
 ) -> Result<Box<dyn ProxyConn>> {
     use tokio::io::AsyncWriteExt;
 
@@ -133,12 +148,13 @@ async fn dial_vmess(
         .await
         .map_err(|e| MeowError::Proxy(format!("vmess transport: {e}")))?;
 
-    let sealed = header::seal_request_header(&cmd_key, security, metadata, false)
-        .map_err(MeowError::Proxy)?;
+    stream
+        .write_all(&sealed.bytes)
+        .await
+        .map_err(MeowError::Io)?;
 
-    stream.write_all(&sealed.bytes).await.map_err(MeowError::Io)?;
-
-    let read_cipher = body::BodyCipher::new(security, &sealed.req_key, &sealed.req_iv, sealed.resp_v);
+    let read_cipher =
+        body::BodyCipher::new(security, &sealed.req_key, &sealed.req_iv, sealed.resp_v);
     let write_cipher =
         body::BodyCipher::new(security, &sealed.req_key, &sealed.req_iv, sealed.resp_v);
 
