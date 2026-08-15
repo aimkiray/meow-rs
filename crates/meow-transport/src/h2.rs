@@ -7,16 +7,10 @@
 //!
 //! upstream: transport/vmess/h2.go
 
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
 use async_trait::async_trait;
-use bytes::Bytes;
 use rand::seq::IndexedRandom as _;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::h2_common::RecvState;
+use crate::h2_common::{H2Stream, RecvState};
 use crate::{Result, Stream, Transport, TransportError};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -38,7 +32,6 @@ pub struct H2Config {
     /// rejects an empty list at parse time (Class A divergence, hard error).
     pub hosts: Vec<String>,
 }
-
 impl Default for H2Config {
     fn default() -> Self {
         Self {
@@ -111,133 +104,3 @@ impl Transport for H2Layer {
         )))
     }
 }
-
-// ─── H2Stream ────────────────────────────────────────────────────────────────
-
-/// A raw bidirectional stream over a single HTTP/2 request/response pair.
-///
-/// Unlike [`GunStream`] in `grpc.rs`, no gun framing is applied — bytes pass
-/// through the h2 DATA frames verbatim.
-struct H2Stream {
-    send: h2::SendStream<Bytes>,
-    /// Response body, resolved on the first read (see [`RecvState`]).
-    recv: RecvState,
-    /// Buffered payload bytes from the most recently received DATA frame.
-    read_buf: Bytes,
-    /// Pre-encoded payload stashed while we wait for h2 send-window capacity.
-    /// Set on the first `poll_write` for a given `buf`; cleared after
-    /// `send_data` succeeds.  Ensures `reserve_capacity` is called exactly
-    /// once per logical write.
-    pending_write: Option<Bytes>,
-}
-
-impl H2Stream {
-    fn new(send: h2::SendStream<Bytes>, recv: RecvState) -> Self {
-        Self {
-            send,
-            recv,
-            read_buf: Bytes::new(),
-            pending_write: None,
-        }
-    }
-}
-
-impl AsyncRead for H2Stream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-
-        loop {
-            // Drain any buffered bytes from the last DATA frame first.
-            if !this.read_buf.is_empty() {
-                let n = this.read_buf.len().min(buf.remaining());
-                buf.put_slice(&this.read_buf[..n]);
-                let _ = this.read_buf.split_to(n);
-                return Poll::Ready(Ok(()));
-            }
-
-            // Fetch the next DATA frame from the h2 receive stream. Resolving
-            // the response is part of the read path, not of `connect()`; see
-            // `h2_common::RecvState`.
-            match this.recv.poll_ready(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => {}
-            }
-            let recv = this.recv.stream().expect("poll_ready resolved Ok");
-            match recv.poll_data(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(Ok(())), // clean EOF
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::other(e)));
-                }
-                Poll::Ready(Some(Ok(bytes))) => {
-                    // Release flow-control window back to the sender.
-                    let _ = recv.flow_control().release_capacity(bytes.len());
-                    this.read_buf = bytes;
-                    // loop → drain read_buf
-                }
-            }
-        }
-    }
-}
-
-impl AsyncWrite for H2Stream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-
-        // Stash the payload exactly once per logical write.  If pending_write
-        // is already set, a previous poll returned Pending; capacity has been
-        // reserved — do not encode or reserve again.
-        if this.pending_write.is_none() {
-            let data = Bytes::copy_from_slice(buf);
-            this.send.reserve_capacity(data.len());
-            this.pending_write = Some(data);
-        }
-
-        // Wait for the h2 send window to open.
-        match this.send.poll_capacity(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => {
-                this.pending_write = None;
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "h2: send stream closed",
-                )))
-            }
-            Poll::Ready(Some(Err(e))) => {
-                this.pending_write = None;
-                Poll::Ready(Err(io::Error::other(e)))
-            }
-            Poll::Ready(Some(Ok(_capacity))) => {
-                let data = this.pending_write.take().expect("set above");
-                this.send.send_data(data, false).map_err(io::Error::other)?;
-                Poll::Ready(Ok(buf.len()))
-            }
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // h2 DATA frames are pushed into the h2 connection immediately on
-        // send_data; there is no write-side buffer to flush.
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        // Send empty DATA + EOS flag to signal end of the request stream.
-        this.send
-            .send_data(Bytes::new(), true)
-            .map_err(io::Error::other)?;
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl Unpin for H2Stream {}

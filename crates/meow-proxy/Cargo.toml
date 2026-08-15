@@ -40,9 +40,9 @@ snell = ["dep:argon2", "dep:aes-gcm"]
 anytls = ["dep:meow-anytls"]
 # Hysteria2 outbound implemented in-tree on top of Quinn.
 hysteria2 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:blake2"]
-# sing-mux connection multiplexing for VLESS/Trojan.  Pulls h2 + yamux +
+# sing-mux connection multiplexing for VLESS/Trojan/Shadowsocks/VMess. Pulls h2 + yamux +
 # tokio-util/compat — opt-out in `minimal` builds (ADR-0007 binary-size caps).
-mux = ["dep:h2", "dep:yamux", "dep:tokio-util"]
+mux = ["dep:h2", "dep:yamux", "dep:tokio-util", "meow-transport/h2"]
 # Native client for the `ech-tls-tunnel` SIP003 plugin
 # (https://github.com/shadowsocks/ech-tls-tunnel). Requires ECH on rustls,
 # which pulls aws-lc-rs in via meow-transport.

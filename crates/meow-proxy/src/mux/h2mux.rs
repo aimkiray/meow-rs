@@ -14,15 +14,14 @@
 
 use bytes::Bytes;
 use http::{Method, Request, StatusCode, Version};
-use std::future::Future;
 use std::io;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::oneshot;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+pub use meow_transport::h2_common::H2Stream as Stream;
+use meow_transport::h2_common::{RecvState, StatusPolicy};
 
 /// Setup timeout for the CONNECT request/response round trip; mirrors
 /// sing-mux's `TCPTimeout` (5 s).  On expiry the read side fails with
@@ -74,215 +73,20 @@ impl Session {
             .clone()
             .send_request(request, false)
             .map_err(io::Error::other)?;
-        let (setup_tx, setup_rx) = oneshot::channel();
-        // Resolve the response in the background, bounded by TCPTimeout —
-        // sing-mux spawns the same RoundTrip + timeout goroutine.
-        tokio::spawn(async move {
-            tokio::select! {
-                result = response_future => {
-                    let result = result
-                        .map_err(io::Error::other)
-                        .and_then(|response| {
-                            if response.status() == StatusCode::OK {
-                                Ok(response.into_body())
-                            } else {
-                                Err(io::Error::other(format!(
-                                    "h2mux: unexpected status {}",
-                                    response.status()
-                                )))
-                            }
-                        });
-                    let _ = setup_tx.send(result);
-                }
-                _ = tokio::time::sleep(RESPONSE_TIMEOUT) => {
-                    let _ = setup_tx.send(Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "h2mux: response timeout",
-                    )));
-                }
-            }
-        });
-        Ok(Stream::new(send_stream, setup_rx))
+        Ok(Stream::new(
+            send_stream,
+            RecvState::with_timeout(
+                response_future,
+                RESPONSE_TIMEOUT,
+                StatusPolicy::Exact(StatusCode::OK),
+                "h2mux",
+            ),
+        )
+        .with_remote_no_error_eof())
     }
 
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::SeqCst)
-    }
-}
-
-/// Response body, delivered by the setup task and resolved lazily on the
-/// first read.
-enum RecvState {
-    Pending(oneshot::Receiver<io::Result<h2::RecvStream>>),
-    Ready(h2::RecvStream),
-}
-
-impl RecvState {
-    /// Resolve the response once; afterwards yields the body stream.
-    fn poll_stream(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<&mut h2::RecvStream>> {
-        loop {
-            match self {
-                RecvState::Pending(rx) => match Pin::new(rx).poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(_)) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "h2mux: setup task dropped",
-                        )))
-                    }
-                    Poll::Ready(Ok(Err(e))) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Ok(Ok(stream))) => {
-                        *self = RecvState::Ready(stream);
-                    }
-                },
-                RecvState::Ready(stream) => return Poll::Ready(Ok(stream)),
-            }
-        }
-    }
-}
-
-/// One h2mux stream (a CONNECT request/response pair), exposed with tokio
-/// IO traits.
-pub struct Stream {
-    send: h2::SendStream<Bytes>,
-    recv: RecvState,
-    /// Buffered payload bytes from the most recently received DATA frame.
-    read_buf: Bytes,
-    /// Payload stashed while waiting for h2 send-window capacity; set on the
-    /// first poll of a logical write so `reserve_capacity` runs exactly
-    /// once per write.
-    pending_write: Option<Bytes>,
-    eos_sent: bool,
-}
-
-impl Stream {
-    fn new(
-        send: h2::SendStream<Bytes>,
-        setup: oneshot::Receiver<io::Result<h2::RecvStream>>,
-    ) -> Self {
-        Self {
-            send,
-            recv: RecvState::Pending(setup),
-            read_buf: Bytes::new(),
-            pending_write: None,
-            eos_sent: false,
-        }
-    }
-
-    /// Half-close the request body with an empty DATA + EOS frame, exactly
-    /// once.
-    fn best_effort_eos(&mut self) {
-        if !self.eos_sent {
-            self.eos_sent = true;
-            let _ = self.send.send_data(Bytes::new(), true);
-        }
-    }
-}
-
-impl Drop for Stream {
-    fn drop(&mut self) {
-        // Let the server see EOF on this stream even when shutdown() was
-        // never called explicitly (mirrors sing-mux's request cancel).
-        self.best_effort_eos();
-    }
-}
-
-impl AsyncRead for Stream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        loop {
-            // Drain buffered bytes from the last DATA frame first.
-            if !this.read_buf.is_empty() {
-                let n = this.read_buf.len().min(buf.remaining());
-                buf.put_slice(&this.read_buf[..n]);
-                let _ = this.read_buf.split_to(n);
-                return Poll::Ready(Ok(()));
-            }
-            // Resolve the response lazily on first read.
-            let recv = match this.recv.poll_stream(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(recv)) => recv,
-            };
-            match recv.poll_data(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(Ok(())), // clean EOF
-                Poll::Ready(Some(Err(e))) => {
-                    // sing-box closes finished mux streams with a remote
-                    // RST_STREAM(NO_ERROR); treat it as clean EOF (Go's
-                    // http2 client maps it to io.EOF the same way).
-                    if e.is_reset() && e.is_remote() && e.reason() == Some(h2::Reason::NO_ERROR) {
-                        return Poll::Ready(Ok(()));
-                    }
-                    return Poll::Ready(Err(io::Error::other(e)));
-                }
-                Poll::Ready(Some(Ok(bytes))) => {
-                    // Release flow-control window back to the sender.
-                    let _ = recv.flow_control().release_capacity(bytes.len());
-                    this.read_buf = bytes;
-                    // loop → drain read_buf
-                }
-            }
-        }
-    }
-}
-
-impl AsyncWrite for Stream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let this = self.get_mut();
-        // Stash the payload exactly once per logical write: if pending_write
-        // is set, a previous poll returned Pending and capacity has been
-        // reserved — do not encode or reserve again.  This relies on the
-        // AsyncWrite contract that a Pending poll is retried with the same
-        // buffer (tokio's write/write_all always do); same pattern as
-        // meow-transport's h2 transport.
-        if this.pending_write.is_none() {
-            let data = Bytes::copy_from_slice(buf);
-            this.send.reserve_capacity(data.len());
-            this.pending_write = Some(data);
-        }
-        // Wait for the h2 send window to open.
-        match this.send.poll_capacity(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => {
-                this.pending_write = None;
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "h2mux: send stream closed",
-                )))
-            }
-            Poll::Ready(Some(Err(e))) => {
-                this.pending_write = None;
-                Poll::Ready(Err(io::Error::other(e)))
-            }
-            Poll::Ready(Some(Ok(_capacity))) => {
-                let data = this.pending_write.take().expect("set above");
-                this.send.send_data(data, false).map_err(io::Error::other)?;
-                Poll::Ready(Ok(buf.len()))
-            }
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // DATA frames are pushed into the h2 connection immediately on
-        // send_data; there is no write-side buffer to flush.
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().best_effort_eos();
-        Poll::Ready(Ok(()))
     }
 }
 

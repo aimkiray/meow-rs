@@ -38,7 +38,7 @@ mod reality_tls;
 pub mod ws;
 
 #[cfg(any(feature = "grpc", feature = "h2"))]
-mod h2_common;
+pub mod h2_common;
 
 #[cfg(feature = "grpc")]
 pub mod grpc;
