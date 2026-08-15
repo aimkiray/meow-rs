@@ -416,10 +416,16 @@ async fn run_memleak_test(args: &Args) -> anyhow::Result<()> {
     )
     .await?;
 
-    // Stop proxy
-    let _ = Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status();
+    // Stop the proxy.  Prefer SIGTERM on Unix for a graceful shutdown;
+    // on Windows `kill` does not exist and the child must be terminated
+    // directly (child.kill is a no-op once the process already exited).
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+    let _ = child.kill();
     let _ = child.wait();
 
     let json = serde_json::to_string_pretty(&result)?;
