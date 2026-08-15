@@ -455,7 +455,7 @@ impl MuxCoolSession {
         self.streams.lock().await.insert(sid, tx);
         // The guard removes the map entry if this future is cancelled
         // while waiting for outbound capacity — otherwise the id stays
-        // consumed and the entry lingers until a server End echo.
+        // consumed and the entry lingers for the session's lifetime.
         let mut guard = StreamMapGuard {
             streams: Arc::clone(&self.streams),
             sid,
@@ -578,18 +578,26 @@ impl EndGuard {
 
 impl Drop for EndGuard {
     fn drop(&mut self) {
-        if !self.ended.swap(true, Ordering::SeqCst) && !self.session.aborted() {
-            let session = Arc::clone(&self.session);
-            let sid = self.sid;
-            // Detached: the End frame queues behind any in-flight data
-            // frames in the driver's channel; drop cannot await the send.
-            // Skip when no runtime exists (teardown): the session is
-            // going away anyway.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
+        let send_end = !self.ended.swap(true, Ordering::SeqCst) && !self.session.aborted();
+        let session = Arc::clone(&self.session);
+        let sid = self.sid;
+        // Detached: the End frame queues behind any in-flight data
+        // frames in the driver's channel; drop cannot await the send.
+        // Skip when no runtime exists (teardown): the session is
+        // going away anyway.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if send_end {
                     let _ = session.send_frame(encode_end_frame(sid, false)).await;
-                });
-            }
+                }
+                // Drop the stream-map entry too: Mux.Cool servers (notably
+                // sing-box) never echo End frames, so the driver cannot
+                // clean this up itself.  Removing the entry closes the
+                // inbound channel (poll_recv → None → Eof) and keeps the
+                // map bounded under connection churn.  Harmless when
+                // poll_shutdown already removed it.
+                session.streams.lock().await.remove(&sid);
+            });
         }
     }
 }
@@ -934,6 +942,7 @@ async fn driver_loop(
     // must see aborted() == true so they surface an error, not a clean EOF.
     closed.store(true, Ordering::SeqCst);
     if let Err(e) = &result {
+        tracing::debug!("mux.cool driver exit: {e}");
         // Push the failure to every live stream, then clear the map —
         // dropping every sender closes the channels, so consumers parked on
         // a full queue observe the abort instead of hanging forever (the
@@ -1140,6 +1149,25 @@ impl AsyncWrite for Stream {
                 // is cancelled while the reserve is Pending, the
                 // EndGuard re-sends the End on drop.
                 this.parts.guard.ended.store(true, Ordering::SeqCst);
+                // Mux.Cool servers (notably sing-box) close the stream
+                // silently and never echo an End frame, so the read side
+                // must EOF locally: consumers would otherwise wait for an
+                // event that never arrives, hanging every half-closed
+                // relay until its linger timer fires and saturating
+                // listener capacity under connection churn.
+                this.eof = true;
+                // Remove the stream-map entry so the inbound channel
+                // closes (poll_recv returns None → Eof) and the entry
+                // cannot accumulate for the session's lifetime.  The
+                // EndGuard repeats this removal for the drop-without-
+                // shutdown path.
+                let session = Arc::clone(&this.parts.session);
+                let sid = this.parts.sid;
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        session.streams.lock().await.remove(&sid);
+                    });
+                }
             }
         }
         Poll::Ready(Ok(()))
