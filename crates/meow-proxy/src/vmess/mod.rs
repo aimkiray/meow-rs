@@ -8,6 +8,7 @@ use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
 use smol_str::SmolStr;
+use std::sync::Arc;
 use tracing::debug;
 
 use crate::transport_chain::TransportChain;
@@ -21,8 +22,15 @@ pub struct VmessAdapter {
     cmd_key: [u8; 16],
     security: Security,
     udp: bool,
-    transport: TransportChain,
+    transport: Arc<TransportChain>,
     health: ProxyHealth,
+    /// sing-mux compatible connection multiplexing (optional).
+    #[cfg(feature = "mux")]
+    mux: Option<Arc<crate::mux::MuxClient>>,
+    /// When mux is enabled, route UDP through the plain proxy path instead
+    /// of mux streams (mihomo `only-tcp`).
+    #[cfg(feature = "mux")]
+    mux_only_tcp: bool,
 }
 
 impl VmessAdapter {
@@ -43,54 +51,91 @@ impl VmessAdapter {
             cmd_key: header::cmd_key(&uuid_bytes),
             security,
             udp,
-            transport,
+            transport: Arc::new(transport),
             health: ProxyHealth::new(),
+            #[cfg(feature = "mux")]
+            mux: None,
+            #[cfg(feature = "mux")]
+            mux_only_tcp: false,
         }
     }
 
-    async fn dial_stream(&self) -> Result<Box<dyn meow_transport::Stream>> {
-        let tcp = meow_common::connect_tcp_host(&self.server, self.port)
-            .await
-            .map_err(MeowError::Io)?;
-        let _ = tcp.set_nodelay(true);
-        self.transport
-            .connect(Box::new(tcp))
-            .await
-            .map_err(|e| MeowError::Proxy(format!("vmess transport: {e}")))
-    }
-}
+    /// Enable sing-mux compatible connection multiplexing.  The session's
+    /// VMess request targets the reserved mux destination and a mux request
+    /// header follows; the server must be a sing-box / mihomo VMess inbound
+    /// with multiplex enabled (Xray Mux.Cool is VLESS-only and not used
+    /// here).
+    #[cfg(feature = "mux")]
+    pub fn with_mux(mut self, options: crate::mux::MuxOptions) -> Self {
+        use crate::mux::{MuxClient, MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
+        use std::sync::Arc as StdArc;
+        use tokio::io::AsyncWriteExt;
 
-#[async_trait]
-impl ProxyAdapter for VmessAdapter {
-    fn name(&self) -> &str {
-        &self.name
+        let transport = Arc::clone(&self.transport);
+        let server = self.server.clone();
+        let cmd_key = self.cmd_key;
+        let security = self.security;
+        let port = self.port;
+
+        let dial: crate::mux::DialFn = StdArc::new(move || {
+            let transport = Arc::clone(&transport);
+            let server = server.clone();
+            Box::pin(async move {
+                let tcp = meow_common::connect_tcp_host(&server, port)
+                    .await
+                    .map_err(MeowError::Io)?;
+                let _ = tcp.set_nodelay(true);
+                let mut stream = transport
+                    .connect(Box::new(tcp))
+                    .await
+                    .map_err(|e| MeowError::Proxy(format!("vmess transport: {e}")))?;
+
+                let metadata = Metadata {
+                    host: MUX_DESTINATION_FQDN.into(),
+                    dst_port: MUX_DESTINATION_PORT,
+                    ..Default::default()
+                };
+                let sealed = header::seal_request_header(&cmd_key, security, &metadata, false)
+                    .map_err(MeowError::Proxy)?;
+
+                stream
+                    .write_all(&sealed.bytes)
+                    .await
+                    .map_err(MeowError::Io)?;
+
+                let read_cipher =
+                    body::BodyCipher::new(security, &sealed.req_key, &sealed.req_iv, sealed.resp_v);
+                let write_cipher =
+                    body::BodyCipher::new(security, &sealed.req_key, &sealed.req_iv, sealed.resp_v);
+
+                let duplex = conn::spawn_vmess_relay(
+                    stream,
+                    read_cipher,
+                    write_cipher,
+                    sealed.req_key,
+                    sealed.req_iv,
+                    sealed.resp_v,
+                );
+                Ok(Box::new(crate::stream_conn::StreamConn(Box::new(duplex)))
+                    as Box<dyn ProxyConn>)
+            })
+        });
+        self.mux_only_tcp = options.only_tcp;
+        self.mux = Some(MuxClient::new(dial, options));
+        self
     }
 
-    fn adapter_type(&self) -> AdapterType {
-        AdapterType::Vmess
-    }
-
-    fn addr(&self) -> &str {
-        &self.addr_str
-    }
-
-    fn support_udp(&self) -> bool {
-        self.udp
-    }
-
-    async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-        debug!(
-            "VMess connecting to {} via {}",
-            metadata.remote_address(),
-            self.addr_str
-        );
+    /// Dial a raw TCP + transport-chain stream to the VMess server, run the
+    /// VMess request header exchange for the given destination, and return
+    /// the encrypted duplex.
+    async fn dial_to(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        use tokio::io::AsyncWriteExt;
 
         let stream = self.dial_stream().await?;
 
         let sealed = header::seal_request_header(&self.cmd_key, self.security, metadata, false)
             .map_err(MeowError::Proxy)?;
 
-        use tokio::io::AsyncWriteExt;
         let mut stream = stream;
         stream
             .write_all(&sealed.bytes)
@@ -121,7 +166,95 @@ impl ProxyAdapter for VmessAdapter {
         Ok(Box::new(crate::stream_conn::StreamConn(Box::new(duplex))))
     }
 
-    async fn dial_udp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+    async fn dial_stream(&self) -> Result<Box<dyn meow_transport::Stream>> {
+        let tcp = meow_common::connect_tcp_host(&self.server, self.port)
+            .await
+            .map_err(MeowError::Io)?;
+        let _ = tcp.set_nodelay(true);
+        self.transport
+            .connect(Box::new(tcp))
+            .await
+            .map_err(|e| MeowError::Proxy(format!("vmess transport: {e}")))
+    }
+}
+
+#[async_trait]
+impl ProxyAdapter for VmessAdapter {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn adapter_type(&self) -> AdapterType {
+        AdapterType::Vmess
+    }
+
+    fn addr(&self) -> &str {
+        &self.addr_str
+    }
+
+    fn support_udp(&self) -> bool {
+        // With mux enabled, UDP rides the mux TCP session (unless
+        // `only-tcp` forces the plain path) — mirrors mihomo's
+        // SingMux.SupportUDP.
+        self.udp || {
+            #[cfg(feature = "mux")]
+            {
+                self.mux.is_some() && !self.mux_only_tcp
+            }
+            #[cfg(not(feature = "mux"))]
+            {
+                false
+            }
+        }
+    }
+
+    async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        debug!(
+            "VMess connecting to {} via {}",
+            metadata.remote_address(),
+            self.addr_str
+        );
+
+        #[cfg(feature = "mux")]
+        if let Some(mux) = &self.mux {
+            let host = if !metadata.host.is_empty() {
+                metadata.host.to_string()
+            } else if let Some(ip) = metadata.dst_ip {
+                ip.to_string()
+            } else {
+                return Err(MeowError::Proxy(
+                    "vmess mux: metadata has no destination host".into(),
+                ));
+            };
+            let conn = mux.open_stream(&host, metadata.dst_port).await?;
+            return Ok(Box::new(conn));
+        }
+
+        self.dial_to(metadata).await
+    }
+
+    async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+        #[cfg(feature = "mux")]
+        if let Some(mux) = &self.mux {
+            if !self.mux_only_tcp {
+                let host = if !metadata.host.is_empty() {
+                    metadata.host.to_string()
+                } else if let Some(ip) = metadata.dst_ip {
+                    ip.to_string()
+                } else {
+                    return Err(MeowError::Proxy(
+                        "vmess mux udp: metadata has no destination host".into(),
+                    ));
+                };
+                debug!(
+                    "VMess mux UDP connecting to {} via {}",
+                    metadata.remote_address(),
+                    self.addr_str
+                );
+                return mux.open_packet_stream(&host, metadata.dst_port).await;
+            }
+        }
+
         Err(MeowError::NotSupported(
             "vmess UDP relay not yet implemented".into(),
         ))

@@ -51,16 +51,29 @@ enum PluginKind {
     EchTlsTunnel(EchTlsTunnelConfig, TlsLayer),
 }
 
-pub struct ShadowsocksAdapter {
-    name: SmolStr,
+/// Dial-relevant SS state, shared (Arc) between the adapter and any mux
+/// session so the SIP003 plugin handle stays alive for both.
+struct SsCore {
     server: SmolStr,
     port: u16,
     server_config: ServerConfig,
     context: shadowsocks::context::SharedContext,
+    plugin: PluginKind,
+}
+
+pub struct ShadowsocksAdapter {
+    name: SmolStr,
+    core: Arc<SsCore>,
     addr_str: SmolStr,
     support_udp: bool,
-    plugin: PluginKind,
     health: ProxyHealth,
+    /// sing-mux compatible connection multiplexing (optional).
+    #[cfg(feature = "mux")]
+    mux: Option<Arc<crate::mux::MuxClient>>,
+    /// When mux is enabled, route UDP through the plain proxy path instead
+    /// of mux streams (mihomo `only-tcp`).
+    #[cfg(feature = "mux")]
+    mux_only_tcp: bool,
 }
 
 impl ShadowsocksAdapter {
@@ -141,17 +154,141 @@ impl ShadowsocksAdapter {
             None => PluginKind::None,
         };
 
-        Ok(Self {
-            name: SmolStr::from(name),
+        let core = Arc::new(SsCore {
             server: SmolStr::from(server),
             port,
             server_config,
             context,
+            plugin,
+        });
+
+        Ok(Self {
+            name: SmolStr::from(name),
+            core,
             addr_str,
             support_udp: udp,
-            plugin,
             health: ProxyHealth::new(),
+            #[cfg(feature = "mux")]
+            mux: None,
+            #[cfg(feature = "mux")]
+            mux_only_tcp: false,
         })
+    }
+
+    /// Enable sing-mux compatible connection multiplexing.  The session's
+    /// SS stream targets the reserved mux destination; the server must be a
+    /// sing-box / mihomo SS inbound with multiplex enabled (a plain
+    /// ss-server does not speak sing-mux).  Xray Mux.Cool is VLESS-only.
+    #[cfg(feature = "mux")]
+    pub fn with_mux(mut self, options: crate::mux::MuxOptions) -> Self {
+        use crate::mux::{MuxClient, MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
+        use std::sync::Arc as StdArc;
+
+        let core = Arc::clone(&self.core);
+        let dial: crate::mux::DialFn = StdArc::new(move || {
+            let core = Arc::clone(&core);
+            Box::pin(async move {
+                let addr = Address::DomainNameAddress(
+                    MUX_DESTINATION_FQDN.to_string(),
+                    MUX_DESTINATION_PORT,
+                );
+                core.dial_tcp_stream(addr).await
+            })
+        });
+        self.mux_only_tcp = options.only_tcp;
+        self.mux = Some(MuxClient::new(dial, options));
+        self
+    }
+}
+
+impl SsCore {
+    /// Dial a raw (or plugin-transported) TCP stream to the SS server and
+    /// wrap it in the SS crypto codec for the given target address.
+    async fn dial_tcp_stream(&self, addr: Address) -> Result<Box<dyn ProxyConn>> {
+        match &self.plugin {
+            PluginKind::Obfs(obfs) => {
+                // Open a raw TCP connection to the SS server, wrap it in the
+                // simple-obfs codec, then layer the SS crypto stream on top.
+                let tcp = meow_common::connect_tcp_host(&self.server, self.port)
+                    .await
+                    .map_err(|e| MeowError::Proxy(format!("ss obfs tcp connect: {e}")))?;
+                let _ = tcp.set_nodelay(true);
+                match obfs.clone() {
+                    BuiltinObfs::Http { host } => {
+                        let wrapped = HttpObfs::new(tcp, host, self.port);
+                        let stream = ProxyClientStream::from_stream(
+                            Arc::clone(&self.context),
+                            wrapped,
+                            &self.server_config,
+                            addr,
+                        );
+                        Ok(Box::new(SsConn(stream)))
+                    }
+                    BuiltinObfs::Tls { server } => {
+                        let wrapped = TlsObfs::new(tcp, server);
+                        let stream = ProxyClientStream::from_stream(
+                            Arc::clone(&self.context),
+                            wrapped,
+                            &self.server_config,
+                            addr,
+                        );
+                        Ok(Box::new(SsConn(stream)))
+                    }
+                }
+            }
+            PluginKind::V2ray(cfg, tls) => {
+                let transport =
+                    v2ray_plugin::dial(cfg, tls.as_ref(), &self.server, self.port).await?;
+                let stream = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    transport,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(stream)))
+            }
+            #[cfg(feature = "ech-tls-tunnel")]
+            PluginKind::EchTlsTunnel(cfg, tls) => {
+                let transport = ech_tls_tunnel::dial(cfg, tls, &self.server, self.port).await?;
+                let stream = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    transport,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(stream)))
+            }
+            PluginKind::None | PluginKind::External(_) => {
+                // Hand-roll the TCP connect so the installed
+                // `meow_common::SocketProtector` sees the fd before connect —
+                // otherwise the upstream `shadowsocks` crate would dial this
+                // stream internally via plain tokio and the Android
+                // `VpnService.protect(fd)` hook would never fire, so the
+                // outbound socket would loop back into our own VPN tunnel.
+                //
+                // For `PluginKind::External`, `tcp_external_addr` returns the
+                // SIP003 plugin's local listener (typically 127.0.0.1:<port>),
+                // so the connect is loopback and `protect()` is harmless;
+                // for `PluginKind::None` it's the remote SS server. Dispatch
+                // on the variant so domain-name servers also go through the
+                // installed `HostResolver` (system DNS would loop the
+                // lookup through the VPN on Android).
+                let tcp = match self.server_config.tcp_external_addr() {
+                    ServerAddr::SocketAddr(sa) => meow_common::connect_tcp(*sa).await,
+                    ServerAddr::DomainName(host, port) => {
+                        meow_common::connect_tcp_host(host, *port).await
+                    }
+                }
+                .map_err(|e| MeowError::Proxy(format!("ss tcp connect: {e}")))?;
+                let stream = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    tcp,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(stream)))
+            }
+        }
     }
 }
 
@@ -371,107 +508,72 @@ impl ProxyAdapter for ShadowsocksAdapter {
     }
 
     fn support_udp(&self) -> bool {
-        self.support_udp
+        // With mux enabled, UDP rides the mux TCP session (unless
+        // `only-tcp` forces the plain path) — mirrors mihomo's
+        // SingMux.SupportUDP.
+        self.support_udp || {
+            #[cfg(feature = "mux")]
+            {
+                self.mux.is_some() && !self.mux_only_tcp
+            }
+            #[cfg(not(feature = "mux"))]
+            {
+                false
+            }
+        }
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         let addr = parse_address(metadata);
         debug!("SS connecting to {} via {}", addr, self.addr_str);
 
-        match &self.plugin {
-            PluginKind::Obfs(obfs) => {
-                // Open a raw TCP connection to the SS server, wrap it in the
-                // simple-obfs codec, then layer the SS crypto stream on top.
-                let tcp = meow_common::connect_tcp_host(&self.server, self.port)
-                    .await
-                    .map_err(|e| MeowError::Proxy(format!("ss obfs tcp connect: {e}")))?;
-                let _ = tcp.set_nodelay(true);
-                match obfs.clone() {
-                    BuiltinObfs::Http { host } => {
-                        let wrapped = HttpObfs::new(tcp, host, self.port);
-                        let stream = ProxyClientStream::from_stream(
-                            Arc::clone(&self.context),
-                            wrapped,
-                            &self.server_config,
-                            addr,
-                        );
-                        Ok(Box::new(SsConn(stream)))
-                    }
-                    BuiltinObfs::Tls { server } => {
-                        let wrapped = TlsObfs::new(tcp, server);
-                        let stream = ProxyClientStream::from_stream(
-                            Arc::clone(&self.context),
-                            wrapped,
-                            &self.server_config,
-                            addr,
-                        );
-                        Ok(Box::new(SsConn(stream)))
-                    }
-                }
-            }
-            PluginKind::V2ray(cfg, tls) => {
-                let transport =
-                    v2ray_plugin::dial(cfg, tls.as_ref(), &self.server, self.port).await?;
-                let stream = ProxyClientStream::from_stream(
-                    Arc::clone(&self.context),
-                    transport,
-                    &self.server_config,
-                    addr,
-                );
-                Ok(Box::new(SsConn(stream)))
-            }
-            #[cfg(feature = "ech-tls-tunnel")]
-            PluginKind::EchTlsTunnel(cfg, tls) => {
-                let transport = ech_tls_tunnel::dial(cfg, tls, &self.server, self.port).await?;
-                let stream = ProxyClientStream::from_stream(
-                    Arc::clone(&self.context),
-                    transport,
-                    &self.server_config,
-                    addr,
-                );
-                Ok(Box::new(SsConn(stream)))
-            }
-            PluginKind::None | PluginKind::External(_) => {
-                // Hand-roll the TCP connect so the installed
-                // `meow_common::SocketProtector` sees the fd before connect —
-                // otherwise the upstream `shadowsocks` crate would dial this
-                // stream internally via plain tokio and the Android
-                // `VpnService.protect(fd)` hook would never fire, so the
-                // outbound socket would loop back into our own VPN tunnel.
-                //
-                // For `PluginKind::External`, `tcp_external_addr` returns the
-                // SIP003 plugin's local listener (typically 127.0.0.1:<port>),
-                // so the connect is loopback and `protect()` is harmless;
-                // for `PluginKind::None` it's the remote SS server. Dispatch
-                // on the variant so domain-name servers also go through the
-                // installed `HostResolver` (system DNS would loop the
-                // lookup through the VPN on Android).
-                let tcp = match self.server_config.tcp_external_addr() {
-                    ServerAddr::SocketAddr(sa) => meow_common::connect_tcp(*sa).await,
-                    ServerAddr::DomainName(host, port) => {
-                        meow_common::connect_tcp_host(host, *port).await
-                    }
-                }
-                .map_err(|e| MeowError::Proxy(format!("ss tcp connect: {e}")))?;
-                let stream = ProxyClientStream::from_stream(
-                    Arc::clone(&self.context),
-                    tcp,
-                    &self.server_config,
-                    addr,
-                );
-                Ok(Box::new(SsConn(stream)))
-            }
+        #[cfg(feature = "mux")]
+        if let Some(mux) = &self.mux {
+            let host = if !metadata.host.is_empty() {
+                metadata.host.to_string()
+            } else if let Some(ip) = metadata.dst_ip {
+                ip.to_string()
+            } else {
+                return Err(MeowError::Proxy(
+                    "ss mux: metadata has no destination host".into(),
+                ));
+            };
+            let conn = mux.open_stream(&host, metadata.dst_port).await?;
+            return Ok(Box::new(conn));
         }
+
+        self.core.dial_tcp_stream(addr).await
     }
 
-    async fn dial_udp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-        if matches!(self.plugin, PluginKind::V2ray(..)) {
+    async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+        #[cfg(feature = "mux")]
+        if let Some(mux) = &self.mux {
+            if !self.mux_only_tcp {
+                let host = if !metadata.host.is_empty() {
+                    metadata.host.to_string()
+                } else if let Some(ip) = metadata.dst_ip {
+                    ip.to_string()
+                } else {
+                    return Err(MeowError::Proxy(
+                        "ss mux udp: metadata has no destination host".into(),
+                    ));
+                };
+                debug!(
+                    "SS mux UDP connecting to {} via {}",
+                    metadata.remote_address(),
+                    self.addr_str
+                );
+                return mux.open_packet_stream(&host, metadata.dst_port).await;
+            }
+        }
+
+        if matches!(self.core.plugin, PluginKind::V2ray(..)) {
             return Err(MeowError::NotSupported(
                 "v2ray-plugin does not support UDP relay".into(),
             ));
         }
         #[cfg(feature = "ech-tls-tunnel")]
-        if matches!(self.plugin, PluginKind::EchTlsTunnel(..)) {
+        if matches!(self.core.plugin, PluginKind::EchTlsTunnel(..)) {
             return Err(MeowError::NotSupported(
                 "ech-tls-tunnel does not support UDP relay".into(),
             ));
@@ -486,7 +588,7 @@ impl ProxyAdapter for ShadowsocksAdapter {
         // `udp_external_addr` returns a literal `SocketAddr` for the standard
         // path and the SIP003 plugin's local listener for external plugins
         // (where the connect is loopback — protect is harmless).
-        let candidates = match self.server_config.udp_external_addr() {
+        let candidates = match self.core.server_config.udp_external_addr() {
             ServerAddr::SocketAddr(sa) => vec![*sa],
             ServerAddr::DomainName(host, port) => meow_common::resolve_host_all(host, *port)
                 .await
@@ -529,8 +631,8 @@ impl ProxyAdapter for ShadowsocksAdapter {
         };
         let socket = ProxySocket::<TokioUdpDatagram>::from_socket(
             UdpSocketType::Client,
-            Arc::clone(&self.context),
-            &self.server_config,
+            Arc::clone(&self.core.context),
+            &self.core.server_config,
             TokioUdpDatagram(udp),
         );
         debug!("SS UDP connected via {}", remote);

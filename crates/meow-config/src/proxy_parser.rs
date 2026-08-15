@@ -129,7 +129,8 @@ pub fn parse_proxy(
             let plugin = config.get("plugin").and_then(|v| v.as_str());
             let plugin_opts_str = config.get("plugin-opts").and_then(serialize_plugin_opts);
 
-            let adapter = ShadowsocksAdapter::new(
+            #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
+            let mut adapter = ShadowsocksAdapter::new(
                 name,
                 server,
                 port,
@@ -140,6 +141,21 @@ pub fn parse_proxy(
                 plugin_opts_str.as_deref(),
             )
             .map_err(|e| format!("ss: {e}"))?;
+            #[cfg(feature = "mux")]
+            if let Some(mux_options) = parse_mux_options(name, config)? {
+                // muxcool rides VLESS CommandMux; shadowsocks has no
+                // equivalent signaling — reject loudly instead of speaking
+                // garbage frames to the server.
+                if mux_options.protocol == meow_proxy::mux::Protocol::MuxCool {
+                    return Err(format!(
+                        "{name}: mux protocol 'muxcool' is VLESS-only; \
+                         use smux/yamux/h2mux for shadowsocks nodes"
+                    ));
+                }
+                adapter = adapter.with_mux(mux_options);
+            }
+            #[cfg(not(feature = "mux"))]
+            parse_mux_options(name, config);
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "trojan")]
@@ -1425,7 +1441,7 @@ fn parse_vless(
     Ok(adapter)
 }
 
-/// Parse the optional `mux:` block shared by VLESS/Trojan.
+/// Parse the optional `mux:` block shared by VLESS/Trojan/Shadowsocks/VMess.
 ///
 /// Two wire protocols are available, picked by `protocol`:
 ///
@@ -1433,12 +1449,20 @@ fn parse_vless(
 ///   targets the reserved mux destination and streams carry a sing-encoded
 ///   Socksaddr prefix.  Server must be sing-box / mihomo based.
 /// * muxcool — Xray's Mux.Cool (VLESS CommandMux, frame mux).  Server must
-///   be Xray / sing-box based; VLESS-only (Trojan ignores it).
+///   be Xray / sing-box based; VLESS-only (Trojan/Shadowsocks/VMess reject it).
 ///
 /// Returns `None` when the block is absent or disabled; `Err` for
 /// malformed values.  Only compiled when one of its call sites
-/// (trojan / vless parsing) exists.
-#[cfg(all(feature = "mux", any(feature = "trojan", feature = "vless")))]
+/// (trojan / vless / ss / vmess parsing) exists.
+#[cfg(all(
+    feature = "mux",
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
 fn parse_mux_options(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
@@ -1513,8 +1537,17 @@ fn parse_mux_options(
 
 /// No-mux builds: warn loudly instead of silently ignoring an enabled
 /// `mux:` block (operators would otherwise think the node is multiplexed).
-/// Only compiled when one of its call sites (trojan / vless parsing) exists.
-#[cfg(all(not(feature = "mux"), any(feature = "trojan", feature = "vless")))]
+/// Only compiled when one of its call sites (trojan / vless / ss / vmess
+/// parsing) exists.
+#[cfg(all(
+    not(feature = "mux"),
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
 fn parse_mux_options(name: &str, config: &HashMap<String, serde_yaml::Value>) {
     if let Some(mux_cfg) = config.get("mux") {
         let enabled = mux_cfg
@@ -1807,20 +1840,6 @@ fn parse_vmess(
         .unwrap_or("tcp");
     let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
 
-    // Warn: mux enabled
-    if let Some(mux) = config.get("mux") {
-        if mux
-            .get("enabled")
-            .and_then(serde_yaml::Value::as_bool)
-            .unwrap_or(false)
-        {
-            tracing::warn!(
-                proxy = %name,
-                "vmess: mux is not implemented; the option is ignored"
-            );
-        }
-    }
-
     // Build transport chain (same pattern as VLESS)
     let mut chain = TransportChain::empty();
 
@@ -1881,9 +1900,26 @@ fn parse_vmess(
         }
     }
 
-    Ok(meow_proxy::VmessAdapter::new(
-        name, server, port, uuid_bytes, security, udp, chain,
-    ))
+    #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
+    let mut adapter =
+        meow_proxy::VmessAdapter::new(name, server, port, uuid_bytes, security, udp, chain);
+    #[cfg(feature = "mux")]
+    if let Some(mux_options) = parse_mux_options(name, config)? {
+        // muxcool rides VLESS CommandMux; vmess has no equivalent
+        // signaling — reject loudly instead of speaking garbage frames to
+        // the server.
+        if mux_options.protocol == meow_proxy::mux::Protocol::MuxCool {
+            return Err(format!(
+                "{name}: mux protocol 'muxcool' is VLESS-only; \
+                 use smux/yamux/h2mux for vmess nodes"
+            ));
+        }
+        adapter = adapter.with_mux(mux_options);
+    }
+    #[cfg(not(feature = "mux"))]
+    parse_mux_options(name, config);
+
+    Ok(adapter)
 }
 
 pub fn parse_proxy_group(

@@ -838,6 +838,119 @@ proxies:
     );
 }
 
+/// D16h: sing-mux on Shadowsocks → accepted (default h2mux).
+#[cfg(all(feature = "mux", feature = "ss"))]
+#[tokio::test]
+async fn parse_ss_mux_singmux_accepted() {
+    let yaml = r#"
+proxies:
+  - name: s
+    type: ss
+    server: example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: pw
+    mux:
+      enabled: true
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    let config = result.expect("ss mux must load");
+    assert!(config.proxies.contains_key("s"), "ss proxy must be kept");
+    let mux_warns = lines
+        .iter()
+        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
+        .count();
+    assert_eq!(mux_warns, 0, "ss sing-mux is implemented: no warn expected");
+}
+
+/// D16i: `protocol: muxcool` on Shadowsocks → rejected (VLESS-only).
+#[cfg(all(feature = "mux", feature = "ss"))]
+#[tokio::test]
+async fn parse_ss_mux_muxcool_rejected() {
+    let yaml = r#"
+proxies:
+  - name: s
+    type: ss
+    server: example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: pw
+    mux:
+      enabled: true
+      protocol: muxcool
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    let config = result.expect("invalid proxy must not fail the whole config");
+    assert!(
+        !config.proxies.contains_key("s"),
+        "ss node with muxcool must be skipped"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("muxcool") && l.contains("VLESS")),
+        "expected a VLESS-only warn; {lines:?}"
+    );
+}
+
+/// D16j: sing-mux on VMess → accepted (default h2mux).
+#[cfg(all(feature = "mux", feature = "vmess"))]
+#[tokio::test]
+async fn parse_vmess_mux_singmux_accepted() {
+    let yaml = r#"
+proxies:
+  - name: m
+    type: vmess
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    cipher: auto
+    mux:
+      enabled: true
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    let config = result.expect("vmess mux must load");
+    assert!(config.proxies.contains_key("m"), "vmess proxy must be kept");
+    let mux_warns = lines
+        .iter()
+        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
+        .count();
+    assert_eq!(
+        mux_warns, 0,
+        "vmess sing-mux is implemented: no warn expected"
+    );
+}
+
+/// D16k: `protocol: muxcool` on VMess → rejected (VLESS-only).
+#[cfg(all(feature = "mux", feature = "vmess"))]
+#[tokio::test]
+async fn parse_vmess_mux_muxcool_rejected() {
+    let yaml = r#"
+proxies:
+  - name: m
+    type: vmess
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    cipher: auto
+    mux:
+      enabled: true
+      protocol: muxcool
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    let config = result.expect("invalid proxy must not fail the whole config");
+    assert!(
+        !config.proxies.contains_key("m"),
+        "vmess node with muxcool must be skipped"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("muxcool") && l.contains("VLESS")),
+        "expected a VLESS-only warn; {lines:?}"
+    );
+}
+
 /// No-mux builds: an enabled `mux:` block must warn loudly instead of
 /// being silently ignored.
 #[cfg(not(feature = "mux"))]

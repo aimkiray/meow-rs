@@ -1,8 +1,9 @@
 # proxy-mux: Connection Multiplexing (sing-mux + Xray Mux.Cool)
 
 Status: sing-mux (smux / yamux / h2mux) and **Xray Mux.Cool**
-(`protocol: muxcool`, VLESS-only) are fully implemented, unit-tested. Interop
-matrix:
+(`protocol: muxcool`, VLESS-only) are fully implemented, unit-tested.
+sing-mux applies to VLESS / Trojan / Shadowsocks / VMess outbounds;
+muxcool applies to VLESS only. Interop matrix:
 
 - sing-mux ↔ sing-box v1.13.18 (VLESS plaintext / Trojan+TLS / Reality /
   Reality+Vision inbounds with multiplex enabled) works both ways;
@@ -22,25 +23,28 @@ sagernet/sing-mux, sagernet/smux (smux frame format), metacubex/sing v0.5.7
 
 Real multiplexing the mihomo way: provide
 `mux: {enabled, protocol, max-connections, min-streams, max-streams, padding, statistic, only-tcp}`
-(aligned with SingMuxOption) on VLESS/Trojan outbounds, multiplexing many
-logical streams over **one physical node connection** and eliminating the
-per-stream node TCP+TLS+protocol handshake cost (measured 500-700ms per new
-connection @140ms RTT).
+(aligned with SingMuxOption) on VLESS / Trojan / Shadowsocks / VMess
+outbounds, multiplexing many logical streams over **one physical node
+connection** and eliminating the per-stream node TCP+TLS+protocol handshake
+cost (measured 500-700ms per new connection @140ms RTT).
 
 ## Wire Protocols (confirmed field-by-field from the sources)
 
-### 1. Physical connection setup (VLESS)
+### 1. Physical connection setup (VLESS / Trojan / SS / VMess)
 
-1. Client TCP+TLS to the node, sends the VLESS request header with
-   **destination = the reserved mux FQDN** `sp.mux.sing-box.arpa:444`
-   (command = CommandTCP). The request header format is unchanged.
+1. Client TCP(+TLS) to the node and performs the protocol handshake with
+   **destination = the reserved mux FQDN** `sp.mux.sing-box.arpa:444`:
+   VLESS and VMess carry the address in their request header; Trojan does
+   not but writes the reserved FQDN anyway for parity; SS carries no wire
+   address at all (the destination is irrelevant to the cipher stream —
+   the server detects multiplexing by sniffing the mux request header).
 2. The mux request header (see §2) is written **immediately after** the
-   request header, in the same write batch.
-3. The server recognizes the FQDN → switches into the mux service; the
-   2-byte VLESS response header (`[version, addons_len]`) is **lazily
-   prefixed to the first downstream write** by the server, so the client
-   strips it on its first read (meow-rs's `VlessConn` already has lazy
-   `response_pending` consumption, which fits naturally).
+   handshake, in the same write batch.
+3. The server recognizes the mux request header → switches into the mux
+   service; the VLESS 2-byte response header (`[version, addons_len]`) is
+   **lazily prefixed to the first downstream write** by the server, so the
+   client strips it on its first read (meow-rs's `VlessConn` already has
+   lazy `response_pending` consumption, which fits naturally).
 
 ### 2. Mux request header (protocol negotiation)
 
@@ -218,11 +222,14 @@ crates/meow-proxy/src/mux/
                 modeled after anytls AnytlsConn)
 ```
 
-- Integration points: `vless_adapter::dial_tcp` and `trojan::dial_tcp` —
+- Integration points: `vless_adapter::dial_tcp`, `trojan::dial_tcp`,
+  `shadowsocks_adapter::dial_tcp` and `vmess::VmessAdapter::dial_tcp` —
   when mux is enabled they call `mux_client.open_stream(dest)` instead of
-  dialing a fresh connection; the `mux_dialer` connection factory reuses
-  the existing `dial_stream`/`open_tls_with_header` with the destination
-  replaced by `sp.mux.sing-box.arpa:444`.
+  dialing a fresh connection; each adapter's `with_mux` builds a
+  `DialFn` that performs the plain protocol handshake targeting
+  `sp.mux.sing-box.arpa:444` (SS shares its dial state with the mux
+  session through an `Arc`-wrapped core so SIP003 plugin handles stay
+  alive).
 - Config parsing: the full mux block is parsed, default protocol=h2mux
   matching mihomo; smux/yamux/h2mux all implemented; unknown protocols
   reject the node with meow's warn+skip semantics (mihomo hard-errors on
@@ -235,10 +242,11 @@ crates/meow-proxy/src/mux/
 
 ## Interop Boundaries (important)
 
-- `protocol: smux|yamux|h2mux` (default h2mux): the server must be
-  sing-box / mihomo based (recognizes `sp.mux.sing-box.arpa` and the
-  sing-mux frames). **Xray servers are incompatible** — Xray only speaks
-  Mux.Cool; use `protocol: muxcool` there.
+- `protocol: smux|yamux|h2mux` (default h2mux): applies to VLESS /
+  Trojan / Shadowsocks / VMess. The server must be sing-box / mihomo
+  based with `multiplex` enabled on the matching inbound (a plain
+  ss-server does not speak sing-mux). **Xray servers are incompatible** —
+  Xray only speaks Mux.Cool; use `protocol: muxcool` (VLESS) there.
 - `protocol: muxcool` (VLESS-only): the server is Xray-core, or a
   sing-box / mihomo VLESS inbound (whose sing-vmess server handles
   CommandMux natively, no inbound config needed). Do not use on Trojan
@@ -255,12 +263,12 @@ crates/meow-proxy/src/mux/
    offer/offerNew/min-max bounds and concurrency caps (mock dialer);
    yamux/h2mux concurrent open + echo.
 2. Integration (done; scripts under target/e2e/mux-interop/):
-   - sing-mux: local sing-box v1.13.18 VLESS (plaintext) / Trojan (TLS)
-     inbounds with multiplex enabled — meow curls the local websrv through
-     all of h2mux/smux/yamux with 200; 6 concurrent curls share one
-     physical connection (sb.log shows a single inbound connection).
-     live_singbox_vless_probe (#[ignore]) is kept as a repeatable interop
-     regression.
+   - sing-mux: local sing-box v1.13.18 VLESS (plaintext) / Trojan (TLS) /
+     Shadowsocks / VMess inbounds with multiplex enabled — meow curls the
+     local websrv through h2mux/smux/yamux with 200, gstatic 204 (h2 +
+     http/1.1) and UDP echo round trips; 6 concurrent curls share one
+     physical connection. live_singbox_vless_probe (#[ignore]) is kept as
+     a repeatable interop regression.
    - muxcool: the same sing-box inbounds (CommandMux needs no inbound
      config) — plaintext VLESS (TCP 204/200 + UDP echo), Reality (204),
      Reality+Vision (204 + UDP echo; configs meow-muxcool.yml /
