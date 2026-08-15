@@ -202,10 +202,10 @@ proxies:
 | `flow: xtls-rprx-direct` / `xtls-rprx-splice` | Accepted (deprecated upstream) | Hard parse error — use `xtls-rprx-vision` instead. |
 | `encryption: mlkem768x25519plus…` (post-quantum Encryption) | Accepted | Supported with the `vless-encryption` feature (in `full`); otherwise a hard parse error naming the feature. |
 | `encryption:` any other non-`""`/`"none"` value | Accepted | Hard parse error — VLESS defines no other body cipher. |
-| `mux: {enabled: true}` | Multiplexes | Implemented as sing-mux (smux/yamux/h2mux; default h2mux). Server must be sing-box/mihomo — Xray Mux.Cool not implemented. |
+| `mux: {enabled: true}` | Multiplexes | Implemented as sing-mux (smux/yamux/h2mux; default h2mux) for sing-box/mihomo servers, plus Xray Mux.Cool (`protocol: muxcool`, VLESS-only) for Xray servers. |
 | `tls: false` with no outer encryption | Accepted silently | Warn-once at load — traffic is plaintext. |
 
-**Deferred:** VLESS inbound and Mux.Cool.
+**Deferred:** VLESS inbound.
 
 ### HTTP CONNECT outbound
 

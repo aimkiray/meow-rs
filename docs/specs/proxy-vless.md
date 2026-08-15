@@ -64,9 +64,9 @@ Out of scope:
   clients only.
 - **mux** (`mux: { enabled: true }`) — implemented as sing-mux compatible
   multiplexing (default h2mux, matching mihomo; smux and yamux also
-  supported; unknown protocols are rejected with warn+skip). Server must
-  be sing-box / mihomo based — Xray-only servers speak Mux.Cool, which is
-  NOT this protocol. See `docs/specs/proxy-mux.md`.
+  supported; unknown protocols are rejected with warn+skip) for
+  sing-box / mihomo servers, plus Xray Mux.Cool (`protocol: muxcool`,
+  VLESS-only) for Xray servers. See `docs/specs/proxy-mux.md`.
 - **`encryption` field enforcement.** Upstream VLESS always sets
   `encryption: none`; the field is present for forward compat. Accept
   any value that is `""` or `"none"` silently; hard-error on anything

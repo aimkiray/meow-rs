@@ -1,209 +1,274 @@
-# proxy-mux: 连接多路复用（sing-mux + Xray Mux.Cool）
+# proxy-mux: Connection Multiplexing (sing-mux + Xray Mux.Cool)
 
-状态：sing-mux（smux / yamux / h2mux）与 **Xray Mux.Cool**（`protocol: muxcool`，
-VLESS-only）全部实现，单测通过。互操作矩阵：
-- sing-mux ↔ sing-box v1.13.18（VLESS 明文 / Trojan+TLS / Reality /
-  Reality+Vision inbound 开 multiplex）双向打通；
-- muxcool ↔ 本地 sing-box（明文 / Reality / Reality+Vision，TCP+UDP）打通；
-- muxcool ↔ **真实 Xray 节点**（example-xray-node，VLESS Reality+Vision）
-  打通——同一节点 sing-mux 无法互通（Xray 只认 Mux.Cool）。
-（follow-up，源自 gap-analysis 的 mux 缺口）
-参考实现：mihomo Alpha（adapter/outbound/singmux.go、listener/sing/sing.go）、
-metacubex/sing-mux、sagernet/sing-mux、sagernet/smux（smux 帧格式）、
-metacubex/sing v0.5.7（地址编解码）；Mux.Cool 参照 xray-core common/mux
-（frame.go / writer.go / session.go）与 sing-vmess mux.go。
+Status: sing-mux (smux / yamux / h2mux) and **Xray Mux.Cool**
+(`protocol: muxcool`, VLESS-only) are fully implemented, unit-tested. Interop
+matrix:
 
-## 目标
+- sing-mux ↔ sing-box v1.13.18 (VLESS plaintext / Trojan+TLS / Reality /
+  Reality+Vision inbounds with multiplex enabled) works both ways;
+- muxcool ↔ local sing-box (plaintext / Reality / Reality+Vision, TCP+UDP)
+  works;
+- muxcool ↔ **real Xray node** (example-xray-node, VLESS Reality+Vision)
+  works — on the same node sing-mux does not interoperate (Xray only speaks
+  Mux.Cool).
+  (follow-up, closing the mux gap from the gap analysis)
+Reference implementations: mihomo Alpha
+(adapter/outbound/singmux.go, listener/sing/sing.go), metacubex/sing-mux,
+sagernet/sing-mux, sagernet/smux (smux frame format), metacubex/sing v0.5.7
+(address codec); Mux.Cool follows xray-core common/mux
+(frame.go / writer.go / session.go) and sing-vmess mux.go.
 
-按 mihomo 的方式实现真 mux：对 VLESS/Trojan 出站提供
+## Goal
+
+Real multiplexing the mihomo way: provide
 `mux: {enabled, protocol, max-connections, min-streams, max-streams, padding, statistic, only-tcp}`
-（对齐 SingMuxOption），在**单条节点连接**上多路复用多条逻辑流，消除每个新隧道流
-都要付一遍节点 TCP+TLS+协议握手的开销（当前实测 500-700ms/新连接 @140ms RTT）。
+(aligned with SingMuxOption) on VLESS/Trojan outbounds, multiplexing many
+logical streams over **one physical node connection** and eliminating the
+per-stream node TCP+TLS+protocol handshake cost (measured 500-700ms per new
+connection @140ms RTT).
 
-## 线上协议（已从源码逐字段确认）
+## Wire Protocols (confirmed field-by-field from the sources)
 
-### 1. 物理连接建立（VLESS）
-1. 客户端 TCP+TLS 到节点，发送 VLESS 请求头，**目标地址 = 保留 mux 域名**
-   `sp.mux.sing-box.arpa:444`（FQDN，命令 = CommandTCP）。普通请求头格式不变。
-2. 紧跟请求头之后**立即**写 mux 请求头（见 §2，与首请求同一批写）。
-3. 服务器识别 FQDN → 切入 mux 服务；VLESS 的 2 字节响应头
-   （`[version, addons_len]`）由服务器**惰性附加在第一次下行写的头部**，
-   客户端首次读时先剥掉（meow-rs 的 `VlessConn` 已有 `response_pending`
-   惰性消费逻辑，天然兼容）。
+### 1. Physical connection setup (VLESS)
 
-### 2. Mux 请求头（协议版本协商）
-| 字段 | 长度 | 说明 |
+1. Client TCP+TLS to the node, sends the VLESS request header with
+   **destination = the reserved mux FQDN** `sp.mux.sing-box.arpa:444`
+   (command = CommandTCP). The request header format is unchanged.
+2. The mux request header (see §2) is written **immediately after** the
+   request header, in the same write batch.
+3. The server recognizes the FQDN → switches into the mux service; the
+   2-byte VLESS response header (`[version, addons_len]`) is **lazily
+   prefixed to the first downstream write** by the server, so the client
+   strips it on its first read (meow-rs's `VlessConn` already has lazy
+   `response_pending` consumption, which fits naturally).
+
+### 2. Mux request header (protocol negotiation)
+
+| Field | Length | Meaning |
 |---|---|---|
-| version | u8 | 0 或 1 |
-| protocol | u8 | 0=smux, 1=yamux, 2=h2mux（mihomo 默认 h2mux） |
-| padding | u8 | 仅 version==1 存在；1=启用 |
-| padding_len | u16 BE | 仅 padding=1；值 = 256 + rand(512) |
-| padding bytes | n | 随机填充 |
+| version | u8 | 0 or 1 |
+| protocol | u8 | 0=smux, 1=yamux, 2=h2mux (mihomo default h2mux) |
+| padding | u8 | present only when version==1; 1=enabled |
+| padding_len | u16 BE | only when padding=1; value = 256 + rand(512) |
+| padding bytes | n | random padding |
 
-### 3. 会话（每物理连接一个，按 protocol 选择实现）
-- **smux**：注意——sing-mux 用的是 **sagernet/smux fork**，帧格式与上游
-  xtaci 不同：[ver=1][cmd][len u16 LE][stream_id u32 LE][data]（8 字节头、
-  小端）。cmd: SYN=0, FIN=1, PSH=2, NOP=3（UPD=4 仅 v2 存在）。v1 **没有
-  窗口更新流控**——写侧直接按 MaxFrameSize=32768 分帧发送（u16 长度上限）。
-  配置 = smux.DefaultConfig() + KeepAliveDisabled=true（Version=1、
-  MaxFrameSize=32768、MaxStreamBuffer=64KiB、MaxReceiveBuffer=4MiB）。
-- **yamux**：hashicorp yamux（libp2p rust-yamux 与其线上互通）；
-  StreamClose/OpenTimeout = 5s。
-- **h2mux**（mihomo 默认）：HTTP/2 之上 sing 自定义（sing-mux/h2mux.go）。
-  每条流 = 一个 CONNECT 请求到 https://localhost（无 :scheme/:path），
-  请求体 DATA 帧 = 客户端→服务端，响应体 DATA 帧 = 服务端→客户端。
-  **服务端惰性 flush 200**：只有首次响应体写入时才把 200 HEADERS 刷上线，
-  所以客户端**不能阻塞等 200**——sing-mux 用 lateHTTPConn（写侧立即可用，
-  读侧等 setup）——meow-rs 同样在首读时惰性解析响应，5s（TCPTimeout）超时。
-  流结束时 sing-box 发 RST_STREAM(NO_ERROR)，按干净 EOF 处理（Go 客户端
-  同样映射为 io.EOF）。空闲超时 30s（h2mux.go idleTimeout）。
+### 3. Sessions (one per physical connection, chosen by protocol)
 
-### 4. 流内寻址（StreamRequest / StreamResponse）
-客户端打开每条流后，第一条写是**流请求**（protocol.go EncodeStreamRequest）：
-[flags u16 BE][type u8][addr][port u16 BE]，flags=0 表示 TCP
-（flagUDP=1 用于 UDP 流）。Socksaddr type：0x01=IPv4(4B)、0x03=FQDN(len u8
-+ bytes)、0x04=IPv6(16B)。服务器读地址 → 按流建立到真实目标的连接。
+- **smux**: note — sing-mux uses the **sagernet/smux fork**, whose frame
+  format differs from upstream xtaci:
+  [ver=1][cmd][len u16 LE][stream_id u32 LE][data] (8-byte header,
+  little-endian). cmd: SYN=0, FIN=1, PSH=2, NOP=3 (UPD=4 only in v2). v1
+  has **no window-update flow control** — the write side splits into
+  MaxFrameSize=32768 frames (u16 length cap). Config =
+  smux.DefaultConfig() + KeepAliveDisabled=true (Version=1,
+  MaxFrameSize=32768, MaxStreamBuffer=64KiB, MaxReceiveBuffer=4MiB).
+- **yamux**: hashicorp yamux (interoperates with libp2p rust-yamux);
+  StreamClose/OpenTimeout = 5s.
+- **h2mux** (mihomo default): sing's custom layer over HTTP/2
+  (sing-mux/h2mux.go). Each stream = one CONNECT request to
+  https://localhost (no :scheme/:path); request-body DATA frames =
+  client→server, response-body DATA frames = server→client. The **server
+  flushes the 200 lazily**: the 200 HEADERS go on the wire only with the
+  first response-body write, so the client **must not block waiting for
+  the 200** — sing-mux uses lateHTTPConn (write side usable immediately,
+  read side waits for setup) — meow-rs likewise parses the response lazily
+  on the first read with a 5s (TCPTimeout) cap. On stream close sing-box
+  sends RST_STREAM(NO_ERROR), treated as a clean EOF (the Go client maps
+  it to io.EOF the same way). Idle timeout 30s (h2mux.go idleTimeout).
 
-**每条流的第一条下行写带状态字节**（serverConn.Write）：[status u8]，
-0=success；1=error 后跟 varbin 长度前缀的错误消息。客户端首读时先剥掉
-状态字节（sing-mux clientConn.readResponse）；meow-rs 在 MuxStream 层统一
-处理（三种协议一致）。
+### 4. Per-stream addressing (StreamRequest / StreamResponse)
 
-**UDP 流**：flags 置 flagUDP(1) 的流是 UDP 流，绑定流请求中的目标地址；
-之后双向都是 [len u16 BE][data] 数据报帧（与 meow VLESS UDP-over-TCP
-同款帧），无逐包地址。服务端以 serverPacketConn 处理。meow-rs 的
-`MuxPacketConn` 实现该封装；`only-tcp: true` 时 UDP 走原明文路径。
-`statistic`/`brutal-opts` 字段暂不支持（解析时各打一条 warn 忽略，
-brutal 上游仅 Linux）。
+After opening a stream, the client's first write is the **stream request**
+(protocol.go EncodeStreamRequest):
+[flags u16 BE][type u8][addr][port u16 BE], flags=0 for TCP (flagUDP=1 for
+UDP streams). Socksaddr types: 0x01=IPv4(4B), 0x03=FQDN(len u8 + bytes),
+0x04=IPv6(16B). The server reads the address and dials the real target for
+that stream.
 
-### 5. 客户端会话管理（对齐 sing-mux client.go）
-- `openStream`：从现存会话中选 `CanTakeNewRequest && NumStreams 最小` 的会话开流；
-  无可用会话 → `offerNew`（新物理连接 + 握手 + 会话）。
-- 约束：maxConnections>0 时按连接数/每连接 minStreams 决定；否则按全局 maxStreams。
-- 连接失败/会话关闭 → 最多重试 2 次；空闲会话按 idle 超时关闭（默认 60s，
-  sing-mux Service 的 IdleTimeout）。
-- padding 模式下 version=1；TCPTimeout=5s 限制建连。
+**Every stream's first downstream write carries a status byte**
+(serverConn.Write): [status u8], 0=success; 1=error followed by a varbin
+length-prefixed error message. The client strips the status byte on its
+first read (sing-mux clientConn.readResponse); meow-rs handles it uniformly
+in the MuxStream layer for all three protocols.
 
-### 6. Xray Mux.Cool（`protocol: muxcool`，VLESS-only）
+**UDP streams**: a stream whose flags set flagUDP(1) is a UDP stream, bound
+to the destination in the stream request; afterwards both directions are
+[len u16 BE][data] datagram frames (the same framing as meow's VLESS
+UDP-over-TCP), with no per-packet addresses. The server handles them via
+serverPacketConn. meow-rs's `MuxPacketConn` implements this framing;
+`only-tcp: true` routes UDP over the plain non-mux path instead. The
+`statistic`/`brutal-opts` fields are not supported yet (each gets a warn
+on parse; brutal is Linux-only upstream).
 
-Mux.Cool 是 Xray 的帧多路复用协议（与 v2ray-plugin 的 mux 同源），与
-sing-mux 完全无关：**没有** mux 请求头，会话信令就是 VLESS 请求头本身。
+### 5. Client session management (aligned with sing-mux client.go)
 
-**信令**：会话连接的 VLESS 请求头 command = 0x03（CommandMux），**不写**
-端口/地址（xray encoding.go::EncodeRequestHeader 对 CommandMux 跳过地址；
-sing-vmess vless/protocol.go::ReadRequest 同样跳过解析）。VLESS 2 字节响应头
-`[version, addons_len]` 依旧惰性消费（VlessConn 逻辑不变）。Vision 下请求头
-随首个 mux 帧一起进首条 Vision 记录（VlessConn::new_mux_deferred，与 sing-mux
-路径同理）。
+- `openStream`: pick the session with the fewest streams among
+  `CanTakeNewRequest` sessions; if none, `offerNew` (fresh physical
+  connection + handshake + session).
+- Bounds: when maxConnections>0, decide by connection count / per-connection
+  minStreams; otherwise by global maxStreams.
+- Connection failure / closed session → retry at most 2 times; idle sessions
+  are closed after an idle timeout (default 60s, sing-mux Service
+  IdleTimeout).
+- padding mode uses version=1; TCPTimeout=5s caps connection setup.
 
-**帧格式**（xray common/mux/frame.go，全大端）：
+### 6. Xray Mux.Cool (`protocol: muxcool`, VLESS-only)
+
+Mux.Cool is Xray's frame multiplexing protocol (same lineage as
+v2ray-plugin's mux) and is **completely unrelated** to sing-mux: there is
+**no** mux request header — the session signaling is the VLESS request
+header itself.
+
+**Signaling**: the session connection's VLESS request header carries
+command = 0x03 (CommandMux) and **omits** the port/address (xray
+encoding.go::EncodeRequestHeader skips the address for CommandMux;
+sing-vmess vless/protocol.go::ReadRequest likewise skips parsing). The
+2-byte VLESS response header `[version, addons_len]` is still consumed
+lazily (VlessConn logic unchanged). Under Vision the request header rides
+inside the first Vision record together with the first mux frame
+(VlessConn::new_mux_deferred, same as the sing-mux path).
+
+**Frame format** (xray common/mux/frame.go, all big-endian):
 
 ```text
-meta_len   u16 BE    meta 块长度
+meta_len   u16 BE    length of the meta block
 meta:
-  session_id u16 BE  流 id——客户端分配（从 1 递增），服务端原样回显
+  session_id u16 BE  stream id — client-allocated (incrementing from 1),
+                      echoed back by the server
   status     u8      1=New 2=Keep 3=End 4=KeepAlive
   option     u8      bit1=Data, bit2=Error
-  （New 帧，或携带 UDP 目标的 Keep 帧：）
+  (New frames, and Keep frames carrying a UDP destination:)
     network u8       1=TCP 2=UDP
     port    u16 BE
     atype   u8       0x01 IPv4 | 0x02 domain | 0x03 IPv6
-    address ...      VMess 地址布局（端口在前）
-payload_len u16 BE   仅 option&Data 时存在
-payload             payload_len 字节
+    address ...      VMess address layout (port first)
+payload_len u16 BE   present only when option&Data
+payload             payload_len bytes
 ```
 
-End 帧无 payload_len；KeepAlive 帧用 sid=0（无绑定流）。服务端**永不主动开流**
-（响应帧沿用客户端的 sid），New 帧的可选尾部 meta（xray 的 fullcone 来源信息、
-UDP GlobalID）我们不发送，两端服务端都会丢弃多余 meta 字节。
+End frames carry no payload_len; KeepAlive frames use sid=0 (unbound). The
+server **never opens streams** (responses echo the client's sid). Optional
+trailing meta bytes on New frames (xray's fullcone source info, UDP
+GlobalID) are not sent by us, and both server implementations discard
+unknown trailing meta bytes.
 
-**流语义**：
-- TCP 流：New 帧（meta-only）开流 → Keep+Data 帧双向传数据（每帧 ≤ 8KiB，
-  对齐 xray writer.go 的分块）→ End 帧（shutdown 或 drop 时发送，EndGuard
-  保证恰好一次）。服务端 End → 干净 EOF；带 Error option → 错误。
-- UDP 流：New 帧 network=UDP 开流；双向 Keep 帧 meta 携带**逐包目标地址**
-  （与 sing-vmess serverMuxPacketConn 对齐），读侧解析回源地址，无地址的
-  帧回退到流的绑定目标。
-- 会话：**单驱动任务**独占连接、同任务轮询读写两个方向（与 h2mux 的 h2 驱动
-  同一纪律）——出站帧经有界通道（PollSender 轮询式背压）交给驱动写，入站帧由
-  驱动状态机读入并解复用（每流 32 深度有界通道）。**入站投递永不阻塞驱动**：
-  队列满时该帧停靠（parked，至多一帧）并暂停连接读取（会话级流控，TCP 窗口
-  语义），消费者每排空一个槽位经 space Notify 唤醒驱动重试（notify_one 的
-  permit 语义保证先注册后通知的窗口也不丢唤醒；循环顶无条件重试兜底）。阻塞
-  投递会死锁"先写后读"的消费者（其写等出站容量、驱动等入站容量）——修复后有
-  专项回归测试（1MiB 全双工回环，旧实现 100% 死锁）。End 帧在投递前先移出
-  map（停靠也不留 stale sender）；sid 耗尽后不回绕（回绕会与活流帧碰撞）。
-  30s KeepAlive（sid=0）保活。
-  **关键教训（已定位到精确机制）**：早期实现的流写路径用 stored-future——
-  poll_write 在写 future 在途时返回 Pending，future 完成后又下落重新打包**当前
-  缓冲**（relay 的 HalfCopy 在 Pending 时 pos 不前进、重轮询传入同一缓冲区）→
-  同一数据块被写两次 → 流内字节重复 → 端到端 TLS 记录错位（schannel 大量
-  校验失败，协议层零报错、HTTP 小响应却完好——极隐蔽）。明文回环写极少
-  Pending 故不触发；TLS 大突发写常 Pending，单会话 12 流锁争用最烈（100% 复现）。
-  修复：流写改为向会话驱动任务入队（PollSender 轮询式背压，无 stored-future，
-  结构上不可能重复）；另将 VlessConn 惰性响应头消费改为持久状态（同类取消安全
-  隐患）。12 并发压测修复后 0 失败（本地 780/780、真实 Xray 612/612）。
+**Stream semantics**:
 
-**服务端兼容性**：Xray-core VLESS inbound（原生）；sing-box / mihomo 的
-VLESS inbound（sing-vmess HandleMuxConnection，帧格式同源）。VMess 不支持
-（Xray VMess 用 `v1.mux.cool` 魔法域名信令，与 sing-vmess 的 CommandMux
-信令不同）。
+- TCP streams: New frame (meta-only) opens the stream → Keep+Data frames
+  carry data in both directions (≤ 8KiB per frame, matching xray writer.go
+  chunking) → End frame (sent on shutdown or drop; EndGuard guarantees
+  exactly-once). Server End → clean EOF; with the Error option → error.
+- UDP streams: New frame with network=UDP opens the stream; Keep frames in
+  both directions carry a **per-datagram destination** in the meta
+  (aligned with sing-vmess serverMuxPacketConn); the read side parses the
+  source address back out, and frames without an address fall back to the
+  stream's bound destination.
+- Session: a **single driver task** owns the connection and polls both
+  directions from that one task (the same discipline as h2mux's h2 driver)
+  — outbound frames go to the driver over a bounded channel (PollSender
+  poll-based backpressure), inbound frames are read and demuxed by the
+  driver's state machine (bounded 32-deep per-stream channel). **Inbound
+  delivery never blocks the driver**: a frame hitting a full queue parks
+  (at most one) and pauses the connection read (session-wide flow control,
+  TCP window semantics); consumers wake the driver via the space Notify
+  whenever they drain a slot (notify_one's permit semantics cover the
+  arm-before-check window; an unconditional loop-top retry is the
+  fallback). Blocking delivery would deadlock a write-then-read consumer
+  (its writes wait on outbound capacity while the driver waits on inbound
+  capacity) — a dedicated regression test covers this (1MiB full-duplex
+  loop, the old design deadlocks 100%). End frames remove the stream entry
+  before the terminal event parks (no stale senders); session ids never
+  wrap around (a recycled id would collide with a live stream's frames).
+  30s KeepAlive (sid=0).
+  **Key lesson (root-caused to the exact mechanism)**: an earlier stream
+  write path used a stored future — poll_write returned Pending while a
+  write future was in flight, and on completion the future fell through and
+  re-framed the **current buffer** (the relay's HalfCopy does not advance
+  pos on Pending and re-polls with the same buffer) → the same chunk was
+  written twice → duplicated bytes inside the stream → end-to-end TLS record
+  desync (bursts of schannel failures with zero protocol-layer errors and
+  intact small HTTP responses — extremely stealthy). Plaintext loopback
+  writes rarely hit Pending so it never triggered; TLS burst writes often
+  did, worst under 12-stream lock contention on one session (100% repro).
+  Fix: stream writes enqueue frames to the session driver task (PollSender
+  poll-based backpressure, no stored future — duplication is structurally
+  impossible); additionally the VlessConn lazy response-header consumption
+  became persistent state (same class of cancel-safety hazard). 12-way
+  concurrent stress after the fix: 0 failures (local 780/780, real Xray
+  612/612).
 
-## meow-rs 架构映射
+**Server compatibility**: Xray-core VLESS inbound (native); sing-box /
+mihomo VLESS inbound (sing-vmess HandleMuxConnection, same frame lineage).
+VMess is not supported (Xray VMess uses the `v1.mux.cool` magic-domain
+signaling, which differs from sing-vmess's CommandMux signaling).
+
+## meow-rs Architecture Mapping
 
 ```
 crates/meow-proxy/src/mux/
-  mod.rs        Protocol（+MuxCool）、MuxClient（会话池 + offer/offerNew + idle 清扫）
-  request.rs    §2 sing-mux 请求头 encode/decode（含 padding）
-  address.rs    §4 流请求编解码（flags + sing Socksaddr）
-  smux.rs       smux 会话 + 流（sagernet fork 帧格式，自实现）
-  yamux.rs      yamux 封装（依赖 libp2p 的 yamux crate）
-  h2mux.rs      h2mux 会话 + 流（h2 crate：CONNECT 流 = 请求体/响应体双向）
-  muxcool.rs    §6 Mux.Cool：帧编解码（纯函数）+ 会话 + TCP 流 + UDP PacketConn
-  packet.rs     MuxPacketConn：UDP 流（flagUDP + [len u16 BE][data] 数据报帧）
-  stream.rs     MuxStreamConn: ProxyConn 封装（!Unpin 内流的 pin-projection，
-                参考 anytls AnytlsConn 的模式）
+  mod.rs        Protocol (+MuxCool), MuxClient (session pool + offer/offerNew + idle sweep)
+  request.rs    §2 sing-mux request header encode/decode (incl. padding)
+  address.rs    §4 stream request codec (flags + sing Socksaddr)
+  smux.rs       smux session + stream (sagernet fork frame format, self-implemented)
+  yamux.rs      yamux wrapper (on the libp2p yamux crate)
+  h2mux.rs      h2mux session + stream (h2 crate: CONNECT stream = bidirectional bodies)
+  muxcool.rs    §6 Mux.Cool: frame codec (pure functions) + session + TCP stream + UDP PacketConn
+  packet.rs     MuxPacketConn: UDP stream (flagUDP + [len u16 BE][data] datagram frames)
+  stream.rs     MuxStreamConn: ProxyConn wrapper (pin-projection of the !Unpin inner stream,
+                modeled after anytls AnytlsConn)
 ```
 
-- 接入点：`vless_adapter::dial_tcp` 与 `trojan::dial_tcp`——mux 启用时改为
-  `mux_client.open_stream(dest)` 而不是新建连接；建连函数 `mux_dialer` 复用
-  现有 `dial_stream`/`open_tls_with_header`，目标地址替换为
-  `sp.mux.sing-box.arpa:444`。
-- 配置解析：解析完整 mux 块，默认 protocol=h2mux 与 mihomo 对齐；
-  smux/yamux/h2mux 均实现；未知 protocol 按 meow 的 warn+skip 语义拒绝该
-  节点（mihomo 对同样输入是硬错误）。
-- 构建门控：`mux` Cargo feature（meow-proxy/meow-config/meow-app，默认开启，
-  `minimal` 排除）。无 mux 构建读到 enabled mux 块会打 warn 提示已忽略。
-- 健康检查/URLTest：走 mux 流的延迟探测天然复用同一会话。
+- Integration points: `vless_adapter::dial_tcp` and `trojan::dial_tcp` —
+  when mux is enabled they call `mux_client.open_stream(dest)` instead of
+  dialing a fresh connection; the `mux_dialer` connection factory reuses
+  the existing `dial_stream`/`open_tls_with_header` with the destination
+  replaced by `sp.mux.sing-box.arpa:444`.
+- Config parsing: the full mux block is parsed, default protocol=h2mux
+  matching mihomo; smux/yamux/h2mux all implemented; unknown protocols
+  reject the node with meow's warn+skip semantics (mihomo hard-errors on
+  the same input).
+- Build gating: the `mux` Cargo feature (meow-proxy/meow-config/meow-app,
+  on by default, excluded from `minimal`). A no-mux build reading an
+  enabled mux block warns that the option was ignored.
+- Health checks / URLTest: delay probes over mux streams naturally reuse
+  the same session.
 
-## 互操作边界（重要）
+## Interop Boundaries (important)
 
-- `protocol: smux|yamux|h2mux`（默认 h2mux）：服务端必须是 sing-box /
-  mihomo 系（认识 `sp.mux.sing-box.arpa` 与 sing-mux 帧）。**Xray 服务器
-  不兼容**——Xray 只认 Mux.Cool，此时请用 `protocol: muxcool`。
-- `protocol: muxcool`（VLESS-only）：服务端为 Xray-core，或 sing-box /
-  mihomo 的 VLESS inbound（其 sing-vmess 服务端原生处理 CommandMux，
-  无需 inbound 配置）。Trojan 节点请勿使用。
-- 两个协议族共用同一个 MuxClient 连接池与 min/max 约束，协议差异全部
-  收敛在 SessionKind 各臂与 with_mux 的 dial 闭包内，适配层零分叉。
+- `protocol: smux|yamux|h2mux` (default h2mux): the server must be
+  sing-box / mihomo based (recognizes `sp.mux.sing-box.arpa` and the
+  sing-mux frames). **Xray servers are incompatible** — Xray only speaks
+  Mux.Cool; use `protocol: muxcool` there.
+- `protocol: muxcool` (VLESS-only): the server is Xray-core, or a
+  sing-box / mihomo VLESS inbound (whose sing-vmess server handles
+  CommandMux natively, no inbound config needed). Do not use on Trojan
+  nodes.
+- Both protocol families share one MuxClient pool and the same min/max
+  bounds; all protocol differences are contained in the SessionKind arms
+  and the with_mux dial closure — zero branching in the adapter layer.
 
-## 测试计划
+## Test Plan
 
-1. 单测：request 头/padding 编解码；Socksaddr 编解码往返；smux 帧编解码
-   （wire 字节断言）、SYN/FIN/PSH 状态机、大块分帧（内存 duplex 双端对打）；
-   MuxClient 的 offer/offerNew/min-max 约束与并发上限（mock dialer）；
-   yamux/h2mux 并发 open + 回显。
-2. 集成（已完成，脚本见 target/e2e/mux-interop/）：
-   - sing-mux：本地 sing-box v1.13.18 VLESS（明文）/Trojan（TLS）inbound
-     开 multiplex，meow 经 h2mux/smux/yamux 三种协议 curl 本地 websrv 均
-     200；6 路并发 curl 全部走同一条物理连接（sb.log 仅 1 次 inbound
-     connection）。live_singbox_vless_probe 单测（#[ignore]）保留为可重复
-     的互操作回归。
-   - muxcool：同套 sing-box 入站（CommandMux 无需 inbound 配置）——明文
-     VLESS（TCP 204/200 + UDP 回环）、Reality（204）、Reality+Vision
-     （204 + UDP 回环，配置 meow-muxcool.yml / meow-reality-muxcool.yml /
-     meow-rv-muxcool.yml）全部打通。
-3. 真机：真实 Xray 节点（example-xray-node，VLESS Reality+Vision，配置
-   meow-real-muxcool.yml）`protocol: muxcool` 打通 204（h2 + http/1.1），
-   4 次连续连接复用同一物理会话（日志仅 1 次 VLESS 响应头消费）；同一节点
-   sing-mux 失败（code=000）——印证两协议族互不兼容、按服务端选型。
+1. Unit: request header/padding codec; Socksaddr codec round trips; smux
+   frame codec (wire byte assertions), SYN/FIN/PSH state machine, large
+   write frame splitting (in-memory duplex both-ends exercise); MuxClient
+   offer/offerNew/min-max bounds and concurrency caps (mock dialer);
+   yamux/h2mux concurrent open + echo.
+2. Integration (done; scripts under target/e2e/mux-interop/):
+   - sing-mux: local sing-box v1.13.18 VLESS (plaintext) / Trojan (TLS)
+     inbounds with multiplex enabled — meow curls the local websrv through
+     all of h2mux/smux/yamux with 200; 6 concurrent curls share one
+     physical connection (sb.log shows a single inbound connection).
+     live_singbox_vless_probe (#[ignore]) is kept as a repeatable interop
+     regression.
+   - muxcool: the same sing-box inbounds (CommandMux needs no inbound
+     config) — plaintext VLESS (TCP 204/200 + UDP echo), Reality (204),
+     Reality+Vision (204 + UDP echo; configs meow-muxcool.yml /
+     meow-reality-muxcool.yml / meow-rv-muxcool.yml) all pass.
+3. Physical device: a real Xray node (example-xray-node, VLESS
+   Reality+Vision, config meow-real-muxcool.yml) with `protocol: muxcool`
+   passes 204 (h2 + http/1.1), and 4 consecutive connections reuse one
+   physical session (the log shows a single VLESS response-header
+   consumption); sing-mux against the same node fails (code=000) —
+   confirming the two protocol families are mutually incompatible and must
+   be chosen by server type.
