@@ -21,7 +21,7 @@
 //! | D13 | `parse_vless_vision_with_grpc_transport_ok`      — vision + grpc (TLS-enforcing) → ok |
 //! | D14 | `parse_vless_encryption_non_none_hard_errors`    — encryption: aes-128-gcm → hard error |
 //! | D15 | `parse_vless_encryption_empty_string_accepted`   — encryption: "" → ok |
-//! | D16 | `parse_vless_mux_enabled_loads_with_sing_mux`   — mux loads (h2mux default) |
+//! | D16 | `parse_vless_mux_enabled_loads_with_sing_mux`   — smux loads (h2mux default) |
 //! | D17 | `parse_vless_vision_udp_true_warns_once`         — vision + udp warns + loads |
 //! | D18 | `parse_vless_uuid_hex_and_dashed_both_accepted`  — both UUID forms ok |
 //! | D19 | `parse_vless_uuid_invalid_hard_errors`           — bad uuid → hard error |
@@ -691,7 +691,7 @@ proxies:
 
 /// D16: `parse_vless_mux_enabled_loads_with_sing_mux`
 ///
-/// `mux: { enabled: true }` → parse succeeds and the adapter is wired for
+/// `smux: { enabled: true }` → parse succeeds and the adapter is wired for
 /// sing-mux multiplexing (default protocol h2mux, matching mihomo).  No mux
 /// warn is emitted — the feature is implemented.
 /// Interop note: server must be sing-box / mihomo based (Xray-only servers
@@ -706,7 +706,7 @@ proxies:
     server: example.com
     port: 443
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
-    mux:
+    smux:
       enabled: true
 "#;
     let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
@@ -808,7 +808,7 @@ proxies:
     assert_eq!(mux_warns, 0, "muxcool is implemented: no warn expected");
 }
 
-/// D16g: `protocol: muxcool` on Trojan → rejected (VLESS-only protocol;
+/// D16g: `protocol: muxcool` on Trojan → rejected (VLESS/VMess-only protocol;
 /// trojan's CommandMux is smux, not Mux.Cool frames).
 #[cfg(all(feature = "mux", feature = "trojan"))]
 #[tokio::test]
@@ -834,7 +834,7 @@ proxies:
         lines
             .iter()
             .any(|l| l.contains("muxcool") && l.contains("VLESS")),
-        "expected a VLESS-only warn; {lines:?}"
+        "expected a VLESS/VMess-only warn; {lines:?}"
     );
 }
 
@@ -863,7 +863,33 @@ proxies:
     assert_eq!(mux_warns, 0, "ss sing-mux is implemented: no warn expected");
 }
 
-/// D16i: `protocol: muxcool` on Shadowsocks → rejected (VLESS-only).
+/// D16h2: the canonical mihomo `smux:` key on Shadowsocks → accepted
+/// (same block as the legacy `mux:` alias, which stays covered above).
+#[cfg(all(feature = "mux", feature = "ss"))]
+#[tokio::test]
+async fn parse_ss_smux_key_accepted() {
+    let yaml = r#"
+proxies:
+  - name: s
+    type: ss
+    server: example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: pw
+    smux:
+      enabled: true
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    let config = result.expect("ss smux: must load");
+    assert!(config.proxies.contains_key("s"), "ss proxy must be kept");
+    let mux_warns = lines
+        .iter()
+        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
+        .count();
+    assert_eq!(mux_warns, 0, "smux: key is canonical: no warn expected");
+}
+
+/// D16i: `protocol: muxcool` on Shadowsocks → rejected (VLESS/VMess-only).
 #[cfg(all(feature = "mux", feature = "ss"))]
 #[tokio::test]
 async fn parse_ss_mux_muxcool_rejected() {
@@ -889,7 +915,7 @@ proxies:
         lines
             .iter()
             .any(|l| l.contains("muxcool") && l.contains("VLESS")),
-        "expected a VLESS-only warn; {lines:?}"
+        "expected a VLESS/VMess-only warn; {lines:?}"
     );
 }
 
@@ -919,6 +945,32 @@ proxies:
         mux_warns, 0,
         "vmess sing-mux is implemented: no warn expected"
     );
+}
+
+/// D16j2: the canonical mihomo `smux:` key on VMess → accepted
+/// (same block as the legacy `mux:` alias, which stays covered above).
+#[cfg(all(feature = "mux", feature = "vmess"))]
+#[tokio::test]
+async fn parse_vmess_smux_key_accepted() {
+    let yaml = r#"
+proxies:
+  - name: m
+    type: vmess
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    cipher: auto
+    smux:
+      enabled: true
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    let config = result.expect("vmess smux: must load");
+    assert!(config.proxies.contains_key("m"), "vmess proxy must be kept");
+    let mux_warns = lines
+        .iter()
+        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
+        .count();
+    assert_eq!(mux_warns, 0, "smux: key is canonical: no warn expected");
 }
 
 /// D16k: `protocol: muxcool` on VMess → accepted (CommandMux 0x03 is the

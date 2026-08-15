@@ -66,7 +66,7 @@ Out of scope:
   multiplexing (default h2mux, matching mihomo; smux and yamux also
   supported; unknown protocols are rejected with warn+skip) for
   sing-box / mihomo servers, plus Xray Mux.Cool (`protocol: muxcool`,
-  VLESS-only) for Xray servers. See `docs/specs/proxy-mux.md`.
+  VLESS/VMess-only) for Xray servers. See `docs/specs/proxy-mux.md`.
 - **`encryption` field enforcement.** Upstream VLESS always sets
   `encryption: none`; the field is present for forward compat. Accept
   any value that is `""` or `"none"` silently; hard-error on anything

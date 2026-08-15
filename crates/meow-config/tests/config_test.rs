@@ -353,7 +353,7 @@ proxies:
 
 #[cfg(feature = "mux")]
 #[tokio::test]
-async fn test_proxy_parsing_trojan_mux_enabled() {
+async fn test_proxy_parsing_trojan_legacy_mux_enabled() {
     let yaml = r#"
 proxies:
   - name: "trojan-mux"
@@ -366,6 +366,41 @@ proxies:
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
     assert!(config.proxies.contains_key("trojan-mux"));
+}
+
+#[cfg(feature = "mux")]
+#[tokio::test]
+async fn test_proxy_parsing_trojan_smux_enabled() {
+    let yaml = r#"
+proxies:
+  - name: "trojan-smux"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "password123"
+    smux:
+      enabled: true
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(config.proxies.contains_key("trojan-smux"));
+}
+
+#[tokio::test]
+async fn test_proxy_parsing_rejects_smux_and_mux_together() {
+    let yaml = r#"
+proxies:
+  - name: "trojan-double-mux"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "password123"
+    smux:
+      enabled: true
+    mux:
+      enabled: true
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(!config.proxies.contains_key("trojan-double-mux"));
 }
 
 #[cfg(feature = "mux")]

@@ -23,11 +23,12 @@ sagernet/sing-mux, sagernet/smux (smux frame format), metacubex/sing v0.5.7
 ## Goal
 
 Real multiplexing the mihomo way: provide
-`mux: {enabled, protocol, max-connections, min-streams, max-streams, padding, statistic, only-tcp}`
+`smux: {enabled, protocol, max-connections, min-streams, max-streams, padding, statistic, only-tcp}`
 (aligned with SingMuxOption) on VLESS / Trojan / Shadowsocks / VMess
 outbounds, multiplexing many logical streams over **one physical node
 connection** and eliminating the per-stream node TCP+TLS+protocol handshake
-cost (measured 500-700ms per new connection @140ms RTT).
+cost (measured 500-700ms per new connection @140ms RTT). The legacy `mux:`
+key remains accepted for compatibility, but configuring both keys is an error.
 
 ## Wire Protocols (confirmed field-by-field from the sources)
 
@@ -234,10 +235,10 @@ crates/meow-proxy/src/mux/
   `sp.mux.sing-box.arpa:444` (SS shares its dial state with the mux
   session through an `Arc`-wrapped core so SIP003 plugin handles stay
   alive).
-- Config parsing: the full mux block is parsed, default protocol=h2mux
-  matching mihomo; smux/yamux/h2mux all implemented; unknown protocols
-  reject the node with meow's warn+skip semantics (mihomo hard-errors on
-  the same input).
+- Config parsing: the canonical `smux:` block (plus legacy `mux:` alias) is
+  parsed, default protocol=h2mux matching mihomo; smux/yamux/h2mux all
+  implemented; unknown protocols reject the node with meow's warn+skip
+  semantics (mihomo hard-errors on the same input).
 - Build gating: the `mux` Cargo feature (meow-proxy/meow-config/meow-app,
   on by default, excluded from `minimal`). A no-mux build reading an
   enabled mux block warns that the option was ignored.

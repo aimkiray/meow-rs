@@ -148,14 +148,14 @@ pub fn parse_proxy(
                 // garbage frames to the server.
                 if mux_options.protocol == meow_proxy::mux::Protocol::MuxCool {
                     return Err(format!(
-                        "{name}: mux protocol 'muxcool' is VLESS-only; \
+                        "{name}: mux protocol 'muxcool' is VLESS/VMess-only; \
                          use smux/yamux/h2mux for shadowsocks nodes"
                     ));
                 }
                 adapter = adapter.with_mux(mux_options);
             }
             #[cfg(not(feature = "mux"))]
-            parse_mux_options(name, config);
+            parse_mux_options(name, config)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "trojan")]
@@ -189,14 +189,14 @@ pub fn parse_proxy(
                 // instead of speaking garbage frames to the server.
                 if mux_options.protocol == meow_proxy::mux::Protocol::MuxCool {
                     return Err(format!(
-                        "{name}: mux protocol 'muxcool' is VLESS-only; \
+                        "{name}: mux protocol 'muxcool' is VLESS/VMess-only; \
                          use smux/yamux/h2mux for trojan nodes"
                     ));
                 }
                 adapter = adapter.with_mux(mux_options);
             }
             #[cfg(not(feature = "mux"))]
-            parse_mux_options(name, config);
+            parse_mux_options(name, config)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "vless")]
@@ -1436,12 +1436,13 @@ fn parse_vless(
         adapter = adapter.with_mux(mux_options);
     }
     #[cfg(not(feature = "mux"))]
-    parse_mux_options(name, config);
+    parse_mux_options(name, config)?;
 
     Ok(adapter)
 }
 
-/// Parse the optional `mux:` block shared by VLESS/Trojan/Shadowsocks/VMess.
+/// Parse the optional mihomo `smux:` block shared by
+/// VLESS/Trojan/Shadowsocks/VMess.  `mux:` remains accepted as a legacy alias.
 ///
 /// Two wire protocols are available, picked by `protocol`:
 ///
@@ -1468,7 +1469,7 @@ fn parse_mux_options(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
 ) -> std::result::Result<Option<meow_proxy::mux::MuxOptions>, String> {
-    let Some(mux_cfg) = config.get("mux") else {
+    let Some(mux_cfg) = mux_config_block(name, config)? else {
         return Ok(None);
     };
     let enabled = mux_cfg
@@ -1537,7 +1538,7 @@ fn parse_mux_options(
 }
 
 /// No-mux builds: warn loudly instead of silently ignoring an enabled
-/// `mux:` block (operators would otherwise think the node is multiplexed).
+/// `smux:`/`mux:` block (operators would otherwise think the node is multiplexed).
 /// Only compiled when one of its call sites (trojan / vless / ss / vmess
 /// parsing) exists.
 #[cfg(all(
@@ -1549,8 +1550,11 @@ fn parse_mux_options(
         feature = "vmess"
     )
 ))]
-fn parse_mux_options(name: &str, config: &HashMap<String, serde_yaml::Value>) {
-    if let Some(mux_cfg) = config.get("mux") {
+fn parse_mux_options(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+) -> std::result::Result<(), String> {
+    if let Some(mux_cfg) = mux_config_block(name, config)? {
         let enabled = mux_cfg
             .get("enabled")
             .and_then(serde_yaml::Value::as_bool)
@@ -1561,6 +1565,26 @@ fn parse_mux_options(name: &str, config: &HashMap<String, serde_yaml::Value>) {
                 "mux is enabled in config but this build was compiled without the `mux` feature; the option is ignored"
             );
         }
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    feature = "trojan",
+    feature = "vless",
+    feature = "ss",
+    feature = "vmess"
+))]
+fn mux_config_block<'a>(
+    name: &str,
+    config: &'a HashMap<String, serde_yaml::Value>,
+) -> std::result::Result<Option<&'a serde_yaml::Value>, String> {
+    match (config.get("smux"), config.get("mux")) {
+        (Some(_), Some(_)) => Err(format!(
+            "{name}: configure only one of `smux` or legacy alias `mux`"
+        )),
+        (Some(config), None) | (None, Some(config)) => Ok(Some(config)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -1909,7 +1933,7 @@ fn parse_vmess(
         adapter = adapter.with_mux(mux_options);
     }
     #[cfg(not(feature = "mux"))]
-    parse_mux_options(name, config);
+    parse_mux_options(name, config)?;
 
     Ok(adapter)
 }
