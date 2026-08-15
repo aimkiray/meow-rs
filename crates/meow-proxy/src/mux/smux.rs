@@ -18,7 +18,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::{CancellationToken, PollSender};
 
 const CMD_SYN: u8 = 0;
 const CMD_FIN: u8 = 1;
@@ -29,6 +30,13 @@ const FRAME_HEADER_LEN: usize = 8;
 
 /// Largest frame payload — sagernet smux MaxFrameSize default (u16 length).
 const MAX_FRAME_SIZE: usize = 32768;
+/// Sagernet's default per-stream receive buffer (two maximum-sized frames).
+const MAX_STREAM_BUFFER: usize = 64 * 1024;
+const STREAM_QUEUE: usize = MAX_STREAM_BUFFER / MAX_FRAME_SIZE;
+/// Sagernet's default session-wide receive budget.
+const MAX_RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
+/// Bounded outbound queue; stream writes wait when the physical writer lags.
+const OUTBOUND_QUEUE: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Frame {
@@ -38,18 +46,9 @@ struct Frame {
 }
 
 impl Frame {
-    fn encode_into(&self, out: &mut BytesMut) {
-        // The u16 length field caps single frames; send_push splits writes at
-        // MAX_FRAME_SIZE, so this only guards future call sites.
-        debug_assert!(
-            self.data.len() <= u16::MAX as usize,
-            "smux frame payload exceeds u16 length"
-        );
-        out.put_u8(SMUX_VERSION);
-        out.put_u8(self.cmd);
-        out.put_u16_le(self.data.len() as u16);
-        out.put_u32_le(self.stream_id);
-        out.put_slice(&self.data);
+    #[cfg(test)]
+    fn encode(&self) -> Bytes {
+        encode_frame(self.cmd, self.stream_id, &self.data)
     }
 
     fn decode_header(buf: &[u8]) -> io::Result<(u8, usize, u32)> {
@@ -72,16 +71,40 @@ impl Frame {
     }
 }
 
-struct SessionInner {
-    writer_tx: mpsc::UnboundedSender<Frame>,
+fn encode_frame(cmd: u8, stream_id: u32, data: &[u8]) -> Bytes {
+    // The u16 length field caps single frames; poll_write limits writes to
+    // MAX_FRAME_SIZE, so this only guards future call sites.
+    debug_assert!(
+        data.len() <= u16::MAX as usize,
+        "smux frame payload exceeds u16 length"
+    );
+    let mut out = BytesMut::with_capacity(FRAME_HEADER_LEN + data.len());
+    out.put_u8(SMUX_VERSION);
+    out.put_u8(cmd);
+    out.put_u16_le(data.len() as u16);
+    out.put_u32_le(stream_id);
+    out.put_slice(data);
+    out.freeze()
+}
+
+struct InboundChunk {
+    data: Bytes,
+    /// Releases session receive capacity when the stream consumes or drops
+    /// this chunk.
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+struct SessionState {
     /// Streams keyed by stream ID; dropping the sender EOFs the stream.
-    streams: Mutex<HashMap<u32, mpsc::UnboundedSender<Bytes>>>,
+    streams: Mutex<HashMap<u32, mpsc::Sender<InboundChunk>>>,
     dead: AtomicBool,
 }
 
 /// smux session over one physical connection (client role).
 pub struct Session {
-    inner: Arc<SessionInner>,
+    state: Arc<SessionState>,
+    writer_tx: mpsc::Sender<Bytes>,
+    cancel: CancellationToken,
     next_stream_id: AtomicU32,
 }
 
@@ -89,7 +112,7 @@ impl Session {
     /// True once the session is dead (reader/writer task ended or the
     /// physical connection failed).
     pub fn is_dead(&self) -> bool {
-        self.inner.dead.load(Ordering::SeqCst)
+        self.state.dead.load(Ordering::SeqCst)
     }
 
     /// Start an smux client session over the IO.  A reader task owns the
@@ -99,117 +122,190 @@ impl Session {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (mut reader, mut writer) = tokio::io::split(io);
-        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Frame>();
-
-        let inner = Arc::new(SessionInner {
-            writer_tx,
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Bytes>(OUTBOUND_QUEUE);
+        let state = Arc::new(SessionState {
             streams: Mutex::new(HashMap::new()),
             dead: AtomicBool::new(false),
         });
+        let receive_budget = Arc::new(Semaphore::new(MAX_RECEIVE_BUFFER));
+        let cancel = CancellationToken::new();
 
-        // Writer task: drain frames, write full wire frames in order.  The
-        // encode buffer is reused across frames (hot path — avoid one
-        // allocation per frame).
-        let writer_inner = Arc::clone(&inner);
+        // Writer task: outbound frames are already encoded, so the hot path
+        // performs no second allocation or payload copy.
+        let writer_state = Arc::clone(&state);
+        let writer_cancel = cancel.clone();
         tokio::spawn(async move {
-            let mut buf = BytesMut::new();
-            while let Some(frame) = writer_rx.recv().await {
-                buf.clear();
-                buf.reserve(FRAME_HEADER_LEN + frame.data.len());
-                frame.encode_into(&mut buf);
-                if writer.write_all(&buf).await.is_err() {
+            loop {
+                let frame = tokio::select! {
+                    _ = writer_cancel.cancelled() => break,
+                    frame = writer_rx.recv() => match frame {
+                        Some(frame) => frame,
+                        None => break,
+                    },
+                };
+                let result = tokio::select! {
+                    _ = writer_cancel.cancelled() => break,
+                    result = writer.write_all(&frame) => result,
+                };
+                if result.is_err() {
                     break;
                 }
             }
-            writer_inner.mark_dead().await;
+            writer_state.mark_dead().await;
+            writer_cancel.cancel();
         });
 
         // Reader task: parse frames, route PSH/FIN to streams.
-        let reader_inner = Arc::clone(&inner);
+        let reader_state = Arc::clone(&state);
+        let reader_cancel = cancel.clone();
         tokio::spawn(async move {
             let mut header = [0u8; FRAME_HEADER_LEN];
             loop {
-                if reader.read_exact(&mut header).await.is_err() {
+                let header_result = tokio::select! {
+                    _ = reader_cancel.cancelled() => break,
+                    result = reader.read_exact(&mut header) => result,
+                };
+                if header_result.is_err() {
                     break;
                 }
                 let Ok((cmd, length, stream_id)) = Frame::decode_header(&header) else {
                     break;
                 };
-                let mut payload = vec![0u8; length];
-                if !payload.is_empty() && reader.read_exact(&mut payload).await.is_err() {
-                    break;
-                }
-                let frame = Frame {
-                    cmd,
-                    stream_id,
-                    data: Bytes::from(payload),
+                let permit = if cmd == CMD_PSH && length > 0 {
+                    let permits = length as u32;
+                    match tokio::select! {
+                        _ = reader_cancel.cancelled() => break,
+                        result = Arc::clone(&receive_budget).acquire_many_owned(permits) => result,
+                    } {
+                        Ok(permit) => Some(permit),
+                        Err(_) => break,
+                    }
+                } else {
+                    None
                 };
-                if reader_inner.handle_frame(&frame).await.is_err() {
+                let mut payload = vec![0u8; length];
+                if !payload.is_empty() {
+                    let payload_result = tokio::select! {
+                        _ = reader_cancel.cancelled() => break,
+                        result = reader.read_exact(&mut payload) => result,
+                    };
+                    if payload_result.is_err() {
+                        break;
+                    }
+                }
+                if reader_state
+                    .handle_frame(
+                        cmd,
+                        stream_id,
+                        InboundChunk {
+                            data: Bytes::from(payload),
+                            _permit: permit,
+                        },
+                        &reader_cancel,
+                    )
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
-            reader_inner.mark_dead().await;
+            reader_state.mark_dead().await;
+            reader_cancel.cancel();
         });
 
         Ok(Self {
-            inner,
+            state,
+            writer_tx,
+            cancel,
             next_stream_id: AtomicU32::new(1),
         })
     }
 
     /// Open a new stream.  Client IDs count up by 2 from 1.
     pub async fn open_stream(self: &Arc<Self>) -> io::Result<SmuxStream> {
-        if self.inner.dead.load(Ordering::SeqCst) {
+        if self.is_dead() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "smux session is closed",
             ));
         }
         let id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.inner.streams.lock().await.insert(id, tx);
-        self.inner
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE);
+        self.state.streams.lock().await.insert(id, tx);
+        if self
             .writer_tx
-            .send(Frame {
-                cmd: CMD_SYN,
-                stream_id: id,
-                data: Bytes::new(),
-            })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "smux writer gone"))?;
+            .send(encode_frame(CMD_SYN, id, &[]))
+            .await
+            .is_err()
+        {
+            self.state.streams.lock().await.remove(&id);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "smux writer gone",
+            ));
+        }
         Ok(SmuxStream {
             id,
-            session: Arc::clone(&self.inner),
+            session: Arc::clone(self),
+            poll_sender: PollSender::new(self.writer_tx.clone()),
             rx,
-            pending: Bytes::new(),
-            eof: AtomicBool::new(false),
-            fin_sent: AtomicBool::new(false),
+            pending: None,
+            eof: false,
+            fin_sent: false,
+            shutdown_frame: None,
         })
     }
 }
 
-impl SessionInner {
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.state.dead.store(true, Ordering::SeqCst);
+        self.cancel.cancel();
+    }
+}
+
+impl SessionState {
     async fn mark_dead(&self) {
-        self.dead.store(true, Ordering::SeqCst);
-        // EOF every stream: dropping the senders closes each receiver.
-        self.streams.lock().await.clear();
+        if !self.dead.swap(true, Ordering::SeqCst) {
+            // Close every stream.  The read side distinguishes this physical
+            // failure from a peer FIN by consulting `Session::is_dead`.
+            self.streams.lock().await.clear();
+        }
     }
 
-    async fn handle_frame(&self, frame: &Frame) -> io::Result<()> {
-        match frame.cmd {
+    async fn handle_frame(
+        &self,
+        cmd: u8,
+        stream_id: u32,
+        chunk: InboundChunk,
+        cancel: &CancellationToken,
+    ) -> io::Result<()> {
+        match cmd {
             CMD_PSH => {
                 // Data for an unknown stream is dropped rather than killing
                 // the session — an intentional divergence from xtaci (which
                 // closes the connection on protocol violation): the server
                 // may legitimately race a FIN (peer closed, stream removed)
                 // against in-flight PSH frames.
-                if let Some(tx) = self.streams.lock().await.get(&frame.stream_id) {
-                    let _ = tx.send(frame.data.clone());
+                let tx = self.streams.lock().await.get(&stream_id).cloned();
+                if let Some(tx) = tx {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "smux session closed",
+                            ));
+                        }
+                        result = tx.send(chunk) => {
+                            let _ = result;
+                        }
+                    }
                 }
                 Ok(())
             }
             CMD_FIN => {
                 // Peer half-closed: EOF the read side by dropping the sender.
-                self.streams.lock().await.remove(&frame.stream_id);
+                self.streams.lock().await.remove(&stream_id);
                 Ok(())
             }
             CMD_NOP => Ok(()),
@@ -230,45 +326,24 @@ impl SessionInner {
 /// One multiplexed stream (AsyncRead + AsyncWrite).
 pub struct SmuxStream {
     id: u32,
-    session: Arc<SessionInner>,
-    rx: mpsc::UnboundedReceiver<Bytes>,
+    session: Arc<Session>,
+    poll_sender: PollSender<Bytes>,
+    rx: mpsc::Receiver<InboundChunk>,
     /// Unread remainder of the last chunk handed to poll_read.
-    pending: Bytes,
-    eof: AtomicBool,
-    fin_sent: AtomicBool,
+    pending: Option<InboundChunk>,
+    eof: bool,
+    fin_sent: bool,
+    shutdown_frame: Option<Bytes>,
 }
 
 impl SmuxStream {
-    fn send_frame(&self, cmd: u8, data: Bytes) -> io::Result<()> {
-        if self.session.dead.load(Ordering::SeqCst) {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "smux session is closed",
-            ));
-        }
-        self.session
-            .writer_tx
-            .send(Frame {
-                cmd,
-                stream_id: self.id,
-                data,
-            })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "smux writer gone"))
-    }
-
-    /// Queue the payload as one or more PSH frames, split at MaxFrameSize
-    /// (the u16 length field caps single frames at 65535; the peer's
-    /// default MaxFrameSize is 32768).
-    fn send_push(&self, data: &[u8]) -> io::Result<()> {
-        for chunk in data.chunks(MAX_FRAME_SIZE) {
-            self.send_frame(CMD_PSH, Bytes::copy_from_slice(chunk))?;
-        }
-        Ok(())
-    }
-
-    fn best_effort_fin(&self) {
-        if !self.fin_sent.swap(true, Ordering::SeqCst) {
-            let _ = self.send_frame(CMD_FIN, Bytes::new());
+    fn best_effort_fin(&mut self) {
+        if !self.fin_sent {
+            self.fin_sent = true;
+            let _ = self
+                .session
+                .writer_tx
+                .try_send(encode_frame(CMD_FIN, self.id, &[]));
         }
     }
 }
@@ -290,26 +365,40 @@ impl AsyncRead for SmuxStream {
         // after writing into the caller's ReadBuf would lose those bytes
         // (the buffer is recreated on the next poll), violating the
         // AsyncRead contract.
-        if !this.pending.is_empty() {
-            let n = this.pending.len().min(buf.remaining());
-            buf.put_slice(&this.pending[..n]);
-            this.pending.advance(n);
+        if buf.remaining() == 0 {
+            return Poll::Pending;
+        }
+        if let Some(mut chunk) = this.pending.take() {
+            let n = chunk.data.len().min(buf.remaining());
+            buf.put_slice(&chunk.data[..n]);
+            chunk.data.advance(n);
+            if !chunk.data.is_empty() {
+                this.pending = Some(chunk);
+            }
             Poll::Ready(Ok(()))
-        } else if this.eof.load(Ordering::SeqCst) {
+        } else if this.eof {
             Poll::Ready(Ok(()))
         } else {
             match this.rx.poll_recv(cx) {
-                Poll::Ready(Some(chunk)) => {
-                    let n = chunk.len().min(buf.remaining());
-                    buf.put_slice(&chunk[..n]);
-                    if n < chunk.len() {
-                        this.pending = chunk.slice(n..);
+                Poll::Ready(Some(mut chunk)) => {
+                    let n = chunk.data.len().min(buf.remaining());
+                    buf.put_slice(&chunk.data[..n]);
+                    chunk.data.advance(n);
+                    if !chunk.data.is_empty() {
+                        this.pending = Some(chunk);
                     }
                     Poll::Ready(Ok(()))
                 }
                 Poll::Ready(None) => {
-                    this.eof.store(true, Ordering::SeqCst);
-                    Poll::Ready(Ok(()))
+                    this.eof = true;
+                    if this.session.is_dead() {
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "smux session closed",
+                        )))
+                    } else {
+                        Poll::Ready(Ok(()))
+                    }
                 }
                 Poll::Pending => Poll::Pending,
             }
@@ -320,15 +409,31 @@ impl AsyncRead for SmuxStream {
 impl AsyncWrite for SmuxStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
         let this = self.get_mut();
-        this.send_push(buf)?;
-        Poll::Ready(Ok(buf.len()))
+        if this.session.is_dead() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "smux session closed",
+            )));
+        }
+        let written = buf.len().min(MAX_FRAME_SIZE);
+        match this.poll_sender.poll_reserve(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(io::Error::other(error.to_string()))),
+            Poll::Ready(Ok(())) => {
+                let frame = encode_frame(CMD_PSH, this.id, &buf[..written]);
+                this.poll_sender
+                    .send_item(frame)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                Poll::Ready(Ok(written))
+            }
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -337,15 +442,36 @@ impl AsyncWrite for SmuxStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().best_effort_fin();
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.fin_sent {
+            return Poll::Ready(Ok(()));
+        }
+        let frame = this
+            .shutdown_frame
+            .take()
+            .unwrap_or_else(|| encode_frame(CMD_FIN, this.id, &[]));
+        match this.poll_sender.poll_reserve(cx) {
+            Poll::Pending => {
+                this.shutdown_frame = Some(frame);
+                Poll::Pending
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(io::Error::other(error.to_string()))),
+            Poll::Ready(Ok(())) => {
+                this.poll_sender
+                    .send_item(frame)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                this.fin_sent = true;
+                Poll::Ready(Ok(()))
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -356,8 +482,7 @@ mod tests {
             stream_id: 1,
             data: Bytes::new(),
         };
-        let mut buf = BytesMut::new();
-        frame.encode_into(&mut buf);
+        let buf = frame.encode();
         assert_eq!(&buf[..], &[0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]);
 
         // PSH with 3 bytes on stream 3.
@@ -366,8 +491,7 @@ mod tests {
             stream_id: 3,
             data: Bytes::from_static(b"abc"),
         };
-        let mut buf = BytesMut::new();
-        frame.encode_into(&mut buf);
+        let buf = frame.encode();
         assert_eq!(
             &buf[..],
             &[0x01, 0x02, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00, b'a', b'b', b'c']
@@ -486,5 +610,101 @@ mod tests {
         let mut resp = Vec::new();
         stream.read_to_end(&mut resp).await.unwrap();
         assert_eq!(&resp[..], b"ping");
+    }
+
+    #[tokio::test]
+    async fn physical_eof_is_reported_as_an_error() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let session = Arc::new(Session::client(client_io).unwrap());
+        let mut stream = session.open_stream().await.unwrap();
+        let server = tokio::spawn(async move {
+            let mut syn = [0u8; FRAME_HEADER_LEN];
+            server_io.read_exact(&mut syn).await.unwrap();
+        });
+        server.await.unwrap();
+
+        let mut buf = [0u8; 1];
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .expect("physical EOF must wake the stream")
+            .expect_err("physical EOF must not look like a clean FIN");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn outbound_queue_applies_backpressure() {
+        let (client_io, _server_io) = tokio::io::duplex(1);
+        let session = Arc::new(Session::client(client_io).unwrap());
+        let mut stream = session.open_stream().await.unwrap();
+        let payload = vec![0x5a; MAX_FRAME_SIZE * (OUTBOUND_QUEUE + 2)];
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stream.write_all(&payload),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a blocked physical writer must backpressure streams"
+        );
+    }
+
+    struct DropTrackedIo {
+        inner: tokio::io::DuplexStream,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for DropTrackedIo {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl AsyncRead for DropTrackedIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DropTrackedIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_idle_session_releases_physical_io() {
+        let (client_io, _server_io) = tokio::io::duplex(64 * 1024);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let session = Session::client(DropTrackedIo {
+            inner: client_io,
+            dropped: Arc::clone(&dropped),
+        })
+        .unwrap();
+        drop(session);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping an idle session must stop its tasks and release the fd");
     }
 }

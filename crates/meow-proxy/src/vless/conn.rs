@@ -10,7 +10,7 @@
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
@@ -43,9 +43,10 @@ pub struct VlessConn {
     /// mihomo/xray, so it is emitted on the first write instead of during
     /// construction.
     pub(crate) header_pending: Option<Bytes>,
-    /// Remaining bytes of a partially-written combined [header][payload]
-    /// buffer plus the payload offset, drained on subsequent polls.
-    pub(crate) write_pending: Option<(Bytes, usize, usize)>,
+    /// Set once the deferred header has reached the inner stream and cleared
+    /// after the next flush.  A read-first protocol must flush the request
+    /// before waiting for the server response.
+    pub(crate) header_needs_flush: bool,
 }
 
 impl VlessConn {
@@ -75,7 +76,7 @@ impl VlessConn {
             response_pos: 0,
             response_addon: Vec::new(),
             header_pending: None,
-            write_pending: None,
+            header_needs_flush: false,
         })
     }
 
@@ -99,7 +100,7 @@ impl VlessConn {
             response_pos: 0,
             response_addon: Vec::new(),
             header_pending: Some(buf.freeze()),
-            write_pending: None,
+            header_needs_flush: false,
         })
     }
 
@@ -127,7 +128,7 @@ impl VlessConn {
             response_pos: 0,
             response_addon: Vec::new(),
             header_pending: None,
-            write_pending: None,
+            header_needs_flush: false,
         })
     }
 
@@ -148,8 +149,63 @@ impl VlessConn {
             response_pos: 0,
             response_addon: Vec::new(),
             header_pending: Some(buf.freeze()),
-            write_pending: None,
+            header_needs_flush: false,
         })
+    }
+
+    /// Write a deferred request header before the caller's first payload.
+    /// Header-only progress may continue inside one poll; payload progress is
+    /// reported immediately so `AsyncWrite` never returns `Pending` or
+    /// `Ok(0)` after consuming caller bytes.
+    fn poll_write_deferred(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        loop {
+            let Some(header) = self.header_pending.take() else {
+                return Pin::new(&mut *self.inner).poll_write(cx, buf);
+            };
+            let header_len = header.len();
+            let mut combined = BytesMut::with_capacity(header_len + buf.len());
+            combined.extend_from_slice(&header);
+            combined.extend_from_slice(buf);
+            match Pin::new(&mut *self.inner).poll_write(cx, &combined) {
+                Poll::Pending => {
+                    self.header_pending = Some(header);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(0)) => {
+                    self.header_pending = Some(header);
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "vless: failed to write deferred request header",
+                    )));
+                }
+                Poll::Ready(Ok(written)) if written < header_len => {
+                    self.header_pending = Some(header.slice(written..));
+                }
+                Poll::Ready(Ok(written)) => {
+                    self.header_needs_flush = true;
+                    let payload_written = written - header_len;
+                    if payload_written > 0 || buf.is_empty() {
+                        return Poll::Ready(Ok(payload_written));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ensure a deferred request is sent and flushed before reading or
+    /// shutting down.  This is the server-first path used by SMTP, IMAP,
+    /// MySQL and similar protocols that do not write application data first.
+    fn poll_flush_deferred_header(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.header_pending.is_some() {
+            let written = ready!(self.poll_write_deferred(cx, &[]))?;
+            debug_assert_eq!(written, 0);
+        }
+        if self.header_needs_flush {
+            ready!(Pin::new(&mut *self.inner).poll_flush(cx))?;
+            self.header_needs_flush = false;
+        }
+        Poll::Ready(Ok(()))
     }
 
     // Called only from the Vision wrapper (vless-vision feature).
@@ -177,6 +233,7 @@ impl AsyncRead for VlessConn {
         // header bytes must keep the byte already consumed — a local buffer
         // would lose it and shift the whole stream by one byte.
         let this = &mut *self;
+        ready!(this.poll_flush_deferred_header(cx))?;
         if this.response_pending {
             while this.response_pos < 2 {
                 let pos = this.response_pos;
@@ -245,63 +302,19 @@ impl AsyncWrite for VlessConn {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        // Drain a partially-written combined buffer first.
-        if let Some((pending, pos, header_len)) = &mut this.write_pending {
-            match Pin::new(&mut this.inner).poll_write(cx, &pending[*pos..]) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => {
-                    this.write_pending = None;
-                    return Poll::Ready(Err(e));
-                }
-                Poll::Ready(Ok(n)) => {
-                    *pos += n;
-                    if *pos < pending.len() {
-                        return Poll::Pending;
-                    }
-                    let written = pending.len() - *header_len;
-                    this.write_pending = None;
-                    return Poll::Ready(Ok(written));
-                }
-            }
-        }
-        if let Some(header) = this.header_pending.take() {
-            // Emit [request header][payload] as one logical write so the
-            // wrapping Vision layer pads them together.
-            let mut combined = BytesMut::with_capacity(header.len() + buf.len());
-            combined.extend_from_slice(&header);
-            combined.extend_from_slice(buf);
-            let header_len = header.len();
-            match Pin::new(&mut this.inner).poll_write(cx, &combined) {
-                Poll::Pending => {
-                    this.header_pending = Some(header);
-                    Poll::Pending
-                }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Ready(Ok(n)) => {
-                    if n < combined.len() {
-                        // Partial write: stash the remainder and drain it on
-                        // subsequent polls (the caller re-polls with the
-                        // same buffer).
-                        let payload_offset = header_len.saturating_sub(n);
-                        let remainder: Bytes = combined[n..].to_vec().into();
-                        this.write_pending = Some((remainder, 0, payload_offset));
-                        Poll::Ready(Ok(n.saturating_sub(header_len)))
-                    } else {
-                        Poll::Ready(Ok(buf.len()))
-                    }
-                }
-            }
-        } else {
-            Pin::new(&mut this.inner).poll_write(cx, buf)
-        }
+        this.poll_write_deferred(cx, buf)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_flush_deferred_header(cx))?;
+        Pin::new(&mut *this.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_flush_deferred_header(cx))?;
+        Pin::new(&mut *this.inner).poll_shutdown(cx)
     }
 }
 
@@ -427,7 +440,44 @@ impl ProxyPacketConn for VlessPacketConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+    struct ChunkedStream {
+        inner: tokio::io::DuplexStream,
+        max_write: usize,
+    }
+
+    impl AsyncRead for ChunkedStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ChunkedStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let count = buf.len().min(this.max_write);
+            Pin::new(&mut this.inner).poll_write(cx, &buf[..count])
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
 
     /// Test UUID: b831381d-6324-4d53-ad4f-8cda48b30811
     const TEST_UUID: [u8; 16] = [
@@ -497,6 +547,60 @@ mod tests {
         assert_eq!(hdr[0], 0x00, "version byte must be 0x00");
         // uuid must match
         assert_eq!(&hdr[1..17], &TEST_UUID, "uuid must match");
+    }
+
+    #[tokio::test]
+    async fn deferred_header_handles_one_byte_partial_writes() {
+        let (client, mut server) = duplex(1024);
+        tokio::spawn(async move {
+            let mut request = vec![0u8; 26 + 4];
+            server.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[26..], b"ping");
+            server.write_all(&[0x00, 0x00, b'!']).await.unwrap();
+        });
+
+        let mut conn = VlessConn::new_deferred(
+            Box::new(ChunkedStream {
+                inner: client,
+                max_write: 1,
+            }),
+            &TEST_UUID,
+            None,
+            Cmd::Tcp,
+            80,
+            &VlessAddr::Ipv4([1, 2, 3, 4]),
+        )
+        .await
+        .unwrap();
+        conn.write_all(b"ping").await.unwrap();
+        let mut response = [0u8; 1];
+        conn.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [b'!']);
+    }
+
+    #[tokio::test]
+    async fn deferred_header_is_flushed_before_server_first_read() {
+        let (client, mut server) = duplex(1024);
+        tokio::spawn(async move {
+            let mut request = vec![0u8; 26];
+            server.read_exact(&mut request).await.unwrap();
+            server.write_all(&[0x00, 0x00]).await.unwrap();
+            server.write_all(b"banner").await.unwrap();
+        });
+
+        let mut conn = VlessConn::new_deferred(
+            Box::new(client),
+            &TEST_UUID,
+            None,
+            Cmd::Tcp,
+            25,
+            &VlessAddr::Ipv4([1, 2, 3, 4]),
+        )
+        .await
+        .unwrap();
+        let mut banner = [0u8; 6];
+        conn.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"banner");
     }
 
     // ─── F2: payload round-trip ───────────────────────────────────────────────

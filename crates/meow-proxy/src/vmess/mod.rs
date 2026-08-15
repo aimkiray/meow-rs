@@ -27,10 +27,6 @@ pub struct VmessAdapter {
     /// sing-mux compatible connection multiplexing (optional).
     #[cfg(feature = "mux")]
     mux: Option<Arc<crate::mux::MuxClient>>,
-    /// When mux is enabled, route UDP through the plain proxy path instead
-    /// of mux streams (mihomo `only-tcp`).
-    #[cfg(feature = "mux")]
-    mux_only_tcp: bool,
 }
 
 impl VmessAdapter {
@@ -55,8 +51,6 @@ impl VmessAdapter {
             health: ProxyHealth::new(),
             #[cfg(feature = "mux")]
             mux: None,
-            #[cfg(feature = "mux")]
-            mux_only_tcp: false,
         }
     }
 
@@ -104,7 +98,6 @@ impl VmessAdapter {
                 dial_vmess(&transport, &server, port, sealed, security).await
             })
         });
-        self.mux_only_tcp = options.only_tcp;
         self.mux = Some(MuxClient::new(dial, options));
         self
     }
@@ -190,7 +183,7 @@ impl ProxyAdapter for VmessAdapter {
         self.udp || {
             #[cfg(feature = "mux")]
             {
-                self.mux.is_some() && !self.mux_only_tcp
+                self.mux.as_ref().is_some_and(|mux| mux.supports_udp())
             }
             #[cfg(not(feature = "mux"))]
             {
@@ -208,16 +201,7 @@ impl ProxyAdapter for VmessAdapter {
 
         #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
-            let host = if !metadata.host.is_empty() {
-                metadata.host.to_string()
-            } else if let Some(ip) = metadata.dst_ip {
-                ip.to_string()
-            } else {
-                return Err(MeowError::Proxy(
-                    "vmess mux: metadata has no destination host".into(),
-                ));
-            };
-            let conn = mux.open_stream(&host, metadata.dst_port).await?;
+            let conn = mux.open_stream_for(metadata, "vmess").await?;
             return Ok(Box::new(conn));
         }
 
@@ -227,22 +211,15 @@ impl ProxyAdapter for VmessAdapter {
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
-            if !self.mux_only_tcp {
-                let host = if !metadata.host.is_empty() {
-                    metadata.host.to_string()
-                } else if let Some(ip) = metadata.dst_ip {
-                    ip.to_string()
-                } else {
-                    return Err(MeowError::Proxy(
-                        "vmess mux udp: metadata has no destination host".into(),
-                    ));
-                };
+            if mux.supports_udp() {
                 debug!(
                     "VMess mux UDP connecting to {} via {}",
                     metadata.remote_address(),
                     self.addr_str
                 );
-                return mux.open_packet_stream(&host, metadata.dst_port).await;
+            }
+            if let Some(conn) = mux.open_packet_stream_for(metadata, "vmess").await? {
+                return Ok(conn);
             }
         }
 

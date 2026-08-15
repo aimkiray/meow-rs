@@ -13,7 +13,7 @@ use super::smux;
 use super::stream::MuxStreamConn;
 use super::yamux;
 use super::{address, Protocol};
-use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
+use meow_common::{MeowError, Metadata, ProxyConn, ProxyPacketConn, Result};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
@@ -28,6 +28,9 @@ use tokio::sync::Mutex;
 
 /// Idle sessions (zero streams) are closed after this long.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum time spent establishing one physical mux session while the pool
+/// lock serializes new connections, matching sing-mux's TCPTimeout.
+const SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Dialer producing one fresh physical connection to the proxy node.  The
 /// connection must already carry the protocol handshake (VLESS/Trojan first
@@ -138,7 +141,7 @@ impl SessionKind {
             SessionKind::Smux(session) => session.is_dead(),
             SessionKind::Yamux(session) => session.is_dead(),
             SessionKind::H2Mux(session) => session.is_dead(),
-            SessionKind::MuxCool(session) => session.aborted(),
+            SessionKind::MuxCool(session) => session.unavailable(),
         }
     }
 }
@@ -304,6 +307,49 @@ impl MuxClient {
         })
     }
 
+    /// Whether UDP should use mux rather than the adapter's plain UDP path.
+    pub(crate) fn supports_udp(&self) -> bool {
+        !self.options.only_tcp
+    }
+
+    fn metadata_host(metadata: &Metadata, adapter: &str) -> Result<String> {
+        if !metadata.host.is_empty() {
+            Ok(metadata.host.to_string())
+        } else if let Some(ip) = metadata.dst_ip {
+            Ok(ip.to_string())
+        } else {
+            Err(MeowError::Proxy(format!(
+                "{adapter} mux: metadata has no destination host"
+            )))
+        }
+    }
+
+    /// Shared adapter hook for a muxed TCP dial.
+    pub(crate) async fn open_stream_for(
+        self: &Arc<Self>,
+        metadata: &Metadata,
+        adapter: &str,
+    ) -> Result<MuxStreamConn> {
+        let host = Self::metadata_host(metadata, adapter)?;
+        self.open_stream(&host, metadata.dst_port).await
+    }
+
+    /// Shared adapter hook for UDP.  `None` means `only-tcp` selected the
+    /// adapter's existing plain UDP path.
+    pub(crate) async fn open_packet_stream_for(
+        self: &Arc<Self>,
+        metadata: &Metadata,
+        adapter: &str,
+    ) -> Result<Option<Box<dyn ProxyPacketConn>>> {
+        if !self.supports_udp() {
+            return Ok(None);
+        }
+        let host = Self::metadata_host(metadata, adapter)?;
+        self.open_packet_stream(&host, metadata.dst_port)
+            .await
+            .map(Some)
+    }
+
     /// Open one multiplexed TCP stream to host:port.  sing-mux writes the
     /// stream request (flags + Socksaddr destination) before returning;
     /// Mux.Cool encodes the destination into the stream's New frame.
@@ -425,8 +471,26 @@ impl MuxClient {
         self: &Arc<Self>,
         sessions: &mut VecDeque<Arc<MuxSession>>,
     ) -> Result<Arc<MuxSession>> {
+        let kind = tokio::time::timeout(SESSION_SETUP_TIMEOUT, self.create_session())
+            .await
+            .map_err(|_| {
+                MeowError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "mux: session setup timed out",
+                ))
+            })??;
+        let session = Arc::new(MuxSession {
+            kind,
+            streams: AtomicUsize::new(0),
+            last_used_ms: AtomicU64::new(now_ms()),
+        });
+        sessions.push_back(Arc::clone(&session));
+        Ok(session)
+    }
+
+    async fn create_session(&self) -> Result<SessionKind> {
         let mut conn = (self.dial)().await?;
-        let kind = match self.options.protocol {
+        match self.options.protocol {
             Protocol::Smux | Protocol::Yamux | Protocol::H2Mux => {
                 let header = Request::new(
                     if self.options.padding { 1 } else { 0 },
@@ -436,7 +500,7 @@ impl MuxClient {
                 .encode();
                 conn.write_all(&header).await.map_err(MeowError::Io)?;
                 conn.flush().await.map_err(MeowError::Io)?;
-                match self.options.protocol {
+                Ok(match self.options.protocol {
                     Protocol::Smux => SessionKind::Smux(Arc::new(
                         smux::Session::client(conn).map_err(MeowError::Io)?,
                     )),
@@ -447,21 +511,14 @@ impl MuxClient {
                         h2mux::Session::client(conn).await.map_err(MeowError::Io)?,
                     )),
                     Protocol::MuxCool => unreachable!("handled above"),
-                }
+                })
             }
-            Protocol::MuxCool => SessionKind::MuxCool(
+            Protocol::MuxCool => Ok(SessionKind::MuxCool(
                 muxcool::MuxCoolSession::client(conn)
                     .await
                     .map_err(MeowError::Io)?,
-            ),
-        };
-        let session = Arc::new(MuxSession {
-            kind,
-            streams: AtomicUsize::new(0),
-            last_used_ms: AtomicU64::new(now_ms()),
-        });
-        sessions.push_back(Arc::clone(&session));
-        Ok(session)
+            )),
+        }
     }
 }
 
@@ -629,5 +686,26 @@ mod tests {
         let streams = futures::future::join_all(opens).await;
         assert_eq!(streams.len(), 8);
         assert_eq!(dials.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_setup_timeout_bounds_a_stalled_dial() {
+        let dial: DialFn =
+            Arc::new(|| Box::pin(std::future::pending::<Result<Box<dyn ProxyConn>>>()));
+        let client = MuxClient::new(
+            dial,
+            MuxOptions {
+                protocol: Protocol::Smux,
+                ..MuxOptions::default()
+            },
+        );
+
+        let Err(error) = client.open_stream("a.example", 80).await else {
+            panic!("a stalled dial must time out");
+        };
+        assert!(
+            error.to_string().contains("session setup timed out"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -8,7 +8,6 @@
 //! stream request — datagrams carry no per-packet address.
 
 use super::client::{MuxSession, MuxStream};
-use bytes::{BufMut, BytesMut};
 use meow_common::{MeowError, ProxyPacketConn, Result};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -19,8 +18,8 @@ use tokio::sync::Mutex;
 /// One UDP flow multiplexed over a mux stream.  Dropping it half-closes
 /// the stream and decrements the session's stream count.
 pub struct MuxPacketConn {
-    reader: Mutex<tokio::io::ReadHalf<MuxStream>>,
-    writer: Mutex<tokio::io::WriteHalf<MuxStream>>,
+    reader: Mutex<PacketReader>,
+    writer: Mutex<PacketWriter>,
     session: Arc<MuxSession>,
     /// The destination bound in the stream request; every read reports this
     /// as the datagram source (no per-packet addressing in sing-mux UDP).
@@ -39,8 +38,8 @@ impl MuxPacketConn {
         // writes, and QUIC-style flows write while waiting for reads.
         let (reader, writer) = tokio::io::split(stream);
         Self {
-            reader: Mutex::new(reader),
-            writer: Mutex::new(writer),
+            reader: Mutex::new(PacketReader::new(reader)),
+            writer: Mutex::new(PacketWriter::new(writer)),
             session,
             destination,
         }
@@ -63,11 +62,7 @@ impl MuxPacketConn {
             )));
         }
         let mut writer = self.writer.lock().await;
-        let mut frame = BytesMut::with_capacity(2 + data.len());
-        frame.put_u16(data.len() as u16);
-        frame.put_slice(data);
-        writer.write_all(&frame).await.map_err(MeowError::Io)?;
-        writer.flush().await.map_err(MeowError::Io)?;
+        writer.write_datagram(data).await.map_err(MeowError::Io)?;
         Ok(data.len())
     }
 
@@ -75,31 +70,101 @@ impl MuxPacketConn {
     /// byte is consumed lazily on the first read by `MuxStream`.
     pub async fn read_datagram(&self, buf: &mut [u8]) -> Result<usize> {
         let mut reader = self.reader.lock().await;
-        let mut len_buf = [0u8; 2];
-        reader
-            .read_exact(&mut len_buf)
-            .await
-            .map_err(MeowError::Io)?;
-        let pkt_len = u16::from_be_bytes(len_buf) as usize;
-        if pkt_len > buf.len() {
-            // Drain the oversized payload before erroring so the stream
-            // framing stays aligned for the next read.
-            let mut discard = vec![0u8; pkt_len];
-            reader
-                .read_exact(&mut discard)
+        reader.read_datagram(buf).await
+    }
+}
+
+/// Cancel-safe datagram reader.  Length and payload progress survive a
+/// dropped `read_packet` future (the TUN pump recreates it inside select!).
+struct PacketReader {
+    stream: tokio::io::ReadHalf<MuxStream>,
+    len: [u8; 2],
+    len_pos: usize,
+    payload: Vec<u8>,
+    payload_pos: usize,
+}
+
+impl PacketReader {
+    fn new(stream: tokio::io::ReadHalf<MuxStream>) -> Self {
+        Self {
+            stream,
+            len: [0; 2],
+            len_pos: 0,
+            payload: Vec::new(),
+            payload_pos: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.len_pos = 0;
+        self.payload.clear();
+        self.payload_pos = 0;
+    }
+
+    async fn read_datagram(&mut self, out: &mut [u8]) -> Result<usize> {
+        while self.len_pos < self.len.len() {
+            let read = self
+                .stream
+                .read(&mut self.len[self.len_pos..])
                 .await
                 .map_err(MeowError::Io)?;
+            if read == 0 {
+                return Err(MeowError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "mux: EOF while reading UDP packet length",
+                )));
+            }
+            self.len_pos += read;
+        }
+
+        if self.payload.is_empty() && self.payload_pos == 0 {
+            self.payload
+                .resize(u16::from_be_bytes(self.len) as usize, 0);
+        }
+        while self.payload_pos < self.payload.len() {
+            let read = self
+                .stream
+                .read(&mut self.payload[self.payload_pos..])
+                .await
+                .map_err(MeowError::Io)?;
+            if read == 0 {
+                return Err(MeowError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "mux: EOF while reading UDP packet payload",
+                )));
+            }
+            self.payload_pos += read;
+        }
+
+        let packet_len = self.payload.len();
+        if packet_len > out.len() {
+            self.reset();
             return Err(MeowError::Proxy(format!(
-                "mux: UDP packet ({} bytes) exceeds read buffer ({} bytes)",
-                pkt_len,
-                buf.len()
+                "mux: UDP packet ({packet_len} bytes) exceeds read buffer ({} bytes)",
+                out.len()
             )));
         }
-        reader
-            .read_exact(&mut buf[..pkt_len])
-            .await
-            .map_err(MeowError::Io)?;
-        Ok(pkt_len)
+        out[..packet_len].copy_from_slice(&self.payload);
+        self.reset();
+        Ok(packet_len)
+    }
+}
+
+struct PacketWriter {
+    stream: tokio::io::WriteHalf<MuxStream>,
+}
+
+impl PacketWriter {
+    fn new(stream: tokio::io::WriteHalf<MuxStream>) -> Self {
+        Self { stream }
+    }
+
+    async fn write_datagram(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.stream
+            .write_all(&(data.len() as u16).to_be_bytes())
+            .await?;
+        self.stream.write_all(data).await?;
+        self.stream.flush().await
     }
 }
 
@@ -351,8 +416,14 @@ mod tests {
                     2 => {
                         psh_count += 1;
                         if psh_count == 2 {
-                            // Datagram arrived: status + echo.
+                            // First datagram bytes arrived: release the
+                            // blocked read with the stream response status.
                             let _ = send(2, &[0x00]).await;
+                        }
+                        if psh_count >= 2 {
+                            // The length prefix and payload may be split
+                            // across smux frames; echo the byte stream, not
+                            // an assumed one-frame datagram.
                             let _ = send(2, &payload).await;
                         }
                         // First PSH (stream request): stay silent so the
@@ -404,6 +475,87 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         drop(server);
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_after_length_prefix_resumes_payload() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let (prefix_sent_tx, prefix_sent_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut sid = 0;
+            for _ in 0..2 {
+                let mut header = [0u8; 8];
+                server_io.read_exact(&mut header).await.unwrap();
+                sid = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+                let length = u16::from_le_bytes([header[2], header[3]]) as usize;
+                let mut payload = vec![0u8; length];
+                server_io.read_exact(&mut payload).await.unwrap();
+            }
+
+            let mut prefix = bytes::BytesMut::with_capacity(11);
+            bytes::BufMut::put_u8(&mut prefix, 0x01);
+            bytes::BufMut::put_u8(&mut prefix, 0x02);
+            bytes::BufMut::put_u16_le(&mut prefix, 3);
+            bytes::BufMut::put_u32_le(&mut prefix, sid);
+            prefix.extend_from_slice(&[0x00, 0x00, 0x04]);
+            server_io.write_all(&prefix).await.unwrap();
+            let _ = prefix_sent_tx.send(());
+            let _ = continue_rx.await;
+
+            let mut payload = bytes::BytesMut::with_capacity(12);
+            bytes::BufMut::put_u8(&mut payload, 0x01);
+            bytes::BufMut::put_u8(&mut payload, 0x02);
+            bytes::BufMut::put_u16_le(&mut payload, 4);
+            bytes::BufMut::put_u32_le(&mut payload, sid);
+            payload.extend_from_slice(b"pong");
+            server_io.write_all(&payload).await.unwrap();
+        });
+
+        let session = Arc::new(smux::Session::client(client_io).unwrap());
+        let smux_stream = session.open_stream().await.unwrap();
+        let mut stream = MuxStream::new(MuxStreamKind::Smux(smux_stream));
+        stream
+            .write_all(&address::encode_stream_request_with_flags(
+                "127.0.0.1",
+                53,
+                1,
+            ))
+            .await
+            .unwrap();
+        let session_arc = Arc::new(MuxSession {
+            kind: SessionKind::Smux(session),
+            streams: AtomicUsize::new(1),
+            last_used_ms: AtomicU64::new(0),
+        });
+        let conn = MuxPacketConn::new(
+            stream,
+            session_arc,
+            "127.0.0.1:53".parse::<SocketAddr>().unwrap(),
+        );
+
+        prefix_sent_rx.await.unwrap();
+        let mut buf = [0u8; 8];
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            conn.read_datagram(&mut buf),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the first read must wait for the payload"
+        );
+
+        continue_tx.send(()).unwrap();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            conn.read_datagram(&mut buf),
+        )
+        .await
+        .expect("the resumed read must complete")
+        .unwrap();
+        assert_eq!(&buf[..n], b"pong");
+        server.await.unwrap();
     }
 
     /// Live interop probe against a running sing-box VLESS mux inbound

@@ -53,10 +53,6 @@ pub struct TrojanAdapter {
     /// sing-mux compatible connection multiplexing (optional).
     #[cfg(feature = "mux")]
     mux: Option<Arc<MuxClient>>,
-    /// When mux is enabled, route UDP through the plain proxy path instead
-    /// of mux streams (mihomo `only-tcp`).
-    #[cfg(feature = "mux")]
-    mux_only_tcp: bool,
 }
 
 impl TrojanAdapter {
@@ -100,8 +96,6 @@ impl TrojanAdapter {
             tls_layer: Arc::new(tls_layer),
             #[cfg(feature = "mux")]
             mux: None,
-            #[cfg(feature = "mux")]
-            mux_only_tcp: false,
         }
     }
 
@@ -157,7 +151,6 @@ impl TrojanAdapter {
                 Ok(Box::new(StreamConn(stream)) as Box<dyn ProxyConn>)
             })
         });
-        self.mux_only_tcp = options.only_tcp;
         self.mux = Some(MuxClient::new(dial, options));
         self
     }
@@ -461,7 +454,7 @@ impl ProxyAdapter for TrojanAdapter {
         self.support_udp || {
             #[cfg(feature = "mux")]
             {
-                self.mux.is_some() && !self.mux_only_tcp
+                self.mux.as_ref().is_some_and(|mux| mux.supports_udp())
             }
             #[cfg(not(feature = "mux"))]
             {
@@ -478,16 +471,7 @@ impl ProxyAdapter for TrojanAdapter {
         );
         #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
-            let host = if !metadata.host.is_empty() {
-                metadata.host.to_string()
-            } else if let Some(ip) = metadata.dst_ip {
-                ip.to_string()
-            } else {
-                return Err(MeowError::Proxy(
-                    "trojan mux: metadata has no destination host".into(),
-                ));
-            };
-            let conn = mux.open_stream(&host, metadata.dst_port).await?;
+            let conn = mux.open_stream_for(metadata, "trojan").await?;
             return Ok(Box::new(conn));
         }
         let stream = self.open_tls_with_header(metadata, CMD_CONNECT).await?;
@@ -499,22 +483,15 @@ impl ProxyAdapter for TrojanAdapter {
         // node's `udp:` flag — check it before the plain-path gate.
         #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
-            if !self.mux_only_tcp {
-                let host = if !metadata.host.is_empty() {
-                    metadata.host.to_string()
-                } else if let Some(ip) = metadata.dst_ip {
-                    ip.to_string()
-                } else {
-                    return Err(MeowError::Proxy(
-                        "trojan mux udp: metadata has no destination host".into(),
-                    ));
-                };
+            if mux.supports_udp() {
                 debug!(
                     "Trojan mux UDP connecting to {} via {}",
                     metadata.remote_address(),
                     self.addr_str
                 );
-                return mux.open_packet_stream(&host, metadata.dst_port).await;
+            }
+            if let Some(conn) = mux.open_packet_stream_for(metadata, "trojan").await? {
+                return Ok(conn);
             }
         }
         if !self.support_udp {

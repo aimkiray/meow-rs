@@ -61,10 +61,6 @@ pub struct VlessAdapter {
     /// sing-mux compatible connection multiplexing (optional).
     #[cfg(feature = "mux")]
     mux: Option<Arc<MuxClient>>,
-    /// When mux is enabled, route UDP through the plain proxy path instead
-    /// of mux streams (mihomo `only-tcp`).
-    #[cfg(feature = "mux")]
-    mux_only_tcp: bool,
     /// VLESS post-quantum Encryption (`mlkem768x25519plus`), applied below the
     /// VLESS header exchange once per dial. `None` for plain VLESS.
     #[cfg(feature = "vless-encryption")]
@@ -98,8 +94,6 @@ impl VlessAdapter {
             transport: Arc::new(transport),
             #[cfg(feature = "mux")]
             mux: None,
-            #[cfg(feature = "mux")]
-            mux_only_tcp: false,
             #[cfg(feature = "vless-encryption")]
             encryption: None,
             health: ProxyHealth::new(),
@@ -197,7 +191,6 @@ impl VlessAdapter {
                 }
             })
         });
-        self.mux_only_tcp = options.only_tcp;
         self.mux = Some(MuxClient::new(dial, options));
         self
     }
@@ -248,7 +241,7 @@ impl ProxyAdapter for VlessAdapter {
         self.udp || {
             #[cfg(feature = "mux")]
             {
-                self.mux.is_some() && !self.mux_only_tcp
+                self.mux.as_ref().is_some_and(|mux| mux.supports_udp())
             }
             #[cfg(not(feature = "mux"))]
             {
@@ -267,16 +260,7 @@ impl ProxyAdapter for VlessAdapter {
 
         #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
-            let host = if !metadata.host.is_empty() {
-                metadata.host.to_string()
-            } else if let Some(ip) = metadata.dst_ip {
-                ip.to_string()
-            } else {
-                return Err(MeowError::Proxy(
-                    "vless mux: metadata has no destination host".into(),
-                ));
-            };
-            let conn = mux.open_stream(&host, metadata.dst_port).await?;
+            let conn = mux.open_stream_for(metadata, "vless").await?;
             return Ok(Box::new(conn));
         }
 
@@ -336,22 +320,15 @@ impl ProxyAdapter for VlessAdapter {
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
-            if !self.mux_only_tcp {
-                let host = if !metadata.host.is_empty() {
-                    metadata.host.to_string()
-                } else if let Some(ip) = metadata.dst_ip {
-                    ip.to_string()
-                } else {
-                    return Err(MeowError::Proxy(
-                        "vless mux udp: metadata has no destination host".into(),
-                    ));
-                };
+            if mux.supports_udp() {
                 debug!(
                     "VLESS mux UDP connecting to {} via {}",
                     metadata.remote_address(),
                     self.addr_str
                 );
-                return mux.open_packet_stream(&host, metadata.dst_port).await;
+            }
+            if let Some(conn) = mux.open_packet_stream_for(metadata, "vless").await? {
+                return Ok(conn);
             }
         }
 

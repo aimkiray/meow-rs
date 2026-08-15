@@ -346,12 +346,10 @@ const OUTBOUND_QUEUE: usize = 64;
 
 /// One Mux.Cool session multiplexing streams over one VLESS connection.
 ///
-/// A single driver task owns the connection and polls BOTH directions —
-/// the same single-task discipline h2mux uses.  Splitting a layered
-/// conn (VlessConn / Vision / TLS) into concurrent read and write pollers
-/// corrupted the stream state under parallel streams, so outbound frames
-/// are handed to the driver over a bounded channel (backpressure via
-/// PollSender) and inbound frames are demuxed by the driver itself.
+/// A single driver task owns both connection halves and polls both directions.
+/// Outbound frames arrive over a bounded channel (backpressure via
+/// PollSender), while persistent read/write state makes either select branch
+/// cancellation-safe.
 ///
 /// Inbound delivery never blocks the driver: a frame that hits a full
 /// stream queue parks (at most one) and pauses the connection read -
@@ -366,6 +364,9 @@ pub(crate) struct MuxCoolSession {
     driver_tx: mpsc::Sender<Bytes>,
     streams: Arc<Mutex<HashMap<u16, mpsc::Sender<Event>>>>,
     next_sid: AtomicU32,
+    /// Stops the pool selecting this session after its u16 id space is used,
+    /// without aborting existing streams or their keepalive traffic.
+    retired: AtomicBool,
     closed: Arc<AtomicBool>,
     done: Arc<Notify>,
     /// Fired by stream consumers whenever they drain their inbound queue
@@ -389,6 +390,7 @@ impl MuxCoolSession {
             driver_tx,
             streams: Arc::clone(&streams),
             next_sid: AtomicU32::new(1),
+            retired: AtomicBool::new(false),
             closed: Arc::clone(&closed),
             done: Arc::clone(&done),
             space: Arc::clone(&space),
@@ -413,7 +415,18 @@ impl MuxCoolSession {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// True when the pool must replace the session.  Retirement is distinct
+    /// from abort: existing streams remain usable after id exhaustion.
+    pub(crate) fn unavailable(&self) -> bool {
+        self.retired.load(Ordering::SeqCst) || self.aborted()
+    }
+
     /// Queue one outbound frame to the driver task (async contexts).
+    ///
+    /// Only a dead session is rejected.  Retirement (sid exhaustion) must
+    /// NOT block this path: it only stops the pool opening *new* streams
+    /// (alloc_sid fails), while already-open streams must keep sending
+    /// data, End and keepalive frames for the rest of their lifetime.
     async fn send_frame(&self, frame: Bytes) -> io::Result<()> {
         if self.aborted() {
             return Err(io::Error::other("mux.cool session closed"));
@@ -471,6 +484,7 @@ impl MuxCoolSession {
     fn alloc_sid(&self) -> io::Result<u16> {
         let prev = self.next_sid.fetch_add(1, Ordering::SeqCst);
         if prev > u16::MAX as u32 {
+            self.retired.store(true, Ordering::SeqCst);
             return Err(io::Error::other("mux.cool session id space exhausted"));
         }
         Ok(prev as u16)
@@ -568,9 +582,11 @@ struct ReadState {
 
 impl ReadState {
     fn fresh() -> Self {
+        let mut buf = BytesMut::with_capacity(2);
+        buf.resize(2, 0);
         Self {
             phase: ReadPhase::MetaLen,
-            buf: BytesMut::new(),
+            buf,
             pos: 0,
             sid: 0,
             option: 0,
@@ -581,7 +597,7 @@ impl ReadState {
     /// Start reading a fresh frame header.
     fn reset_header(&mut self) {
         self.phase = ReadPhase::MetaLen;
-        self.buf.clear();
+        self.buf.resize(2, 0);
         self.pos = 0;
     }
 }
@@ -589,7 +605,7 @@ impl ReadState {
 /// Read until the buffer is full.  Every call site sizes the buffer before
 /// entering its phase, so the slice exposed to the connection is exactly
 /// buf[pos..] - there is no separate length argument to get wrong.
-async fn read_into(conn: &mut Box<dyn ProxyConn>, state: &mut ReadState) -> io::Result<()> {
+async fn read_into(conn: &mut (impl AsyncRead + Unpin), state: &mut ReadState) -> io::Result<()> {
     while state.pos < state.buf.len() {
         let n = conn.read(&mut state.buf[state.pos..]).await?;
         if n == 0 {
@@ -642,14 +658,12 @@ fn retry_parked(parked: &mut Option<Parked>) {
 /// completion, so cancellation mid-phase is safe.  Returns Some(frame) when
 /// the frame could not be delivered (full stream queue) and must park.
 async fn read_step(
-    conn: &mut Box<dyn ProxyConn>,
+    conn: &mut (impl AsyncRead + Unpin),
     state: &mut ReadState,
     streams: &Arc<Mutex<HashMap<u16, mpsc::Sender<Event>>>>,
 ) -> io::Result<Option<Parked>> {
     match state.phase {
         ReadPhase::MetaLen => {
-            state.buf.resize(2, 0);
-            state.pos = 0;
             read_into(conn, state).await?;
             let meta_len = u16::from_be_bytes([state.buf[0], state.buf[1]]);
             if meta_len as usize > MAX_META {
@@ -727,8 +741,6 @@ async fn read_step(
             }
         }
         ReadPhase::DataLen => {
-            state.buf.resize(2, 0);
-            state.pos = 0;
             read_into(conn, state).await?;
             let data_len = u16::from_be_bytes([state.buf[0], state.buf[1]]) as usize;
             state.buf.resize(data_len, 0);
@@ -738,6 +750,13 @@ async fn read_step(
         }
         ReadPhase::Data => {
             read_into(conn, state).await?;
+            // Acquire the map entry before consuming persistent frame state.
+            // If select! cancels while this lock is pending, the payload and
+            // phase remain intact and the next read_step retries delivery.
+            let tx = {
+                let map = streams.lock().await;
+                map.get(&state.sid).cloned()
+            };
             // Read the payload before delivering an error: an Error|Data
             // frame still carries data_len + payload, and skipping it would
             // desync the frame stream.
@@ -758,17 +777,63 @@ async fn read_step(
             };
             state.reset_header();
             match event {
-                Some(event) => {
-                    let tx = {
-                        let map = streams.lock().await;
-                        map.get(&state.sid).cloned()
-                    };
-                    Ok(deliver_now(tx, event))
-                }
+                Some(event) => Ok(deliver_now(tx, event)),
                 None => Ok(None),
             }
         }
     }
+}
+
+/// Persistent outbound batch.  `pos` and the retained buffer make write and
+/// flush cancellation-safe while allowing the read side to keep progressing.
+struct WriteState {
+    buf: BytesMut,
+    pos: usize,
+}
+
+impl WriteState {
+    fn new() -> Self {
+        Self {
+            buf: BytesMut::new(),
+            pos: 0,
+        }
+    }
+}
+
+/// Advance one outbound operation.  Newly queued frames are coalesced into a
+/// single batch and flushed together; partial writes persist in `state`.
+async fn write_step(
+    writer: &mut (impl AsyncWrite + Unpin),
+    out_rx: &mut mpsc::Receiver<Bytes>,
+    state: &mut WriteState,
+) -> io::Result<()> {
+    if state.buf.is_empty() {
+        let Some(frame) = out_rx.recv().await else {
+            return Err(io::Error::other("mux.cool outbound channel closed"));
+        };
+        state.buf.extend_from_slice(&frame);
+        while let Ok(frame) = out_rx.try_recv() {
+            state.buf.extend_from_slice(&frame);
+        }
+        state.pos = 0;
+    }
+
+    if state.pos < state.buf.len() {
+        let written = writer.write(&state.buf[state.pos..]).await?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "mux.cool session write returned zero",
+            ));
+        }
+        state.pos += written;
+        return Ok(());
+    }
+
+    writer.flush().await?;
+    state.buf.clear();
+    state.pos = 0;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -778,20 +843,20 @@ async fn read_u16(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<u16> {
     Ok(u16::from_be_bytes(b))
 }
 
-/// Owns the connection and polls BOTH directions from this single task —
-/// the same discipline h2mux's h2 driver uses.  Concurrent read/write
-/// polling of a layered conn (VlessConn / Vision / TLS) corrupted the
-/// stream state under parallel streams, so writes arrive via the outbound
-/// channel instead.
+/// Owns both halves and polls both directions from one task.  Tokio's split
+/// only interleaves polls; persistent state in `read_step` and `write_step`
+/// prevents the stored-future duplication that corrupted earlier builds.
 async fn driver_loop(
-    mut conn: Box<dyn ProxyConn>,
+    conn: Box<dyn ProxyConn>,
     mut out_rx: mpsc::Receiver<Bytes>,
     streams: Arc<Mutex<HashMap<u16, mpsc::Sender<Event>>>>,
     closed: Arc<AtomicBool>,
     done: Arc<Notify>,
     space: Arc<Notify>,
 ) {
+    let (mut reader, mut writer) = tokio::io::split(conn);
     let mut state = ReadState::fresh();
+    let mut write_state = WriteState::new();
     // A parked inbound frame pauses the read side (flow control) while
     // outbound frames keep flowing: the driver never blocks on a stream
     // queue, so a consumer waiting for outbound capacity can always make
@@ -809,17 +874,11 @@ async fn driver_loop(
                 _ = done.notified() => {
                     return Err(io::Error::other("mux.cool session closed"));
                 }
-                frame = out_rx.recv() => {
-                    let Some(frame) = frame else {
-                        return Err(io::Error::other("mux.cool outbound channel closed"));
-                    };
-                    conn.write_all(&frame).await?;
-                    conn.flush().await?;
-                }
+                result = write_step(&mut writer, &mut out_rx, &mut write_state) => result?,
                 // A consumer drained a stream queue (or dropped a stream):
                 // wake so the retry above re-runs promptly.
                 _ = space_fut, if parked.is_some() => {}
-                step = read_step(&mut conn, &mut state, &streams), if parked.is_none() => {
+                step = read_step(&mut reader, &mut state, &streams), if parked.is_none() => {
                     if let Some(p) = step? {
                         parked = Some(p);
                     }
@@ -838,7 +897,7 @@ async fn driver_loop(
         // a full queue observe the abort instead of hanging forever (the
         // session itself keeps the map alive).
         let mut map = streams.lock().await;
-        for (_, tx) in map.iter() {
+        for tx in map.values() {
             let _ = tx.try_send(Event::Error(io::Error::new(
                 e.kind(),
                 format!("mux.cool session aborted: {e}"),
@@ -1815,6 +1874,108 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn data_delivery_survives_cancellation_while_stream_map_is_locked() {
+        let (mut client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        server_io
+            .write_all(&encode_data_frame(1, b"payload", None).unwrap())
+            .await
+            .unwrap();
+
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(1);
+        streams.lock().await.insert(1, tx);
+        let mut state = ReadState::fresh();
+        read_step(&mut client_io, &mut state, &streams)
+            .await
+            .unwrap();
+        read_step(&mut client_io, &mut state, &streams)
+            .await
+            .unwrap();
+        read_step(&mut client_io, &mut state, &streams)
+            .await
+            .unwrap();
+        assert!(matches!(state.phase, ReadPhase::Data));
+
+        let guard = streams.lock().await;
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            read_step(&mut client_io, &mut state, &streams),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "delivery must wait for the stream map lock"
+        );
+        assert!(matches!(state.phase, ReadPhase::Data));
+        assert_eq!(&state.buf[..], b"payload");
+        drop(guard);
+
+        assert!(read_step(&mut client_io, &mut state, &streams)
+            .await
+            .unwrap()
+            .is_none());
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(event, Event::Data { bytes, .. } if bytes.as_ref() == b"payload"));
+    }
+
+    #[tokio::test]
+    async fn length_prefix_read_survives_cancellation() {
+        let (mut client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        server_io.write_all(&[0]).await.unwrap();
+
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(1);
+        streams.lock().await.insert(1, tx);
+        let mut state = ReadState::fresh();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            read_step(&mut client_io, &mut state, &streams),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the read must wait for the second length byte"
+        );
+        assert_eq!(state.pos, 1);
+        assert!(matches!(state.phase, ReadPhase::MetaLen));
+
+        let frame = encode_data_frame(1, b"x", None).unwrap();
+        server_io.write_all(&frame[1..]).await.unwrap();
+        for _ in 0..4 {
+            read_step(&mut client_io, &mut state, &streams)
+                .await
+                .unwrap();
+        }
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(event, Event::Data { bytes, .. } if bytes.as_ref() == b"x"));
+    }
+
+    #[tokio::test]
+    async fn blocked_physical_write_does_not_starve_reads() {
+        let (client_io, mut server_io) = tokio::io::duplex(1);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            server_io
+                .write_all(&encode_data_frame(1, b"reply", None).unwrap())
+                .await
+                .unwrap();
+            let _ = done_rx.await;
+        });
+        let session = MuxCoolSession::client(Box::new(TestConn(client_io)))
+            .await
+            .unwrap();
+        let mut stream = session.open_stream("a.example", 80, false).await.unwrap();
+        let mut reply = [0u8; 5];
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut reply))
+            .await
+            .expect("read progress must continue while the New frame is blocked")
+            .unwrap();
+        assert_eq!(&reply, b"reply");
+        done_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
     /// Regression: a full-duplex bulk transfer must not deadlock.  The
     /// consumer writes 1 MiB (128 x 8 KiB frames) before reading while the
     /// server echoes every frame: the 32-frame inbound queue fills
@@ -1921,12 +2082,27 @@ mod tests {
             .store(u16::MAX as u32 + 1, Ordering::SeqCst);
         assert!(session.alloc_sid().is_err());
         assert!(
+            session.unavailable(),
+            "the pool must retire the exhausted session"
+        );
+        assert!(
+            !session.aborted(),
+            "retirement must not abort streams that are already open"
+        );
+        assert!(
             session.alloc_sid().is_err(),
             "exhausted session ids must not wrap around"
         );
         assert!(
             session.open_stream("a.example", 80, false).await.is_err(),
             "open_stream must fail on an exhausted session"
+        );
+        // Retirement must not break traffic that is already open: existing
+        // streams' frames (and the session keepalive) keep flowing even
+        // though the pool will never select this session again.
+        assert!(
+            session.send_frame(encode_keepalive_frame()).await.is_ok(),
+            "retired sessions must keep sending existing-stream frames"
         );
     }
 
