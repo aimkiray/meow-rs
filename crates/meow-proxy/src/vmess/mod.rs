@@ -69,7 +69,6 @@ impl VmessAdapter {
     pub fn with_mux(mut self, options: crate::mux::MuxOptions) -> Self {
         use crate::mux::{MuxClient, MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
         use std::sync::Arc as StdArc;
-        use tokio::io::AsyncWriteExt;
 
         let transport = Arc::clone(&self.transport);
         let server = self.server.clone();
@@ -81,43 +80,12 @@ impl VmessAdapter {
             let transport = Arc::clone(&transport);
             let server = server.clone();
             Box::pin(async move {
-                let tcp = meow_common::connect_tcp_host(&server, port)
-                    .await
-                    .map_err(MeowError::Io)?;
-                let _ = tcp.set_nodelay(true);
-                let mut stream = transport
-                    .connect(Box::new(tcp))
-                    .await
-                    .map_err(|e| MeowError::Proxy(format!("vmess transport: {e}")))?;
-
                 let metadata = Metadata {
                     host: MUX_DESTINATION_FQDN.into(),
                     dst_port: MUX_DESTINATION_PORT,
                     ..Default::default()
                 };
-                let sealed = header::seal_request_header(&cmd_key, security, &metadata, false)
-                    .map_err(MeowError::Proxy)?;
-
-                stream
-                    .write_all(&sealed.bytes)
-                    .await
-                    .map_err(MeowError::Io)?;
-
-                let read_cipher =
-                    body::BodyCipher::new(security, &sealed.req_key, &sealed.req_iv, sealed.resp_v);
-                let write_cipher =
-                    body::BodyCipher::new(security, &sealed.req_key, &sealed.req_iv, sealed.resp_v);
-
-                let duplex = conn::spawn_vmess_relay(
-                    stream,
-                    read_cipher,
-                    write_cipher,
-                    sealed.req_key,
-                    sealed.req_iv,
-                    sealed.resp_v,
-                );
-                Ok(Box::new(crate::stream_conn::StreamConn(Box::new(duplex)))
-                    as Box<dyn ProxyConn>)
+                dial_vmess(&transport, &server, port, cmd_key, security, &metadata).await
             })
         });
         self.mux_only_tcp = options.only_tcp;
@@ -129,53 +97,60 @@ impl VmessAdapter {
     /// VMess request header exchange for the given destination, and return
     /// the encrypted duplex.
     async fn dial_to(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-        use tokio::io::AsyncWriteExt;
-
-        let stream = self.dial_stream().await?;
-
-        let sealed = header::seal_request_header(&self.cmd_key, self.security, metadata, false)
-            .map_err(MeowError::Proxy)?;
-
-        let mut stream = stream;
-        stream
-            .write_all(&sealed.bytes)
-            .await
-            .map_err(MeowError::Io)?;
-
-        let read_cipher = body::BodyCipher::new(
+        dial_vmess(
+            &self.transport,
+            &self.server,
+            self.port,
+            self.cmd_key,
             self.security,
-            &sealed.req_key,
-            &sealed.req_iv,
-            sealed.resp_v,
-        );
-        let write_cipher = body::BodyCipher::new(
-            self.security,
-            &sealed.req_key,
-            &sealed.req_iv,
-            sealed.resp_v,
-        );
-
-        let duplex = conn::spawn_vmess_relay(
-            stream,
-            read_cipher,
-            write_cipher,
-            sealed.req_key,
-            sealed.req_iv,
-            sealed.resp_v,
-        );
-        Ok(Box::new(crate::stream_conn::StreamConn(Box::new(duplex))))
+            metadata,
+        )
+        .await
     }
 
-    async fn dial_stream(&self) -> Result<Box<dyn meow_transport::Stream>> {
-        let tcp = meow_common::connect_tcp_host(&self.server, self.port)
-            .await
-            .map_err(MeowError::Io)?;
-        let _ = tcp.set_nodelay(true);
-        self.transport
-            .connect(Box::new(tcp))
-            .await
-            .map_err(|e| MeowError::Proxy(format!("vmess transport: {e}")))
-    }
+}
+
+/// Dial a raw TCP + transport-chain stream to the VMess server, run the
+/// VMess request header exchange for the given destination, and return the
+/// encrypted duplex.  Shared by the plain dial path and the sing-mux
+/// session dialer (which targets the reserved mux destination).
+async fn dial_vmess(
+    transport: &TransportChain,
+    server: &str,
+    port: u16,
+    cmd_key: [u8; 16],
+    security: Security,
+    metadata: &Metadata,
+) -> Result<Box<dyn ProxyConn>> {
+    use tokio::io::AsyncWriteExt;
+
+    let tcp = meow_common::connect_tcp_host(server, port)
+        .await
+        .map_err(MeowError::Io)?;
+    let _ = tcp.set_nodelay(true);
+    let mut stream = transport
+        .connect(Box::new(tcp))
+        .await
+        .map_err(|e| MeowError::Proxy(format!("vmess transport: {e}")))?;
+
+    let sealed = header::seal_request_header(&cmd_key, security, metadata, false)
+        .map_err(MeowError::Proxy)?;
+
+    stream.write_all(&sealed.bytes).await.map_err(MeowError::Io)?;
+
+    let read_cipher = body::BodyCipher::new(security, &sealed.req_key, &sealed.req_iv, sealed.resp_v);
+    let write_cipher =
+        body::BodyCipher::new(security, &sealed.req_key, &sealed.req_iv, sealed.resp_v);
+
+    let duplex = conn::spawn_vmess_relay(
+        stream,
+        read_cipher,
+        write_cipher,
+        sealed.req_key,
+        sealed.req_iv,
+        sealed.resp_v,
+    );
+    Ok(Box::new(crate::stream_conn::StreamConn(Box::new(duplex))))
 }
 
 #[async_trait]
