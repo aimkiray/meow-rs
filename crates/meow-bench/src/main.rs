@@ -129,6 +129,18 @@ async fn wait_for_udp_port(addr: SocketAddr, timeout: Duration) -> anyhow::Resul
     }
 }
 
+/// Reaps a spawned proxy on drop — benchmark error paths must not leak
+/// the child process (its listener would hold the port and break the
+/// next target).
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 async fn benchmark_target(
     binary: &Path,
     config: &Path,
@@ -143,22 +155,23 @@ async fn benchmark_target(
 
     eprintln!("[{}] starting proxy: {}", target_name, binary.display());
 
-    // Start proxy process (SOCKS5 config for W1–W3)
-    let mut child = Command::new(binary)
-        .args(["-f", &config.to_string_lossy()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to start {}: {}", binary.display(), e))?;
+    // Start proxy process (SOCKS5 config for W1–W3).  The guard reaps
+    // the child on every error path; the success path reaps it
+    // explicitly below and forgets the guard.
+    let mut child = ChildGuard(
+        Command::new(binary)
+            .args(["-f", &config.to_string_lossy()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to start {}: {}", binary.display(), e))?,
+    );
 
-    let pid = child.id();
+    let pid = child.0.id();
 
-    // Wait for SOCKS5 port to be ready
-    if let Err(e) = wait_for_port(proxy_addr, Duration::from_secs(10)).await {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(e);
-    }
+    // Wait for SOCKS5 port to be ready (the guard reaps the child if
+    // this or any later step fails).
+    wait_for_port(proxy_addr, Duration::from_secs(10)).await?;
     eprintln!("[{target_name}] proxy ready on port {PROXY_PORT}");
 
     // Settle time
@@ -246,12 +259,19 @@ async fn benchmark_target(
         rss_load as f64 / 1048576.0
     );
 
-    // Stop the SOCKS5 proxy process before starting the DNS process
+    // Stop the SOCKS5 proxy process before starting the DNS process.
+    // SIGTERM on Unix; Windows has no `kill` command, so terminate the
+    // child directly (a no-op once it already exited).
     eprintln!("[{target_name}] stopping SOCKS5 proxy...");
-    let _ = Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status();
-    let _ = child.wait();
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+    let _ = child.0.kill();
+    let _ = child.0.wait();
+    std::mem::forget(child); // already reaped
     echo_handle.abort();
 
     // W4 — DNS QPS (separate process with DNS-enabled config)
@@ -259,20 +279,21 @@ async fn benchmark_target(
         (true, Some(dns_config)) => {
             eprintln!("[{}] starting DNS proxy: {}", target_name, binary.display());
 
-            let mut dns_child = Command::new(binary)
-                .args(["-f", &dns_config.to_string_lossy()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| anyhow::anyhow!("failed to start DNS proxy: {e}"))?;
+            let mut dns_child = ChildGuard(
+                Command::new(binary)
+                    .args(["-f", &dns_config.to_string_lossy()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|e| anyhow::anyhow!("failed to start DNS proxy: {e}"))?,
+            );
 
-            let dns_pid = dns_child.id();
+            #[cfg_attr(not(unix), allow(unused_variables))]
+            let dns_pid = dns_child.0.id();
             let dns_addr: SocketAddr = format!("127.0.0.1:{}", args.dns_port).parse()?;
 
             let ready = wait_for_udp_port(dns_addr, Duration::from_secs(10)).await;
             if let Err(e) = ready {
-                let _ = dns_child.kill();
-                let _ = dns_child.wait();
                 eprintln!("[{target_name}] DNS port not ready: {e} — skipping W4");
                 None
             } else {
@@ -282,10 +303,15 @@ async fn benchmark_target(
                 eprintln!("[{target_name}] benchmarking DNS QPS...");
                 let dns_result = bench_dns::bench_dns(dns_addr, args.duration).await;
 
-                let _ = Command::new("kill")
-                    .args(["-TERM", &dns_pid.to_string()])
-                    .status();
-                let _ = dns_child.wait();
+                #[cfg(unix)]
+                {
+                    let _ = Command::new("kill")
+                        .args(["-TERM", &dns_pid.to_string()])
+                        .status();
+                }
+                let _ = dns_child.0.kill();
+                let _ = dns_child.0.wait();
+                std::mem::forget(dns_child); // already reaped
 
                 match dns_result {
                     Ok(r) => Some(r),
