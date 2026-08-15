@@ -120,7 +120,12 @@ pub struct H2Stream {
     send: h2::SendStream<Bytes>,
     recv: RecvState,
     read_buf: Bytes,
-    pending_write: Option<Bytes>,
+    /// Pre-encoded payload stashed while waiting for h2 send-window
+    /// capacity, plus the number of bytes already handed to the
+    /// connection.  Only the ungranted remainder is ever sent, so a
+    /// peer that stops reading applies real backpressure instead of
+    /// growing h2's internal buffer.
+    pending_write: Option<(Bytes, usize)>,
     remote_no_error_is_eof: bool,
     eos_sent: bool,
 }
@@ -163,6 +168,12 @@ impl AsyncRead for H2Stream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        // A zero-capacity buffer yields Ready(Ok(())) per the tokio
+        // AsyncRead docs (a Pending here would leave `read(&mut [])`
+        // parked forever).
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         loop {
             if !this.read_buf.is_empty() {
                 let count = this.read_buf.len().min(buf.remaining());
@@ -208,10 +219,15 @@ impl AsyncWrite for H2Stream {
             return Poll::Ready(Ok(0));
         }
         let this = self.get_mut();
+        // Stash the payload exactly once per logical write: if
+        // pending_write is set, a previous poll returned Pending and
+        // capacity has been reserved — do not encode or reserve again.
+        // This relies on the AsyncWrite contract that a Pending poll is
+        // retried with the same buffer.
         if this.pending_write.is_none() {
             let data = Bytes::copy_from_slice(buf);
             this.send.reserve_capacity(data.len());
-            this.pending_write = Some(data);
+            this.pending_write = Some((data, 0));
         }
         match this.send.poll_capacity(cx) {
             Poll::Pending => Poll::Pending,
@@ -226,10 +242,27 @@ impl AsyncWrite for H2Stream {
                 this.pending_write = None;
                 Poll::Ready(Err(io::Error::other(error)))
             }
-            Poll::Ready(Some(Ok(_))) => {
-                let data = this.pending_write.take().expect("set above");
-                this.send.send_data(data, false).map_err(io::Error::other)?;
-                Poll::Ready(Ok(buf.len()))
+            Poll::Ready(Some(Ok(capacity))) => {
+                let (data, offset) = this.pending_write.as_mut().expect("set above");
+                let remaining = data.len() - *offset;
+                // poll_capacity may grant less than the reserved amount
+                // (the peer's flow-control window); send only the
+                // granted prefix and keep the rest pending.
+                let allowed = capacity.min(remaining);
+                if allowed == 0 {
+                    return Poll::Pending;
+                }
+                let chunk = data.slice(*offset..*offset + allowed);
+                let chunk_len = chunk.len();
+                if let Err(error) = this.send.send_data(chunk, false) {
+                    this.pending_write = None;
+                    return Poll::Ready(Err(io::Error::other(error)));
+                }
+                *offset += chunk_len;
+                if *offset >= data.len() {
+                    this.pending_write = None;
+                }
+                Poll::Ready(Ok(chunk_len))
             }
         }
     }

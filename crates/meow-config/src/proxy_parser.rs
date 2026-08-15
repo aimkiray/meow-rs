@@ -1472,18 +1472,20 @@ fn parse_mux_options(
     let Some(mux_cfg) = mux_config_block(name, config)? else {
         return Ok(None);
     };
-    let enabled = mux_cfg
-        .get("enabled")
-        .and_then(serde_yaml::Value::as_bool)
-        .unwrap_or(false);
+    let enabled = mux_bool_field(name, mux_cfg, "enabled", false)?;
     if !enabled {
         return Ok(None);
     }
     // Empty protocol maps to h2mux, matching mihomo's default.
-    let protocol_str = mux_cfg
-        .get("protocol")
-        .and_then(serde_yaml::Value::as_str)
-        .unwrap_or("h2mux");
+    let protocol_str = match mux_cfg.get("protocol") {
+        None => "h2mux",
+        Some(serde_yaml::Value::String(s)) => s.as_str(),
+        Some(other) => {
+            return Err(format!(
+                "{name}: mux option 'protocol' must be a string, got {other:?}"
+            ))
+        }
+    };
     let Some(protocol) = meow_proxy::mux::Protocol::parse(protocol_str) else {
         // mihomo hard-errors on unknown protocols; do the same so a typo
         // cannot silently speak the wrong wire protocol to the server.
@@ -1491,17 +1493,11 @@ fn parse_mux_options(
             "{name}: unknown mux protocol '{protocol_str}'; valid values: smux, yamux, h2mux, muxcool"
         ));
     };
-    let get_usize = |key: &str, default: usize| {
-        mux_cfg
-            .get(key)
-            .and_then(serde_yaml::Value::as_u64)
-            .map_or(default, |v| v as usize)
-    };
     // max-connections=0 AND max-streams=0 means one physical connection
     // per stream (mirrors mihomo/sing-mux exactly) — almost never what an
     // operator wants, so say so.
-    let max_connections = get_usize("max-connections", 4);
-    let max_streams = get_usize("max-streams", 4);
+    let max_connections = mux_usize_field(name, mux_cfg, "max-connections", 4)?;
+    let max_streams = mux_usize_field(name, mux_cfg, "max-streams", 4)?;
     if max_connections == 0 && max_streams == 0 {
         tracing::warn!(
             proxy = %name,
@@ -1523,17 +1519,11 @@ fn parse_mux_options(
     }
     Ok(Some(meow_proxy::mux::MuxOptions {
         protocol,
-        padding: mux_cfg
-            .get("padding")
-            .and_then(serde_yaml::Value::as_bool)
-            .unwrap_or(false),
+        padding: mux_bool_field(name, mux_cfg, "padding", false)?,
         max_connections,
-        min_streams: get_usize("min-streams", 4),
+        min_streams: mux_usize_field(name, mux_cfg, "min-streams", 4)?,
         max_streams,
-        only_tcp: mux_cfg
-            .get("only-tcp")
-            .and_then(serde_yaml::Value::as_bool)
-            .unwrap_or(false),
+        only_tcp: mux_bool_field(name, mux_cfg, "only-tcp", false)?,
     }))
 }
 
@@ -1579,12 +1569,77 @@ fn mux_config_block<'a>(
     name: &str,
     config: &'a HashMap<String, serde_yaml::Value>,
 ) -> std::result::Result<Option<&'a serde_yaml::Value>, String> {
-    match (config.get("smux"), config.get("mux")) {
-        (Some(_), Some(_)) => Err(format!(
-            "{name}: configure only one of `smux` or legacy alias `mux`"
+    let block = match (config.get("smux"), config.get("mux")) {
+        (Some(_), Some(_)) => {
+            // Migration-friendly: prefer the canonical key and say so,
+            // instead of rejecting the node for a likely leftover.
+            tracing::warn!(
+                proxy = %name,
+                "both `smux` and legacy alias `mux` are configured; using the canonical `smux` key"
+            );
+            config.get("smux")
+        }
+        (Some(config), None) | (None, Some(config)) => Some(config),
+        (None, None) => None,
+    };
+    let Some(block) = block else {
+        return Ok(None);
+    };
+    // A scalar like `smux: true` must not be treated as "disabled" —
+    // the operator clearly tried to enable multiplexing.
+    if !block.is_mapping() {
+        return Err(format!(
+            "{name}: `smux`/`mux` must be a mapping, got {block:?}"
+        ));
+    }
+    Ok(Some(block))
+}
+
+#[cfg(all(
+    feature = "mux",
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn mux_bool_field(
+    name: &str,
+    mux_cfg: &serde_yaml::Value,
+    key: &str,
+    default: bool,
+) -> std::result::Result<bool, String> {
+    match mux_cfg.get(key) {
+        None => Ok(default),
+        Some(serde_yaml::Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(format!(
+            "{name}: mux option '{key}' must be a boolean, got {other:?}"
         )),
-        (Some(config), None) | (None, Some(config)) => Ok(Some(config)),
-        (None, None) => Ok(None),
+    }
+}
+
+#[cfg(all(
+    feature = "mux",
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn mux_usize_field(
+    name: &str,
+    mux_cfg: &serde_yaml::Value,
+    key: &str,
+    default: usize,
+) -> std::result::Result<usize, String> {
+    match mux_cfg.get(key) {
+        None => Ok(default),
+        Some(serde_yaml::Value::Number(n)) if n.is_u64() => Ok(n.as_u64().unwrap() as usize),
+        Some(other) => Err(format!(
+            "{name}: mux option '{key}' must be a non-negative integer, got {other:?}"
+        )),
     }
 }
 

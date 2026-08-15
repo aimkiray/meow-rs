@@ -386,7 +386,7 @@ proxies:
 }
 
 #[tokio::test]
-async fn test_proxy_parsing_rejects_smux_and_mux_together() {
+async fn test_proxy_parsing_prefers_smux_when_both_keys_present() {
     let yaml = r#"
 proxies:
   - name: "trojan-double-mux"
@@ -397,10 +397,43 @@ proxies:
     smux:
       enabled: true
     mux:
-      enabled: true
+      enabled: false
+"#;
+    // The canonical smux: key wins (warn) and the node stays usable.
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(config.proxies.contains_key("trojan-double-mux"));
+}
+
+#[tokio::test]
+async fn test_proxy_parsing_rejects_non_boolean_mux_enabled() {
+    let yaml = r#"
+proxies:
+  - name: "trojan-bad-mux"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "password123"
+    smux:
+      enabled: "true"
+"#;
+    // A string "true" must not be silently treated as disabled.
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(!config.proxies.contains_key("trojan-bad-mux"));
+}
+
+#[tokio::test]
+async fn test_proxy_parsing_rejects_scalar_mux_block() {
+    let yaml = r#"
+proxies:
+  - name: "trojan-scalar-mux"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "password123"
+    smux: true
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
-    assert!(!config.proxies.contains_key("trojan-double-mux"));
+    assert!(!config.proxies.contains_key("trojan-scalar-mux"));
 }
 
 #[cfg(feature = "mux")]

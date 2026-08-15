@@ -28,7 +28,7 @@ Real multiplexing the mihomo way: provide
 outbounds, multiplexing many logical streams over **one physical node
 connection** and eliminating the per-stream node TCP+TLS+protocol handshake
 cost (measured 500-700ms per new connection @140ms RTT). The legacy `mux:`
-key remains accepted for compatibility, but configuring both keys is an error.
+key remains accepted for compatibility; configuring both keys warns and prefers the canonical `smux:`.
 
 ## Wire Protocols (confirmed field-by-field from the sources)
 

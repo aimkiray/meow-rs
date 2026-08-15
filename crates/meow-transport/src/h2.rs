@@ -89,6 +89,14 @@ impl Transport for H2Layer {
             let _ = conn.await;
         });
 
+        // h2 requires poll_ready/ready before send_request: sending
+        // without readiness is rejected once MAX_CONCURRENT_STREAMS is
+        // exhausted.
+        h2 = h2
+            .ready()
+            .await
+            .map_err(|e| TransportError::H2(e.to_string()))?;
+
         // Open the h2 stream; `end_of_stream = false` — we will stream data.
         let (response_future, send_stream) = h2
             .send_request(request, false)
