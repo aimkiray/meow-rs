@@ -287,6 +287,9 @@ enum StreamReadState {
 struct StreamPendingWrite {
     frame: Vec<u8>,
     pos: usize,
+    /// Plaintext bytes this record represents, reported once the frame
+    /// is fully written.
+    consumed: usize,
 }
 
 impl AsyncRead for RealityTlsStream {
@@ -430,10 +433,20 @@ impl AsyncWrite for RealityTlsStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        if let Poll::Ready(done) = self.drain_pending_write(cx) {
-            done?;
-        } else {
-            return Poll::Pending;
+        // Finish an in-flight record first and report its plaintext
+        // length only once it is fully written — reporting progress for
+        // a *different* buffer would drop the caller's bytes.
+        // Finish an in-flight record first and report its plaintext
+        // length only once it is fully written — reporting progress for
+        // a *different* buffer would drop the caller's bytes.  (The
+        // drain removes the pending entry when it completes, so the
+        // consumed count must be read before draining.)
+        if self.write_pending.is_some() {
+            let consumed = self.write_pending.as_ref().expect("checked above").consumed;
+            if self.drain_pending_write(cx).is_pending() {
+                return Poll::Pending;
+            }
+            return Poll::Ready(Ok(consumed));
         }
 
         if buf.is_empty() {
@@ -444,15 +457,23 @@ impl AsyncWrite for RealityTlsStream {
             return Pin::new(&mut self.inner).poll_write(cx, buf);
         }
 
+        // TLS records carry a u16 length: chunk large writes into
+        // standard 16 KiB records instead of letting the length field
+        // wrap (which would desynchronise the peer's TLS reader).
+        let chunk_len = buf.len().min(16 * 1024);
         let frame = self
             .write_key
-            .seal(TLS_RECORD_APPLICATION_DATA, buf)
+            .seal(TLS_RECORD_APPLICATION_DATA, &buf[..chunk_len])
             .map_err(transport_io_error)?;
-        self.write_pending = Some(StreamPendingWrite { frame, pos: 0 });
-        match self.drain_pending_write(cx) {
-            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(buf.len())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+        self.write_pending = Some(StreamPendingWrite {
+            frame,
+            pos: 0,
+            consumed: chunk_len,
+        });
+        if self.drain_pending_write(cx).is_pending() {
+            return Poll::Pending;
         }
+        Poll::Ready(Ok(chunk_len))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -1066,6 +1087,10 @@ impl RecordKey {
         body.push(inner_type);
 
         let record_len = body.len() + 16;
+        debug_assert!(
+            record_len <= u16::MAX as usize,
+            "TLS record exceeds u16 length: {record_len}"
+        );
         let mut header = Vec::with_capacity(5);
         header.push(TLS_RECORD_APPLICATION_DATA);
         header.extend_from_slice(&[0x03, 0x03]);

@@ -548,7 +548,11 @@ impl AsyncWrite for VisionConn {
         if !this.write_padding {
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
-        this.build_write_frame(buf);
+        // The padding frame carries u16 content/padding length fields:
+        // chunk large writes so those fields cannot wrap and
+        // desynchronise the peer's vision decoder.
+        let chunk_len = buf.len().min(16 * 1024);
+        this.build_write_frame(&buf[..chunk_len]);
         match this.drain_pending_write(cx) {
             Poll::Ready(Ok(Some(n))) => Poll::Ready(Ok(n)),
             Poll::Ready(Ok(None)) => Poll::Ready(Ok(0)),
