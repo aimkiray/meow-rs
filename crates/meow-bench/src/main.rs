@@ -26,6 +26,10 @@ struct Args {
     #[arg(long, default_value = "target/release/meow")]
     rust_binary: PathBuf,
 
+    /// CLI flag the binary takes before the config path (meow: -f, xray: -c)
+    #[arg(long, default_value = "-f")]
+    binary_arg: String,
+
     /// Path to the Go mihomo binary (skip Go benchmarks if absent)
     #[arg(long)]
     go_binary: Option<PathBuf>,
@@ -160,9 +164,10 @@ async fn benchmark_target(
     // explicitly below and forgets the guard.
     let mut child = ChildGuard(
         Command::new(binary)
-            .args(["-f", &config.to_string_lossy()])
+            .arg(&args.binary_arg)
+            .arg(config.as_os_str())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| anyhow::anyhow!("failed to start {}: {}", binary.display(), e))?,
     );
@@ -193,15 +198,29 @@ async fn benchmark_target(
         rss_idle as f64 / 1048576.0
     );
 
-    // Warmup
+    // Warmup.  Each connection is bounded by the socks5 connect timeout
+    // and the whole phase by a hard deadline, so a proxy whose dial path
+    // stalls surfaces an error instead of wedging the harness.
     eprintln!("[{target_name}] warming up...");
-    for _ in 0..50 {
-        if let Ok(mut s) = socks5_client::socks5_connect(proxy_addr, echo_addr).await {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let _ = s.write_all(&[0x42]).await;
-            let mut buf = [0u8; 1];
-            let _ = s.read_exact(&mut buf).await;
+    let warmup = async {
+        for _ in 0..50 {
+            if let Ok(mut s) = socks5_client::socks5_connect(proxy_addr, echo_addr).await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                    s.write_all(&[0x42]).await?;
+                    let mut buf = [0u8; 1];
+                    s.read_exact(&mut buf).await?;
+                    Ok::<_, std::io::Error>(())
+                })
+                .await;
+            }
         }
+    };
+    if tokio::time::timeout(Duration::from_secs(30), warmup)
+        .await
+        .is_err()
+    {
+        eprintln!("[{target_name}] warmup deadline hit — continuing anyway");
     }
 
     let run_all = args.only.is_none();

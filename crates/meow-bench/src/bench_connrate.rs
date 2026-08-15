@@ -7,6 +7,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::bench_memory::measure_rss;
 use crate::socks5_client::socks5_connect;
 
+/// Per-connection echo deadline: a proxy whose echo never returns must not
+/// wedge a worker forever — time it out and move on to the next conn.
+const ECHO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConnRateResult {
     pub duration_secs: f64,
@@ -31,10 +35,13 @@ pub async fn bench_conn_rate(
                 let Ok(mut stream) = socks5_connect(proxy, echo).await else {
                     continue;
                 };
-                if stream.write_all(&[0x42]).await.is_ok() {
-                    let mut buf = [0u8; 1];
-                    let _ = stream.read_exact(&mut buf).await;
-                }
+                let _ = tokio::time::timeout(ECHO_TIMEOUT, async {
+                    if stream.write_all(&[0x42]).await.is_ok() {
+                        let mut buf = [0u8; 1];
+                        let _ = stream.read_exact(&mut buf).await;
+                    }
+                })
+                .await;
                 drop(stream);
                 counter.fetch_add(1, Ordering::Relaxed);
             }
@@ -104,10 +111,13 @@ pub async fn bench_connrate_steady_state(
                 let Ok(mut stream) = socks5_connect(proxy, echo).await else {
                     continue;
                 };
-                if stream.write_all(&[0x42]).await.is_ok() {
-                    let mut buf = [0u8; 1];
-                    let _ = stream.read_exact(&mut buf).await;
-                }
+                let _ = tokio::time::timeout(ECHO_TIMEOUT, async {
+                    if stream.write_all(&[0x42]).await.is_ok() {
+                        let mut buf = [0u8; 1];
+                        let _ = stream.read_exact(&mut buf).await;
+                    }
+                })
+                .await;
                 drop(stream);
                 counter.fetch_add(1, Ordering::Relaxed);
             }
