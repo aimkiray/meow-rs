@@ -435,18 +435,16 @@ impl AsyncWrite for RealityTlsStream {
     ) -> Poll<std::io::Result<usize>> {
         // Finish an in-flight record first and report its plaintext
         // length only once it is fully written — reporting progress for
-        // a *different* buffer would drop the caller's bytes.
-        // Finish an in-flight record first and report its plaintext
-        // length only once it is fully written — reporting progress for
         // a *different* buffer would drop the caller's bytes.  (The
         // drain removes the pending entry when it completes, so the
         // consumed count must be read before draining.)
         if self.write_pending.is_some() {
             let consumed = self.write_pending.as_ref().expect("checked above").consumed;
-            if self.drain_pending_write(cx).is_pending() {
-                return Poll::Pending;
-            }
-            return Poll::Ready(Ok(consumed));
+            return match self.drain_pending_write(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(consumed)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            };
         }
 
         if buf.is_empty() {
@@ -470,10 +468,11 @@ impl AsyncWrite for RealityTlsStream {
             pos: 0,
             consumed: chunk_len,
         });
-        if self.drain_pending_write(cx).is_pending() {
-            return Poll::Pending;
+        match self.drain_pending_write(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(chunk_len)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
         }
-        Poll::Ready(Ok(chunk_len))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -574,9 +573,10 @@ fn build_reality_client_hello(
         .duration_since(UNIX_EPOCH)
         .map_err(|e| TransportError::Tls(format!("system clock before UNIX_EPOCH: {e}")))?
         .as_secs() as u32;
-    // Auth payload layout must match the server's expectation (sing-box
-    // v1.13.18 reality client writes auth_len = 1; xray servers tolerate
-    // this byte's exact value but sing-box's utls fork validates it).
+    // Auth payload layout must match the server's expectation.  The first
+    // three bytes are the REALITY ClientVer triple (Version_x/y/z, matching
+    // xray-core reality.go SessionId[0..3]); sing-box's utls fork validates
+    // the exact value, so keep it at the current [1, 8, 1] version triple.
     reality_plain[0] = 1;
     reality_plain[1] = 8;
     reality_plain[2] = 1;
@@ -1601,7 +1601,7 @@ mod tests {
 
     /// The 32-byte session_id must decrypt, under the key/nonce/AAD a real
     /// Reality server reconstructs, to the authentication payload
-    /// (`[1, 8, 2, 0] || timestamp || short_id`). Asserting the plaintext —
+    /// (`[1, 8, 1, 0] || timestamp || short_id`). Asserting the plaintext —
     /// not just the length — is what proves the server could authenticate us.
     #[test]
     fn reality_client_hello_session_id_decrypts_to_auth_payload() {
@@ -1641,9 +1641,9 @@ mod tests {
             .decrypt_in_place_detached(nonce, &aad, &mut buf, Tag::from_slice(tag))
             .expect("session_id must decrypt under the server-derived key");
 
-        // auth_len = 1 (sing-box v1.13.18 reality client layout; the 2->1
-        // fix in dae71ec — xray tolerates either, sing-box's utls fork
-        // validates the exact value).
+        // ClientVer triple [1, 8, 1] (xray reality.go SessionId[0..3];
+        // xray servers tolerate the previous [1, 8, 2] while sing-box's
+        // utls fork validates the exact version).
         assert_eq!(&buf[0..4], &[1, 8, 1, 0], "reality auth header");
         assert_eq!(&buf[8..16], &reality.short_id, "short_id echoed");
     }

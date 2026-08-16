@@ -563,7 +563,7 @@ impl Drop for SpaceWake {
 pub(crate) struct EndGuard {
     sid: u16,
     session: Arc<MuxCoolSession>,
-    ended: Arc<AtomicBool>,
+    ended: bool,
 }
 
 impl EndGuard {
@@ -571,14 +571,14 @@ impl EndGuard {
         Self {
             sid,
             session,
-            ended: Arc::new(AtomicBool::new(false)),
+            ended: false,
         }
     }
 }
 
 impl Drop for EndGuard {
     fn drop(&mut self) {
-        let send_end = !self.ended.swap(true, Ordering::SeqCst) && !self.session.aborted();
+        let send_end = !std::mem::replace(&mut self.ended, true) && !self.session.aborted();
         if !send_end {
             // The shutdown path already spawned its own map removal (and
             // claims the End); an aborted session's driver clears the map
@@ -623,10 +623,9 @@ enum ReadPhase {
 /// and the read resumes exactly where it left off.
 struct ReadState {
     phase: ReadPhase,
-    /// Scratch buffer for the current phase.  Capacity is retained across
-    /// phases and frames (resize reuses the allocation; only the delivered
-    /// payload splits off its own Bytes): the read path allocates once per
-    /// payload, not once per header, meta and payload.
+    /// Scratch buffer for the current phase.  Resizing retains the
+    /// capacity across frames; only the delivered payload splits off its
+    /// own Bytes, so large allocations happen once per payload.
     buf: BytesMut,
     pos: usize,
     sid: u16,
@@ -1093,11 +1092,17 @@ impl AsyncWrite for Stream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        if this.parts.guard.ended.load(Ordering::SeqCst) {
+        if this.parts.guard.ended {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "mux.cool: stream closed",
             )));
+        }
+        if this.parts.session.aborted() {
+            // A frame reserved while the driver is exiting would be
+            // dropped without ever reaching the wire — surface an error
+            // instead of reporting the bytes as written.
+            return Poll::Ready(Err(io::Error::other("mux.cool session closed")));
         }
         let n = buf.len().min(MAX_PAYLOAD);
         match this.poll_sender.poll_reserve(cx) {
@@ -1126,7 +1131,7 @@ impl AsyncWrite for Stream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.parts.guard.ended.load(Ordering::SeqCst) {
+        if this.parts.guard.ended {
             return Poll::Ready(Ok(()));
         }
         if this.shutdown_frame.is_none() {
@@ -1152,19 +1157,21 @@ impl AsyncWrite for Stream {
                 // Claim the End only once it is enqueued: if this future
                 // is cancelled while the reserve is Pending, the
                 // EndGuard re-sends the End on drop.
-                this.parts.guard.ended.store(true, Ordering::SeqCst);
+                this.parts.guard.ended = true;
                 // Mux.Cool servers (notably sing-box) close the stream
                 // silently and never echo an End frame, so the read side
-                // must EOF locally: consumers would otherwise wait for an
-                // event that never arrives, hanging every half-closed
-                // relay until its linger timer fires and saturating
-                // listener capacity under connection churn.
-                this.eof = true;
+                // must EOF locally: the map removal below closes the
+                // inbound channel (poll_recv → None → Eof), which is
+                // what consumers observe.  Data frames the server sent
+                // before processing our End are still delivered first —
+                // the channel drains before it reports closure — so a
+                // response that was already in flight is not discarded
+                // (the End itself is a full close on the wire: Mux.Cool
+                // has no TCP-style half-close, matching xray).
                 // Remove the stream-map entry so the inbound channel
-                // closes (poll_recv returns None → Eof) and the entry
-                // cannot accumulate for the session's lifetime.  The
-                // EndGuard repeats this removal for the drop-without-
-                // shutdown path.
+                // closes and the entry cannot accumulate for the
+                // session's lifetime.  The EndGuard repeats this removal
+                // for the drop-without-shutdown path.
                 let session = Arc::clone(&this.parts.session);
                 let sid = this.parts.sid;
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -2427,12 +2434,15 @@ mod tests {
         );
     }
 
-    /// Once the local shutdown queues the End, buffered inbound data is
-    /// moot: Mux.Cool End is a full close on both server implementations
-    /// (sing-box closes the stream side, xray frees the sid), so the read
-    /// side must not deliver bytes that were still pending.
+    /// After a local shutdown, inbound data the server already sent (it
+    /// cannot know about our End yet) is still delivered: the read side
+    /// drains what is queued before the channel close surfaces as EOF.
+    /// Mux.Cool End is a full close on the wire (both server
+    /// implementations kill the stream on receiving it), so nothing can
+    /// arrive after the server processes the End — but frames already in
+    /// flight must not be discarded.
     #[tokio::test]
-    async fn shutdown_discards_unread_inbound_data() {
+    async fn shutdown_delivers_buffered_data_then_eofs() {
         let (session, _log) = session_pair_with(vec![], false).await;
         let mut stream = session.open_stream("a.example", 80, false).await.unwrap();
         stream.write_all(b"ab").await.unwrap();
@@ -2446,8 +2456,19 @@ mod tests {
                 .await
                 .expect("post-End read must not hang")
                 .unwrap(),
-            0,
-            "buffered inbound data is moot once the End frame is queued"
+            1,
+            "data the server sent before the End must still be delivered"
+        );
+        assert_eq!(rest[0], b'b');
+        // The map removal closes the inbound channel: EOF follows the
+        // buffered data without waiting for a server End echo.
+        let mut eof = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), stream.read(&mut eof))
+                .await
+                .expect("EOF must follow without a server End echo")
+                .unwrap(),
+            0
         );
     }
 

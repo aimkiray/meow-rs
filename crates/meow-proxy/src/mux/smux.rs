@@ -459,28 +459,35 @@ impl AsyncRead for SmuxStream {
         } else if this.eof {
             Poll::Ready(Ok(()))
         } else {
-            match this.rx.poll_recv(cx) {
-                Poll::Ready(Some(mut chunk)) => {
-                    let n = chunk.data.len().min(buf.remaining());
-                    buf.put_slice(&chunk.data[..n]);
-                    chunk.data.advance(n);
-                    if !chunk.data.is_empty() {
-                        this.pending = Some(chunk);
+            loop {
+                match this.rx.poll_recv(cx) {
+                    Poll::Ready(Some(mut chunk)) => {
+                        if chunk.data.is_empty() {
+                            // Zero-length PSH frames carry no payload (flush /
+                            // ack signals from the peer); returning Ready with
+                            // an empty ReadBuf would read as EOF to consumers.
+                            continue;
+                        }
+                        let n = chunk.data.len().min(buf.remaining());
+                        buf.put_slice(&chunk.data[..n]);
+                        chunk.data.advance(n);
+                        if !chunk.data.is_empty() {
+                            this.pending = Some(chunk);
+                        }
+                        return Poll::Ready(Ok(()));
                     }
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(None) => {
-                    this.eof = true;
-                    if this.session.is_dead() {
-                        Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "smux session closed",
-                        )))
-                    } else {
-                        Poll::Ready(Ok(()))
+                    Poll::Ready(None) => {
+                        this.eof = true;
+                        if this.session.is_dead() {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "smux session closed",
+                            )));
+                        }
+                        return Poll::Ready(Ok(()));
                     }
+                    Poll::Pending => return Poll::Pending,
                 }
-                Poll::Pending => Poll::Pending,
             }
         }
     }
@@ -718,6 +725,40 @@ mod tests {
         let mut resp = vec![0u8; payload.len()];
         stream.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, payload);
+    }
+
+    /// A zero-length PSH frame carries no payload (flush / ack signal):
+    /// it must be skipped, not delivered as an empty read, which consumers
+    /// (the tunnel relay) treat as EOF.
+    #[tokio::test]
+    async fn zero_length_psh_frame_does_not_read_as_eof() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let session = Arc::new(Session::client(client_io).unwrap());
+        let mut stream = session.open_stream().await.unwrap();
+        let server = tokio::spawn(async move {
+            let mut hdr = [0u8; FRAME_HEADER_LEN];
+            server_io.read_exact(&mut hdr).await.unwrap(); // client SYN
+            let stream_id = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+            server_io
+                .write_all(&encode_frame(CMD_PSH, stream_id, &[]))
+                .await
+                .unwrap();
+            server_io
+                .write_all(&encode_frame(CMD_PSH, stream_id, b"ok"))
+                .await
+                .unwrap();
+        });
+        stream.write_all(b"x").await.unwrap();
+        let mut buf = [0u8; 4];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .expect("read must not hang")
+            .expect("zero-length PSH must not read as EOF");
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..2], b"ok");
+        drop(stream);
+        drop(session);
+        server.await.unwrap();
     }
 
     #[tokio::test]

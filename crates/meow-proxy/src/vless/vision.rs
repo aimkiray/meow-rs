@@ -545,6 +545,9 @@ impl AsyncWrite for VisionConn {
             return Poll::Pending;
         }
 
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         if !this.write_padding {
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }

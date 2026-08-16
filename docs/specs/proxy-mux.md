@@ -80,7 +80,8 @@ key remains accepted for compatibility; configuring both keys warns and prefers 
   read side waits for setup) — meow-rs likewise parses the response lazily
   on the first read with a 5s (TCPTimeout) cap. On stream close sing-box
   sends RST_STREAM(NO_ERROR), treated as a clean EOF (the Go client maps
-  it to io.EOF the same way). Idle timeout 30s (h2mux.go idleTimeout).
+  it to io.EOF the same way). The sing-box *server* reaps idle h2mux
+  sessions after 30s (h2mux.go idleTimeout).
 
 ### 4. Per-stream addressing (StreamRequest / StreamResponse)
 
@@ -113,9 +114,9 @@ on parse; brutal is Linux-only upstream).
   connection + handshake + session).
 - Bounds: when maxConnections>0, decide by connection count / per-connection
   minStreams; otherwise by global maxStreams.
-- Connection failure / closed session → retry at most 2 times; idle sessions
-  are closed after an idle timeout (default 60s, sing-mux Service
-  IdleTimeout).
+- Connection failure / closed session → retry at most 2 times; the
+  *client* pool evicts zero-stream sessions after a 60s idle timeout
+  (meow-rs `IDLE_TIMEOUT`, mirroring sing-mux Service IdleTimeout).
 - padding mode uses version=1; TCPTimeout=5s caps connection setup.
 
 ### 6. Xray Mux.Cool (`protocol: muxcool`, VLESS + VMess)
