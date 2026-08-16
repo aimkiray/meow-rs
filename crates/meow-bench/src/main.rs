@@ -267,6 +267,7 @@ async fn benchmark_target(
                 duration_secs: 0.0,
                 total_connections: 0,
                 connections_per_sec: 0.0,
+                echo_timeouts: 0,
             },
             rss_idle,
         )
@@ -300,7 +301,8 @@ async fn benchmark_target(
 
             let mut dns_child = ChildGuard(
                 Command::new(binary)
-                    .args(["-f", &dns_config.to_string_lossy()])
+                    .arg(&args.binary_arg)
+                    .arg(dns_config.as_os_str())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()

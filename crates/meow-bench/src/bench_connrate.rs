@@ -16,6 +16,9 @@ pub struct ConnRateResult {
     pub duration_secs: f64,
     pub total_connections: u64,
     pub connections_per_sec: f64,
+    /// Connections whose echo phase hit the deadline (a proxy that
+    /// accepted the CONNECT but never answered).
+    pub echo_timeouts: u64,
 }
 
 pub async fn bench_conn_rate(
@@ -25,24 +28,30 @@ pub async fn bench_conn_rate(
     concurrency: usize,
 ) -> anyhow::Result<ConnRateResult> {
     let counter = Arc::new(AtomicU64::new(0));
+    let echo_timeouts = Arc::new(AtomicU64::new(0));
     let deadline = Instant::now() + Duration::from_secs(duration_secs);
 
     let mut handles = Vec::new();
     for _ in 0..concurrency {
         let counter = Arc::clone(&counter);
+        let echo_timeouts = Arc::clone(&echo_timeouts);
         handles.push(tokio::spawn(async move {
             while Instant::now() < deadline {
                 let Ok(mut stream) = socks5_connect(proxy, echo).await else {
                     continue;
                 };
-                let _ = tokio::time::timeout(ECHO_TIMEOUT, async {
+                let timed_out = tokio::time::timeout(ECHO_TIMEOUT, async {
                     if stream.write_all(&[0x42]).await.is_ok() {
                         let mut buf = [0u8; 1];
                         let _ = stream.read_exact(&mut buf).await;
                     }
                 })
-                .await;
+                .await
+                .is_err();
                 drop(stream);
+                if timed_out {
+                    echo_timeouts.fetch_add(1, Ordering::Relaxed);
+                }
                 counter.fetch_add(1, Ordering::Relaxed);
             }
         }));
@@ -53,15 +62,20 @@ pub async fn bench_conn_rate(
     }
 
     let total = counter.load(Ordering::Relaxed);
+    let timeouts = echo_timeouts.load(Ordering::Relaxed);
     let actual_elapsed = duration_secs as f64;
     let cps = total as f64 / actual_elapsed;
 
     eprintln!("  conn-rate: {total} connections in {duration_secs}s = {cps:.0}/s");
+    if timeouts > 0 {
+        eprintln!("  echo-timeouts: {timeouts} connections never answered their echo");
+    }
 
     Ok(ConnRateResult {
         duration_secs: actual_elapsed,
         total_connections: total,
         connections_per_sec: cps,
+        echo_timeouts: timeouts,
     })
 }
 
