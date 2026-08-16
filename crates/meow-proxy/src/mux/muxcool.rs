@@ -579,6 +579,12 @@ impl EndGuard {
 impl Drop for EndGuard {
     fn drop(&mut self) {
         let send_end = !self.ended.swap(true, Ordering::SeqCst) && !self.session.aborted();
+        if !send_end {
+            // The shutdown path already spawned its own map removal (and
+            // claims the End); an aborted session's driver clears the map
+            // on exit.  Nothing left for this drop to do.
+            return;
+        }
         let session = Arc::clone(&self.session);
         let sid = self.sid;
         // Detached: the End frame queues behind any in-flight data
@@ -587,16 +593,14 @@ impl Drop for EndGuard {
         // going away anyway.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                if send_end {
-                    let _ = session.send_frame(encode_end_frame(sid, false)).await;
-                }
-                // Drop the stream-map entry too: Mux.Cool servers (notably
+                // Drop the stream-map entry first: Mux.Cool servers (notably
                 // sing-box) never echo End frames, so the driver cannot
-                // clean this up itself.  Removing the entry closes the
+                // clean this up itself, and the cleanup must not wait on
+                // outbound channel capacity.  Removing the entry closes the
                 // inbound channel (poll_recv → None → Eof) and keeps the
-                // map bounded under connection churn.  Harmless when
-                // poll_shutdown already removed it.
+                // map bounded under connection churn.
                 session.streams.lock().await.remove(&sid);
+                let _ = session.send_frame(encode_end_frame(sid, false)).await;
             });
         }
     }
@@ -2404,10 +2408,76 @@ mod tests {
             session.streams.lock().await.is_empty(),
             "shutdown must remove the stream entry without a server End echo"
         );
+        drop(stream); // EndGuard must not re-send: shutdown claimed the End
         wait_for(&log, "End frame after shutdown", |l| {
             l.end_frames.contains(&sid)
         })
         .await;
+        // Give a duplicate End a chance to appear, then pin exactly-once.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .end_frames
+                .iter()
+                .filter(|s| **s == sid)
+                .count(),
+            1,
+            "End must be sent exactly once across shutdown + drop"
+        );
+    }
+
+    /// Once the local shutdown queues the End, buffered inbound data is
+    /// moot: Mux.Cool End is a full close on both server implementations
+    /// (sing-box closes the stream side, xray frees the sid), so the read
+    /// side must not deliver bytes that were still pending.
+    #[tokio::test]
+    async fn shutdown_discards_unread_inbound_data() {
+        let (session, _log) = session_pair_with(vec![], false).await;
+        let mut stream = session.open_stream("a.example", 80, false).await.unwrap();
+        stream.write_all(b"ab").await.unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 1);
+        assert_eq!(buf[0], b'a'); // 'b' stays buffered in the stream
+        stream.shutdown().await.unwrap();
+        let mut rest = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), stream.read(&mut rest))
+                .await
+                .expect("post-End read must not hang")
+                .unwrap(),
+            0,
+            "buffered inbound data is moot once the End frame is queued"
+        );
+    }
+
+    /// The UDP flow's teardown rides the same EndGuard: dropping a
+    /// PacketConn must remove its map entry even when the server stays
+    /// silent, so a reader parked on the flow's channel observes the
+    /// closed channel instead of hanging forever.
+    #[tokio::test]
+    async fn packet_conn_drop_removes_map_entry_without_server_end_echo() {
+        use crate::mux::client::{MuxSession, SessionKind};
+        let (session, _log) = session_pair_with(vec![], false).await;
+        let pool_session = Arc::new(MuxSession {
+            kind: SessionKind::MuxCool(Arc::clone(&session)),
+            streams: std::sync::atomic::AtomicUsize::new(1),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            last_used_ms: std::sync::atomic::AtomicU64::new(0),
+        });
+        let parts = session
+            .open_stream_parts("a.example", 80, true)
+            .await
+            .unwrap();
+        let conn = PacketConn::new(parts, pool_session, "127.0.0.1:9".parse().unwrap());
+        drop(conn);
+        for _ in 0..100 {
+            if session.streams.lock().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("PacketConn drop must remove the stream entry without a server End echo");
     }
 
     /// Dropping a stream without an explicit shutdown also removes its map
