@@ -1373,7 +1373,14 @@ mod tests {
     /// echoes every data frame back on the same session id (UDP frames keep
     /// their destination), and records New/End frames.  prefix bytes are
     /// written first (e.g. a VLESS response header for integration tests).
-    async fn run_mock_server(mut io: DuplexStream, log: Arc<StdMutex<ServerLog>>, prefix: Vec<u8>) {
+    /// With `echo_end` false the server stays silent on End frames, matching
+    /// sing-box's server (sing-vmess/mux.go), which never answers them.
+    async fn run_mock_server(
+        mut io: DuplexStream,
+        log: Arc<StdMutex<ServerLog>>,
+        prefix: Vec<u8>,
+        echo_end: bool,
+    ) {
         if !prefix.is_empty() {
             io.write_all(&prefix).await.unwrap();
         }
@@ -1395,15 +1402,16 @@ mod tests {
                 }
                 STATUS_END => {
                     log.lock().unwrap().end_frames.push(frame.session_id);
-                    // Mirror real servers (xray/sing-vmess answer a client
-                    // End with an End on the same session id - this is what
-                    // removes the client's stream entry).
-                    if io
-                        .write_all(&encode_end_frame(frame.session_id, false))
-                        .await
-                        .is_err()
-                    {
-                        return;
+                    if echo_end {
+                        // Mirror xray-core's server: it answers a client End
+                        // with an End on the same session id.
+                        if io
+                            .write_all(&encode_end_frame(frame.session_id, false))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
                 STATUS_KEEPALIVE => {
@@ -1438,9 +1446,22 @@ mod tests {
 
     /// Run a client session + mock server over a duplex pair.
     async fn session_pair(prefix: Vec<u8>) -> (Arc<MuxCoolSession>, Arc<StdMutex<ServerLog>>) {
+        session_pair_with(prefix, true).await
+    }
+
+    /// Like [`session_pair`] but the server can stay silent on End frames.
+    async fn session_pair_with(
+        prefix: Vec<u8>,
+        echo_end: bool,
+    ) -> (Arc<MuxCoolSession>, Arc<StdMutex<ServerLog>>) {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let log = Arc::new(StdMutex::new(ServerLog::default()));
-        tokio::spawn(run_mock_server(server_io, Arc::clone(&log), prefix));
+        tokio::spawn(run_mock_server(
+            server_io,
+            Arc::clone(&log),
+            prefix,
+            echo_end,
+        ));
         let session = MuxCoolSession::client(Box::new(TestConn(client_io)))
             .await
             .unwrap();
@@ -1764,7 +1785,7 @@ mod tests {
     async fn cancelled_shutdown_still_sends_end_on_drop() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let log = Arc::new(StdMutex::new(ServerLog::default()));
-        tokio::spawn(run_mock_server(server_io, Arc::clone(&log), vec![]));
+        tokio::spawn(run_mock_server(server_io, Arc::clone(&log), vec![], true));
         let open = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(StdMutex::new(None));
         let polled = Arc::new(AtomicBool::new(false));
@@ -1952,7 +1973,7 @@ mod tests {
     async fn client_sends_keepalive_frames_while_idle() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let log = Arc::new(StdMutex::new(ServerLog::default()));
-        tokio::spawn(run_mock_server(server_io, Arc::clone(&log), vec![]));
+        tokio::spawn(run_mock_server(server_io, Arc::clone(&log), vec![], true));
         let session = MuxCoolSession::client(Box::new(TestConn(client_io)))
             .await
             .unwrap();
@@ -2266,7 +2287,7 @@ mod tests {
         // stall in the harness).
         let (client_io, server_io) = tokio::io::duplex(2 * 1024 * 1024);
         let log = Arc::new(StdMutex::new(ServerLog::default()));
-        tokio::spawn(run_mock_server(server_io, Arc::clone(&log), vec![]));
+        tokio::spawn(run_mock_server(server_io, Arc::clone(&log), vec![], true));
         let session = MuxCoolSession::client(Box::new(TestConn(client_io)))
             .await
             .unwrap();
@@ -2329,15 +2350,16 @@ mod tests {
     }
 
     /// Churn regression: opening and dropping many streams must not
-    /// leave stale entries behind - the server's echoed End removes each
-    /// entry, so the map stays empty on a long-lived session.
+    /// leave stale entries behind, even against a sing-box-style server
+    /// that never echoes End frames - the client's own teardown removes
+    /// each entry, so the map stays empty on a long-lived session.
     #[tokio::test]
     async fn stream_churn_leaves_no_entries_behind() {
-        let (session, _log) = session_pair(vec![]).await;
+        let (session, _log) = session_pair_with(vec![], false).await;
         for _ in 0..50 {
             let mut stream = session.open_stream("a.example", 80, false).await.unwrap();
             stream.write_all(b"x").await.unwrap();
-            drop(stream); // EndGuard sends End; the server echoes it back
+            drop(stream); // EndGuard sends End; the server answers nothing
         }
         for _ in 0..200 {
             if session.streams.lock().await.is_empty() {
@@ -2346,6 +2368,68 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("stream map must drain after churn");
+    }
+
+    /// sing-box's Mux.Cool server answers a client End with silence (it
+    /// never echoes End frames): the stream's read side must EOF when the
+    /// local shutdown queues the End, without waiting for an echo that
+    /// never comes - otherwise every half-closed relay lingers until its
+    /// own timeout.
+    #[tokio::test]
+    async fn shutdown_eofs_read_side_without_server_end_echo() {
+        let (session, log) = session_pair_with(vec![], false).await;
+        let mut stream = session.open_stream("a.example", 80, false).await.unwrap();
+        stream.write_all(b"x").await.unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 1);
+        let sid = stream.parts.sid;
+        stream.shutdown().await.unwrap();
+        let mut eof = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), stream.read(&mut eof))
+                .await
+                .expect("read must not wait for a server End echo")
+                .unwrap(),
+            0,
+            "shutdown must EOF the read side locally"
+        );
+        // The map removal runs detached; give it a tick.
+        for _ in 0..100 {
+            if session.streams.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            session.streams.lock().await.is_empty(),
+            "shutdown must remove the stream entry without a server End echo"
+        );
+        wait_for(&log, "End frame after shutdown", |l| {
+            l.end_frames.contains(&sid)
+        })
+        .await;
+    }
+
+    /// Dropping a stream without an explicit shutdown also removes its map
+    /// entry even when the server never answers (sing-box behavior), so a
+    /// long-lived session cannot accumulate entries under churn.
+    #[tokio::test]
+    async fn drop_removes_map_entry_without_server_end_echo() {
+        let (session, log) = session_pair_with(vec![], false).await;
+        let stream = session.open_stream("a.example", 80, false).await.unwrap();
+        let sid = stream.parts.sid;
+        drop(stream);
+        wait_for(&log, "End frame after drop", |l| {
+            l.end_frames.contains(&sid)
+        })
+        .await;
+        for _ in 0..100 {
+            if session.streams.lock().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("drop must remove the stream entry without a server End echo");
     }
 
     /// Once the 16-bit session id space is exhausted the session keeps
