@@ -272,7 +272,6 @@ mod tests {
         let session_arc = Arc::new(MuxSession {
             kind: SessionKind::Smux(session),
             streams: AtomicUsize::new(1),
-            pending: AtomicUsize::new(0),
             last_used_ms: AtomicU64::new(0),
         });
         let conn = MuxPacketConn::new(
@@ -356,7 +355,6 @@ mod tests {
         let session_arc = Arc::new(MuxSession {
             kind: SessionKind::Yamux(session),
             streams: AtomicUsize::new(1),
-            pending: AtomicUsize::new(0),
             last_used_ms: AtomicU64::new(0),
         });
         let conn = MuxPacketConn::new(
@@ -437,7 +435,6 @@ mod tests {
         let session_arc = Arc::new(MuxSession {
             kind: SessionKind::Smux(session),
             streams: AtomicUsize::new(1),
-            pending: AtomicUsize::new(0),
             last_used_ms: AtomicU64::new(0),
         });
         let conn = Arc::new(MuxPacketConn::new(
@@ -513,7 +510,6 @@ mod tests {
         let session_arc = Arc::new(MuxSession {
             kind: SessionKind::Smux(session),
             streams: AtomicUsize::new(1),
-            pending: AtomicUsize::new(0),
             last_used_ms: AtomicU64::new(0),
         });
         let conn = MuxPacketConn::new(

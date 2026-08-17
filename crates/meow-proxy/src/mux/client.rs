@@ -287,22 +287,26 @@ impl AsyncWrite for MuxStream {
 
 pub(crate) struct MuxSession {
     pub(crate) kind: SessionKind,
+    /// Unified slot counter: each value represents one stream slot held
+    /// by this session — either an in-flight open (reserved by `offer()`
+    /// via CAS, released by `Reservation::drop` on failure/cancel) or an
+    /// established stream (released by `MuxStreamConn::drop`).
+    ///
+    /// A single counter eliminates the read-read race that two separate
+    /// `streams` + `pending` atomics had: `offer()` can check-and-reserve
+    /// with one `compare_exchange`, so the load assessment and the
+    /// increment are one atomic step.
     pub(crate) streams: AtomicUsize,
-    /// Streams whose open is in flight: reserved under the pool lock
-    /// before the (async) open, released when the open settles or the
-    /// future is cancelled.  Selection counts both counters so
-    /// concurrent opens cannot overshoot max-streams / min-streams.
-    pub(crate) pending: AtomicUsize,
     pub(crate) last_used_ms: AtomicU64,
 }
 
-/// Releases a [`MuxSession`] pending slot when dropped — the
-/// cancellation-safe counterpart of the reservation `offer()` made.
+/// Releases a [`MuxSession`] slot when dropped — the cancellation-safe
+/// counterpart of the reservation `offer()` made via CAS on `streams`.
 struct Reservation(Arc<MuxSession>);
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.0.pending.fetch_sub(1, Ordering::SeqCst);
+        self.0.streams.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -421,16 +425,17 @@ impl MuxClient {
                 Ok(session) => session,
                 Err(e) => return Err(e),
             };
-            // offer() reserved one pending slot for this open.  The
+            // offer() reserved one slot on `streams` via CAS.  The
             // guard releases it if the open future is cancelled or the
             // session rejects the stream.
             let reservation = Reservation(Arc::clone(&session));
             match session.kind.open_stream(host, port, udp).await {
                 Ok(stream) => {
-                    // Slot converted from pending to established.
-                    session.pending.fetch_sub(1, Ordering::SeqCst);
+                    // The slot reserved by offer() is now an established
+                    // stream.  Forget the reservation so its Drop doesn't
+                    // decrement — MuxStreamConn::drop will do that when
+                    // the stream is eventually closed.
                     std::mem::forget(reservation);
-                    session.streams.fetch_add(1, Ordering::SeqCst);
                     // Idle eviction is measured from the last successful open
                     // (not the last activity): conservative — a long-lived
                     // stream keeps its session alive via the streams count,
@@ -440,7 +445,7 @@ impl MuxClient {
                     return Ok((stream, session));
                 }
                 Err(e) => {
-                    // reservation drops here → pending released
+                    // reservation drops here → slot released
                     last_err = Some(MeowError::Io(e));
                     continue;
                 }
@@ -451,8 +456,10 @@ impl MuxClient {
 
     /// Pick an existing session that can take a new request, or dial a new
     /// one.  Dead sessions are pruned and zero-stream sessions idle past
-    /// `IDLE_TIMEOUT` are evicted.  The returned session has one pending
-    /// slot reserved for the caller (see [`MuxSession::pending`]).
+    /// `IDLE_TIMEOUT` are evicted.  The returned session has one slot
+    /// reserved for the caller via a CAS on `streams` — the check and the
+    /// increment are a single atomic step, so concurrent offers can never
+    /// overshoot max-streams.
     async fn offer(self: &Arc<Self>) -> Result<Arc<MuxSession>> {
         let mut sessions = self.sessions.lock().await;
         let now = now_ms();
@@ -461,30 +468,44 @@ impl MuxClient {
                 return false;
             }
             let idle = now.saturating_sub(s.last_used_ms.load(Ordering::SeqCst));
-            s.streams.load(Ordering::SeqCst) + s.pending.load(Ordering::SeqCst) > 0
-                || idle < IDLE_TIMEOUT.as_millis() as u64
+            s.streams.load(Ordering::SeqCst) > 0 || idle < IDLE_TIMEOUT.as_millis() as u64
         });
         let options = &self.options;
         let best = sessions
             .iter()
-            .min_by_key(|s| s.streams.load(Ordering::SeqCst) + s.pending.load(Ordering::SeqCst));
+            .min_by_key(|s| s.streams.load(Ordering::SeqCst));
         if let Some(session) = best {
-            let load =
-                session.streams.load(Ordering::SeqCst) + session.pending.load(Ordering::SeqCst);
-            let reuse = if load == 0 {
-                // An idle session always takes the next stream — never
-                // dial a fresh connection while one is free.
-                true
-            } else if options.max_connections > 0 {
-                sessions.len() >= options.max_connections || load < options.min_streams
-            } else {
-                // max-connections=0 with max-streams=0 keeps the mihomo
-                // semantics: one physical connection per stream.
-                options.max_streams > 0 && load < options.max_streams
-            };
-            if reuse {
-                session.pending.fetch_add(1, Ordering::SeqCst);
-                return Ok(Arc::clone(session));
+            // CAS loop: atomically check the current load and reserve a
+            // slot.  If another thread modifies `streams` between our
+            // load and the CAS, we retry with the updated value.  This
+            // eliminates the read-read race that separate `streams` +
+            // `pending` atomics had — the assessment and the increment
+            // are now one atomic step.
+            loop {
+                let load = session.streams.load(Ordering::SeqCst);
+                let reuse = if load == 0 {
+                    // An idle session always takes the next stream — never
+                    // dial a fresh connection while one is free.
+                    true
+                } else if options.max_connections > 0 {
+                    sessions.len() >= options.max_connections || load < options.min_streams
+                } else {
+                    // max-connections=0 with max-streams=0 keeps the mihomo
+                    // semantics: one physical connection per stream.
+                    options.max_streams > 0 && load < options.max_streams
+                };
+                if !reuse {
+                    break;
+                }
+                match session.streams.compare_exchange(
+                    load,
+                    load + 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => return Ok(Arc::clone(session)),
+                    Err(_) => continue,
+                }
             }
         }
         // Bounds reached: dial a fresh session while still holding the
@@ -512,14 +533,13 @@ impl MuxClient {
             })??;
         let session = Arc::new(MuxSession {
             kind,
-            streams: AtomicUsize::new(0),
-            pending: AtomicUsize::new(0),
+            // Start at 1: the caller's reservation.  The pool lock is
+            // held, so no concurrent offer can see this session before
+            // the slot is reserved.
+            streams: AtomicUsize::new(1),
             last_used_ms: AtomicU64::new(now_ms()),
         });
         sessions.push_back(Arc::clone(&session));
-        // Reserve the caller's stream: the pool lock is held, so the
-        // pending count participates in every concurrent selection.
-        session.pending.fetch_add(1, Ordering::SeqCst);
         Ok(session)
     }
 
@@ -624,18 +644,21 @@ mod tests {
                 dials.fetch_add(1, Ordering::SeqCst);
                 let (client_io, server_io) = tokio::io::duplex(64 * 1024);
                 tokio::spawn(async move {
+                    // Drain frames without parsing: the previous version read a
+                    // 10-byte header and extracted a u32 BE "length" from bytes
+                    // 2–5, but smux frames are 8 bytes (u16 LE length at 2–3)
+                    // and yamux frames are 12 bytes.  On a misaligned read the
+                    // u32 can be enormous (e.g. 0x01000000 = 16 MiB when the
+                    // smux version byte 0x01 lands at header[2]), causing a
+                    // huge heap allocation that crashes the Windows runner.
+                    // A fixed-size read-and-discard loop is all a data sink
+                    // needs.
                     let mut io = server_io;
-                    let mut header = [0u8; 10];
+                    let mut buf = [0u8; 4096];
                     loop {
-                        if io.read_exact(&mut header).await.is_err() {
-                            return;
-                        }
-                        let length =
-                            u32::from_be_bytes([header[2], header[3], header[4], header[5]])
-                                as usize;
-                        let mut payload = vec![0u8; length];
-                        if !payload.is_empty() && io.read_exact(&mut payload).await.is_err() {
-                            return;
+                        match io.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
                         }
                     }
                 });
@@ -721,13 +744,55 @@ mod tests {
         );
         for session in sessions.iter() {
             assert_eq!(session.streams.load(Ordering::SeqCst), 4);
-            assert_eq!(
-                session.pending.load(Ordering::SeqCst),
-                0,
-                "every reservation must have settled"
-            );
         }
         drop(streams);
+    }
+
+    /// Stress test for the max-streams overshoot race: with max-streams=1
+    /// every session must end with at most one stream slot.  The original
+    /// design used separate `streams` + `pending` atomics whose sum was
+    /// read with two independent loads — a concurrent open could transition
+    /// between them and make the load appear falsely 0.  The unified
+    /// `streams` counter with CAS-based reservation makes the check-and-
+    /// increment one atomic step, so the overshoot is structurally
+    /// impossible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn stress_concurrent_opens_never_overshoot_max_streams_one() {
+        for round in 0..200 {
+            let dials = Arc::new(AtomicUsize::new(0));
+            let options = MuxOptions {
+                protocol: Protocol::Smux,
+                max_connections: 0,
+                min_streams: 1,
+                max_streams: 1,
+                ..MuxOptions::default()
+            };
+            let client = mock_mux_client_with(Arc::clone(&dials), options).await;
+            let handles: Vec<_> = (0..16)
+                .map(|i| {
+                    let client = Arc::clone(&client);
+                    tokio::spawn(async move {
+                        client
+                            .open_stream(format!("h{i}.example").as_str(), 80)
+                            .await
+                            .unwrap()
+                    })
+                })
+                .collect();
+            let mut streams = Vec::new();
+            for handle in handles {
+                streams.push(handle.await.unwrap());
+            }
+            let sessions = client.sessions.lock().await;
+            for session in sessions.iter() {
+                let streams = session.streams.load(Ordering::SeqCst);
+                assert!(
+                    streams <= 1,
+                    "round {round}: session overshot max-streams=1 with {streams} streams"
+                );
+            }
+            drop(streams);
+        }
     }
 
     #[tokio::test]

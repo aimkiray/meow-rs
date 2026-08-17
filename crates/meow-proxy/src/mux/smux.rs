@@ -300,6 +300,7 @@ impl Session {
             fin_sent: false,
             shutdown_frame: None,
             flush_rx: None,
+            write_since_flush: false,
         })
     }
 }
@@ -412,16 +413,40 @@ pub struct SmuxStream {
     shutdown_frame: Option<Bytes>,
     /// Pending flush acknowledgement; see `poll_flush`.
     flush_rx: Option<oneshot::Receiver<()>>,
+    /// Set when a data frame is queued after the current flush request was
+    /// sent: the flush ack then no longer covers every write, so
+    /// `poll_flush` must send another request once the pending one lands.
+    write_since_flush: bool,
 }
 
 impl SmuxStream {
     fn best_effort_fin(&mut self) {
-        if !self.fin_sent {
-            self.fin_sent = true;
-            let _ =
-                self.session
-                    .writer_tx
-                    .try_send(OutMsg::Frame(encode_frame(CMD_FIN, self.id, &[])));
+        if self.fin_sent {
+            return;
+        }
+        let frame = encode_frame(CMD_FIN, self.id, &[]);
+        match self
+            .session
+            .writer_tx
+            .try_send(OutMsg::Frame(frame.clone()))
+        {
+            Ok(()) => self.fin_sent = true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // The outbound channel is full: queue the FIN
+                // asynchronously instead of dropping it.  Mark fin_sent
+                // now so a later poll_shutdown/drop does not double-send.
+                self.fin_sent = true;
+                let sender = self.session.writer_tx.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let _ = sender.send(OutMsg::Frame(frame)).await;
+                    });
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                // Session is gone; the connection is closing anyway.
+                self.fin_sent = true;
+            }
         }
     }
 }
@@ -518,6 +543,7 @@ impl AsyncWrite for SmuxStream {
                 this.poll_sender
                     .send_item(OutMsg::Frame(frame))
                     .map_err(|error| io::Error::other(error.to_string()))?;
+                this.write_since_flush = true;
                 Poll::Ready(Ok(written))
             }
         }
@@ -530,20 +556,25 @@ impl AsyncWrite for SmuxStream {
         // bytes reached the physical transport (matters for buffered
         // outer transports like WebSocket).
         if let Some(rx) = &mut this.flush_rx {
-            return match Pin::new(rx).poll(cx) {
-                Poll::Pending => Poll::Pending,
+            match Pin::new(rx).poll(cx) {
+                Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(_)) => {
                     this.flush_rx = None;
-                    Poll::Ready(Err(io::Error::new(
+                    return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "smux writer gone",
-                    )))
+                    )));
                 }
                 Poll::Ready(Ok(())) => {
                     this.flush_rx = None;
-                    Poll::Ready(Ok(()))
+                    if !this.write_since_flush {
+                        return Poll::Ready(Ok(()));
+                    }
+                    // Data was queued after the flush request went out:
+                    // fall through and send another flush so the ack
+                    // covers those writes too.
                 }
-            };
+            }
         }
         match this.poll_sender.poll_reserve(cx) {
             Poll::Pending => Poll::Pending,
@@ -553,6 +584,8 @@ impl AsyncWrite for SmuxStream {
                 this.poll_sender
                     .send_item(OutMsg::Flush(Arc::new(tx)))
                     .map_err(|error| io::Error::other(error.to_string()))?;
+                // Every write queued before this request is now covered.
+                this.write_since_flush = false;
                 // Poll the fresh receiver once to register the waker
                 // before parking.
                 let mut rx = rx;
@@ -816,6 +849,180 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// IO with independent write and flush gates: the writer can be
+    /// parked inside `poll_flush` while later writes are queued, which is
+    /// the exact interleaving that exposes a flush-contract bug.
+    struct FlushGatedIo {
+        inner: tokio::io::DuplexStream,
+        write_open: Arc<AtomicBool>,
+        flush_open: Arc<AtomicBool>,
+        write_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+        flush_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+        write_polled: Arc<AtomicBool>,
+        flush_polled: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for FlushGatedIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for FlushGatedIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if this.write_open.load(Ordering::SeqCst) {
+                return Pin::new(&mut this.inner).poll_write(cx, buf);
+            }
+            this.write_polled.store(true, Ordering::SeqCst);
+            *this.write_waker.lock().unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.flush_open.load(Ordering::SeqCst) {
+                return Pin::new(&mut this.inner).poll_flush(cx);
+            }
+            this.flush_polled.store(true, Ordering::SeqCst);
+            *this.flush_waker.lock().unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Regression: a second flush issued while a first flush is still
+    /// pending must cover data written after the first flush request.
+    /// Current code returns the first flush's ack and silently leaves the
+    /// later data unflushed.
+    #[tokio::test]
+    async fn second_flush_must_cover_data_written_while_first_flush_pending() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let write_open = Arc::new(AtomicBool::new(true));
+        let flush_open = Arc::new(AtomicBool::new(false));
+        let write_waker = Arc::new(std::sync::Mutex::new(None));
+        let flush_waker = Arc::new(std::sync::Mutex::new(None));
+        let write_polled = Arc::new(AtomicBool::new(false));
+        let flush_polled = Arc::new(AtomicBool::new(false));
+        let session = Arc::new(
+            Session::client(FlushGatedIo {
+                inner: client_io,
+                write_open: Arc::clone(&write_open),
+                flush_open: Arc::clone(&flush_open),
+                write_waker: Arc::clone(&write_waker),
+                flush_waker: Arc::clone(&flush_waker),
+                write_polled: Arc::clone(&write_polled),
+                flush_polled: Arc::clone(&flush_polled),
+            })
+            .unwrap(),
+        );
+        let mut stream = session.open_stream().await.unwrap();
+
+        // D1 is written and the first flush request is queued behind it.
+        stream.write_all(b"abc").await.unwrap();
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let first_poll = Pin::new(&mut stream).poll_flush(&mut cx);
+        assert!(first_poll.is_pending(), "first flush must be pending");
+
+        // Wait until the writer is parked inside the transport flush.
+        for _ in 0..100 {
+            if flush_polled.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            flush_polled.load(Ordering::SeqCst),
+            "writer must be parked in poll_flush"
+        );
+
+        // D2 is queued AFTER the first flush request.
+        stream.write_all(b"def").await.unwrap();
+
+        // Before releasing the first flush, close the write gate so the
+        // writer will block when it later tries to write D2.
+        write_open.store(false, Ordering::SeqCst);
+
+        // Release the first flush.
+        flush_open.store(true, Ordering::SeqCst);
+        if let Some(w) = flush_waker.lock().unwrap().take() {
+            w.wake();
+        }
+
+        // The second flush must NOT complete while D2 is still unflushed:
+        // the first flush's ack only covers D1.
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let second_poll = Pin::new(&mut stream).poll_flush(&mut cx);
+        assert!(
+            second_poll.is_pending(),
+            "second flush must stay pending until D2 is flushed"
+        );
+
+        // Release the write gate: the writer drains D2, and only then may
+        // the second flush complete.
+        write_open.store(true, Ordering::SeqCst);
+        if let Some(w) = write_waker.lock().unwrap().take() {
+            w.wake();
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            std::future::poll_fn(|cx| Pin::new(&mut stream).poll_flush(cx)),
+        )
+        .await
+        .expect("second flush must not hang")
+        .expect("second flush must succeed");
+
+        // The transport must have received both D1 and D2.
+        let mut hdr = [0u8; FRAME_HEADER_LEN];
+        server_io.read_exact(&mut hdr).await.unwrap();
+        let (cmd, length, _sid) = Frame::decode_header(&hdr).unwrap();
+        assert_eq!(cmd, CMD_SYN, "first frame must be the stream SYN");
+        assert_eq!(length, 0);
+        server_io.read_exact(&mut hdr).await.unwrap();
+        let (cmd, length, _sid) = Frame::decode_header(&hdr).unwrap();
+        assert_eq!(cmd, CMD_PSH, "second frame must be D1");
+        let mut payload = vec![0u8; length];
+        server_io.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"abc");
+        server_io.read_exact(&mut hdr).await.unwrap();
+        let (cmd, length, _sid) = Frame::decode_header(&hdr).unwrap();
+        assert_eq!(cmd, CMD_PSH, "third frame must be D2");
+        let mut payload = vec![0u8; length];
+        server_io.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"def");
+
+        // Cleanup: release the write gate and drain.
+        write_open.store(true, Ordering::SeqCst);
+        if let Some(w) = write_waker.lock().unwrap().take() {
+            w.wake();
+        }
+        drop(stream);
+        drop(session);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut buf = [0u8; 64];
+            loop {
+                match server_io.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+    }
+
     /// IO whose write half stays Pending until the test releases it —
     /// parks the session writer deterministically so the bounded
     /// outbound channel can be filled (a plain small duplex cannot: the
@@ -925,6 +1132,80 @@ mod tests {
         });
         drop(session);
         drain.await.unwrap();
+    }
+
+    /// Regression: dropping a stream while the outbound channel is full
+    /// must not silently lose the FIN frame.  `best_effort_fin` uses
+    /// `try_send`; when the channel is full the FIN is dropped and the
+    /// server never learns the stream closed.
+    #[tokio::test]
+    async fn dropped_stream_under_backpressure_still_sends_fin() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let open = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(std::sync::Mutex::new(None));
+        let polled = Arc::new(AtomicBool::new(false));
+        let session = Arc::new(
+            Session::client(GatedIo {
+                inner: client_io,
+                open: Arc::clone(&open),
+                waker: Arc::clone(&waker),
+                polled: Arc::clone(&polled),
+            })
+            .unwrap(),
+        );
+        // Open a stream first: its SYN is queued and the writer parks on
+        // it (gate closed).
+        let stream = session.open_stream().await.unwrap();
+        let sid = stream.id;
+        // Keep the channel topped up so the FIN try_send must fail.
+        let filler = OutMsg::Frame(encode_frame(CMD_PSH, 0xFFFF, &[1]));
+        while session.writer_tx.capacity() > 0 {
+            session.writer_tx.try_send(filler.clone()).unwrap();
+        }
+        loop {
+            while session.writer_tx.capacity() > 0 {
+                session.writer_tx.try_send(filler.clone()).unwrap();
+            }
+            if polled.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Drop the stream while the channel is full: try_send(FIN) fails.
+        drop(stream);
+        // Release the writer and collect every frame the server sees.
+        open.store(true, Ordering::SeqCst);
+        if let Some(w) = waker.lock().unwrap().take() {
+            w.wake();
+        }
+        let mut seen_fin_for_sid = false;
+        let mut io = server_io;
+        let mut hdr = [0u8; FRAME_HEADER_LEN];
+        let mut payload = [0u8; 64];
+        let drain = async {
+            loop {
+                if io.read_exact(&mut hdr).await.is_err() {
+                    break;
+                }
+                let Ok((cmd, length, frame_sid)) = Frame::decode_header(&hdr) else {
+                    break;
+                };
+                if length > 0 && io.read_exact(&mut payload[..length]).await.is_err() {
+                    break;
+                }
+                if cmd == CMD_FIN && frame_sid == sid {
+                    seen_fin_for_sid = true;
+                }
+            }
+        };
+        // The writer drains the channel and then idles; EOF never comes
+        // while the session is alive, so bound the observation window.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), drain).await;
+        assert!(
+            seen_fin_for_sid,
+            "server must receive FIN for the dropped stream even under backpressure"
+        );
+        drop(session);
     }
 
     #[tokio::test]

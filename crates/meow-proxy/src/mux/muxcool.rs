@@ -2293,17 +2293,21 @@ mod tests {
     /// driver (waiting for inbound capacity) forever.
     #[tokio::test]
     async fn full_duplex_bulk_transfer_does_not_deadlock() {
-        // 2 MiB duplex: both directions absorb the whole transfer, so the
-        // only backpressure under test is the mux queues (no OS-level
-        // stall in the harness).
-        let (client_io, server_io) = tokio::io::duplex(2 * 1024 * 1024);
+        // 512 KiB duplex: large enough that the duplex itself never
+        // backpressures (both directions absorb the 256 KiB transfer), so
+        // the only backpressure under test is the mux queues.  Kept well
+        // below 1 MiB to avoid the BytesMut capacity-doubling spikes that
+        // can trigger a 16 MiB heap allocation on the Windows debug runner.
+        let (client_io, server_io) = tokio::io::duplex(512 * 1024);
         let log = Arc::new(StdMutex::new(ServerLog::default()));
         tokio::spawn(run_mock_server(server_io, Arc::clone(&log), vec![], true));
         let session = MuxCoolSession::client(Box::new(TestConn(client_io)))
             .await
             .unwrap();
         let mut stream = session.open_stream("a.example", 80, false).await.unwrap();
-        let payload = vec![0x5A; 1024 * 1024];
+        // 256 KiB = 32 × 8 KiB frames: fills the 32-frame inbound queue
+        // exactly once, exercising the driver's park-and-retry path.
+        let payload = vec![0x5A; 256 * 1024];
         let result = tokio::time::timeout(Duration::from_secs(10), async {
             stream.write_all(&payload).await.unwrap();
             let mut received = vec![0u8; payload.len()];
@@ -2483,7 +2487,6 @@ mod tests {
         let pool_session = Arc::new(MuxSession {
             kind: SessionKind::MuxCool(Arc::clone(&session)),
             streams: std::sync::atomic::AtomicUsize::new(1),
-            pending: std::sync::atomic::AtomicUsize::new(0),
             last_used_ms: std::sync::atomic::AtomicU64::new(0),
         });
         let parts = session
@@ -2563,7 +2566,6 @@ mod tests {
         let pool_session = Arc::new(MuxSession {
             kind: super::super::client::SessionKind::MuxCool(Arc::clone(&session)),
             streams: AtomicUsize::new(1),
-            pending: AtomicUsize::new(0),
             last_used_ms: std::sync::atomic::AtomicU64::new(0),
         });
         let parts = session
