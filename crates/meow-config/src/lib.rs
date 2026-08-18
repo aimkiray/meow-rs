@@ -462,7 +462,7 @@ fn rebuild_from_raw_impl(
     shared_ctx: Option<&meow_rules::ParserContext>,
     prefetched_payloads: Option<&rule_provider::PrefetchedPayloads>,
 ) -> Result<RebuildResult, anyhow::Error> {
-    let ipv6 = raw.ipv6.unwrap_or(false);
+    let ipv6 = raw.ipv6.unwrap_or(true);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
     // Built-in proxies
     let mut direct = meow_proxy::DirectAdapter::new();
@@ -699,7 +699,7 @@ async fn prefetch_rule_provider_payloads_async(
         return HashMap::new();
     };
     let raw_providers = raw_providers.clone();
-    let ipv6 = raw.ipv6.unwrap_or(false);
+    let ipv6 = raw.ipv6.unwrap_or(true);
     let raw_proxies: Vec<HashMap<String, serde_yaml::Value>> =
         raw.proxies.clone().unwrap_or_default();
     spawn_blocking_with_current_dispatcher(move || {
@@ -937,7 +937,7 @@ async fn ensure_geodata(raw: &raw::RawConfig, geo: &GeoDataConfig, scan_lines: &
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy, raw.ipv6.unwrap_or(false)).ok());
+        .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy, raw.ipv6.unwrap_or(true)).ok());
 
     let mut downloads = Vec::new();
     if geoip_missing {
@@ -1484,7 +1484,7 @@ async fn build_config(
     let general = GeneralConfig {
         mode,
         log_level,
-        ipv6: raw.ipv6.unwrap_or(false),
+        ipv6: raw.ipv6.unwrap_or(true),
         allow_lan: raw.allow_lan.unwrap_or(false),
         bind_address,
     };

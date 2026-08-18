@@ -34,7 +34,7 @@ pub async fn parse_dns(
                 DnsMode::Normal,
                 hosts,
                 use_hosts,
-                raw.ipv6.unwrap_or(false),
+                raw.ipv6.unwrap_or(true),
             );
             return Ok(DnsConfig {
                 resolver: Arc::new(resolver),
@@ -106,7 +106,7 @@ pub async fn parse_dns(
         mode,
         hosts,
         use_hosts,
-        raw.ipv6.unwrap_or(false),
+        raw.ipv6.unwrap_or(true),
         policy,
         fallback_filter,
         proxy_registry,

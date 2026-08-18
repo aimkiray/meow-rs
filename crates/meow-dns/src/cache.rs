@@ -18,6 +18,7 @@
 // Per-entry savings: CacheEntry 40 B → 32 B (−8 B); ReverseEntry 40 B → 32 B (−8 B).
 // At default caps (1024 fwd, 4096 rev): total struct savings ≈ 40 KiB; on top,
 // reverse-entry domain allocation drops from N+1 to 1 per cache write.
+use hickory_proto::rr::RecordType;
 use lru::LruCache;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
@@ -32,20 +33,61 @@ use std::time::{Duration, Instant};
 /// common case.
 pub type IpList = SmallVec<[IpAddr; 2]>;
 
+/// One forward DNS cache entry. Expiry is tracked **per family**
+/// (`expire_v4` / `expire_v6`) rather than as a single merged `expire_at`.
+/// A single `expire_at` forced `min()` across families, so a 10 s AAAA NODATA
+/// (clamped MIN TTL) evicted a still-fresh 3600 s A answer in 10 s — a ~360×
+/// re-query amplification for dual-stack domains (PR #387 review issue D).
+/// Per-family expiry keeps each family on its own upstream schedule. Each
+/// `expire_*` is meaningful only when `queried` contains that family.
+///
+/// ADR-0011 footprint (review issue G): per-family expiry replaces one
+/// `expire_at` with two `Instant`s, growing `CacheEntry` by one `Instant`.
+/// `-Zprint-type-sizes` (macOS, `Instant` = 16 B):
+///   before (`expire_at`): 56 B = expire_at 16 + ips 16 + source 16 + queried 1 + pad 7
+///   after (`expire_v4`/`expire_v6`): 72 B = expire_v4 16 + expire_v6 16 + ips 16
+///                                     + source 16 + queried 1 + pad 7
+///   i.e. 56 B -> 72 B (at the M2 72 B per-`LruEntry`-slot cap; `LruEntry`'s
+///   `.val` is the entry). On Linux (`Instant` = 8 B) the same change is
+///   48 B -> 56 B (under the cap). The `queried` bitset stays a single `u8`;
+///   the size-regression test below guards the cap. Packing `queried` into
+///   the `Option<Arc<str>>` niche is not viable here: `preload_cache` inserts
+///   entries with `source = None` yet `queried = BOTH`, so the null niche is
+///   already consumed and cannot also carry the family bits.
 struct CacheEntry {
     ips: Box<[IpAddr]>,
-    expire_at: Instant,
+    expire_v4: Instant,
+    expire_v6: Instant,
     source: Option<Arc<str>>,
     queried: QueryFamilies,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Which address families a lookup concerns — the single source of truth for
+/// family dispatch across the client, cache, and resolver (review issue I):
+/// every `RecordType → family` and `IpAddr → family` test routes through here
+/// instead of being re-derived at each call site.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct QueryFamilies(u8);
 
 impl QueryFamilies {
     pub(crate) const NONE: Self = Self(0);
     pub(crate) const IPV4: Self = Self(1);
     pub(crate) const IPV6: Self = Self(2);
+
+    /// Both families — the dual-stack query set used by the "give me every
+    /// enabled address" path (`resolve_ips`).
+    pub(crate) const BOTH: Self = Self(Self::IPV4.0 | Self::IPV6.0);
+
+    /// The single family a DNS record type maps to. One source of truth for the
+    /// `RecordType → family` mapping used by the client and resolver, so a
+    /// change to the mapping cannot desync the three call sites.
+    pub(crate) fn from_record_type(record_type: RecordType) -> Self {
+        match record_type {
+            RecordType::A => Self::IPV4,
+            RecordType::AAAA => Self::IPV6,
+            _ => Self::NONE,
+        }
+    }
 
     pub(crate) fn from_ips(ips: &[IpAddr]) -> Self {
         ips.iter().fold(Self::NONE, |families, ip| {
@@ -61,15 +103,64 @@ impl QueryFamilies {
         Self(self.0 | other.0)
     }
 
-    fn contains_ip(self, ip: IpAddr) -> bool {
+    /// Remove `other` from this set (set difference).
+    pub(crate) fn minus(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// True when no family is requested or queried.
+    pub(crate) fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Single source of truth for per-IP family membership (review issue I).
+    pub(crate) fn contains_ip(self, ip: IpAddr) -> bool {
         self.contains(if ip.is_ipv4() { Self::IPV4 } else { Self::IPV6 })
+    }
+
+    /// The family not represented by a single-family `self`.
+    fn other(self) -> Self {
+        if self == Self::IPV4 {
+            Self::IPV6
+        } else {
+            Self::IPV4
+        }
+    }
+}
+
+/// Per-family cache-read outcome. The resolver uses this to decide, for one
+/// family, between serving a fresh answer, serving a fresh negative, or
+/// re-querying upstream.
+#[derive(Clone, Debug)]
+pub(crate) enum FamilyCacheHit {
+    /// Fresh answer with at least one IP of this family and its remaining TTL.
+    Answer(IpList, Duration),
+    /// The family was queried and is still fresh, but the upstream returned no
+    /// IPs of this family (NOERROR with zero answers). Serve NODATA without
+    /// re-querying until this family's own expiry fires.
+    NoData,
+    /// The family was never queried, or its answer has expired — the caller
+    /// must query it upstream.
+    Miss,
+}
+
+impl FamilyCacheHit {
+    /// True for `Answer` or `NoData` — a family the cache can answer for
+    /// without an upstream round-trip. `Miss` returns false.
+    pub(crate) fn is_fresh(&self) -> bool {
+        !matches!(self, FamilyCacheHit::Miss)
     }
 }
 
 pub(crate) struct CacheLookup {
+    /// All IPs belonging to families that are still fresh.
     pub(crate) ips: IpList,
+    /// Minimum remaining TTL across the fresh IPs in `ips` (the value a cached
+    /// answer should carry). Zero when there are no fresh IPs.
     pub(crate) ttl: Duration,
-    pub(crate) queried: QueryFamilies,
+    /// Per-family freshness for the resolver's family-specific read path.
+    pub(crate) v4: FamilyCacheHit,
+    pub(crate) v6: FamilyCacheHit,
 }
 
 struct ReverseEntry {
@@ -167,6 +258,36 @@ fn per_shard_cap(total: usize, min: usize) -> usize {
     (total / SHARDS).max(min)
 }
 
+/// Build the per-family read outcome for one family of a [`CacheEntry`].
+/// `fresh` is the caller's already-computed "this family is queried and its
+/// expiry is in the future" bit.
+fn family_hit(
+    entry: &CacheEntry,
+    family: QueryFamilies,
+    fresh: bool,
+    now: Instant,
+) -> FamilyCacheHit {
+    if !fresh {
+        return FamilyCacheHit::Miss;
+    }
+    let remaining = if family == QueryFamilies::IPV4 {
+        entry.expire_v4.saturating_duration_since(now)
+    } else {
+        entry.expire_v6.saturating_duration_since(now)
+    };
+    let ips: IpList = entry
+        .ips
+        .iter()
+        .copied()
+        .filter(|ip| family.contains_ip(*ip))
+        .collect();
+    if ips.is_empty() {
+        FamilyCacheHit::NoData
+    } else {
+        FamilyCacheHit::Answer(ips, remaining)
+    }
+}
+
 impl DnsCache {
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -196,16 +317,37 @@ impl DnsCache {
         let shard = &self.cache[shard_str(&domain)];
         let mut cache = shard.lock();
         let mut expired = false;
-        if let Some(entry) = cache.get(domain.as_ref()) {
+        let lookup = cache.get(domain.as_ref()).map(|entry| {
             let now = Instant::now();
-            if entry.expire_at > now {
+            let v4_fresh = entry.queried.contains(QueryFamilies::IPV4) && entry.expire_v4 > now;
+            let v6_fresh = entry.queried.contains(QueryFamilies::IPV6) && entry.expire_v6 > now;
+            (entry, v4_fresh, v6_fresh, now)
+        });
+        if let Some((entry, v4_fresh, v6_fresh, now)) = lookup {
+            if v4_fresh || v6_fresh {
+                let v4 = family_hit(entry, QueryFamilies::IPV4, v4_fresh, now);
+                let v6 = family_hit(entry, QueryFamilies::IPV6, v6_fresh, now);
+                let mut ips: IpList = SmallVec::new();
+                let mut min_remaining = Duration::MAX;
+                for hit in [&v4, &v6] {
+                    if let FamilyCacheHit::Answer(hit_ips, ttl) = hit {
+                        ips.extend_from_slice(hit_ips);
+                        if *ttl < min_remaining {
+                            min_remaining = *ttl;
+                        }
+                    }
+                }
+                if min_remaining == Duration::MAX {
+                    min_remaining = Duration::ZERO;
+                }
                 return Some(CacheLookup {
-                    ips: SmallVec::from_slice(&entry.ips),
-                    ttl: entry.expire_at.saturating_duration_since(now),
-                    queried: entry.queried,
+                    ips,
+                    ttl: min_remaining,
+                    v4,
+                    v6,
                 });
             }
-            // Expired — flag for eviction; can't pop while `entry` borrows.
+            // No family is still fresh — evict on the way out.
             expired = true;
         }
         if expired {
@@ -221,7 +363,11 @@ impl DnsCache {
     }
 
     /// Insert a resolved-domain record and remember the upstream that supplied
-    /// it for DNS results panels.
+    /// it for DNS results panels. This *replaces* the whole entry, so the
+    /// `queried` set is derived from the supplied IPs. An empty IP list is
+    /// recorded as a negative answer for both families (the only way to
+    /// represent "this name has no records at all" without per-family input),
+    /// keeping the NXDOMAIN-cache test contract.
     pub fn put_with_source(
         &self,
         domain: &str,
@@ -229,7 +375,12 @@ impl DnsCache {
         ttl: Duration,
         source: Option<&str>,
     ) {
-        self.put_replacing(domain, ips, ttl, source, QueryFamilies::from_ips(ips));
+        let queried = if ips.is_empty() {
+            QueryFamilies::BOTH
+        } else {
+            QueryFamilies::from_ips(ips)
+        };
+        self.put_replacing(domain, ips, ttl, source, queried);
     }
 
     fn put_replacing(
@@ -241,7 +392,7 @@ impl DnsCache {
         queried: QueryFamilies,
     ) {
         let now = Instant::now();
-        let expire_at = now + ttl;
+        let expire = now + ttl;
         // Reverse entries get a longer floor so the IP → host mapping survives
         // until the inbound connection that uses the IP can recover its host
         // for rule matching, even when the DNS TTL is short (10s clamp).
@@ -271,7 +422,8 @@ impl DnsCache {
 
         let entry = CacheEntry {
             ips: ips.into(),
-            expire_at,
+            expire_v4: expire,
+            expire_v6: expire,
             source: source.map(Arc::from),
             queried,
         };
@@ -282,16 +434,23 @@ impl DnsCache {
         }
     }
 
-    pub(crate) fn merge_lookup(
+    /// Merge a single family's answer into an existing entry without disturbing
+    /// the other family's expiry or IPs (review issue D). `family` is exactly
+    /// one of [`QueryFamilies::IPV4`] / [`QueryFamilies::IPV6`]; `ips` is that
+    /// family's address list (possibly empty for a NOERROR-with-zero-answers
+    /// NODATA, which is still cached so the resolver can serve it from cache
+    /// until this family's own TTL fires). `ttl` is the clamped upstream TTL.
+    pub(crate) fn merge_family(
         &self,
         domain: &str,
+        family: QueryFamilies,
         ips: &[IpAddr],
         ttl: Duration,
         source: Option<&str>,
-        queried: QueryFamilies,
     ) {
+        debug_assert!(family == QueryFamilies::IPV4 || family == QueryFamilies::IPV6);
         let now = Instant::now();
-        let incoming_expire_at = now + ttl;
+        let expire = now + ttl;
         let reverse_expire_at = now + ttl.max(REVERSE_TTL_FLOOR);
         let domain = normalize_domain(domain);
         let key: Arc<str> = Arc::from(domain.as_ref());
@@ -310,25 +469,41 @@ impl DnsCache {
             }
         }
 
+        let other = family.other();
         let mut cache = self.cache[shard_str(&domain)].lock();
-        let mut merged = Vec::new();
-        let mut merged_queried = queried;
-        let mut expire_at = incoming_expire_at;
+        let mut merged: Vec<IpAddr> = Vec::new();
+        let mut merged_queried = family;
+        let mut expire_v4 = expire;
+        let mut expire_v6 = expire;
         let mut merged_source = source.map(Arc::from);
         if let Some(existing) = cache.get(domain.as_ref()) {
-            if existing.expire_at > now {
-                merged.extend(
-                    existing
-                        .ips
-                        .iter()
-                        .copied()
-                        .filter(|ip| !queried.contains_ip(*ip)),
-                );
-                merged_queried = existing.queried.union(queried);
-                expire_at = existing.expire_at.min(incoming_expire_at);
-                if merged_source.is_none() {
-                    merged_source = existing.source.clone();
+            // Preserve the OTHER family's fresh IPs and, crucially, its own
+            // expiry — the bug was `min()` over both families, letting a
+            // short-TTL family evict a still-fresh long-TTL one.
+            if existing.queried.contains(other) {
+                let other_fresh = if other == QueryFamilies::IPV4 {
+                    existing.expire_v4 > now
+                } else {
+                    existing.expire_v6 > now
+                };
+                if other_fresh {
+                    merged.extend(
+                        existing
+                            .ips
+                            .iter()
+                            .copied()
+                            .filter(|ip| other.contains_ip(*ip)),
+                    );
+                    if other == QueryFamilies::IPV4 {
+                        expire_v4 = existing.expire_v4;
+                    } else {
+                        expire_v6 = existing.expire_v6;
+                    }
+                    merged_queried = existing.queried.union(family);
                 }
+            }
+            if merged_source.is_none() {
+                merged_source = existing.source.clone();
             }
         }
         merged.extend_from_slice(ips);
@@ -338,7 +513,8 @@ impl DnsCache {
             key,
             CacheEntry {
                 ips: merged.into(),
-                expire_at,
+                expire_v4,
+                expire_v6,
                 source: merged_source,
                 queried: merged_queried,
             },
@@ -383,19 +559,37 @@ impl DnsCache {
         let mut entries = Vec::new();
         for shard in &self.cache {
             let mut cache = shard.lock();
+            // An entry is live while at least one queried family is still
+            // fresh; once both expire the whole entry is evicted.
             let expired: Vec<Arc<str>> = cache
                 .iter()
-                .filter(|(_, entry)| entry.expire_at <= now)
+                .filter(|(_, entry)| {
+                    let v4 = entry.queried.contains(QueryFamilies::IPV4) && entry.expire_v4 > now;
+                    let v6 = entry.queried.contains(QueryFamilies::IPV6) && entry.expire_v6 > now;
+                    !v4 && !v6
+                })
                 .map(|(name, _)| Arc::clone(name))
                 .collect();
             for name in expired {
                 cache.pop(name.as_ref());
             }
-            entries.extend(cache.iter().map(|(name, entry)| DnsCacheSnapshotEntry {
-                name: name.to_string(),
-                ips: entry.ips.to_vec(),
-                ttl: entry.expire_at.saturating_duration_since(now),
-                source: entry.source.as_ref().map(std::string::ToString::to_string),
+            entries.extend(cache.iter().map(|(name, entry)| {
+                // Display the entry's overall remaining lifetime: the latest
+                // fresh family's expiry, so the panel reflects how long the
+                // entry as a whole stays cache-resolvable.
+                let mut latest = now;
+                if entry.queried.contains(QueryFamilies::IPV4) && entry.expire_v4 > latest {
+                    latest = entry.expire_v4;
+                }
+                if entry.queried.contains(QueryFamilies::IPV6) && entry.expire_v6 > latest {
+                    latest = entry.expire_v6;
+                }
+                DnsCacheSnapshotEntry {
+                    name: name.to_string(),
+                    ips: entry.ips.to_vec(),
+                    ttl: latest.saturating_duration_since(now),
+                    source: entry.source.as_ref().map(std::string::ToString::to_string),
+                }
             }));
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -723,40 +917,84 @@ mod tests {
     }
 
     #[test]
-    fn merge_lookup_tracks_empty_families_without_dropping_other_answers() {
+    fn merge_family_tracks_empty_families_without_dropping_other_answers() {
         let c = DnsCache::new(64);
         let v4 = ipv4(192, 0, 2, 1);
         let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
 
-        c.merge_lookup(
+        c.merge_family(
             "dual.example",
+            QueryFamilies::IPV4,
             &[v4],
             Duration::from_secs(60),
             None,
-            QueryFamilies::IPV4,
         );
-        c.merge_lookup(
+        c.merge_family(
             "dual.example",
+            QueryFamilies::IPV6,
             &[],
             Duration::from_secs(30),
             None,
-            QueryFamilies::IPV6,
         );
         let no_v6 = c.get_lookup("dual.example").unwrap();
         assert_eq!(no_v6.ips.as_slice(), &[v4]);
-        assert!(no_v6.queried.contains(QueryFamilies::IPV4));
-        assert!(no_v6.queried.contains(QueryFamilies::IPV6));
+        // v4 is a fresh answer; v6 is a fresh negative (NoData) — both families
+        // are now answered from cache without dropping the v4 address.
+        assert!(matches!(no_v6.v4, FamilyCacheHit::Answer(..)));
+        assert!(matches!(no_v6.v6, FamilyCacheHit::NoData));
 
-        c.merge_lookup(
+        c.merge_family(
             "dual.example",
+            QueryFamilies::IPV6,
             &[v6],
             Duration::from_secs(30),
             None,
-            QueryFamilies::IPV6,
         );
         let dual = c.get_lookup("dual.example").unwrap();
         assert!(dual.ips.contains(&v4));
         assert!(dual.ips.contains(&v6));
+    }
+
+    /// Review issue D: a short-TTL AAAA NODATA must not evict a still-fresh
+    /// long-TTL A answer. The whole merged entry used to take
+    /// `min(existing, incoming)` expiry, collapsing a 3600 s A to 10 s.
+    #[test]
+    fn merge_family_short_ttl_nodata_does_not_expire_other_family() {
+        let c = DnsCache::new(64);
+        let v4 = ipv4(192, 0, 2, 1);
+        // A answer: 3600 s TTL.
+        c.merge_family(
+            "cdn.example",
+            QueryFamilies::IPV4,
+            &[v4],
+            Duration::from_secs(3600),
+            None,
+        );
+        // AAAA NODATA: clamped MIN TTL of 10 s.
+        c.merge_family(
+            "cdn.example",
+            QueryFamilies::IPV6,
+            &[],
+            Duration::from_secs(10),
+            None,
+        );
+        let entry = c
+            .get_lookup("cdn.example")
+            .expect("entry must still be live");
+        // The A answer is still fresh and served from cache with its own
+        // (long) remaining TTL — not the AAAA's collapsed 10 s.
+        let v4_ttl = match &entry.v4 {
+            FamilyCacheHit::Answer(ips, ttl) => {
+                assert_eq!(ips.as_slice(), &[v4]);
+                *ttl
+            }
+            other => panic!("expected fresh A answer, got {other:?}"),
+        };
+        assert!(
+            v4_ttl > Duration::from_secs(3500),
+            "A TTL {v4_ttl:?} must not be collapsed to the AAAA's 10 s",
+        );
+        assert!(matches!(entry.v6, FamilyCacheHit::NoData));
     }
 
     #[test]
@@ -813,6 +1051,20 @@ mod tests {
             c.forward_len() <= 128,
             "forward_len {} exceeded global shard cap",
             c.forward_len()
+        );
+    }
+
+    /// ADR-0011 size invariant (review issue G): `CacheEntry` must fit the M2
+    /// 72 B per-`LruEntry`-slot cap. Per-family expiry grows the struct by one
+    /// `Instant`; this test locks the cap in so a future field addition can't
+    /// silently breach it. See the struct doc for the before/after byte counts.
+    #[test]
+    fn cache_entry_fits_m2_size_cap() {
+        use std::mem::size_of;
+        assert!(
+            size_of::<CacheEntry>() <= 72,
+            "CacheEntry {} B exceeded the 72 B M2 per-slot cap",
+            size_of::<CacheEntry>()
         );
     }
 }

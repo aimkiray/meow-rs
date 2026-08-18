@@ -26,7 +26,11 @@ async fn test_general_config_defaults() {
     let config = load_config_from_str(yaml).await.unwrap();
     assert_eq!(config.general.mode.to_string(), "rule");
     assert_eq!(config.general.log_level, "info");
-    assert!(!config.general.ipv6);
+    // `ipv6` defaults to `true` for backward compatibility: before the
+    // top-level flag drove the resolver, dual-stack DNS was always on, so an
+    // existing config that omits `ipv6:` must keep dual-stack behavior rather
+    // than silently losing AAAA everywhere. Set `ipv6: false` to opt out.
+    assert!(config.general.ipv6);
     assert!(!config.general.allow_lan);
     assert_eq!(config.general.bind_address, "127.0.0.1");
 }

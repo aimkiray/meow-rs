@@ -128,6 +128,34 @@ pub(crate) enum FamilyLookupResult {
     NxDomain,
 }
 
+/// One family's answer within a [`FamilySet`]. The resolver/cache consume this
+/// unified shape so the per-family and "all enabled families" lookup paths
+/// share one pipeline (review issue J). TTLs are the raw upstream values; the
+/// resolver clamps them once before use.
+#[derive(Clone, Debug)]
+pub(crate) enum FamilyAnswer {
+    /// NOERROR with at least one address record of this family.
+    Answer { ips: Vec<IpAddr>, ttl: Duration },
+    /// NOERROR with zero address records of this family (NODATA). Carries the
+    /// upstream TTL so the cache can expire the negative on its own schedule.
+    NoData(Duration),
+    /// The upstream authoritatively said the name does not exist. Not cached.
+    NxDomain,
+    /// A network/timeout failure for this family — not a definitive answer.
+    Failed,
+}
+
+/// A client's resolution result across the requested family set. `None` for a
+/// family means "not queried" (e.g. the prefer-IPv4 path skips AAAA once A has
+/// addresses); the resolver treats that as a cache miss for the family and
+/// re-queries on demand.
+#[derive(Clone, Debug)]
+pub(crate) struct FamilySet {
+    pub(crate) v4: Option<FamilyAnswer>,
+    pub(crate) v6: Option<FamilyAnswer>,
+    pub(crate) source: String,
+}
+
 struct TcpPool {
     idle: AsyncMutex<Vec<TcpStream>>,
     permits: Semaphore,
@@ -371,15 +399,12 @@ impl DnsClient {
         name: &str,
         record_type: RecordType,
     ) -> Result<FamilyLookupResult, ClientError> {
-        let queried = match record_type {
-            RecordType::A => QueryFamilies::IPV4,
-            RecordType::AAAA => QueryFamilies::IPV6,
-            _ => {
-                return Err(ClientError::Protocol(
-                    "address family query must be A or AAAA",
-                ))
-            }
-        };
+        let queried = QueryFamilies::from_record_type(record_type);
+        if queried.is_empty() {
+            return Err(ClientError::Protocol(
+                "address family query must be A or AAAA",
+            ));
+        }
         let message = self.query(name, record_type).await?;
         match message.metadata.response_code {
             ResponseCode::NoError => {}
@@ -392,6 +417,57 @@ impl DnsClient {
             ttl: Duration::from_secs(u64::from(ttl.unwrap_or(0))),
             queried,
         }))
+    }
+
+    /// Unified entry point for the resolver pipeline (review issue J). For a
+    /// single family (`IPV4`/`IPV6`) this is a per-family query that preserves
+    /// the NXDOMAIN/NODATA distinction the DNS server needs; for `BOTH` it is
+    /// the prefer-IPv4 A-then-AAAA path that returns every enabled address for
+    /// `resolve_ips`. `Err` means the client could not produce *any* answer for
+    /// the requested set (e.g. both families timed out); the resolver keeps
+    /// racing the remaining clients.
+    pub(crate) async fn lookup_set(
+        &self,
+        name: &str,
+        want: QueryFamilies,
+        ipv6_enabled: bool,
+    ) -> Result<FamilySet, ClientError> {
+        let source = self.upstream_label();
+        if want == QueryFamilies::BOTH {
+            let result = self.lookup_ip_with_ipv6(name, ipv6_enabled).await?;
+            return Ok(family_set_from_ip_lookup(&result, source));
+        }
+        let family = if want == QueryFamilies::IPV4 {
+            QueryFamilies::IPV4
+        } else if want == QueryFamilies::IPV6 {
+            QueryFamilies::IPV6
+        } else {
+            return Err(ClientError::Protocol(
+                "lookup_set requires a single family or BOTH",
+            ));
+        };
+        let record_type = match family {
+            QueryFamilies::IPV4 => RecordType::A,
+            _ => RecordType::AAAA,
+        };
+        let answer = match self.lookup_family(name, record_type).await {
+            Ok(FamilyLookupResult::Response(r)) => {
+                let ttl = r.ttl;
+                if r.ips.is_empty() {
+                    FamilyAnswer::NoData(ttl)
+                } else {
+                    FamilyAnswer::Answer { ips: r.ips, ttl }
+                }
+            }
+            Ok(FamilyLookupResult::NxDomain) => FamilyAnswer::NxDomain,
+            Err(_) => FamilyAnswer::Failed,
+        };
+        let (v4, v6) = if family == QueryFamilies::IPV4 {
+            (Some(answer), None)
+        } else {
+            (None, Some(answer))
+        };
+        Ok(FamilySet { v4, v6, source })
     }
 
     async fn lookup_ip_with_ipv6_inner(
@@ -465,6 +541,16 @@ impl DnsClient {
     /// Send a direct `tcp://` query through a bounded keep-alive pool.
     /// Checked-out streams stay local to this future, so cancellation drops a
     /// partially consumed stream instead of returning it to the pool.
+    ///
+    /// The pooled (reused) attempt runs under a *short* read deadline — half
+    /// the per-query timeout (review issue H). A reused stream that has been
+    /// idle-half-closed by an upstream or NAT (write succeeds, peer never
+    /// answers) would otherwise block in `read_lp` until the outer 5 s deadline
+    /// is nearly exhausted, leaving the fresh-connect retry almost no budget.
+    /// RST/EOF still fail fast; only the silent half-close case is bounded here,
+    /// so a query that would succeed in ~30 ms on a fresh connection no longer
+    /// spuriously times out. Pooling is intentionally scoped to plain `tcp://`;
+    /// DoT/DoH reconnect and full TLS handshake per query (review issue #8).
     async fn tcp_exchange_pooled(
         &self,
         addr: SocketAddr,
@@ -478,12 +564,19 @@ impl DnsClient {
             .await
             .map_err(|_| ClientError::Protocol("TCP pool closed"))?;
         let pooled = self.tcp_pool.idle.lock().await.pop();
+        // Half the budget for the reused-stream attempt, half in reserve for a
+        // fresh connect + full exchange if the pooled stream turns out stale.
+        let pooled_budget = self.timeout / 2;
 
         if let Some(mut stream) = pooled {
-            if let Ok(response) = tcp_message_exchange(&mut stream, wire, expected).await {
+            let attempt = tcp_message_exchange(&mut stream, wire, expected);
+            if let Ok(Ok(response)) = tokio::time::timeout(pooled_budget, attempt).await {
                 self.tcp_pool.idle.lock().await.push(stream);
                 return Ok(response);
             }
+            // Timeout or error: drop the (possibly desynced/half-closed)
+            // stream and reconnect. Do not return a timed-out reused stream
+            // to the pool.
         }
 
         let mut stream = factory().connect_tcp(addr).await?;
@@ -739,6 +832,37 @@ fn absorb_ip_response(
         *min_ttl = Some(min_ttl.map_or(ttl, |current| current.min(ttl)));
     }
     non_empty
+}
+
+/// Convert a `lookup_ip_with_ipv6` merged result (the prefer-IPv4 A-then-AAAA
+/// path, which does not distinguish NXDOMAIN from NODATA) into a [`FamilySet`].
+/// NXDOMAIN is folded into `NoData` here — the "give me every enabled address"
+/// caller (`resolve_ips`) ignores the rcode, and the per-family `queried`
+/// tracking in the cache ensures a later family-specific query still re-queries
+/// and gets the real rcode from `lookup_family`.
+fn family_set_from_ip_lookup(result: &IpLookupResult, source: String) -> FamilySet {
+    let ttl = result.ttl;
+    let split = |family: QueryFamilies| -> Option<FamilyAnswer> {
+        if !result.queried.contains(family) {
+            return None;
+        }
+        let ips: Vec<IpAddr> = result
+            .ips
+            .iter()
+            .copied()
+            .filter(|ip| family.contains_ip(*ip))
+            .collect();
+        if ips.is_empty() {
+            Some(FamilyAnswer::NoData(ttl))
+        } else {
+            Some(FamilyAnswer::Answer { ips, ttl })
+        }
+    };
+    FamilySet {
+        v4: split(QueryFamilies::IPV4),
+        v6: split(QueryFamilies::IPV6),
+        source,
+    }
 }
 
 async fn udp_exchange(
@@ -1228,14 +1352,22 @@ mod tests {
             .query("warm.example", RecordType::A)
             .await
             .expect("the first query primes the pool");
-        assert!(matches!(
-            client.query("partial.example", RecordType::A).await,
-            Err(ClientError::Timeout(_))
-        ));
+        // The reused stream stalls on a partial length-prefixed frame (the
+        // server announces 64 bytes but sends 1, then sleeps). With a short
+        // read deadline on the pooled attempt (review issue H), the client
+        // abandons the stale stream well before the 200 ms query budget is
+        // spent and retries on a fresh connection — so this query succeeds
+        // instead of burning the full timeout. Cancellation safety (the
+        // partial stream is discarded, never returned to the pool) is what
+        // makes the retry safe.
+        client
+            .query("partial.example", RecordType::A)
+            .await
+            .expect("stale pooled stream retried within budget");
         client
             .query("after-cancel.example", RecordType::A)
             .await
-            .expect("the cancelled partial stream must not be reused");
+            .expect("the discarded partial stream must not be reused");
         assert!(accepted.load(Ordering::SeqCst) >= 2);
     }
 
