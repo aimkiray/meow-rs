@@ -61,15 +61,26 @@ impl MixedListener {
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let listener = TcpListener::bind(self.listen_addr).await?;
+        self.run_on(listener).await
+    }
+
+    /// Serve on an already-bound socket. Lets the caller bind first (e.g. to
+    /// resolve a `port: 0` ephemeral listener to its OS-assigned port before
+    /// the API snapshot is taken) and hand the socket over.
+    pub async fn run_on(
+        &self,
+        listener: TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let bound_addr = listener.local_addr().unwrap_or(self.listen_addr);
         if self.max_connections == 0 {
             info!(
                 "Mixed listener '{}' on {} (max_connections=unlimited)",
-                self.name, self.listen_addr
+                self.name, bound_addr
             );
         } else {
             info!(
                 "Mixed listener '{}' on {} (max_connections={})",
-                self.name, self.listen_addr, self.max_connections
+                self.name, bound_addr, self.max_connections
             );
         }
 
@@ -122,7 +133,7 @@ impl MixedListener {
             let tunnel = self.tunnel.clone();
             let sniffer = self.sniffer.clone();
             let name = self.name.clone();
-            let port = self.listen_addr.port();
+            let port = bound_addr.port();
             let auth = self.auth.clone();
             tokio::spawn(async move {
                 handle_connection(tunnel, stream, src_addr, sniffer, name, port, auth).await;

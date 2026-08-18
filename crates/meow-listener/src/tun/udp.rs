@@ -1,6 +1,6 @@
 //! Per-flow UDP handling for the TUN inbound.
 //!
-//! `netstack-smoltcp` surfaces UDP as one packet-level socket yielding
+//! lwIP surfaces UDP as one packet-level socket yielding
 //! `(payload, src, dst)` tuples — there are no per-flow streams and no
 //! built-in NAT, so this module owns the flow table: the reader loop
 //! dispatches datagrams to per-flow tasks keyed by the (src, dst) tuple,
@@ -20,12 +20,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use ipnet::Ipv4Net;
+use lwip::UdpSocket;
 use meow_common::{ConnType, Metadata, Network, ProxyAdapter};
 use meow_dns::server::{hex_prefix, DnsServer};
 use meow_tunnel::Tunnel;
-use netstack_smoltcp::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
 use tracing::{debug, info};
@@ -47,18 +47,22 @@ type ReplyMsg = (Vec<u8>, SocketAddr, SocketAddr);
 
 pub(super) async fn run_udp(
     tunnel: Tunnel,
-    socket: UdpSocket,
+    socket: Box<UdpSocket>,
     dns_hijack: bool,
     udp_timeout: Duration,
     in_name: String,
     tun_net: Ipv4Net,
 ) {
-    let (mut read_half, mut write_half) = socket.split();
+    let (write_half, mut read_half) = socket.split();
 
     let (reply_tx, mut reply_rx) = mpsc::channel::<ReplyMsg>(REPLY_QUEUE);
     tokio::spawn(async move {
-        while let Some(msg) = reply_rx.recv().await {
-            if let Err(e) = write_half.send(msg).await {
+        while let Some((data, src, dst)) = reply_rx.recv().await {
+            // `send_to(data, src, dst)`: appear as `src`, deliver to `dst`.
+            if let Err(e) = write_half.send_to(&data, &src, &dst) {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    continue;
+                }
                 debug!("tun UDP write half closed: {e}");
                 break;
             }

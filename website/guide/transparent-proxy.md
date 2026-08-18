@@ -1,15 +1,63 @@
 # Transparent Proxy
 
-A transparent proxy (TProxy) intercepts traffic at the kernel and routes it through
-meow-rs **without** any per-app proxy settings. meow-rs implements it with a `REDIRECT`
-strategy plus firewall rules it installs and tears down automatically.
+A transparent proxy intercepts traffic at the kernel and routes it through
+meow-rs **without** any per-app proxy settings. The backend is platform-specific:
+
+| Platform | Mechanism | Config |
+| --- | --- | --- |
+| **Windows** | [Wintun](https://www.wintun.net/) TUN adapter + userspace stack | `tun:` |
+| Linux | nftables `REDIRECT` (tproxy) or TUN | `tproxy-port` or `tun:` |
+| macOS | pf redirect (experimental) or utun | `tproxy-port` or `tun:` |
+
+On Windows there is no nftables/pf equivalent, so **Wintun is the transparent-proxy
+path**. Official Windows release zips ship `wintun.dll` next to `meow.exe`.
+
+## Windows (Wintun)
+
+```yaml
+mode: rule
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip          # required for v1 TUN capture
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - https://1.1.1.1/dns-query
+
+tun:
+  enable: true
+  auto-route: true                # routes the fake-ip range into the adapter
+  dns-hijack:
+    - any:53
+```
+
+1. Use a build with the `listener-tun` feature (included in `full`, so release
+   binaries have it). Official zips ship `wintun.dll` next to `meow.exe`. If
+   the sidecar is missing, meow extracts the official signed DLL embedded in
+   the binary (next to the exe, or under `%LOCALAPPDATA%\meow\`). From-source
+   Windows builds fetch that DLL at compile time.
+2. Run the process **elevated** ("Run as administrator", or the Windows service).
+3. Start meow. `auto-route` + `dns-hijack` point the OS resolver at a loopback
+   DNS server that returns fake IPs; connections to those IPs enter the Wintun
+   adapter and go through the normal rule engine.
+
+v1 captures **domain-based** traffic only (the fake-IP range). Outbound dials
+always go to real IPs, so they cannot loop back into the adapter. IP-literal
+connections are not captured. Full field reference and the loop-freedom
+argument are in
+[docs/tun.md](https://github.com/madeye/meow-rs/blob/main/docs/tun.md).
+
+## Linux / macOS tproxy
+
+meow-rs implements host tproxy with a `REDIRECT` strategy plus firewall rules
+it installs and tears down automatically.
 
 ```yaml
 tproxy-port: 7893
 routing-mark: 9527     # Linux: SO_MARK for loop avoidance
 ```
 
-## How it works
+## How tproxy works
 
 - **REDIRECT-based, TCP only.** Traffic is redirected to the TProxy listener, and the
   original destination is recovered via `SO_ORIGINAL_DST` (Linux) or a `getpeername`

@@ -186,6 +186,82 @@ dns:
 }
 
 #[tokio::test]
+async fn test_dns_listen_ephemeral_port() {
+    let yaml = r#"
+dns:
+  enable: true
+  listen: 127.0.0.1:0
+  nameserver:
+    - 1.1.1.1
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert_eq!(config.dns.listen_addr.unwrap().to_string(), "127.0.0.1:0");
+}
+
+#[tokio::test]
+async fn test_named_listener_listen_host_port_ephemeral() {
+    let yaml = r#"
+listeners:
+  - name: mixed
+    type: mixed
+    listen: 127.0.0.1:0
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert_eq!(config.listeners.named.len(), 1);
+    let nl = &config.listeners.named[0];
+    assert_eq!(nl.name, "mixed");
+    assert_eq!(nl.listen, "127.0.0.1");
+    assert_eq!(nl.port, 0);
+}
+
+#[tokio::test]
+async fn test_named_listener_listen_host_port_explicit() {
+    let yaml = r#"
+listeners:
+  - name: socks
+    type: socks5
+    listen: 0.0.0.0:7891
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let nl = &config.listeners.named[0];
+    assert_eq!(nl.name, "socks");
+    assert_eq!(nl.listen, "0.0.0.0");
+    assert_eq!(nl.port, 7891);
+}
+
+#[tokio::test]
+async fn test_named_listener_listen_port_conflict() {
+    let yaml = r#"
+listeners:
+  - name: socks
+    type: socks5
+    listen: 127.0.0.1:7891
+    port: 7892
+"#;
+    let Err(err) = load_config_from_str(yaml).await else {
+        panic!("conflicting listen/port must hard-error");
+    };
+    let msg = format!("{err:#}");
+    assert!(msg.contains("conflicts"), "msg: {msg}");
+}
+
+#[tokio::test]
+async fn test_two_ephemeral_listeners_do_not_conflict() {
+    let yaml = r#"
+listeners:
+  - name: a
+    type: mixed
+    listen: 127.0.0.1:0
+  - name: b
+    type: socks5
+    listen: 127.0.0.1:0
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert_eq!(config.listeners.named.len(), 2);
+    assert!(config.listeners.named.iter().all(|nl| nl.port == 0));
+}
+
+#[tokio::test]
 async fn test_dns_config_fakeip_enabled() {
     // `enhanced-mode: fake-ip` must be accepted, with the pool synthesising
     // IPs from the configured CIDR.
@@ -1034,4 +1110,51 @@ rules:
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
     assert_eq!(config.rules.len(), 2);
+}
+
+#[tokio::test]
+async fn test_expected_status_integer_accepted_end_to_end() {
+    // issue #390: `expected-status: 204` (unquoted integer, as documented)
+    // used to abort config load with "invalid type: integer `204`, expected
+    // a string" — in both proxy-groups and proxy-provider health-checks.
+    let yaml = r#"
+proxies:
+  - name: p1
+    type: ss
+    server: 127.0.0.1
+    port: 8388
+    cipher: aes-256-gcm
+    password: test
+proxy-groups:
+  - name: auto
+    type: url-test
+    proxies: [p1]
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    expected-status: 204
+proxy-providers:
+  prov:
+    type: file
+    path: /nonexistent/meow-issue-390-provider.yaml
+    health-check:
+      enable: true
+      interval: 300
+      expected-status: 204
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(config.proxies.contains_key("auto"));
+}
+
+#[tokio::test]
+async fn test_shorthand_port_zero_means_disabled() {
+    // mihomo compat: `mixed-port: 0` (and the other shorthand port fields)
+    // means the inbound is disabled, not "bind an ephemeral port". Ephemeral
+    // ports are an explicit `listeners:`-entry opt-in.
+    let yaml = r#"
+mixed-port: 0
+socks-port: 0
+port: 0
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(config.listeners.named.is_empty());
 }

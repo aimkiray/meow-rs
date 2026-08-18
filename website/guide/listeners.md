@@ -20,6 +20,9 @@ mixed-port: 7890
 
 `mixed-port` is usually all you need — it serves both HTTP and SOCKS5 clients on one port.
 
+Setting a shorthand port to `0` disables that inbound (mihomo-compatible) — it does
+**not** bind an ephemeral port. Ephemeral ports are a `listeners`-array feature.
+
 ## The `listeners` array
 
 For multiple instances, per-listener binds, or per-listener limits, declare them
@@ -45,16 +48,33 @@ listeners:
 | --- | --- | --- | --- | --- |
 | `name` | string | ✓ | — | Unique; appears in logs, the API, and `IN-NAME` rules |
 | `type` | string | ✓ | — | `mixed` · `http` · `socks5` · `tproxy` |
-| `port` | u16 | ✓ | — | Unique across listeners; `0` is invalid |
-| `listen` | string | | per type | Bind IP literal (not a hostname) |
+| `port` | u16 | | — | Unique across listeners; omit or `0` to let the OS assign an ephemeral port |
+| `listen` | string | | per type | Bind IP literal, or `host:port` (e.g. `127.0.0.1:0`) |
 | `tproxy-sni` | bool | | global | (tproxy) deprecated SNI shorthand — prefer [`sniffer`](./sniffer) |
 | `max-connections` | usize | | global | Per-listener concurrency cap; `0` = unlimited |
 
 `listen` defaults to `127.0.0.1` for `tproxy` and to the global `bind-address` otherwise.
 
+### Ephemeral ports
+
+A listener with port `0` (via `port: 0`, an omitted `port`, or `listen: 127.0.0.1:0`)
+binds an OS-assigned ephemeral port at startup. Discover the assigned port from the
+startup log line (`Mixed listener 'auto' on 127.0.0.1:49321 …`) or from
+[`GET /listeners`](#inspecting-listeners) on the REST API, which reports the actual
+bound port.
+Giving both `listen: host:port` and `port` with different values is a load-time error.
+
+```yaml
+listeners:
+  - name: auto
+    type: mixed
+    listen: 127.0.0.1:0
+```
+
 ::: warning Duplicates are fatal
 Duplicate listener **ports** or **names** are a hard load-time error (unlike upstream,
-which may accept them silently).
+which may accept them silently). Multiple port-`0` listeners are fine — each gets its
+own OS-assigned port.
 :::
 
 ## Listener types
@@ -62,7 +82,9 @@ which may accept them silently).
 - **`mixed`** — HTTP and SOCKS5 on one port; supports inbound auth and the sniffer.
 - **`http`** — HTTP CONNECT proxy.
 - **`socks5`** — SOCKS5 proxy; supports inbound auth.
-- **`tproxy`** — transparent proxy; see [Transparent Proxy](./transparent-proxy).
+- **`tproxy`** — firewall transparent proxy (Linux / experimental macOS); see [Transparent Proxy](./transparent-proxy).
+- **`tun:`** (top-level, not in this array) — L3 TUN inbound. On Windows this is a
+  Wintun adapter and is the transparent-proxy path. See [Transparent Proxy](./transparent-proxy).
 
 ## Inbound authentication
 
@@ -98,4 +120,5 @@ rules:
 ## Inspecting listeners
 
 `GET /listeners` returns the active listeners with their name, type, port, and bind
-address. See the [REST API reference](../reference/rest-api).
+address. For [ephemeral listeners](#ephemeral-ports) the reported port is the actual
+OS-assigned one, not the configured `0`. See the [REST API reference](../reference/rest-api).

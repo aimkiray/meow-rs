@@ -230,6 +230,18 @@ jobs:
           cache-on-failure: true
           key: windows
 
+      # lwIP (listener-tun, in the `full` default bundle) uses bindgen.
+      - name: Install LLVM
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18"
+
+      - name: Fetch wintun.dll
+        shell: bash
+        run: |
+          bash scripts/fetch-wintun.sh --target x86_64-pc-windows-msvc --outdir "$RUNNER_TEMP/wintun"
+          echo "MEOW_WINTUN_DLL=$RUNNER_TEMP/wintun/wintun.dll" >> "$GITHUB_ENV"
+
       - name: Clippy (default features)
         run: cargo clippy --all-targets -- -D warnings
 

@@ -19,7 +19,7 @@ listener-mixed = ["listener-http", "listener-socks5"]
 # userspace-stack, and route-control deps below.
 listener-tun = [
     "dep:tun-rs",
-    "dep:netstack-smoltcp",
+    "dep:lwip",
     "dep:futures",
     "dep:route_manager",
     "dep:meow-dns",
@@ -36,7 +36,7 @@ tracing = { workspace = true }
 libc = "0.2"
 smallvec = { workspace = true }
 tun-rs = { workspace = true, optional = true }
-netstack-smoltcp = { workspace = true, optional = true }
+lwip = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 route_manager = { workspace = true, optional = true }
 meow-dns = { workspace = true, optional = true }

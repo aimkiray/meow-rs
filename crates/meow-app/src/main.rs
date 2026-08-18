@@ -807,57 +807,6 @@ async fn run(
         });
     }
 
-    // Start REST API if configured
-    if let Some(api_addr) = config.api.external_controller {
-        // `external-ui-url` auto-download is gated behind the optional
-        // `external-ui-download` feature (it pulls in the `zip` crate, against
-        // the ADR-0007 size caps). Without the feature we just hint the user to
-        // populate the directory manually. See issue #223.
-        if let (Some(url), Some(dir)) = (&config.api.external_ui_url, &config.api.external_ui) {
-            if !dir.is_dir() {
-                // Auto-download is gated behind `external-ui-download` AND is
-                // force-disabled on iOS/Android (mobile ships its own UI).
-                #[cfg(all(
-                    feature = "external-ui-download",
-                    not(any(target_os = "ios", target_os = "android"))
-                ))]
-                {
-                    if let Err(e) = meow_config::external_ui::download_external_ui(url, dir).await {
-                        warn!("failed to download external-ui from {url}: {e:#}");
-                    }
-                }
-                #[cfg(not(all(
-                    feature = "external-ui-download",
-                    not(any(target_os = "ios", target_os = "android"))
-                )))]
-                {
-                    warn!(
-                        "external-ui-url ({url}) is set but auto-download is unavailable in this \
-                         build; download and extract the UI into {} manually",
-                        dir.display()
-                    );
-                }
-            }
-        }
-        let api_server = ApiServer::new(
-            tunnel.clone(),
-            api_addr,
-            config.api.secret.clone(),
-            config_path.clone(),
-            Arc::clone(&raw_config),
-            log_tx.clone(),
-            Arc::clone(&proxy_providers),
-            Arc::clone(&rule_providers),
-            config.listeners.named.clone(),
-            config.api.external_ui.clone(),
-        );
-        tokio::spawn(async move {
-            if let Err(e) = api_server.run().await {
-                error!("API server error: {}", e);
-            }
-        });
-    }
-
     // Spawn background refresh tasks for HTTP rule-providers with interval > 0.
     {
         let providers_snap: Vec<_> = rule_providers
@@ -926,10 +875,14 @@ async fn run(
     // consumed only inside feature-gated listener blocks below.
     let _ = (&sniffer_runtime, &auth);
 
-    // Start listeners
+    // Start listeners. Bind before spawning the accept loops so a `port: 0`
+    // (ephemeral) listener resolves to its OS-assigned port up front; the
+    // resolved ports are patched into `named_listeners`, which feeds the
+    // startup logs and the API snapshot (`GET /listeners`) below.
     use meow_config::ListenerType;
 
-    for nl in &config.listeners.named {
+    let mut named_listeners = config.listeners.named.clone();
+    for nl in &mut named_listeners {
         let addr = bind_socket_addr(&nl.listen, nl.port)
             .map_err(|e| anyhow::anyhow!("listener '{}': {e}", nl.name))?;
         // Suppress unused-variable warning: addr is consumed only inside
@@ -939,12 +892,21 @@ async fn run(
             ListenerType::Mixed | ListenerType::Http | ListenerType::Socks5 => {
                 #[cfg(feature = "listener-mixed")]
                 {
-                    let listener = MixedListener::new(tunnel.clone(), addr, nl.name.clone())
+                    let socket = match tokio::net::TcpListener::bind(addr).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("listener '{}': bind {} failed: {}", nl.name, addr, e);
+                            continue;
+                        }
+                    };
+                    let bound = socket.local_addr().unwrap_or(addr);
+                    nl.port = bound.port();
+                    let listener = MixedListener::new(tunnel.clone(), bound, nl.name.clone())
                         .with_sniffer(Arc::clone(&sniffer_runtime))
                         .with_auth(Arc::clone(&auth))
                         .with_max_connections(nl.max_connections);
                     tokio::spawn(async move {
-                        if let Err(e) = listener.run().await {
+                        if let Err(e) = listener.run_on(socket).await {
                             error!("Listener error: {}", e);
                         }
                     });
@@ -959,16 +921,25 @@ async fn run(
             ListenerType::TProxy => {
                 #[cfg(feature = "listener-tproxy")]
                 {
+                    let socket = match tokio::net::TcpListener::bind(addr).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("listener '{}': bind {} failed: {}", nl.name, addr, e);
+                            continue;
+                        }
+                    };
+                    let bound = socket.local_addr().unwrap_or(addr);
+                    nl.port = bound.port();
                     let listener = TProxyListener::new(
                         tunnel.clone(),
-                        addr,
+                        bound,
                         nl.tproxy_sni,
                         config.listeners.routing_mark,
                         nl.name.clone(),
                     )
                     .with_sniffer(Arc::clone(&sniffer_runtime));
                     tokio::spawn(async move {
-                        if let Err(e) = listener.run().await {
+                        if let Err(e) = listener.run_on(socket).await {
                             error!("TProxy listener error: {}", e);
                         }
                     });
@@ -980,6 +951,59 @@ async fn run(
                 );
             }
         }
+    }
+
+    // Start REST API if configured. Runs after the listener bind phase so the
+    // `GET /listeners` snapshot reports OS-assigned ports for `port: 0`
+    // (ephemeral) listeners rather than the configured `0`.
+    if let Some(api_addr) = config.api.external_controller {
+        // `external-ui-url` auto-download is gated behind the optional
+        // `external-ui-download` feature (it pulls in the `zip` crate, against
+        // the ADR-0007 size caps). Without the feature we just hint the user to
+        // populate the directory manually. See issue #223.
+        if let (Some(url), Some(dir)) = (&config.api.external_ui_url, &config.api.external_ui) {
+            if !dir.is_dir() {
+                // Auto-download is gated behind `external-ui-download` AND is
+                // force-disabled on iOS/Android (mobile ships its own UI).
+                #[cfg(all(
+                    feature = "external-ui-download",
+                    not(any(target_os = "ios", target_os = "android"))
+                ))]
+                {
+                    if let Err(e) = meow_config::external_ui::download_external_ui(url, dir).await {
+                        warn!("failed to download external-ui from {url}: {e:#}");
+                    }
+                }
+                #[cfg(not(all(
+                    feature = "external-ui-download",
+                    not(any(target_os = "ios", target_os = "android"))
+                )))]
+                {
+                    warn!(
+                        "external-ui-url ({url}) is set but auto-download is unavailable in this \
+                         build; download and extract the UI into {} manually",
+                        dir.display()
+                    );
+                }
+            }
+        }
+        let api_server = ApiServer::new(
+            tunnel.clone(),
+            api_addr,
+            config.api.secret.clone(),
+            config_path.clone(),
+            Arc::clone(&raw_config),
+            log_tx.clone(),
+            Arc::clone(&proxy_providers),
+            Arc::clone(&rule_providers),
+            named_listeners.clone(),
+            config.api.external_ui.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = api_server.run().await {
+                error!("API server error: {}", e);
+            }
+        });
     }
 
     // TUN inbound (issue #326) — spawned from the top-level `tun:` section,
@@ -1010,10 +1034,14 @@ async fn run(
                     tunnel.set_tun_handle(handle).await;
                 }
                 Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
-                    error!(
-                        "TUN listener failed to start: {msg} — \
-                         check permissions / admin / CAP_NET_ADMIN"
-                    );
+                    if msg.contains("wintun.dll") {
+                        error!("TUN listener failed to start: {msg}");
+                    } else {
+                        error!(
+                            "TUN listener failed to start: {msg} — \
+                             check permissions / admin / CAP_NET_ADMIN"
+                        );
+                    }
                     handle.abort();
                 }
                 Ok(Err(_)) => {

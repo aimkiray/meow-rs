@@ -430,6 +430,33 @@ proxies:
     );
 }
 
+/// Subscription generators (e.g. Clash Verge) emit `short-id: null` when the
+/// server has no short-id; mihomo treats it as absent and the node works.
+/// Rejecting the explicit null silently dropped every such VLESS node (#388).
+#[tokio::test]
+async fn parse_vless_reality_opts_null_short_id_treated_as_absent() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
+      short-id: null
+"#;
+    let config = load_config_from_str(yaml)
+        .await
+        .expect("REALITY VLESS config with null short-id must load");
+    assert!(
+        config.proxies.contains_key("v"),
+        "REALITY VLESS proxy with `short-id: null` must be registered, not dropped"
+    );
+}
+
 // ─── D10: tls: false + plain VLESS → warn once, loads ok ─────────────────────
 
 /// D10: `parse_vless_tls_false_plain_warns_once`

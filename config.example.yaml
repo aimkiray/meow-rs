@@ -5,10 +5,21 @@ mixed-port: 7890
 # port: 7891        # HTTP proxy port (optional, mixed-port covers both)
 # socks-port: 7892  # SOCKS5 port (optional, mixed-port covers both)
 
-# Transparent proxy (requires root/sudo for firewall rules)
+# Transparent proxy
+# Linux / macOS: tproxy-port + firewall (nftables / pf). Requires root.
 # tproxy-port: 7893      # Enable transparent proxy on this port
 # tproxy-sni: true       # Extract SNI from TLS ClientHello (default: true)
 # routing-mark: 9527     # SO_MARK for DIRECT loop avoidance on Linux
+#
+# Windows: Wintun TUN inbound (the transparent-proxy path). Requires an
+# elevated process. Official zips ship wintun.dll next to meow.exe; if it
+# is missing the official DLL embedded in the binary is extracted. Also
+# needs dns.enhanced-mode: fake-ip. See docs/tun.md.
+# tun:
+#   enable: true
+#   auto-route: true
+#   dns-hijack:
+#     - any:53
 
 allow-lan: false
 bind-address: "127.0.0.1"

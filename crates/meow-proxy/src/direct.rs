@@ -58,6 +58,13 @@ impl DirectAdapter {
         self
     }
 
+    /// Read back the configured connect bound. `None` = unbounded. Lets
+    /// config-layer tests assert the `tcp-connect-timeout` /
+    /// `connect-timeout` wiring without dialing anything.
+    pub fn connect_timeout(&self) -> Option<Duration> {
+        self.connect_timeout
+    }
+
     /// Determine the concrete `SocketAddr` candidates to dial for `metadata`,
     /// avoiding the OS resolver whenever possible.
     async fn resolve_targets(&self, metadata: &Metadata) -> Result<Vec<SocketAddr>> {
@@ -232,6 +239,10 @@ async fn connect_with_mark(
 
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_mark(mark)?;
+        // TUN global-route loop avoidance (#375): this branch bypasses
+        // `meow_common::connect_tcp`, so apply the outbound-interface
+        // binding here too (no-op when none is installed).
+        meow_common::apply_outbound_interface(&socket)?;
         socket.set_nonblocking(true)?;
 
         match socket.connect(&dest.into()) {
@@ -338,6 +349,7 @@ impl ProxyAdapter for DirectAdapter {
 mod tests {
     use super::*;
     use meow_common::DnsMode;
+    use meow_dns::HostEntry;
     use meow_trie::DomainTrie;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -366,13 +378,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        let mut hosts: DomainTrie<Vec<IpAddr>> = DomainTrie::new();
+        let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
         hosts.insert(
             "multi.test",
             vec![
                 IpAddr::V6(Ipv6Addr::LOCALHOST),
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ],
+            ]
+            .into(),
         );
         let resolver = Arc::new(Resolver::new(
             vec![],

@@ -44,8 +44,14 @@ pub fn tun_config_to_listener_config(
         mtu: tun.mtu,
         inet4_address: tun.inet4_address,
         auto_route: tun.auto_route,
+        route_scope: match tun.route_mode {
+            meow_config::TunRouteMode::FakeIp => meow_listener::TunRouteScope::FakeIp,
+            meow_config::TunRouteMode::Global => meow_listener::TunRouteScope::Global,
+        },
+        outbound_interface: tun.outbound_interface.clone(),
         dns_hijack: tun.dns_hijack,
         udp_timeout: tun.udp_timeout,
+        max_connections: tun.max_connections,
     }
 }
 

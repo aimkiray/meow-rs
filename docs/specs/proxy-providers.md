@@ -157,7 +157,7 @@ proxy-groups:
 | `health-check.url` | string | if `enable` | — | URL used for reachability probes. |
 | `health-check.interval` | integer | no | `300` | Health-check sweep interval in seconds. |
 | `health-check.lazy` | bool | no | `true` | If true, defer first probe until the proxy is first used by a connection. |
-| `health-check.expected-status` | integer | no | `204` | HTTP status code that counts as healthy. |
+| `health-check.expected-status` | integer or string | no | any 2xx | HTTP status that counts as healthy: a bare code (`204`) or a range string (`"200-299"`, `"200,204"`). |
 | `override` | map | no | `{}` | Key-value overrides applied to every proxy. See §Override. |
 | `filter` | string | no | `""` | Regex. Include only proxies whose `name` matches. Empty = include all. |
 | `exclude-filter` | string | no | `""` | Regex. Exclude proxies whose `name` matches. Applied after `filter`. |

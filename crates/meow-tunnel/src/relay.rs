@@ -32,11 +32,33 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// Buffer size used for each relay direction.
+/// Buffer size used for each relay direction at connection setup.
 /// 4 KiB halves the tokio default (8 KiB) to save 8 KiB/conn at the
 /// cost of more syscalls; acceptable for proxy workloads where connections
 /// are long-lived and latency matters less than memory at 5k+ conns.
+/// Directions that prove bulk are upgraded to the private
+/// `RELAY_BULK_BUF_SIZE` (32 KiB) — see the tiered-buffer note below.
 pub const RELAY_BUF_SIZE: usize = 4 * 1024;
+
+/// Tiered bulk buffer (#386): once a direction has relayed
+/// [`RELAY_BULK_UPGRADE_BYTES`], its scratch buffer is swapped for a
+/// heap-allocated buffer of this size, matching Go mihomo's 32 KiB relay
+/// buffers. At 4 KiB the relay is syscall-bound on fast paths — one
+/// read+write pair per 4 KiB left bulk throughput ~40% behind mihomo
+/// (19 vs 31 Gbps loopback, see the issue) — while at 32 KiB the gap closes
+/// to parity. The upgrade is lazy so the per-connection footprint at 5k+
+/// mostly-idle connections stays at the small stack buffers; only
+/// connections that actually stream pay the 32 KiB, amortized over at least
+/// [`RELAY_BULK_UPGRADE_BYTES`] of traffic. The one-time allocation is far
+/// past HP-1's warmup window and amortizes to ~0.0001 allocations per
+/// iteration over its 10k-iteration budget (ADR-0008 §3 threshold 0.5).
+const RELAY_BULK_BUF_SIZE: usize = 32 * 1024;
+
+/// Bytes a direction must relay before its scratch buffer is upgraded to
+/// [`RELAY_BULK_BUF_SIZE`]. Typical request/response exchanges stay below
+/// this and never allocate; a bulk stream crosses it in single-digit
+/// milliseconds.
+const RELAY_BULK_UPGRADE_BYTES: u64 = 128 * 1024;
 
 /// Idle window granted to the surviving relay direction after the *other*
 /// direction has reached EOF.
@@ -69,6 +91,12 @@ pub const RELAY_HALF_CLOSE_LINGER: Duration = Duration::from_secs(30);
 /// deterministic: at 4 KiB per cycle it bounds one poll at 256 KiB relayed.
 const RELAY_CYCLES_PER_POLL: u32 = 64;
 
+/// Byte-based companion to [`RELAY_CYCLES_PER_POLL`]: after bulk upgrade a
+/// single cycle moves up to 32 KiB, so 64 cycles would stretch one poll to
+/// 2 MiB. Yield once this many bytes have moved in a poll instead, keeping
+/// the pre-upgrade 256 KiB-per-poll bound regardless of buffer size.
+const RELAY_BYTES_PER_POLL: u64 = 256 * 1024;
+
 // ---------------------------------------------------------------------------
 // Internal copy-one-direction state (no heap allocation)
 // ---------------------------------------------------------------------------
@@ -84,8 +112,38 @@ enum Cycle {
     Pending,
 }
 
+/// Per-direction scratch storage: the caller's stack array until the
+/// direction proves bulk, then a one-time owned upgrade (#386).
+enum Scratch<'buf> {
+    Borrowed(&'buf mut [u8]),
+    Owned(Box<[u8]>),
+}
+
+impl Scratch<'_> {
+    fn slice(&mut self) -> &mut [u8] {
+        match self {
+            Scratch::Borrowed(b) => b,
+            Scratch::Owned(b) => b,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Scratch::Borrowed(b) => b.len(),
+            Scratch::Owned(b) => b.len(),
+        }
+    }
+}
+
+/// Whether a direction that has relayed `amt` bytes through a `buf_len`-byte
+/// scratch buffer should upgrade to the owned [`RELAY_BULK_BUF_SIZE`] buffer.
+/// Callers that already supply a bulk-sized (or larger) buffer never upgrade.
+fn wants_bulk_upgrade(amt: u64, buf_len: usize) -> bool {
+    amt >= RELAY_BULK_UPGRADE_BYTES && buf_len < RELAY_BULK_BUF_SIZE
+}
+
 struct HalfCopy<'buf> {
-    buf: &'buf mut [u8],
+    buf: Scratch<'buf>,
     read_done: bool,
     pos: usize,
     cap: usize,
@@ -96,7 +154,7 @@ struct HalfCopy<'buf> {
 impl<'buf> HalfCopy<'buf> {
     fn new(buf: &'buf mut [u8]) -> Self {
         Self {
-            buf,
+            buf: Scratch::Borrowed(buf),
             read_done: false,
             pos: 0,
             cap: 0,
@@ -126,7 +184,13 @@ impl<'buf> HalfCopy<'buf> {
     {
         // Refill the buffer when empty — at most one read per cycle.
         if self.pos == self.cap && !self.read_done {
-            let mut rb = ReadBuf::new(self.buf);
+            // Tiered upgrade (#386): the buffer is empty, so swapping it is
+            // safe — no buffered bytes to carry over. One allocation per bulk
+            // direction for the connection's remaining lifetime.
+            if wants_bulk_upgrade(self.amt, self.buf.len()) {
+                self.buf = Scratch::Owned(vec![0u8; RELAY_BULK_BUF_SIZE].into_boxed_slice());
+            }
+            let mut rb = ReadBuf::new(self.buf.slice());
             match reader.as_mut().poll_read(cx, &mut rb) {
                 Poll::Ready(Ok(())) => {
                     let filled = rb.filled().len();
@@ -155,7 +219,7 @@ impl<'buf> HalfCopy<'buf> {
 
         // Drain buffered data to the writer.
         while self.pos < self.cap {
-            let data = &self.buf[self.pos..self.cap];
+            let data = &self.buf.slice()[self.pos..self.cap];
             match writer.as_mut().poll_write(cx, data) {
                 Poll::Ready(Ok(0)) => {
                     return Err(io::Error::new(
@@ -265,6 +329,7 @@ where
         // looping marks the task notified and triggers an immediate re-poll,
         // so no wakeup is lost by parking.
         let mut cycles: u32 = 0;
+        let poll_start_bytes = a_to_b.amt + b_to_a.amt;
         let mut a_parked = false;
         let mut b_parked = false;
         loop {
@@ -306,9 +371,12 @@ where
                 break;
             }
 
-            if cycles >= RELAY_CYCLES_PER_POLL {
+            if cycles >= RELAY_CYCLES_PER_POLL
+                || (a_to_b.amt + b_to_a.amt) - poll_start_bytes >= RELAY_BYTES_PER_POLL
+            {
                 // Yield to sibling tasks; self-wake so the scheduler re-polls
-                // this relay promptly.
+                // this relay promptly. The byte bound keeps one poll at
+                // ~256 KiB even after a bulk buffer upgrade.
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
@@ -366,6 +434,81 @@ mod tests {
 
         assert_eq!(up, 5, "a→b direction");
         assert_eq!(down, 5, "b→a direction");
+    }
+
+    // Tiered upgrade decision (#386): small callers upgrade only after the
+    // bulk threshold; callers that already supply bulk-sized buffers never do.
+    #[test]
+    fn bulk_upgrade_decision() {
+        assert!(!wants_bulk_upgrade(0, RELAY_BUF_SIZE));
+        assert!(!wants_bulk_upgrade(
+            RELAY_BULK_UPGRADE_BYTES - 1,
+            RELAY_BUF_SIZE
+        ));
+        assert!(wants_bulk_upgrade(RELAY_BULK_UPGRADE_BYTES, RELAY_BUF_SIZE));
+        assert!(!wants_bulk_upgrade(u64::MAX, RELAY_BULK_BUF_SIZE));
+        assert!(!wants_bulk_upgrade(u64::MAX, RELAY_BULK_BUF_SIZE * 2));
+    }
+
+    // Data integrity across the in-flight buffer swap (#386): stream several
+    // multiples of the upgrade threshold through standard small caller
+    // buffers in both directions and verify every byte arrives, in order.
+    #[tokio::test]
+    async fn bulk_stream_survives_buffer_upgrade() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const TOTAL: usize = (RELAY_BULK_UPGRADE_BYTES as usize) * 4;
+
+        let (mut client, mut a) = duplex(16 * 1024);
+        let (mut b, mut upstream) = duplex(16 * 1024);
+
+        let relay = tokio::spawn(async move {
+            let mut buf1 = [0u8; RELAY_BUF_SIZE];
+            let mut buf2 = [0u8; RELAY_BUF_SIZE];
+            copy_bidirectional_buf(&mut a, &mut b, &mut buf1, &mut buf2).await
+        });
+
+        let pattern: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+
+        // client → upstream
+        let tx = {
+            let pattern = pattern.clone();
+            tokio::spawn(async move {
+                client.write_all(&pattern).await.unwrap();
+                client.shutdown().await.unwrap();
+                client
+            })
+        };
+        let mut received = vec![0u8; TOTAL];
+        upstream.read_exact(&mut received).await.unwrap();
+        assert_eq!(
+            received, pattern,
+            "client→upstream bytes must survive the upgrade"
+        );
+
+        // upstream → client, past the threshold in the other direction too.
+        // Write and read concurrently: the duplex pipes are far smaller than
+        // TOTAL, so a sequential write-then-read would deadlock and trip the
+        // half-close linger instead of exercising the upgrade.
+        let tx_back = {
+            let pattern = pattern.clone();
+            tokio::spawn(async move {
+                upstream.write_all(&pattern).await.unwrap();
+                upstream.shutdown().await.unwrap();
+            })
+        };
+        let mut client = tx.await.unwrap();
+        let mut back = vec![0u8; TOTAL];
+        client.read_exact(&mut back).await.unwrap();
+        assert_eq!(
+            back, pattern,
+            "upstream→client bytes must survive the upgrade"
+        );
+        tx_back.await.unwrap();
+
+        let (up, down) = relay.await.unwrap().unwrap();
+        assert_eq!(up, TOTAL as u64);
+        assert_eq!(down, TOTAL as u64);
     }
 
     // Regression: a peer that half-closes (sends EOF on its write side) and

@@ -1617,7 +1617,7 @@ async fn spawn_tun_from_raw(
     tunnel: &Tunnel,
     raw: &RawConfig,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
-    let tun_cfg = match meow_config::parse_tun_config(raw.tun.as_ref()) {
+    let tun_cfg = match meow_config::parse_tun_config(raw.tun.as_ref(), raw.max_connections) {
         Ok(c) => c,
         Err(e) => {
             return Err(format!("tun config parse error: {e}"));

@@ -27,7 +27,7 @@ use proxy_provider::ProxyProvider;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -48,10 +48,15 @@ pub(crate) fn parse_optional_socket_addr(
     value: Option<&str>,
 ) -> Result<Option<SocketAddr>, anyhow::Error> {
     match value {
-        Some(value) if !value.is_empty() => value
-            .parse()
-            .map(Some)
-            .map_err(|e| anyhow::anyhow!("invalid {field} socket address '{value}': {e}")),
+        Some(value) if !value.is_empty() => {
+            let normalized = value
+                .strip_prefix(':')
+                .map_or_else(|| value.to_string(), |port| format!("0.0.0.0:{port}"));
+            normalized
+                .parse()
+                .map(Some)
+                .map_err(|e| anyhow::anyhow!("invalid {field} socket address '{value}': {e}"))
+        }
         _ => Ok(None),
     }
 }
@@ -134,9 +139,33 @@ pub struct TunConfig {
     /// Address + prefix assigned to the device.
     pub inet4_address: ipnet::Ipv4Net,
     pub auto_route: bool,
+    /// Which routes `auto-route` installs (#375). Only meaningful when
+    /// `auto_route` is true.
+    pub route_mode: TunRouteMode,
+    /// Physical interface outbound sockets bind to in global mode; `None`
+    /// = auto-detect from the default route at listener startup.
+    pub outbound_interface: Option<String>,
     /// True when `dns-hijack` contains at least one usable (`:53`) entry.
     pub dns_hijack: bool,
     pub udp_timeout: std::time::Duration,
+    /// Cap on concurrent TUN TCP flows. Inherited from the top-level
+    /// `max-connections` key (default 256; `0` = unlimited). The accept
+    /// loop has no listen-queue back-pressure of its own — this is what
+    /// stops a reconnect storm from spawning unbounded `handle_tcp` tasks.
+    pub max_connections: usize,
+}
+
+/// Scope of the routes `tun.auto-route` installs (#375).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TunRouteMode {
+    /// v1 behavior: route only the fake-IP range into the device. Loop-free
+    /// by construction; IP-literal traffic is not captured.
+    #[default]
+    FakeIp,
+    /// Route all IPv4 traffic into the device (split default routes) and
+    /// bind outbound sockets to the physical interface for loop avoidance.
+    /// Experimental; currently Linux-only.
+    Global,
 }
 
 impl Default for TunConfig {
@@ -148,8 +177,11 @@ impl Default for TunConfig {
             // mihomo's default TUN subnet.
             inet4_address: "172.19.0.1/30".parse().expect("static CIDR parses"),
             auto_route: true,
+            route_mode: TunRouteMode::FakeIp,
+            outbound_interface: None,
             dns_hijack: false,
             udp_timeout: std::time::Duration::from_secs(60),
+            max_connections: 256,
         }
     }
 }
@@ -160,7 +192,10 @@ const TUN_MIN_MTU: u16 = 1280;
 
 /// Parse and validate the raw `tun:` block. Returns `TunConfig::default()`
 /// (disabled) when the block is absent.
-pub fn parse_tun_config(raw: Option<&raw::RawTun>) -> Result<TunConfig, anyhow::Error> {
+pub fn parse_tun_config(
+    raw: Option<&raw::RawTun>,
+    global_max_connections: Option<usize>,
+) -> Result<TunConfig, anyhow::Error> {
     let Some(r) = raw else {
         return Ok(TunConfig::default());
     };
@@ -227,14 +262,42 @@ pub fn parse_tun_config(raw: Option<&raw::RawTun>) -> Result<TunConfig, anyhow::
         None => defaults.udp_timeout.as_secs(),
     });
 
+    // `auto-route` (#375): mihomo boolean, or a mode string selecting what
+    // gets routed. `true` keeps the loop-free v1 fake-IP scope.
+    let (auto_route, route_mode) = match r.auto_route.as_ref() {
+        None => (defaults.auto_route, defaults.route_mode),
+        Some(raw::RawAutoRoute::Enabled(on)) => (*on, TunRouteMode::FakeIp),
+        Some(raw::RawAutoRoute::Mode(s)) => match s.as_str() {
+            "fake-ip" => (true, TunRouteMode::FakeIp),
+            "global" => (true, TunRouteMode::Global),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "tun.auto-route: unknown value '{other}' (expected true, false, \
+                     fake-ip, or global)"
+                ));
+            }
+        },
+    };
+
+    let outbound_interface = r.outbound_interface.clone().filter(|s| !s.is_empty());
+    if outbound_interface.is_some() && route_mode != TunRouteMode::Global {
+        warn!(
+            "tun.outbound-interface: only used with 'auto-route: global'; \
+             ignored in fake-ip mode"
+        );
+    }
+
     Ok(TunConfig {
         enable: r.enable,
         device: r.device.clone().filter(|s| !s.is_empty()),
         mtu,
         inet4_address,
-        auto_route: r.auto_route.unwrap_or(defaults.auto_route),
+        auto_route,
+        route_mode,
+        outbound_interface,
         dns_hijack,
         udp_timeout,
+        max_connections: global_max_connections.unwrap_or(defaults.max_connections),
     })
 }
 
@@ -471,6 +534,9 @@ fn rebuild_from_raw_impl(
     }
     if let Some(resolver) = resolver {
         direct = direct.with_resolver(resolver);
+    }
+    if let Some(secs) = raw.tcp_connect_timeout {
+        direct = direct.with_connect_timeout(std::time::Duration::from_secs(secs));
     }
     proxies.insert(
         SmolStr::new_static("DIRECT"),
@@ -1328,6 +1394,40 @@ fn resource_cache_dir_for_config_path_with_home(path: &str, home_dir: Option<Pat
         )
 }
 
+/// Resolve a listener `listen` field plus optional `port`.
+///
+/// `listen` may be:
+/// - an IP literal (`127.0.0.1`, `::`, `0.0.0.0`) — combined with `port`
+/// - a socket address (`127.0.0.1:0`, `[::1]:7890`) — port taken from the
+///   address unless it is `0` and an explicit `port` was also given
+///
+/// Port `0` means the OS picks an ephemeral port at bind time.
+pub(crate) fn resolve_listener_bind(
+    listen: &str,
+    port: Option<u16>,
+) -> Result<(String, u16), anyhow::Error> {
+    let explicit_port = port.unwrap_or(0);
+
+    if listen.parse::<IpAddr>().is_ok() {
+        return Ok((listen.to_string(), explicit_port));
+    }
+
+    if let Ok(addr) = listen.parse::<SocketAddr>() {
+        let listen_port = addr.port();
+        let resolved = match (listen_port, explicit_port) {
+            (0, p) => p,
+            (lp, 0) => lp,
+            (lp, p) if lp == p => lp,
+            (lp, p) => anyhow::bail!("listen '{listen}' port {lp} conflicts with port {p}"),
+        };
+        return Ok((addr.ip().to_string(), resolved));
+    }
+
+    anyhow::bail!(
+        "invalid bind address '{listen}': expected an IP literal or host:port (e.g. 127.0.0.1:0)"
+    )
+}
+
 /// Parse `type:` string from a `listeners:` entry into `ListenerType`.
 /// Hard errors on unknown types (Class A per ADR-0002).
 fn parse_listener_type(s: &str) -> Result<ListenerType, anyhow::Error> {
@@ -1363,17 +1463,21 @@ fn build_named_listeners(
                    tproxy_sni: bool,
                    max_connections: usize|
      -> Result<(), anyhow::Error> {
-        if let Some(existing) = used_ports.get(&port) {
-            anyhow::bail!(
-                "port {port} already used by listener '{existing}' (duplicate port, Class A per ADR-0002)"
-            );
+        // Port 0 is "OS assigns an ephemeral port" — each such listener binds
+        // a distinct port at runtime, so they are not duplicates of each other.
+        if port != 0 {
+            if let Some(existing) = used_ports.get(&port) {
+                anyhow::bail!(
+                    "port {port} already used by listener '{existing}' (duplicate port, Class A per ADR-0002)"
+                );
+            }
+            used_ports.insert(port, name.to_string());
         }
         if !used_names.insert(name.to_string()) {
             anyhow::bail!(
                 "listener name '{name}' already defined (duplicate name, Class A per ADR-0002)"
             );
         }
-        used_ports.insert(port, name.to_string());
         result.push(NamedListener {
             name: name.to_string(),
             listener_type: ltype,
@@ -1385,8 +1489,11 @@ fn build_named_listeners(
         Ok(())
     };
 
-    // Shorthand fields → auto-named listeners (inherit global max-connections)
-    if let Some(port) = raw.mixed_port {
+    // Shorthand fields → auto-named listeners (inherit global max-connections).
+    // Port `0` on a shorthand field means "disabled", matching upstream mihomo
+    // (`mixed-port: 0` is how generated configs turn an inbound off). Ephemeral
+    // ports are an explicit `listeners:`-entry opt-in only.
+    if let Some(port) = raw.mixed_port.filter(|p| *p != 0) {
         add(
             "mixed",
             ListenerType::Mixed,
@@ -1396,7 +1503,7 @@ fn build_named_listeners(
             global_max_conns,
         )?;
     }
-    if let Some(port) = raw.socks_port {
+    if let Some(port) = raw.socks_port.filter(|p| *p != 0) {
         add(
             "socks",
             ListenerType::Socks5,
@@ -1406,7 +1513,7 @@ fn build_named_listeners(
             global_max_conns,
         )?;
     }
-    if let Some(port) = raw.port {
+    if let Some(port) = raw.port.filter(|p| *p != 0) {
         add(
             "http",
             ListenerType::Http,
@@ -1416,7 +1523,7 @@ fn build_named_listeners(
             global_max_conns,
         )?;
     }
-    if let Some(port) = raw.tproxy_port {
+    if let Some(port) = raw.tproxy_port.filter(|p| *p != 0) {
         add(
             "tproxy",
             ListenerType::TProxy,
@@ -1430,7 +1537,7 @@ fn build_named_listeners(
     // Explicit `listeners:` entries
     for raw_l in raw.listeners.as_deref().unwrap_or(&[]) {
         let ltype = parse_listener_type(&raw_l.listener_type)?;
-        let listen = raw_l
+        let listen_raw = raw_l
             .listen
             .as_deref()
             .unwrap_or(if ltype == ListenerType::TProxy {
@@ -1438,13 +1545,14 @@ fn build_named_listeners(
             } else {
                 default_bind
             });
+        let (listen, port) = resolve_listener_bind(listen_raw, raw_l.port)?;
         let tproxy_sni = raw_l.tproxy_sni.unwrap_or(global_tproxy_sni);
         let max_connections = raw_l.max_connections.unwrap_or(global_max_conns);
         add(
             &raw_l.name,
             ltype,
-            raw_l.port,
-            listen,
+            port,
+            &listen,
             tproxy_sni,
             max_connections,
         )?;
@@ -1476,10 +1584,15 @@ async fn build_config(
         .parse::<TunnelMode>()
         .unwrap_or(TunnelMode::Rule);
     let log_level = raw.log_level.clone().unwrap_or_else(|| "info".to_string());
-    let bind_address = raw
-        .bind_address
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+    // mihomo (and Clash Verge output) use `bind-address: '*'` as the
+    // all-interfaces wildcard; normalize it here so listeners never see the
+    // raw `*`, which is not an IP literal (#388). Dual-stack wildcard stays
+    // spellable as `'::'`.
+    let bind_address = match raw.bind_address.as_deref() {
+        None => "127.0.0.1".to_string(),
+        Some("*" | "") => "0.0.0.0".to_string(),
+        Some(addr) => addr.to_string(),
+    };
 
     let general = GeneralConfig {
         mode,
@@ -1616,7 +1729,7 @@ async fn build_config(
     };
 
     // TUN inbound (issue #326).
-    let tun = parse_tun_config(raw.tun.as_ref())?;
+    let tun = parse_tun_config(raw.tun.as_ref(), raw.max_connections)?;
 
     // API config
     let external_ui = raw
@@ -2239,9 +2352,125 @@ mod socket_address_tests {
         assert!(parse_optional_socket_addr("dns.listen", Some("127.0.0.1:70000")).is_err());
         assert!(parse_optional_socket_addr("external-controller", Some("[::1]:9090")).is_ok());
         assert_eq!(
+            parse_optional_socket_addr("external-controller", Some(":9090")).unwrap(),
+            Some("0.0.0.0:9090".parse().unwrap())
+        );
+        assert_eq!(
+            parse_optional_socket_addr("dns.listen", Some("127.0.0.1:0")).unwrap(),
+            Some("127.0.0.1:0".parse().unwrap())
+        );
+        assert_eq!(
             parse_optional_socket_addr("dns.listen", None).unwrap(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod listener_bind_tests {
+    use super::resolve_listener_bind;
+
+    #[test]
+    fn ip_literal_plus_port() {
+        assert_eq!(
+            resolve_listener_bind("127.0.0.1", Some(7890)).unwrap(),
+            ("127.0.0.1".into(), 7890)
+        );
+        assert_eq!(
+            resolve_listener_bind("0.0.0.0", None).unwrap(),
+            ("0.0.0.0".into(), 0)
+        );
+        assert_eq!(
+            resolve_listener_bind("::", Some(7890)).unwrap(),
+            ("::".into(), 7890)
+        );
+    }
+
+    #[test]
+    fn host_port_ephemeral() {
+        assert_eq!(
+            resolve_listener_bind("127.0.0.1:0", None).unwrap(),
+            ("127.0.0.1".into(), 0)
+        );
+        assert_eq!(
+            resolve_listener_bind("[::1]:0", None).unwrap(),
+            ("::1".into(), 0)
+        );
+    }
+
+    #[test]
+    fn host_port_explicit() {
+        assert_eq!(
+            resolve_listener_bind("0.0.0.0:7891", None).unwrap(),
+            ("0.0.0.0".into(), 7891)
+        );
+        assert_eq!(
+            resolve_listener_bind("127.0.0.1:7891", Some(7891)).unwrap(),
+            ("127.0.0.1".into(), 7891)
+        );
+        // listen :0 + explicit port uses the port field
+        assert_eq!(
+            resolve_listener_bind("127.0.0.1:0", Some(7890)).unwrap(),
+            ("127.0.0.1".into(), 7890)
+        );
+    }
+
+    #[test]
+    fn host_port_conflict_errors() {
+        let err = resolve_listener_bind("127.0.0.1:7891", Some(7892)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("conflicts"), "msg: {msg}");
+        assert!(msg.contains("7891"), "msg: {msg}");
+        assert!(msg.contains("7892"), "msg: {msg}");
+    }
+
+    #[test]
+    fn hostname_is_rejected() {
+        let err = resolve_listener_bind("localhost:0", None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("invalid bind address"), "msg: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod bind_address_tests {
+    use super::load_config_from_str;
+
+    // Regression tests for #388: mihomo/Clash Verge configs use
+    // `bind-address: '*'` as the all-interfaces wildcard; feeding the raw
+    // `*` to the listener's IpAddr parse was a fatal startup error.
+
+    #[tokio::test]
+    async fn wildcard_star_normalizes_to_unspecified_ipv4() {
+        let config = load_config_from_str("mixed-port: 7890\nallow-lan: true\nbind-address: '*'\n")
+            .await
+            .expect("bind-address '*' must be accepted");
+        assert_eq!(config.general.bind_address, "0.0.0.0");
+        assert_eq!(config.listeners.bind_address, "0.0.0.0");
+    }
+
+    #[tokio::test]
+    async fn empty_bind_address_normalizes_to_unspecified_ipv4() {
+        let config = load_config_from_str("allow-lan: true\nbind-address: ''\n")
+            .await
+            .expect("empty bind-address must be accepted");
+        assert_eq!(config.general.bind_address, "0.0.0.0");
+    }
+
+    #[tokio::test]
+    async fn explicit_bind_address_is_preserved() {
+        let config = load_config_from_str("allow-lan: true\nbind-address: '::'\n")
+            .await
+            .expect("explicit bind-address must load");
+        assert_eq!(config.general.bind_address, "::");
+    }
+
+    #[tokio::test]
+    async fn default_bind_address_is_loopback() {
+        let config = load_config_from_str("mixed-port: 7890\n")
+            .await
+            .expect("minimal config must load");
+        assert_eq!(config.general.bind_address, "127.0.0.1");
     }
 }
 

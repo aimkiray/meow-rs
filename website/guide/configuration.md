@@ -42,6 +42,7 @@ Use it as a pre-flight check.
 | `dns` | block | — | DNS resolver/server config — [DNS](./dns) |
 | `sniffer` | block | — | Domain sniffing config — [Sniffer](./sniffer) |
 | `listeners` | list | — | Explicit named listeners — [Listeners](./listeners) |
+| `tun` | block | off | TUN inbound (Wintun on Windows) — [Transparent Proxy](./transparent-proxy) |
 | `geodata` | block | — | GeoIP / ASN / GeoSite databases — [Geodata](./geodata) |
 
 ## Tunnel modes

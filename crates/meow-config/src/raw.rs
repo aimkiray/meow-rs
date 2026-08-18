@@ -41,6 +41,50 @@ where
     deserializer.deserialize_any(StringOrSeq)
 }
 
+/// `expected-status` accepts either a bare integer (`204`) or a string
+/// (`"204"`, `"200-299"`, `"200,204"`). The docs and upstream mihomo both
+/// allow the unquoted integer form; normalize it to the string form the
+/// health-check range parser consumes (issue #390).
+fn deserialize_status_or_int<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct StatusOrInt;
+
+    impl Visitor<'_> for StatusOrInt {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an HTTP status code (integer) or status-range string")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_owned()))
+        }
+    }
+
+    deserializer.deserialize_any(StatusOrInt)
+}
+
 /// `geodata:` YAML subsection — path overrides, download URLs, auto-update.
 ///
 /// Fields `geodata-mode`, `geodata-loader`, and `geoip-matcher` exist in
@@ -116,8 +160,17 @@ pub struct RawConfig {
     pub tproxy_port: Option<u16>,
     pub tproxy_sni: Option<bool>,
     pub routing_mark: Option<u32>,
-    /// Static host → IP mappings, preferred over upstream DNS lookups.
-    /// Values may be a single IP string or a list of IPs.
+    /// Wall-clock bound, in seconds, on the built-in DIRECT adapter's
+    /// `TcpStream::connect`. Unset = unbounded (legacy behaviour, subject
+    /// only to the OS connect timeout). Motivated by iOS/macOS
+    /// scoped-routing and reachability-cache transients that can leave a
+    /// direct connect hanging indefinitely — see meow-ios
+    /// docs/INVESTIGATION-2026-05-18-tcp-direct-rule-disconnect.md.
+    /// Explicit `type: direct` proxy blocks are NOT covered by this
+    /// global; they accept their own per-proxy `connect-timeout` field.
+    pub tcp_connect_timeout: Option<u64>,
+    /// Static host mappings, preferred over upstream DNS lookups. Values may
+    /// be a single IP, a list of IPs, or one domain-name alias.
     pub hosts: Option<HashMap<String, HostsValue>>,
     pub sniffer: Option<RawSniffer>,
     /// Named listener array. Each entry defines an explicitly-named proxy
@@ -135,7 +188,7 @@ pub struct RawConfig {
     pub max_connections: Option<usize>,
 }
 
-/// A `hosts:` map value: either a single IP address or a list of addresses.
+/// A `hosts:` map value: one IP/domain alias or a list of IP addresses.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum HostsValue {
@@ -172,8 +225,14 @@ pub struct RawTun {
     pub mtu: Option<u16>,
     /// CIDR assigned to the device, e.g. `172.19.0.1/30` (default).
     pub inet4_address: Option<String>,
-    /// Install the fake-IP-range route on startup. Default true.
-    pub auto_route: Option<bool>,
+    /// Route installation on startup. Accepts the mihomo boolean
+    /// (`true` = fake-IP scope, `false` = off) plus the #375 mode strings
+    /// `fake-ip` and `global`. Default true (fake-IP scope).
+    pub auto_route: Option<RawAutoRoute>,
+    /// Physical interface outbound sockets bind to in `auto-route: global`
+    /// mode (loop avoidance, #375). Auto-detected from the default route
+    /// when omitted. Ignored outside global mode.
+    pub outbound_interface: Option<String>,
     /// DNS hijack targets. meow-rs v1 hijacks all UDP :53 flows entering
     /// the device whenever this list is non-empty; entries with a port
     /// other than 53 warn and are ignored.
@@ -194,6 +253,15 @@ pub struct RawTun {
     pub exclude_uid: Option<serde_yaml::Value>,
 }
 
+/// `tun.auto-route` value: mihomo's boolean or a #375 mode string.
+/// Untagged so `auto-route: true` and `auto-route: global` both parse.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum RawAutoRoute {
+    Enabled(bool),
+    Mode(String),
+}
+
 /// One entry in the `listeners:` array.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
@@ -201,7 +269,10 @@ pub struct RawListener {
     pub name: String,
     #[serde(rename = "type")]
     pub listener_type: String,
-    pub port: u16,
+    /// Optional when `listen` is a `host:port` socket address. `0` (or omitted
+    /// with no port in `listen`) means the OS assigns an ephemeral port at bind.
+    #[serde(default)]
+    pub port: Option<u16>,
     pub listen: Option<String>,
     pub tproxy_sni: Option<bool>,
     /// Per-listener override of the global `max-connections` cap. `0`
@@ -230,7 +301,7 @@ pub struct RawDns {
     /// If false, the hosts trie lookup is skipped entirely at query time.
     pub use_hosts: Option<bool>,
     /// If true, `/etc/hosts` is read at startup and merged (lower priority than
-    /// `dns.hosts` config entries). No-op + warn on Windows.
+    /// top-level `hosts` config entries). No-op + warn on Windows.
     pub use_system_hosts: Option<bool>,
     /// Per-domain nameserver routing: each key is an exact domain or a `+.`
     /// wildcard prefix; value is a single server URL or a list of URLs.
@@ -276,6 +347,11 @@ pub struct RawProxyGroup {
     pub url: Option<String>,
     pub interval: Option<u64>,
     pub tolerance: Option<u16>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_status_or_int",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub expected_status: Option<String>,
     pub strategy: Option<String>,
     pub lazy: Option<bool>,
@@ -321,6 +397,11 @@ pub struct RawHealthCheck {
     pub url: Option<String>,
     pub interval: Option<u64>,
     pub timeout: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_status_or_int",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub expected_status: Option<String>,
     pub lazy: Option<bool>,
 }
@@ -453,4 +534,55 @@ pub struct RawSubscription {
     pub url: String,
     pub interval: Option<u64>,
     pub last_updated: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RawConfig, RawHealthCheck, RawProxyGroup};
+
+    #[test]
+    fn expected_status_accepts_integer_scalar() {
+        // issue #390: docs promise `expected-status: 204` (integer); it used
+        // to fail with "invalid type: integer `204`, expected a string".
+        let group: RawProxyGroup =
+            serde_yaml::from_str("name: auto\ntype: url-test\nexpected-status: 204\n").unwrap();
+        assert_eq!(group.expected_status.as_deref(), Some("204"));
+
+        let hc: RawHealthCheck =
+            serde_yaml::from_str("enable: true\nexpected-status: 204\n").unwrap();
+        assert_eq!(hc.expected_status.as_deref(), Some("204"));
+    }
+
+    #[test]
+    fn expected_status_accepts_string_forms() {
+        let group: RawProxyGroup =
+            serde_yaml::from_str("name: auto\ntype: url-test\nexpected-status: \"200-299\"\n")
+                .unwrap();
+        assert_eq!(group.expected_status.as_deref(), Some("200-299"));
+
+        let hc: RawHealthCheck =
+            serde_yaml::from_str("enable: true\nexpected-status: \"204\"\n").unwrap();
+        assert_eq!(hc.expected_status.as_deref(), Some("204"));
+    }
+
+    #[test]
+    fn expected_status_absent_is_none() {
+        let group: RawProxyGroup = serde_yaml::from_str("name: auto\ntype: url-test\n").unwrap();
+        assert_eq!(group.expected_status, None);
+
+        let hc: RawHealthCheck = serde_yaml::from_str("enable: true\n").unwrap();
+        assert_eq!(hc.expected_status, None);
+    }
+
+    #[test]
+    fn tcp_connect_timeout_parses_from_kebab_yaml() {
+        let raw: RawConfig = serde_yaml::from_str("tcp-connect-timeout: 10\n").unwrap();
+        assert_eq!(raw.tcp_connect_timeout, Some(10));
+    }
+
+    #[test]
+    fn tcp_connect_timeout_defaults_to_none() {
+        let raw: RawConfig = serde_yaml::from_str("mixed-port: 7890\n").unwrap();
+        assert_eq!(raw.tcp_connect_timeout, None);
+    }
 }

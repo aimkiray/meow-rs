@@ -146,6 +146,16 @@ jobs:
             echo "Size check passed: ${SIZE} <= ${BUDGET}"
           fi
 
+      - name: Fetch wintun.dll
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # Official signed Wintun DLL (https://www.wintun.net/). Required
+          # for the Windows TUN inbound / transparent-proxy path.
+          bash scripts/fetch-wintun.sh \
+            --target "${{ matrix.target }}" \
+            --outdir dist/wintun
+
       - name: Package archive
         id: pkg
         shell: bash
@@ -161,6 +171,10 @@ jobs:
 
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/meow.exe" "${staging}/"
+            cp dist/wintun/wintun.dll "${staging}/"
+            if [ -f dist/wintun/LICENSE.txt ]; then
+              cp dist/wintun/LICENSE.txt "${staging}/LICENSE.wintun.txt"
+            fi
             cp README.md LICENSE "${staging}/" 2>/dev/null || true
             pwsh -Command "Compress-Archive -Path 'dist/${name}' -DestinationPath '${name}.zip'"
             sha256sum "${name}.zip" > "${name}.zip.sha256"

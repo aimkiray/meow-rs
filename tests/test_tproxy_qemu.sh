@@ -37,10 +37,12 @@ FROM rust:1-alpine AS builder
 RUN apk add --no-cache musl-dev nftables bash busybox-extras
 WORKDIR /src
 COPY . .
-# tproxy tests don't need boring-tls; building with default features pulls in
-# boring-sys which requires libclang via dlopen — unsupported on musl-static
-# clang. Use --no-default-features + `full` to skip boring-tls cleanly.
-RUN cargo build -p meow-app --no-default-features --features=full 2>&1
+# tproxy tests don't need boring-tls or TUN. Default features pull boring-sys
+# (libclang dlopen, unsupported on musl-static). `full` now also pulls lwIP
+# (C + bindgen), same constraint. Enable the tproxy-relevant features only.
+RUN cargo build -p meow-app --no-default-features \
+    --features=ss,trojan,vless,vless-vision,vless-encryption,vmess,snell,hysteria2,anytls,ech-tls-tunnel,dns-server,dns-encrypted,listener-http,listener-socks5,listener-tproxy,listener-mixed \
+    2>&1
 
 FROM alpine:latest
 RUN apk add --no-cache nftables bash busybox-extras

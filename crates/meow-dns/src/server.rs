@@ -49,7 +49,8 @@ impl DnsServer {
     /// "bind failed, every query will be dropped".
     pub async fn bind(&self) -> std::io::Result<BoundDnsServer> {
         let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
-        info!("DNS server listening on {}", self.listen_addr);
+        let bound = socket.local_addr().unwrap_or(self.listen_addr);
+        info!("DNS server listening on {bound}");
         Ok(BoundDnsServer {
             resolver: Arc::clone(&self.resolver),
             socket,

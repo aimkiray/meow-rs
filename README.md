@@ -76,16 +76,18 @@ Logic composition rules (AND, OR, NOT) are also supported for combining conditio
 - **HTTP Proxy** -- HTTP CONNECT and plain HTTP forwarding
 - **SOCKS5** -- SOCKS5 with optional authentication
 - **Transparent Proxy (TProxy)** -- Kernel-level traffic interception via nftables (Linux) or pf (macOS)
+- **TUN / Wintun** -- L3 inbound (`tun:`). On Windows this is a [Wintun](https://www.wintun.net/) adapter and is the transparent-proxy path; official Windows zips ship `wintun.dll` beside `meow.exe`, and the binary also embeds a copy to extract if the sidecar is missing
 
 ### Transparent Proxy
-Intercept all local TCP traffic at the kernel firewall level without per-app proxy configuration.
+Intercept local traffic without per-app proxy configuration.
 
-- **nftables** redirect on Linux, **pf** anchor on macOS
-- **Loop avoidance**: SO_MARK on outbound DIRECT sockets (Linux), UID-based bypass (macOS), plus IP bypass for upstream proxy servers
+- **Windows**: Wintun TUN adapter (`tun:`). Requires an elevated process and `wintun.dll` next to `meow.exe` (included in official zips). Fake-IP DNS capture; see [docs/tun.md](docs/tun.md).
+- **Linux / macOS**: nftables redirect (Linux) or pf anchor (macOS) via `tproxy-port`
+- **Loop avoidance (tproxy)**: SO_MARK on outbound DIRECT sockets (Linux), UID-based bypass (macOS), plus IP bypass for upstream proxy servers
 - **SNI extraction**: Peek at TLS ClientHello to recover hostname for HTTPS traffic
 - **DNS snooping**: Reverse IP→domain lookup from recent DNS queries for non-TLS traffic
-- **RAII firewall guard**: Rules automatically cleaned up on shutdown (SIGINT/SIGTERM)
-- Configurable via `tproxy-port`, `routing-mark`, and `tproxy-sni` in YAML
+- **RAII firewall guard**: tproxy rules automatically cleaned up on shutdown (SIGINT/SIGTERM)
+- Configurable via `tun:`, `tproxy-port`, `routing-mark`, and `tproxy-sni` in YAML
 
 The built-in firewall transparently proxies the **host's own** traffic. To build a **LAN gateway** that forwards and proxies *other* devices' traffic, see [docs/tproxy-gateway.md](docs/tproxy-gateway.md).
 
@@ -154,21 +156,21 @@ Built-in web UI served at `http://<api-addr>/ui` with:
 
 ## Benchmarks
 
-Side-by-side against upstream Go mihomo v1.19.27 on the same host (Apple Silicon arm64, macOS 26.4.1, loopback `127.0.0.1`). Both binaries use identical config: `mode: direct`, SOCKS5 listener on port 17890, DNS disabled. Reproduce with `bash bench.sh` (auto-downloads the latest Go mihomo release).
+Side-by-side against upstream Go mihomo v1.19.29 on the same host (Apple M4 arm64, macOS 26.5.2, loopback `127.0.0.1`). Both binaries use identical config: `mode: direct`, SOCKS5 listener on port 17890, DNS disabled. Reproduce with `bash bench.sh` (auto-downloads the latest Go mihomo release).
 
-| Metric | mihomo (Go) | meow-rs v0.14.0 | Delta |
+| Metric | mihomo (Go) v1.19.29 | meow-rs v0.20.1 | Delta |
 |--------|-------------|--------------------|-------|
-| Binary size (stripped) | 40.7 MB | **7.2 MB** | **−82%** |
-| RSS idle | 30.8 MB | **9.7 MB** | **−69%** |
-| RSS under load (peak) | 30.8 MB | **9.7 MB** | **−69%** |
-| TCP throughput, 64 MB×1 | 5.15 Gbps | **5.23 Gbps** | **+2%** |
-| TCP throughput, 1 MB×10 | 4.62 Gbps | 4.15 Gbps | −10% |
-| TCP throughput, 4 KB×10000 | 0.92 Gbps | 0.90 Gbps | −2% |
-| Latency p50 (connect + 1 B echo) | 257 µs | 258 µs | ±0% |
-| Latency p99 | 332 µs | 354 µs | +7% |
-| Connections/sec (10 s, concurrency 64) | 709 /s | 710 /s | ±0% |
+| Binary size (stripped) | 41.2 MB | **8.6 MB** | **−79%** |
+| RSS idle | 29.6 MB | **9.9 MB** | **−67%** |
+| RSS under load (peak) | 41.0 MB | **13.5 MB** | **−67%** |
+| TCP throughput, 64 MB×1 | 31.30 Gbps | 19.07 Gbps | −39% |
+| TCP throughput, 1 MB×10 | 35.77 Gbps | 18.86 Gbps | −47% |
+| TCP throughput, 4 KB×10000 | 2.14 Gbps | 1.99 Gbps | −7% |
+| Latency p50 (connect + 1 B echo) | 135 µs | **130 µs** | **−4%** |
+| Latency p99 | 198 µs | 232 µs | +17% |
+| Connections/sec (10 s, concurrency 64) | 711 /s | 714 /s | ±0% |
 
-Single-run results from `bash bench.sh`; numbers will vary with host load. For the full methodology, three-run-median protocol, and workload definitions (W1–W5), see [ADR-0006](docs/adr/0006-m2-benchmark-methodology.md) and [docs/benchmarks/index.md](docs/benchmarks/index.md).
+Per-metric medians of three `bash bench.sh` runs; numbers will vary with host load. Loopback bulk-transfer throughput measures per-proxy CPU overhead, not real-network throughput — both kernels saturate multi-Gbps links with headroom. For the full methodology, three-run-median protocol, and workload definitions (W1–W5), see [ADR-0006](docs/adr/0006-m2-benchmark-methodology.md) and [docs/benchmarks/index.md](docs/benchmarks/index.md).
 
 ## Architecture
 

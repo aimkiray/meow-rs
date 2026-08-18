@@ -20,8 +20,8 @@ sidecar, no telemetry.
   HTTP/2, and HTTP Upgrade, with uTLS fingerprints and REALITY.
 - **Resolves and snoops DNS.** A caching resolver with FakeIP, redir-host snooping,
   per-domain nameserver policies, and DoT / DoH upstreams. [→ DNS](./dns)
-- **Acts as a transparent proxy.** Kernel-level interception via nftables (Linux) or pf
-  (macOS). [→ Transparent Proxy](./transparent-proxy)
+- **Acts as a transparent proxy.** Wintun TUN on Windows; nftables (Linux) or pf
+  (macOS) tproxy, or the same TUN inbound. [→ Transparent Proxy](./transparent-proxy)
 - **Exposes a REST API.** Runtime control over proxies, rules, connections, DNS, and
   config — plus WebSocket log and traffic streams. [→ REST API](../reference/rest-api)
 

@@ -271,7 +271,33 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
             return android::connect_tcp_protected(addr, p.as_ref()).await;
         }
     }
+    // TUN global-route loop avoidance (#375): when an outbound interface is
+    // installed, bind the socket to it before connect() so the SYN already
+    // takes the physical route past the TUN default routes.
+    #[cfg(target_os = "linux")]
+    {
+        if crate::outbound_iface::outbound_interface().is_some() {
+            return connect_tcp_iface_bound(addr).await;
+        }
+    }
     TcpStream::connect(addr).await
+}
+
+/// Dial with the socket bound to the installed outbound interface
+/// (`SO_BINDTODEVICE`) before `connect()`. Uses `tokio::net::TcpSocket` for
+/// the async connect so connection errors surface here, not on first I/O.
+#[cfg(target_os = "linux")]
+async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpStream> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    crate::outbound_iface::apply_outbound_interface(&socket)?;
+    socket.set_nonblocking(true)?;
+    let tokio_socket = tokio::net::TcpSocket::from_std_stream(socket.into());
+    tokio_socket.connect(addr).await
 }
 
 /// Single resolution chokepoint shared by [`connect_tcp_host`],
@@ -399,7 +425,38 @@ pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
             return android::bind_udp_protected(resolved, p.as_ref());
         }
     }
+    // TUN global-route loop avoidance (#375): bind the socket to the
+    // installed outbound interface before the local-address bind, mirroring
+    // `connect_tcp` — so the first datagram already bypasses the TUN routes.
+    #[cfg(target_os = "linux")]
+    {
+        if crate::outbound_iface::outbound_interface().is_some() {
+            let resolved = tokio::net::lookup_host(local)
+                .await?
+                .next()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "bind_udp: no address resolved")
+                })?;
+            return bind_udp_iface_bound(resolved);
+        }
+    }
     UdpSocket::bind(local).await
+}
+
+/// Bind a UDP socket to the installed outbound interface
+/// (`SO_BINDTODEVICE`), then to `local`.
+#[cfg(target_os = "linux")]
+fn bind_udp_iface_bound(local: SocketAddr) -> io::Result<UdpSocket> {
+    let domain = if local.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    crate::outbound_iface::apply_outbound_interface(&socket)?;
+    socket.bind(&local.into())?;
+    socket.set_nonblocking(true)?;
+    UdpSocket::from_std(socket.into())
 }
 
 #[cfg(all(test, unix))]

@@ -6,9 +6,16 @@ application proxy settings, using a `tproxy` listener and pf. For forwarding
 gateway script is experimental); for the strategic, more capable path on macOS
 (UDP, IPv6, IP-literal capture without pf) see [tun.md](tun.md).
 
-**Status: experimental.** Requires a build containing the `DIOCNATLOOK`
-direction fix (#353) and the lo0 reply-exemption fix (#355) — `main` since
-July 2026, first release after 0.18.0. Scope today: **IPv4 TCP only**, no UDP.
+**Status: experimental, scope settled (#248).** Requires a build containing
+the `DIOCNATLOOK` direction fix (#353) and the lo0 reply-exemption fix (#355)
+— `main` since July 2026, first release after 0.18.0. Scope: **IPv4 TCP
+only**, no UDP, and the *managed* ruleset intercepts **loopback-traversing
+traffic only**. Steering real outbound (`en0`) traffic is deliberately left
+to the manual `route-to` detour below rather than having meow rewrite the
+host's pf configuration — automated physical-interface steering was
+considered under #248 and rejected in favor of the TUN inbound
+([tun.md](tun.md)), which captures all traffic without pf, handles UDP, and
+is the recommended path for a fully transparent macOS setup.
 
 ## How it works
 

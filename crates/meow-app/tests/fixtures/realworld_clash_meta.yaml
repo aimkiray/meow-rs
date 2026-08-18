@@ -3,7 +3,7 @@
 # `filter`, a `url-test` auto-group, fake-IP DNS with TLS-bootstrap, sniffer
 # (TLS/HTTP/QUIC), and the full GEOIP/GEOSITE rule set used by typical CN users.
 #
-# Three patches vs. the original to satisfy the current parser:
+# Four patches vs. the original to satisfy the current parser:
 #   1. `sniffer.sniff.HTTP.ports: [80, "8080-8880"]` → `[80, 8080]`
 #      (port-range strings not supported; tracked as a parser gap).
 #   2. `exclude-type: direct` → `exclude-type: [direct]` on every geo group
@@ -11,6 +11,8 @@
 #   3. `default-nameserver: tls://223.5.5.5` → `udp://223.5.5.5`
 #      (TLS in default-nameserver intentionally rejected per ADR-0002 to
 #      avoid a bootstrap loop — Class A divergence, no fix planned).
+#   4. The `其它地区` negative-lookahead `filter` is expressed as an
+#      equivalent `exclude-filter` (the Rust regex engine has no look-around).
 proxy-providers:
   provider1:
     url: ""
@@ -179,7 +181,7 @@ proxy-groups:
     type: select
     include-all: true
     exclude-type: [direct]
-    filter: "(?i)^(?!.*(?:🇭🇰|🇯🇵|🇺🇸|🇸🇬|🇨🇳|港|hk|hongkong|台|tw|taiwan|日|jp|japan|新|sg|singapore|美|us|unitedstates)).*"
+    exclude-filter: "(?i)(?:🇭🇰|🇯🇵|🇺🇸|🇸🇬|🇨🇳|港|hk|hongkong|台|tw|taiwan|日|jp|japan|新|sg|singapore|美|us|unitedstates)"
 
   - name: 全部节点
     type: select

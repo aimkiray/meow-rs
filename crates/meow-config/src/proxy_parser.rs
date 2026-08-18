@@ -204,8 +204,43 @@ pub fn parse_proxy(
             let adapter = parse_snell(name, config)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
+        #[cfg(not(feature = "ss"))]
+        "ss" => Err(feature_gated_proxy_type("ss")),
+        #[cfg(not(feature = "trojan"))]
+        "trojan" => Err(feature_gated_proxy_type("trojan")),
+        #[cfg(not(feature = "vless"))]
+        "vless" => Err(feature_gated_proxy_type("vless")),
+        #[cfg(not(feature = "anytls"))]
+        "anytls" => Err(feature_gated_proxy_type("anytls")),
+        #[cfg(not(feature = "hysteria2"))]
+        "hysteria2" => Err(feature_gated_proxy_type("hysteria2")),
+        #[cfg(not(feature = "vmess"))]
+        "vmess" => Err(feature_gated_proxy_type("vmess")),
+        #[cfg(not(feature = "snell"))]
+        "snell" => Err(feature_gated_proxy_type("snell")),
         _ => Err(format!("unsupported proxy type: {proxy_type}")),
     }
+}
+
+/// Error for a proxy type this codebase implements but which was compiled out
+/// of the running binary. The generic "unsupported proxy type" message made
+/// users think the protocol was missing entirely, when the actual fix is to
+/// use a full-featured build (issue #390).
+#[cfg(not(all(
+    feature = "ss",
+    feature = "trojan",
+    feature = "vless",
+    feature = "anytls",
+    feature = "hysteria2",
+    feature = "vmess",
+    feature = "snell"
+)))]
+fn feature_gated_proxy_type(proxy_type: &str) -> String {
+    format!(
+        "proxy type '{proxy_type}' is not compiled into this build; \
+         use an official release binary or rebuild with `--features full` \
+         (or `--features {proxy_type}`)"
+    )
 }
 
 /// Parse a `type: snell` proxy block.
@@ -459,6 +494,17 @@ fn parse_direct(
 
     let mut adapter = DirectAdapter::new();
 
+    // Optional `connect-timeout:` (seconds) — per-proxy counterpart of the
+    // global `tcp-connect-timeout:` that covers the built-in DIRECT. Hard
+    // error on a non-integer (Class A per ADR-0002): silently ignoring it
+    // would leave the connect unbounded when the user asked for a bound.
+    if let Some(v) = config.get("connect-timeout") {
+        let secs = v.as_u64().ok_or_else(|| {
+            format!("direct[{name}]: connect-timeout must be a non-negative integer (seconds)")
+        })?;
+        adapter = adapter.with_connect_timeout(std::time::Duration::from_secs(secs));
+    }
+
     if let Some(v) = config.get("dns") {
         let entries: Vec<String> = match v {
             serde_yaml::Value::String(s) => vec![s.clone()],
@@ -500,7 +546,7 @@ fn parse_direct(
             servers,
             Vec::new(),
             DnsMode::Normal,
-            DomainTrie::<Vec<IpAddr>>::new(),
+            DomainTrie::new(),
             false,
             ipv6,
         ));
@@ -1477,11 +1523,13 @@ fn parse_vless_reality_opts(
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&public_key_bytes);
 
+    // Subscription generators (e.g. Clash Verge) emit `short-id: null` when
+    // the server has no short-id; mihomo treats it as absent (#388).
     let short_id_str = match opts.get("short-id") {
+        None | Some(serde_yaml::Value::Null) => "",
         Some(value) => value
             .as_str()
             .ok_or_else(|| "vless: reality-opts.short-id must be a hex string".to_string())?,
-        None => "",
     };
     let short_id_vec = parse_reality_short_id(short_id_str)?;
     let mut short_id = [0u8; 8];
@@ -2162,6 +2210,32 @@ tls: true
             panic!("empty dns list must hard-error (Class A)");
         };
         assert!(err.contains("dns list is empty"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_direct_with_connect_timeout_wires_adapter() {
+        let cfg = direct_config("name: d\ntype: direct\nconnect-timeout: 7\n");
+        let adapter = parse_direct("d", &cfg, true).unwrap();
+        assert_eq!(
+            adapter.connect_timeout(),
+            Some(std::time::Duration::from_secs(7))
+        );
+    }
+
+    #[test]
+    fn parse_direct_without_connect_timeout_is_unbounded() {
+        let cfg = direct_config("name: d\ntype: direct\n");
+        let adapter = parse_direct("d", &cfg, true).unwrap();
+        assert_eq!(adapter.connect_timeout(), None);
+    }
+
+    #[test]
+    fn parse_direct_rejects_non_integer_connect_timeout() {
+        let cfg = direct_config("name: bad\ntype: direct\nconnect-timeout: fast\n");
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("non-integer connect-timeout must hard-error (Class A)");
+        };
+        assert!(err.contains("connect-timeout"), "msg: {err}");
     }
 
     #[test]

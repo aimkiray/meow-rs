@@ -30,8 +30,8 @@ filtered client-side via `?level=`.
 
 ## Run as a service
 
-Subcommands install meow-rs as a managed service (systemd on Linux, launchd on macOS).
-These need root/sudo.
+Subcommands install meow-rs as a managed service (systemd on Linux, launchd on macOS,
+Windows Service on Windows). These need root/sudo (or an elevated shell on Windows).
 
 | Command | Action |
 | --- | --- |
@@ -58,6 +58,17 @@ sudo ./meow install -f /path/to/config.yaml
 Copies the config under `~/Library/Application Support/meow/`, writes
 `~/Library/LaunchAgents/com.meow.proxy.plist`, and bootstraps it. Runs as your user (the
 pf rules use a UID bypass for loop avoidance). Logs go to `~/Library/Logs/meow/`.
+
+### Windows (Service Control Manager)
+
+```powershell
+# From an elevated prompt, with wintun.dll next to meow.exe
+.\meow.exe install -f C:\meow\config.yaml
+```
+
+Installs the `meow` service (LocalSystem). Wintun TUN / `tun:` needs that elevation.
+Official Windows zips ship `wintun.dll` beside the executable; if it is missing
+the official DLL embedded in `meow.exe` is extracted on first TUN start.
 
 ## Hot reload
 
