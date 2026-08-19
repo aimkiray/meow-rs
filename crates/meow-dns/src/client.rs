@@ -5,6 +5,7 @@
 //! `protect()` before the socket is used. This is the reason the project
 //! ships its own DNS client instead of relying on `hickory-resolver`.
 
+use crate::cache::QueryFamilies;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
@@ -109,6 +110,56 @@ pub struct DnsClient {
     timeout: Duration,
     proxy: Option<DnsProxy>,
     label: Option<Arc<str>>,
+}
+
+pub(crate) struct IpLookupResult {
+    pub(crate) ips: Vec<IpAddr>,
+    pub(crate) ttl: Duration,
+    /// Preserve the per-family result for the BOTH path. The aggregate IP list
+    /// is sufficient for callers that only need addresses, but the resolver
+    /// cache also needs to retain NXDOMAIN versus NODATA.
+    pub(crate) v4: Option<FamilyAnswer>,
+    pub(crate) v6: Option<FamilyAnswer>,
+}
+
+pub(crate) enum FamilyLookupResult {
+    Response(IpLookupResult),
+    /// Authoritative "name does not exist". Carries the RFC 2308 negative
+    /// cache TTL — `min(SOA.TTL, SOA.MINIMUM)` from the authority section, or
+    /// `0` when the upstream omitted the SOA (the resolver's clamp floor
+    /// still gives it a short cache lifetime).
+    NxDomain(Duration),
+}
+
+/// One family's answer within a [`FamilySet`]. The resolver/cache consume this
+/// unified shape so the per-family and "all enabled families" lookup paths
+/// share one pipeline (review issue J). TTLs are the raw upstream values; the
+/// resolver clamps them once before use.
+#[derive(Clone, Debug)]
+pub(crate) enum FamilyAnswer {
+    /// NOERROR with at least one address record of this family.
+    Answer { ips: Vec<IpAddr>, ttl: Duration },
+    /// NOERROR with zero address records of this family (NODATA). Carries the
+    /// upstream TTL so the cache can expire the negative on its own schedule.
+    NoData(Duration),
+    /// The upstream authoritatively said the name does not exist. Carries the
+    /// RFC 2308 negative cache TTL (SOA-derived) so the cache can serve the
+    /// NXDOMAIN rcode from cache for that family until its own expiry fires,
+    /// damping DGA/retry-loop load (aligns with mihomo `putMsgToCache`).
+    NxDomain(Duration),
+    /// A network/timeout failure for this family — not a definitive answer.
+    Failed,
+}
+
+/// A client's resolution result across the requested family set. `None` for a
+/// family means "not queried" (e.g. the prefer-IPv4 path skips AAAA once A has
+/// addresses); the resolver treats that as a cache miss for the family and
+/// re-queries on demand.
+#[derive(Clone, Debug)]
+pub(crate) struct FamilySet {
+    pub(crate) v4: Option<FamilyAnswer>,
+    pub(crate) v6: Option<FamilyAnswer>,
+    pub(crate) source: String,
 }
 
 enum Transport {
@@ -279,6 +330,16 @@ impl DnsClient {
     /// question must match the request before any response flags or records
     /// are used.
     pub async fn query(&self, name: &str, record_type: RecordType) -> Result<Message, ClientError> {
+        tokio::time::timeout(self.timeout, self.query_inner(name, record_type))
+            .await
+            .map_err(|_| ClientError::Timeout(self.timeout))?
+    }
+
+    async fn query_inner(
+        &self,
+        name: &str,
+        record_type: RecordType,
+    ) -> Result<Message, ClientError> {
         let id: u16 = rand::random();
         let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
         msg.metadata.recursion_desired = true;
@@ -297,42 +358,192 @@ impl DnsClient {
         msg.add_query(query.clone());
         let wire = msg.to_bytes()?;
         let expected = ExpectedResponse { id, query };
-        tokio::time::timeout(self.timeout, self.exchange(&wire, &expected))
-            .await
-            .map_err(|_| ClientError::Timeout(self.timeout))?
+        self.exchange(&wire, &expected).await
     }
 
-    /// Convenience: query `A` and `AAAA` in parallel, merge addresses, return
-    /// (addrs, min_ttl).  Empty answer set returns `Ok((vec![], _))`; upstream
-    /// SERVFAIL surfaces as `ClientError::Rcode`.
+    /// Convenience: query `A` first and fall back to `AAAA` when needed.
+    /// Returns the addresses and minimum answer TTL.
     pub async fn lookup_ip(&self, name: &str) -> Result<(Vec<IpAddr>, Duration), ClientError> {
-        let (a, aaaa) = tokio::join!(
-            self.query(name, RecordType::A),
-            self.query(name, RecordType::AAAA),
-        );
-        let mut addrs = Vec::new();
-        let mut min_ttl: Option<u32> = None;
-        let mut had_any_ok = false;
-        let mut last_err: Option<ClientError> = None;
-        for r in [a, aaaa] {
-            match r {
-                Ok(msg) => {
-                    had_any_ok = true;
-                    let (response_addrs, response_ttl) = relevant_ip_answers(&msg);
-                    addrs.extend(response_addrs);
-                    if let Some(ttl) = response_ttl {
-                        min_ttl = Some(min_ttl.map_or(ttl, |current| current.min(ttl)));
-                    }
+        let result = self.lookup_ip_with_ipv6(name, true).await?;
+        Ok((result.ips, result.ttl))
+    }
+
+    pub(crate) async fn lookup_ip_with_ipv6(
+        &self,
+        name: &str,
+        ipv6_enabled: bool,
+    ) -> Result<IpLookupResult, ClientError> {
+        tokio::time::timeout(
+            self.timeout,
+            self.lookup_ip_with_ipv6_inner(name, ipv6_enabled),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout(self.timeout))?
+    }
+
+    pub(crate) async fn lookup_family(
+        &self,
+        name: &str,
+        record_type: RecordType,
+    ) -> Result<FamilyLookupResult, ClientError> {
+        let queried = QueryFamilies::from_record_type(record_type);
+        if queried.is_empty() {
+            return Err(ClientError::Protocol(
+                "address family query must be A or AAAA",
+            ));
+        }
+        let message = self.query(name, record_type).await?;
+        match message.metadata.response_code {
+            ResponseCode::NoError => {}
+            ResponseCode::NXDomain => {
+                // RFC 2308: a negative response's cache lifetime is
+                // `min(SOA.TTL, SOA.MINIMUM)` from the authority section. Cache
+                // it so repeat queries for a bogus name don't re-query upstream
+                // on every attempt (DGA / retry loops). `0` when no SOA is
+                // present; the resolver clamp floor still yields a short life.
+                let ttl = negative_ttl(&message);
+                return Ok(FamilyLookupResult::NxDomain(ttl));
+            }
+            code => return Err(ClientError::Rcode(code)),
+        }
+        let (ips, answer_ttl) = relevant_ip_answers(&message);
+        let ttl = if ips.is_empty() {
+            // RFC 2308: NODATA uses the SOA negative TTL, not a CNAME or
+            // address-answer TTL accidentally found in the response.
+            negative_ttl(&message)
+        } else {
+            Duration::from_secs(u64::from(answer_ttl.unwrap_or(0)))
+        };
+        Ok(FamilyLookupResult::Response(IpLookupResult {
+            ips,
+            ttl,
+            v4: None,
+            v6: None,
+        }))
+    }
+
+    /// Unified entry point for the resolver pipeline (review issue J). For a
+    /// single family (`IPV4`/`IPV6`) this is a per-family query that preserves
+    /// the NXDOMAIN/NODATA distinction the DNS server needs; for `BOTH` it is
+    /// the prefer-IPv4 A-then-AAAA path that returns every enabled address for
+    /// `resolve_ips`. `Err` means the client could not produce *any* answer for
+    /// the requested set (e.g. both families timed out); the resolver keeps
+    /// racing the remaining clients.
+    pub(crate) async fn lookup_set(
+        &self,
+        name: &str,
+        want: QueryFamilies,
+        ipv6_enabled: bool,
+    ) -> Result<FamilySet, ClientError> {
+        let source = self.upstream_label();
+        if want == QueryFamilies::BOTH {
+            let result = self.lookup_ip_with_ipv6(name, ipv6_enabled).await?;
+            return Ok(family_set_from_ip_lookup(&result, source));
+        }
+        let family = if want == QueryFamilies::IPV4 {
+            QueryFamilies::IPV4
+        } else if want == QueryFamilies::IPV6 {
+            QueryFamilies::IPV6
+        } else {
+            return Err(ClientError::Protocol(
+                "lookup_set requires a single family or BOTH",
+            ));
+        };
+        let record_type = match family {
+            QueryFamilies::IPV4 => RecordType::A,
+            _ => RecordType::AAAA,
+        };
+        let answer = match self.lookup_family(name, record_type).await {
+            Ok(FamilyLookupResult::Response(r)) => {
+                let ttl = r.ttl;
+                if r.ips.is_empty() {
+                    FamilyAnswer::NoData(ttl)
+                } else {
+                    FamilyAnswer::Answer { ips: r.ips, ttl }
                 }
-                Err(e) => {
-                    last_err = Some(e);
+            }
+            Ok(FamilyLookupResult::NxDomain(ttl)) => FamilyAnswer::NxDomain(ttl),
+            Err(_) => FamilyAnswer::Failed,
+        };
+        let (v4, v6) = if family == QueryFamilies::IPV4 {
+            (Some(answer), None)
+        } else {
+            (None, Some(answer))
+        };
+        Ok(FamilySet { v4, v6, source })
+    }
+
+    async fn lookup_ip_with_ipv6_inner(
+        &self,
+        name: &str,
+        ipv6_enabled: bool,
+    ) -> Result<IpLookupResult, ClientError> {
+        // Prefer IPv4: query A first and fall back to AAAA only when A has no
+        // address. Keep the per-family answer here because the aggregate IP
+        // list alone cannot distinguish NODATA from NXDOMAIN when it is later
+        // written to the shared cache.
+        let mut addrs = Vec::new();
+        let mut min_ttl: Option<Duration> = None;
+        let mut first_err: Option<ClientError> = None;
+        let mut v4 = None;
+        let mut v6 = None;
+
+        let got_v4 = match self.query_inner(name, RecordType::A).await {
+            Ok(message) => {
+                let answer = classify_family_message(&message);
+                let got_address =
+                    matches!(&answer, FamilyAnswer::Answer { ips, .. } if !ips.is_empty());
+                if let FamilyAnswer::Answer { ips, ttl } = &answer {
+                    addrs.extend_from_slice(ips);
+                    min_ttl = Some(min_ttl.map_or(*ttl, |current| current.min(*ttl)));
+                }
+                v4 = Some(answer.clone());
+                if let FamilyAnswer::NxDomain(ttl) = answer {
+                    if ipv6_enabled {
+                        v6 = Some(FamilyAnswer::NxDomain(ttl));
+                    }
+                    return Ok(IpLookupResult {
+                        ips: addrs,
+                        ttl,
+                        v4,
+                        v6,
+                    });
+                }
+                got_address
+            }
+            Err(error) => {
+                first_err = Some(error);
+                false
+            }
+        };
+
+        if !got_v4 && ipv6_enabled {
+            match self.query_inner(name, RecordType::AAAA).await {
+                Ok(message) => {
+                    let answer = classify_family_message(&message);
+                    if let FamilyAnswer::Answer { ips, ttl } = &answer {
+                        addrs.extend_from_slice(ips);
+                        min_ttl = Some(min_ttl.map_or(*ttl, |current| current.min(*ttl)));
+                    }
+                    v6 = Some(answer);
+                }
+                Err(error) => {
+                    if first_err.is_none() {
+                        first_err = Some(error);
+                    }
                 }
             }
         }
-        if !had_any_ok {
-            return Err(last_err.unwrap_or(ClientError::Protocol("no response")));
+
+        if v4.is_none() && v6.is_none() {
+            return Err(first_err.unwrap_or(ClientError::Protocol("no response")));
         }
-        Ok((addrs, Duration::from_secs(u64::from(min_ttl.unwrap_or(0)))))
+        Ok(IpLookupResult {
+            ips: addrs,
+            ttl: min_ttl.unwrap_or(Duration::ZERO),
+            v4,
+            v6,
+        })
     }
 
     async fn exchange(
@@ -477,6 +688,44 @@ fn canonical_name(name: &Name) -> Name {
     canonical
 }
 
+/// RFC 2308 negative-cache TTL for an NXDOMAIN/NODATA response: the minimum of
+/// the SOA record's own TTL and its MINIMUM field, taken from the authority
+/// (`authorities`) section. Returns `0` when no SOA is present — the
+/// resolver's clamp floor still gives such a negative a short cache life.
+/// Mirrors mihomo's `minimalTTL(concat(Answer, Ns, Extra))` for negative
+/// responses (the SOA lives in the authority section).
+fn negative_ttl(message: &Message) -> Duration {
+    let mut best: Option<u32> = None;
+    for record in &message.authorities {
+        let RData::SOA(soa) = &record.data else {
+            continue;
+        };
+        let ttl = record.ttl.min(soa.minimum);
+        best = Some(best.map_or(ttl, |b| b.min(ttl)));
+    }
+    Duration::from_secs(u64::from(best.unwrap_or(0)))
+}
+
+fn classify_family_message(message: &Message) -> FamilyAnswer {
+    match message.metadata.response_code {
+        ResponseCode::NoError => {
+            let (ips, ttl) = relevant_ip_answers(message);
+            if ips.is_empty() {
+                // NODATA uses the SOA negative TTL even when the response
+                // contains a CNAME with its own TTL but no terminal address.
+                FamilyAnswer::NoData(negative_ttl(message))
+            } else {
+                FamilyAnswer::Answer {
+                    ips,
+                    ttl: Duration::from_secs(u64::from(ttl.unwrap_or(0))),
+                }
+            }
+        }
+        ResponseCode::NXDomain => FamilyAnswer::NxDomain(negative_ttl(message)),
+        _ => FamilyAnswer::Failed,
+    }
+}
+
 struct CnameLink {
     target: Name,
     ttl: u32,
@@ -561,6 +810,17 @@ fn relevant_ip_answers(message: &Message) -> (Vec<IpAddr>, Option<u32>) {
         }
     }
     (addrs, min_ttl)
+}
+
+/// Convert the prefer-IPv4 A-then-AAAA result into a [`FamilySet`]. The
+/// family answers retain NXDOMAIN versus NODATA so the shared cache cannot
+/// downgrade the upstream RCODE.
+fn family_set_from_ip_lookup(result: &IpLookupResult, source: String) -> FamilySet {
+    FamilySet {
+        v4: result.v4.clone(),
+        v6: result.v6.clone(),
+        source,
+    }
 }
 
 async fn udp_exchange(
@@ -732,6 +992,7 @@ mod tests {
     use hickory_proto::rr::rdata::{A, CNAME};
     use hickory_proto::rr::DNSClass;
     use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn expected(name: &str, record_type: RecordType, id: u16) -> ExpectedResponse {
         ExpectedResponse {
@@ -772,9 +1033,9 @@ mod tests {
 
     #[tokio::test]
     async fn udp_client_times_out_on_unroutable() {
-        // 192.0.2.1/24 is TEST-NET-1, guaranteed not to respond.
-        let client = DnsClient::udp("192.0.2.1:53".parse().unwrap())
-            .with_timeout(Duration::from_millis(200));
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            DnsClient::udp(sink.local_addr().unwrap()).with_timeout(Duration::from_millis(200));
         let r = client.query("example.test", RecordType::A).await;
         assert!(matches!(r, Err(ClientError::Timeout(_))));
     }
@@ -979,6 +1240,49 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn lookup_ip_shares_one_timeout_across_a_and_aaaa() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        tokio::spawn(async move {
+            // A and AAAA ride separate connections (no pooling here), so the
+            // server accepts twice. The point under test is that the *client*
+            // covers both sequential queries with one overall timeout, not
+            // that they share a socket.
+            for expected in [RecordType::A, RecordType::AAAA] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_lp(&mut stream).await.unwrap();
+                let request = Message::from_bytes(&request).unwrap();
+                assert_eq!(request.queries[0].query_type, expected);
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                if expected == RecordType::A {
+                    // Empty NOERROR (no address records) after 250 ms, so the
+                    // prefer-IPv4 path falls back to AAAA.
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    let response = response_for(&request, request.metadata.id);
+                    write_lp(&mut stream, &response.to_bytes().unwrap())
+                        .await
+                        .unwrap();
+                } else {
+                    // AAAA never answers within the client budget.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        });
+
+        let client = DnsClient::tcp(addr).with_timeout(Duration::from_millis(400));
+        let result = tokio::time::timeout(
+            Duration::from_millis(550),
+            client.lookup_ip_with_ipv6("dual.example", true),
+        )
+        .await
+        .expect("A and AAAA must share the client's overall timeout");
+        assert!(matches!(result, Err(ClientError::Timeout(_))));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
     #[cfg(feature = "encrypted")]
     #[test]
     fn encrypted_upstream_labels_include_scheme() {
@@ -998,5 +1302,98 @@ mod tests {
         let client = DnsClient::udp("8.8.8.8:53".parse().unwrap())
             .with_upstream_label("tls://dns.google:853");
         assert_eq!(client.upstream_label(), "tls://dns.google:853");
+    }
+
+    /// RFC 2308: the negative cache TTL of an NXDOMAIN/NODATA response is
+    /// `min(SOA.TTL, SOA.MINIMUM)` from the authority section. Verifies the
+    /// helper used by the NXDOMAIN-cache path picks the smaller of the record
+    /// TTL and the SOA MINIMUM field, and falls back to 0 when no SOA is
+    /// present (the resolver clamp floor still gives it a short life).
+    fn soa_record(name: &str, ttl: u32, minimum: u32) -> Record {
+        use hickory_proto::rr::rdata::SOA;
+        Record::from_rdata(
+            name.parse().unwrap(),
+            ttl,
+            RData::SOA(SOA::new(
+                "ns.example".parse().unwrap(),
+                "hostmaster.example".parse().unwrap(),
+                1,
+                3600,
+                900,
+                1209600,
+                minimum,
+            )),
+        )
+    }
+
+    #[test]
+    fn negative_ttl_uses_min_of_soa_ttl_and_minimum() {
+        let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+        // SOA TTL 600, MINIMUM 300 → negative TTL 300.
+        msg.add_authority(soa_record("example.", 600, 300));
+        assert_eq!(negative_ttl(&msg), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn negative_ttl_picks_the_soa_record_ttl_when_smaller_than_minimum() {
+        let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+        // SOA TTL 120, MINIMUM 3600 → negative TTL 120.
+        msg.add_authority(soa_record("example.", 120, 3600));
+        assert_eq!(negative_ttl(&msg), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn negative_ttl_is_zero_when_no_soa_in_authority() {
+        let msg = Message::new(1, MessageType::Response, OpCode::Query);
+        assert_eq!(negative_ttl(&msg), Duration::ZERO);
+    }
+
+    /// `classify_family_message` is the BOTH-path classifier. Verify its four
+    /// branches: NoError+addresses → Answer, NoError+empty → NoData(SOA TTL),
+    /// NXDOMAIN → NxDomain(SOA TTL), other rcode → Failed.
+    #[test]
+    fn classify_family_message_branches() {
+        use hickory_proto::op::ResponseCode;
+
+        // NoError with an A record → Answer.
+        let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NoError;
+        msg.add_query(Query::query("a.example".parse().unwrap(), RecordType::A));
+        msg.add_answer(Record::from_rdata(
+            "a.example".parse().unwrap(),
+            60,
+            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+        ));
+        let ans = classify_family_message(&msg);
+        assert!(matches!(
+            ans,
+            FamilyAnswer::Answer { ips, ttl } if ips == vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))] && ttl == Duration::from_secs(60)
+        ));
+
+        // NoError with zero address records → NoData(SOA TTL).
+        let mut msg = Message::new(2, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NoError;
+        msg.add_query(Query::query(
+            "empty.example".parse().unwrap(),
+            RecordType::A,
+        ));
+        msg.add_authority(soa_record("example.", 600, 300));
+        let ans = classify_family_message(&msg);
+        assert!(matches!(ans, FamilyAnswer::NoData(t) if t == Duration::from_secs(300)));
+
+        // NXDOMAIN → NxDomain(SOA TTL).
+        let mut msg = Message::new(3, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NXDomain;
+        msg.add_query(Query::query("gone.example".parse().unwrap(), RecordType::A));
+        msg.add_authority(soa_record("example.", 600, 300));
+        let ans = classify_family_message(&msg);
+        assert!(matches!(ans, FamilyAnswer::NxDomain(t) if t == Duration::from_secs(300)));
+
+        // SERVFAIL → Failed.
+        let mut msg = Message::new(4, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::ServFail;
+        msg.add_query(Query::query("fail.example".parse().unwrap(), RecordType::A));
+        let ans = classify_family_message(&msg);
+        assert!(matches!(ans, FamilyAnswer::Failed));
     }
 }

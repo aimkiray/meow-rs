@@ -38,7 +38,7 @@ async fn test_general_config_table() {
             yaml: "",
             mode: "rule",
             log_level: "info",
-            ipv6: false,
+            ipv6: true,
             allow_lan: false,
             bind_address: "127.0.0.1",
         },
