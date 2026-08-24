@@ -59,9 +59,6 @@ pub async fn send_authentication<W: AsyncWriteExt + Unpin>(
     password_hash: &[u8; 32],
     padding_factory: &Arc<PaddingFactory>,
 ) -> Result<()> {
-    // Write SHA256(password)
-    writer.write_all(password_hash).await?;
-
     // Get padding0 length from padding scheme
     let padding_sizes = padding_factory.generate_record_payload_sizes(0);
     let padding_len = padding_sizes.first().copied().unwrap_or(0);
@@ -73,15 +70,26 @@ pub async fn send_authentication<W: AsyncWriteExt + Unpin>(
         padding_len as u16
     };
 
-    // Write padding0_length
-    writer.write_all(&padding_len.to_be_bytes()).await?;
-
-    // Write padding0
+    // Coalesce the entire auth record — SHA256(password) (32) + padding0
+    // length (2) + padding0 — into a single buffer and write it in one shot.
+    //
+    // The reference anytls server (anytls-go / sing-anytls) authenticates with
+    // a *single* read off the TLS connection (`ReadOnceFrom`), then parses 32
+    // + 2 bytes from that buffer. Each `write_all` on a rustls TLS stream
+    // emits its own TLS record, so issuing three separate writes produces
+    // three TLS records: the server's single read returns only the first
+    // 32-byte record and then EOFs reading the 2-byte padding length,
+    // yielding `EOF: read padding length: fallback disabled` and tearing the
+    // session down before SYNACK. The Go client builds the whole header in
+    // one buffer and `WriteTo`s it once (sing-anytls client.go); mirror that.
+    let mut buf = Vec::with_capacity(32 + 2 + padding_len as usize);
+    buf.extend_from_slice(password_hash);
+    buf.extend_from_slice(&padding_len.to_be_bytes());
     if padding_len > 0 {
-        let padding = vec![0u8; padding_len as usize];
-        writer.write_all(&padding).await?;
+        buf.resize(buf.len() + padding_len as usize, 0);
     }
 
+    writer.write_all(&buf).await?;
     writer.flush().await?;
 
     Ok(())
@@ -91,7 +99,52 @@ pub async fn send_authentication<W: AsyncWriteExt + Unpin>(
 mod tests {
     use super::*;
     use crate::padding::PaddingFactory;
-    use tokio::io::duplex;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncWrite, duplex};
+
+    /// A writer that records every `poll_write` call verbatim.
+    ///
+    /// Used to assert that [`send_authentication`] emits the entire auth
+    /// record in a *single* write — the property the reference anytls server
+    /// (anytls-go / sing-anytls) depends on. That server authenticates with
+    /// one `ReadOnceFrom(conn)` then parses `SHA256(password) (32) + padding0
+    /// length (2) + padding0` from that one buffer. On a rustls TLS stream one
+    /// `write_all` is one TLS record, so splitting the auth across multiple
+    /// writes makes the server's single read return only the first record and
+    /// EOF on the padding length (`EOF: read padding length: fallback
+    /// disabled`), tearing the session down before SYNACK.
+    ///
+    /// A real-TLS single-read test is *not* a reliable guard here: rustls
+    /// coalesces multiple already-arrived records into one `poll_read`, so it
+    /// would false-pass under the old multi-write code. This recorder pins
+    /// the precise cause instead — the whole record is written in a single
+    /// `poll_write` — which is what yields one TLS record on the wire.
+    #[derive(Default)]
+    struct WriteRecorder {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl AsyncWrite for WriteRecorder {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            // Always accept the full buffer so `write_all` resolves in a
+            // single `poll_write` — matching a real TLS stream that takes the
+            // whole (small) record at once.
+            self.writes.push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn test_authentication_success() {
@@ -143,5 +196,43 @@ mod tests {
 
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);
+    }
+
+    /// Regression for the all-AnyTLS-nodes-handshake-failed bug: the whole
+    /// auth record must leave in one `poll_write` so it becomes a single TLS
+    /// record on the wire — see [`WriteRecorder`] for why this is the
+    /// invariant, and why a real-TLS single-read test can't pin it.
+    #[tokio::test]
+    async fn send_authentication_writes_whole_record_in_one_call() {
+        let password = "regression-password";
+        let password_hash = hash_password(password);
+        let padding = PaddingFactory::default();
+
+        let mut writer = WriteRecorder::default();
+        send_authentication(&mut writer, &password_hash, &padding)
+            .await
+            .expect("send_authentication must succeed");
+
+        assert_eq!(
+            writer.writes.len(),
+            1,
+            "auth record must be a single write (one TLS record on the wire); got {} writes",
+            writer.writes.len()
+        );
+
+        // Default scheme pkt 0 is `0=30-30` → 30 bytes of zero padding.
+        let record = &writer.writes[0];
+        assert_eq!(record.len(), 32 + 2 + 30, "full auth record length");
+        assert_eq!(
+            &record[..32],
+            password_hash.as_slice(),
+            "password hash prefix"
+        );
+        let padding_len = u16::from_be_bytes([record[32], record[33]]);
+        assert_eq!(padding_len, 30, "padding0 length field");
+        assert!(
+            record[34..].iter().all(|&b| b == 0),
+            "padding0 must be zero-filled"
+        );
     }
 }
