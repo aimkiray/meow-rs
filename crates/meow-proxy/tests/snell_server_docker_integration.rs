@@ -1,11 +1,13 @@
 #![cfg(feature = "snell")]
 
 use meow_common::{Metadata, Network, ProxyAdapter, ProxyPacketConn};
+use meow_proxy::dialer::DirectDialer;
 use meow_proxy::{SnellAdapter, SnellObfs, SnellVersion};
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -229,6 +231,7 @@ fn adapter(port: u16) -> SnellAdapter {
         SnellVersion::V3,
         true,
         false,
+        Arc::new(DirectDialer),
     )
     .expect("snell adapter must build")
 }

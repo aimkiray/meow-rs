@@ -140,6 +140,7 @@ pub fn parse_proxy(
                 udp,
                 plugin,
                 plugin_opts_str.as_deref(),
+                std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
             )
             .map_err(|e| format!("ss: {e}"))?;
             #[cfg(feature = "mux")]
@@ -182,7 +183,7 @@ pub fn parse_proxy(
 
             #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
             let mut adapter =
-                TrojanAdapter::new(name, server, port, password, sni, skip_verify, udp);
+                TrojanAdapter::new(name, server, port, password, sni, skip_verify, udp, std::sync::Arc::new(meow_proxy::dialer::DirectDialer));
             #[cfg(feature = "mux")]
             if let Some(mux_options) = parse_mux_options(name, config)? {
                 // muxcool rides VLESS CommandMux; trojan has no equivalent
@@ -389,7 +390,7 @@ fn parse_snell(
         SnellObfs::None
     };
 
-    SnellAdapter::new(name, server, port, psk, obfs, version, udp, reuse)
+    SnellAdapter::new(name, server, port, psk, obfs, version, udp, reuse, std::sync::Arc::new(meow_proxy::dialer::DirectDialer))
         .map_err(|e| format!("snell[{name}]: {e}"))
 }
 
@@ -452,6 +453,7 @@ fn parse_http(
         tls,
         skip_cert_verify,
         extra_headers,
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
     ))
 }
 
@@ -500,7 +502,7 @@ fn parse_socks5(
         .and_then(serde_yaml::Value::as_bool)
         .unwrap_or(false);
 
-    Ok(Socks5Adapter::new(name, server, port, auth, tls, skip_cert_verify).with_udp(udp))
+    Ok(Socks5Adapter::new(name, server, port, auth, tls, skip_cert_verify, std::sync::Arc::new(meow_proxy::dialer::DirectDialer)).with_udp(udp))
 }
 
 /// Parse a `type: direct` proxy block into a [`DirectAdapter`].
@@ -1455,7 +1457,7 @@ fn parse_vless(
     }
 
     #[cfg_attr(not(feature = "vless-encryption"), allow(unused_mut))]
-    let mut adapter = VlessAdapter::new(name, server, port, uuid_bytes, flow, udp, chain);
+    let mut adapter = VlessAdapter::new(name, server, port, uuid_bytes, flow, udp, chain, std::sync::Arc::new(meow_proxy::dialer::DirectDialer));
     #[cfg(feature = "vless-encryption")]
     adapter.set_encryption(vless_encryption);
 
@@ -2075,8 +2077,16 @@ fn parse_vmess(
     }
 
     #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
-    let mut adapter =
-        meow_proxy::VmessAdapter::new(name, server, port, uuid_bytes, security, udp, chain);
+    let mut adapter = meow_proxy::VmessAdapter::new(
+        name,
+        server,
+        port,
+        uuid_bytes,
+        security,
+        udp,
+        chain,
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
+    );
     #[cfg(feature = "mux")]
     if let Some(mux_options) = parse_mux_options(name, config)? {
         adapter = adapter.with_mux(mux_options);

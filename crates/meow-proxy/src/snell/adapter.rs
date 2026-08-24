@@ -65,8 +65,8 @@ pub struct SnellAdapter {
     pool: Option<Arc<Pool>>,
     version: SnellVersion,
     health: ProxyHealth,
+    dialer: Arc<dyn crate::dialer::TcpDialer>,
 }
-
 impl SnellAdapter {
     #[allow(
         clippy::too_many_arguments,
@@ -81,6 +81,7 @@ impl SnellAdapter {
         version: SnellVersion,
         udp: bool,
         reuse: bool,
+        dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Result<Self> {
         if psk.is_empty() {
             return Err(MeowError::Config(format!(
@@ -126,16 +127,20 @@ impl SnellAdapter {
             },
             version,
             health: ProxyHealth::new(),
+            dialer,
         })
     }
+
+
 
     /// Open a fresh underlying byte stream (TCP, optionally wrapped in obfs)
     /// and Snell-wrap it. No CONNECT header is sent yet.
     async fn dial_fresh(&self) -> Result<PoolStream> {
-        let tcp = meow_common::connect_tcp_host(&self.server, self.port)
+        let tcp = self
+            .dialer
+            .dial(&self.server, self.port)
             .await
             .map_err(MeowError::Io)?;
-        let _ = tcp.set_nodelay(true);
         let inner: Box<dyn TransportStream> = Box::new(tcp);
         Ok(self.wrap_stream(inner))
     }
@@ -439,6 +444,7 @@ mod tests {
             SnellVersion::V3,
             false,
             false,
+            Arc::new(crate::dialer::DirectDialer),
         )
         .unwrap();
         let metadata = Metadata {

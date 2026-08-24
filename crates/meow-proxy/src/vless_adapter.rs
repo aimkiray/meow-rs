@@ -58,6 +58,7 @@ pub struct VlessAdapter {
     flow: Option<VlessFlow>,
     udp: bool,
     transport: Arc<TransportChain>,
+    dialer: Arc<dyn crate::dialer::TcpDialer>,
     /// sing-mux compatible connection multiplexing (optional).
     #[cfg(feature = "mux")]
     mux: Option<Arc<MuxClient>>,
@@ -74,6 +75,10 @@ impl VlessAdapter {
     /// `uuid_bytes` — 16-byte binary UUID.
     /// `transport`  — pre-built chain (TLS, WS, etc.).
     /// `flow`       — None for plain VLESS, Some(XtlsRprxVision) for Vision.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "dialer param for pluggable TcpDialer"
+    )]
     pub fn new(
         name: &str,
         server: &str,
@@ -82,6 +87,7 @@ impl VlessAdapter {
         flow: Option<VlessFlow>,
         udp: bool,
         transport: TransportChain,
+        dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Self {
         Self {
             name: SmolStr::from(name),
@@ -92,6 +98,7 @@ impl VlessAdapter {
             flow,
             udp,
             transport: Arc::new(transport),
+            dialer,
             #[cfg(feature = "mux")]
             mux: None,
             #[cfg(feature = "vless-encryption")]
@@ -119,6 +126,7 @@ impl VlessAdapter {
         let uuid_bytes = self.uuid_bytes;
         let transport = StdArc::clone(&self.transport);
         let flow = self.flow;
+        let dialer = Arc::clone(&self.dialer);
         let protocol = options.protocol;
         #[cfg(feature = "vless-encryption")]
         let encryption = self.encryption.clone();
@@ -126,13 +134,12 @@ impl VlessAdapter {
         let dial: crate::mux::DialFn = StdArc::new(move || {
             let server = server.clone();
             let transport = StdArc::clone(&transport);
+            let dialer = Arc::clone(&dialer);
             #[cfg(feature = "vless-encryption")]
             let encryption = encryption.clone();
             Box::pin(async move {
-                let tcp = meow_common::connect_tcp_host(&server, port)
-                    .await
-                    .map_err(MeowError::Io)?;
-                let stream = transport.connect(Box::new(tcp)).await?;
+                let stream = dialer.dial(&server, port).await.map_err(MeowError::Io)?;
+                let stream = transport.connect(stream).await?;
                 #[cfg(feature = "vless-encryption")]
                 let stream = match &encryption {
                     Some(encryption) => encryption.handshake(stream).await?,
@@ -211,10 +218,12 @@ impl VlessAdapter {
     /// Dial a raw TCP + transport-chain stream to the VLESS server, then run the
     /// VLESS Encryption handshake if one is configured.
     async fn dial_stream(&self) -> Result<Box<dyn meow_transport::Stream>> {
-        let tcp = meow_common::connect_tcp_host(&self.server, self.port)
+        let stream = self
+            .dialer
+            .dial(&self.server, self.port)
             .await
             .map_err(MeowError::Io)?;
-        let stream = self.transport.connect(Box::new(tcp)).await?;
+        let stream = self.transport.connect(stream).await?;
         #[cfg(feature = "vless-encryption")]
         if let Some(encryption) = &self.encryption {
             return encryption.handshake(stream).await;
@@ -362,6 +371,7 @@ impl ProxyAdapter for VlessAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dialer::DirectDialer;
     use meow_common::AdapterType;
 
     fn make_adapter(flow: Option<VlessFlow>, udp: bool) -> VlessAdapter {
@@ -373,6 +383,7 @@ mod tests {
             flow,
             udp,
             TransportChain::empty(),
+            Arc::new(DirectDialer),
         )
     }
 
@@ -417,7 +428,16 @@ mod tests {
         let tls_cfg = TlsConfig::new("example.com");
         let tls_layer = TlsLayer::new(&tls_cfg).expect("TlsLayer");
         chain.push(Box::new(tls_layer));
-        let a = VlessAdapter::new("t", "127.0.0.1", 1, [0u8; 16], None, false, chain);
+        let a = VlessAdapter::new(
+            "t",
+            "127.0.0.1",
+            1,
+            [0u8; 16],
+            None,
+            false,
+            chain,
+            Arc::new(DirectDialer),
+        );
         assert_eq!(a.transport.len(), 1, "TLS-only chain must have 1 layer");
     }
 
@@ -437,7 +457,16 @@ mod tests {
             })
             .expect("WsLayer::new"),
         ));
-        let a = VlessAdapter::new("t", "127.0.0.1", 1, [0u8; 16], None, false, chain);
+        let a = VlessAdapter::new(
+            "t",
+            "127.0.0.1",
+            1,
+            [0u8; 16],
+            None,
+            false,
+            chain,
+            Arc::new(DirectDialer),
+        );
         assert_eq!(a.transport.len(), 2, "TLS+WS chain must have 2 layers");
     }
 

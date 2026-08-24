@@ -12,8 +12,10 @@
 #![cfg(feature = "snell")]
 
 use meow_common::{Metadata, Network, ProxyAdapter};
+use meow_proxy::dialer::DirectDialer;
 use meow_proxy::{SnellAdapter, SnellObfs, SnellVersion};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -166,6 +168,7 @@ async fn snell_dial_real_server() {
         version,
         udp,
         reuse,
+        Arc::new(DirectDialer),
     )
     .expect("snell adapter config");
     let metadata = Metadata {

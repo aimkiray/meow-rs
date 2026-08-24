@@ -22,6 +22,7 @@ use meow_common::{
 };
 use smallvec::SmallVec;
 use smol_str::SmolStr;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tracing::debug;
@@ -63,8 +64,8 @@ pub struct Socks5Adapter {
     /// Whether `udp: true` was configured — gates UDP ASSOCIATE.
     udp: bool,
     health: ProxyHealth,
+    dialer: Arc<dyn crate::dialer::TcpDialer>,
 }
-
 impl Socks5Adapter {
     /// Create a `Socks5Adapter`. UDP ASSOCIATE is disabled by default; call
     /// [`Self::with_udp`] to enable it (set from `udp: true` in config).
@@ -75,9 +76,8 @@ impl Socks5Adapter {
         auth: Option<(String, String)>,
         tls: bool,
         skip_cert_verify: bool,
+        dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Self {
-        // Hoisted out of the dial path: TlsLayer::new clones the webpki root
-        // store and builds verifier + crypto provider — per-adapter, not
         // per-connection (same pattern as TrojanAdapter::new).
         let tls_layer = tls.then(|| {
             use meow_transport::tls::{TlsConfig, TlsLayer};
@@ -98,10 +98,10 @@ impl Socks5Adapter {
             tls_layer,
             udp: false,
             health: ProxyHealth::new(),
+            dialer,
         }
     }
 
-    /// Enable SOCKS5 UDP ASSOCIATE (HTTP/3 / QUIC relay). Off by default.
     #[must_use]
     pub fn with_udp(mut self, udp: bool) -> Self {
         self.udp = udp;
@@ -110,7 +110,9 @@ impl Socks5Adapter {
 
     /// Dial TCP to the proxy server, optionally wrapping in TLS.
     async fn dial_stream(&self) -> Result<Box<dyn meow_transport::Stream>> {
-        let tcp = meow_common::connect_tcp_host(&self.server, self.port)
+        let tcp = self
+            .dialer
+            .dial(&self.server, self.port)
             .await
             .map_err(MeowError::Io)?;
 
@@ -842,7 +844,15 @@ mod tests {
     }
 
     fn make_adapter(server: &str, port: u16, auth: Option<(String, String)>) -> Socks5Adapter {
-        Socks5Adapter::new(server, server, port, auth, false, false)
+        Socks5Adapter::new(
+            server,
+            server,
+            port,
+            auth,
+            false,
+            false,
+            Arc::new(crate::dialer::DirectDialer),
+        )
     }
 
     fn meta_with_host(host: &str, port: u16) -> Metadata {

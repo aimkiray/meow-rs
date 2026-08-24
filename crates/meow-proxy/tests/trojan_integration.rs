@@ -336,6 +336,7 @@ async fn test_trojan_tcp_relay() {
         "localhost", // SNI
         true,        // skip_verify
         false,       // udp
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
     );
 
     // Build metadata pointing to the echo server
@@ -391,6 +392,7 @@ async fn test_trojan_tcp_large_payload() {
         "localhost",
         true,
         false,
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
     );
 
     let metadata = Metadata {
@@ -454,6 +456,7 @@ async fn test_trojan_udp_echo() {
         "localhost",
         true,
         true,
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
     );
 
     // The CMD=0x03 header carries a placeholder destination (the echo server),
@@ -514,6 +517,7 @@ async fn test_trojan_udp_multi_destination() {
         "localhost",
         true,
         true,
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
     );
 
     let metadata = Metadata {
@@ -564,6 +568,7 @@ async fn test_trojan_udp_disabled_returns_not_supported() {
         "localhost",
         true,
         false,
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
     );
 
     let metadata = Metadata {

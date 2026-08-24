@@ -5,9 +5,11 @@
 //! Tests are skipped automatically if `ssserver` is not available.
 
 use meow_common::{Metadata, Network, ProxyAdapter};
+use meow_proxy::dialer::DirectDialer;
 use meow_proxy::ShadowsocksAdapter;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::process::{Child, Command};
@@ -230,6 +232,7 @@ async fn test_ss_tcp_relay() {
         false,
         None,
         None,
+        Arc::new(DirectDialer),
     )
     .unwrap();
 
@@ -292,6 +295,7 @@ async fn test_ss_udp_relay() {
         true,
         None,
         None,
+        Arc::new(DirectDialer),
     )
     .unwrap();
 
@@ -363,6 +367,7 @@ async fn test_ss_tcp_relay_with_obfs_plugin() {
         false,
         Some("obfs-local"),
         Some("obfs=http"),
+        Arc::new(DirectDialer),
     )
     .expect("failed to create adapter with obfs-local plugin");
 
@@ -438,6 +443,7 @@ async fn test_ss_tcp_relay_with_builtin_obfs_http() {
         false,
         Some("obfs"),
         Some("mode=http;host=bing.com"),
+        Arc::new(DirectDialer),
     )
     .expect("failed to create adapter with built-in obfs http");
 
@@ -502,6 +508,7 @@ async fn test_ss_tcp_relay_with_builtin_obfs_tls() {
         false,
         Some("obfs"),
         Some("mode=tls;host=cloudflare.com"),
+        Arc::new(DirectDialer),
     )
     .expect("failed to create adapter with built-in obfs tls");
 

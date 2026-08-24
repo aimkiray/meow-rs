@@ -50,12 +50,19 @@ pub struct TrojanAdapter {
     support_udp: bool,
     health: ProxyHealth,
     tls_layer: Arc<TlsLayer>,
+    /// Pluggable TCP dialer for the underlying connection to the proxy
+    /// server (direct or via dialer-proxy).
+    dialer: Arc<dyn crate::dialer::TcpDialer>,
     /// sing-mux compatible connection multiplexing (optional).
     #[cfg(feature = "mux")]
     mux: Option<Arc<MuxClient>>,
 }
 
 impl TrojanAdapter {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "dialer param for pluggable TcpDialer"
+    )]
     pub fn new(
         name: &str,
         server: &str,
@@ -64,6 +71,7 @@ impl TrojanAdapter {
         sni: &str,
         skip_verify: bool,
         udp: bool,
+        dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Self {
         // SHA-224 hash of password, hex-encoded = 56 chars.
         let mut hasher = Sha224::new();
@@ -91,6 +99,7 @@ impl TrojanAdapter {
             port,
             addr_str: SmolStr::from(format!("{server}:{port}")),
             hex_password: SmolStr::from(hex_password),
+            dialer,
             support_udp: udp,
             health: ProxyHealth::new(),
             tls_layer: Arc::new(tls_layer),
@@ -111,11 +120,13 @@ impl TrojanAdapter {
         let port = self.port;
         let hex_password = self.hex_password.clone();
         let tls_layer = Arc::clone(&self.tls_layer);
+        let dialer = Arc::clone(&self.dialer);
 
         let dial: crate::mux::DialFn = Arc::new(move || {
             let server = server.clone();
             let hex_password = hex_password.clone();
             let tls_layer = Arc::clone(&tls_layer);
+            let dialer = Arc::clone(&dialer);
             Box::pin(async move {
                 // Build the mux-destination request header.
                 let mut hdr_buf = [0u8; TROJAN_HEADER_BUF_SIZE];
@@ -140,11 +151,9 @@ impl TrojanAdapter {
                 pos += 2;
                 let header = &hdr_buf[..pos];
 
-                let tcp = meow_common::connect_tcp_host(&server, port)
-                    .await
-                    .map_err(MeowError::Io)?;
+                let tcp = dialer.dial(&server, port).await.map_err(MeowError::Io)?;
                 let mut stream = tls_layer
-                    .connect(Box::new(tcp))
+                    .connect(tcp)
                     .await
                     .map_err(transport_to_proxy_err)?;
                 stream.write_all(header).await.map_err(MeowError::Io)?;
@@ -184,13 +193,15 @@ impl TrojanAdapter {
         let mut hdr_buf = [0u8; TROJAN_HEADER_BUF_SIZE];
         let header = self.build_header(metadata, cmd, &mut hdr_buf)?;
 
-        let tcp = meow_common::connect_tcp_host(&self.server, self.port)
+        let tcp = self
+            .dialer
+            .dial(&self.server, self.port)
             .await
             .map_err(MeowError::Io)?;
 
         let mut stream = self
             .tls_layer
-            .connect(Box::new(tcp))
+            .connect(tcp)
             .await
             .map_err(transport_to_proxy_err)?;
 
@@ -580,8 +591,16 @@ mod tests {
 
     #[test]
     fn build_header_accepts_max_length_domain() {
-        let adapter =
-            TrojanAdapter::new("t", "127.0.0.1", 443, "secret", "example.com", true, false);
+        let adapter = TrojanAdapter::new(
+            "t",
+            "127.0.0.1",
+            443,
+            "secret",
+            "example.com",
+            true,
+            false,
+            std::sync::Arc::new(crate::dialer::DirectDialer),
+        );
         let md = Metadata {
             host: "a".repeat(MAX_DOMAIN_LEN).into(),
             dst_port: 443,
@@ -599,8 +618,16 @@ mod tests {
 
     #[test]
     fn build_header_rejects_overlong_domain_without_panic() {
-        let adapter =
-            TrojanAdapter::new("t", "127.0.0.1", 443, "secret", "example.com", true, false);
+        let adapter = TrojanAdapter::new(
+            "t",
+            "127.0.0.1",
+            443,
+            "secret",
+            "example.com",
+            true,
+            false,
+            std::sync::Arc::new(crate::dialer::DirectDialer),
+        );
         let md = Metadata {
             host: "a".repeat(MAX_DOMAIN_LEN + 1).into(),
             dst_port: 443,

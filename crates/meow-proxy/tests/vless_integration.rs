@@ -12,6 +12,7 @@
 #[cfg(feature = "vless")]
 mod vless_tests {
     use meow_common::{Metadata, Network, ProxyAdapter};
+    use meow_proxy::dialer::DirectDialer;
     use meow_proxy::{TransportChain, VlessAdapter};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
@@ -227,6 +228,7 @@ mod vless_tests {
             None,
             false,
             TransportChain::empty(),
+            Arc::new(DirectDialer),
         );
 
         let metadata = Metadata {
@@ -268,6 +270,7 @@ mod vless_tests {
             None,
             false,
             TransportChain::empty(),
+            Arc::new(DirectDialer),
         );
 
         let metadata = Metadata {
@@ -310,6 +313,7 @@ mod vless_tests {
             None,
             false,
             TransportChain::empty(),
+            Arc::new(DirectDialer),
         ));
 
         let mut handles = Vec::new();
@@ -364,6 +368,7 @@ mod vless_tests {
             None,
             false,
             TransportChain::empty(),
+            Arc::new(DirectDialer),
         );
 
         let metadata = Metadata {
@@ -419,6 +424,7 @@ mod vless_tests {
             None,
             false,
             TransportChain::empty(),
+            Arc::new(DirectDialer),
         );
 
         let metadata = Metadata {
@@ -483,6 +489,7 @@ mod vless_tests {
             None,
             false,
             TransportChain::empty(),
+            Arc::new(DirectDialer),
         );
 
         let metadata = Metadata {

@@ -143,6 +143,7 @@ pub async fn dial(
     tls_layer: Option<&TlsLayer>,
     server_host: &str,
     server_port: u16,
+    dialer: &dyn crate::dialer::TcpDialer,
 ) -> Result<Box<dyn meow_transport::Stream>> {
     let host_header = if cfg.host.is_empty() {
         server_host.to_string()
@@ -156,9 +157,11 @@ pub async fn dial(
     );
 
     // 1) Raw TCP.
-    let tcp = meow_common::connect_tcp_host(server_host, server_port)
+    let tcp = dialer
+        .dial(server_host, server_port)
         .await
         .map_err(MeowError::Io)?;
+
 
     // 2) Optional TLS handshake via the pre-built TlsLayer.
     let stream: Box<dyn meow_transport::Stream> = if let Some(tls) = tls_layer {

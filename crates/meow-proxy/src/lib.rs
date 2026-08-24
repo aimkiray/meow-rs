@@ -4,6 +4,7 @@
 //! HTTP, SOCKS5, Direct, and Reject, plus Selector, URLTest, Fallback,
 //! LoadBalance, and Relay groups.
 
+pub mod dialer;
 pub mod direct;
 pub mod group;
 pub mod health;

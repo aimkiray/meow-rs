@@ -23,6 +23,7 @@ pub struct VmessAdapter {
     security: Security,
     udp: bool,
     transport: Arc<TransportChain>,
+    dialer: Arc<dyn crate::dialer::TcpDialer>,
     health: ProxyHealth,
     /// sing-mux compatible connection multiplexing (optional).
     #[cfg(feature = "mux")]
@@ -30,6 +31,10 @@ pub struct VmessAdapter {
 }
 
 impl VmessAdapter {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "dialer param for pluggable TcpDialer"
+    )]
     pub fn new(
         name: &str,
         server: &str,
@@ -38,6 +43,7 @@ impl VmessAdapter {
         security: Security,
         udp: bool,
         transport: TransportChain,
+        dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Self {
         Self {
             name: SmolStr::from(name),
@@ -48,6 +54,7 @@ impl VmessAdapter {
             security,
             udp,
             transport: Arc::new(transport),
+            dialer,
             health: ProxyHealth::new(),
             #[cfg(feature = "mux")]
             mux: None,
@@ -76,10 +83,12 @@ impl VmessAdapter {
         let security = self.security;
         let port = self.port;
         let protocol = options.protocol;
+        let dialer = Arc::clone(&self.dialer);
 
         let dial: crate::mux::DialFn = StdArc::new(move || {
             let transport = Arc::clone(&transport);
             let server = server.clone();
+            let dialer = Arc::clone(&dialer);
             Box::pin(async move {
                 let sealed = match protocol {
                     crate::mux::Protocol::MuxCool => {
@@ -95,7 +104,7 @@ impl VmessAdapter {
                     }
                 }
                 .map_err(MeowError::Proxy)?;
-                dial_vmess(&transport, &server, port, sealed, security).await
+                dial_vmess(&transport, &server, port, dialer.as_ref(), sealed, security).await
             })
         });
         self.mux = Some(MuxClient::new(dial, options));
@@ -112,6 +121,7 @@ impl VmessAdapter {
             &self.transport,
             &self.server,
             self.port,
+            self.dialer.as_ref(),
             sealed,
             self.security,
         )
@@ -127,17 +137,15 @@ async fn dial_vmess(
     transport: &TransportChain,
     server: &str,
     port: u16,
+    dialer: &dyn crate::dialer::TcpDialer,
     sealed: header::SealedHeader,
     security: Security,
 ) -> Result<Box<dyn ProxyConn>> {
     use tokio::io::AsyncWriteExt;
 
-    let tcp = meow_common::connect_tcp_host(server, port)
-        .await
-        .map_err(MeowError::Io)?;
-    let _ = tcp.set_nodelay(true);
+    let stream = dialer.dial(server, port).await.map_err(MeowError::Io)?;
     let mut stream = transport
-        .connect(Box::new(tcp))
+        .connect(stream)
         .await
         .map_err(|e| MeowError::Proxy(format!("vmess transport: {e}")))?;
 

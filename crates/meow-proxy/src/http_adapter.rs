@@ -27,6 +27,7 @@ use meow_common::{
 };
 use smol_str::SmolStr;
 use std::fmt;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::debug;
 
@@ -51,13 +52,17 @@ pub struct HttpAdapter {
     /// Extra headers injected into the CONNECT request only.
     extra_headers: Vec<(String, String)>,
     health: ProxyHealth,
+    dialer: Arc<dyn crate::dialer::TcpDialer>,
 }
-
 impl HttpAdapter {
     /// Create an `HttpAdapter`.
     ///
     /// `auth` — `Some((username, password))` for Basic auth; `None` for no auth.
     /// Both username and password must be set or neither (validated at parse time).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "dialer param for pluggable TcpDialer"
+    )]
     pub fn new(
         name: &str,
         server: &str,
@@ -66,9 +71,8 @@ impl HttpAdapter {
         tls: bool,
         skip_cert_verify: bool,
         extra_headers: Vec<(String, String)>,
+        dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Self {
-        // Hoisted out of the dial path: TlsLayer::new clones the webpki root
-        // store and builds verifier + crypto provider — per-adapter, not
         // per-connection (same pattern as TrojanAdapter::new).
         let tls_layer = tls.then(|| {
             use meow_transport::tls::{TlsConfig, TlsLayer};
@@ -89,12 +93,17 @@ impl HttpAdapter {
             tls_layer,
             extra_headers,
             health: ProxyHealth::new(),
+
+            dialer,
         }
     }
 
     /// Dial TCP to the proxy server, optionally wrapping in TLS.
+
     async fn dial_stream(&self) -> Result<Box<dyn meow_transport::Stream>> {
-        let tcp = meow_common::connect_tcp_host(&self.server, self.port)
+        let tcp = self
+            .dialer
+            .dial(&self.server, self.port)
             .await
             .map_err(MeowError::Io)?;
 
@@ -108,9 +117,6 @@ impl HttpAdapter {
             Ok(Box::new(tcp))
         }
     }
-
-    /// Run the HTTP CONNECT handshake over `stream`.
-    ///
     /// On success the stream is ready for tunnelled application data.
     /// On failure returns the appropriate `MeowError` variant.
     async fn run_connect<S>(
@@ -415,7 +421,16 @@ mod tests {
     }
 
     fn make_adapter_no_auth(server: &str, port: u16) -> HttpAdapter {
-        HttpAdapter::new(server, server, port, None, false, false, vec![])
+        HttpAdapter::new(
+            server,
+            server,
+            port,
+            None,
+            false,
+            false,
+            vec![],
+            Arc::new(crate::dialer::DirectDialer),
+        )
     }
 
     // ─── http_connect_no_auth_succeeds ────────────────────────────────────────
@@ -473,6 +488,7 @@ mod tests {
             false,
             false,
             vec![],
+            Arc::new(crate::dialer::DirectDialer),
         );
         let meta = make_metadata("example.com", 443);
         let _ = adapter.dial_tcp(&meta).await.expect("dial_tcp");
@@ -556,6 +572,7 @@ mod tests {
             false,
             false,
             vec![("X-Foo".into(), "bar".into())],
+            Arc::new(crate::dialer::DirectDialer),
         );
         let meta = make_metadata("example.com", 443);
         let _ = adapter.dial_tcp(&meta).await.expect("dial_tcp");
@@ -577,6 +594,7 @@ mod tests {
             false,
             false,
             vec![("X-Foo".into(), "bar\r\nX-Injected: yes".into())],
+            Arc::new(crate::dialer::DirectDialer),
         );
         let (mut client, _server) = tokio::io::duplex(64);
         let target = "example.com:443";
@@ -629,6 +647,7 @@ mod tests {
             false,
             false,
             vec![("X-Long".into(), long_value.clone())],
+            Arc::new(crate::dialer::DirectDialer),
         );
         let meta = make_metadata("example.com", 443);
         let _ = adapter.dial_tcp(&meta).await.expect("dial_tcp");

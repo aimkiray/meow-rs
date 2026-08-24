@@ -5,8 +5,10 @@
 //! No TLS — the adapter's TLS-wrap branch is covered by source-level units.
 
 use meow_common::{ConnType, MeowError, Metadata, Network, ProxyAdapter};
+use meow_proxy::dialer::DirectDialer;
 use meow_proxy::Socks5Adapter;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
@@ -210,7 +212,15 @@ fn metadata_for_host(host: &str, port: u16) -> Metadata {
 async fn no_auth_tunnel_round_trips_through_echo() {
     let (echo, _e) = start_echo().await;
     let (s5, _h) = start_socks5(AuthPolicy::None).await;
-    let adapter = Socks5Adapter::new("p", "127.0.0.1", s5.port(), None, false, false);
+    let adapter = Socks5Adapter::new(
+        "p",
+        "127.0.0.1",
+        s5.port(),
+        None,
+        false,
+        false,
+        Arc::new(DirectDialer),
+    );
     let mut conn = timeout(TIMEOUT, adapter.dial_tcp(&metadata_for(echo)))
         .await
         .expect("dial timed out")
@@ -235,6 +245,7 @@ async fn correct_userpass_succeeds_and_tunnels() {
         Some(("alice".into(), "p@ss".into())),
         false,
         false,
+        Arc::new(DirectDialer),
     );
     let mut conn = timeout(TIMEOUT, adapter.dial_tcp(&metadata_for(echo)))
         .await
@@ -260,6 +271,7 @@ async fn wrong_password_fails_with_proxy_auth_failed() {
         Some(("alice".into(), "wrong".into())),
         false,
         false,
+        Arc::new(DirectDialer),
     );
     let err = timeout(TIMEOUT, adapter.dial_tcp(&metadata_for(echo)))
         .await
@@ -279,7 +291,15 @@ async fn missing_auth_to_authed_server_fails() {
     // succeed.
     let (echo, _e) = start_echo().await;
     let (s5, _h) = start_socks5(AuthPolicy::UserPass("alice", "p")).await;
-    let adapter = Socks5Adapter::new("p", "127.0.0.1", s5.port(), None, false, false);
+    let adapter = Socks5Adapter::new(
+        "p",
+        "127.0.0.1",
+        s5.port(),
+        None,
+        false,
+        false,
+        Arc::new(DirectDialer),
+    );
     let res = timeout(TIMEOUT, adapter.dial_tcp(&metadata_for(echo)))
         .await
         .expect("dial timed out");
@@ -291,7 +311,15 @@ async fn unreachable_target_surfaces_proxy_error() {
     // Server can speak SOCKS5 but the target it tries to dial is closed →
     // SOCKS5 reply rep=0x05 (connection refused). Adapter must not return Ok.
     let (s5, _h) = start_socks5(AuthPolicy::None).await;
-    let adapter = Socks5Adapter::new("p", "127.0.0.1", s5.port(), None, false, false);
+    let adapter = Socks5Adapter::new(
+        "p",
+        "127.0.0.1",
+        s5.port(),
+        None,
+        false,
+        false,
+        Arc::new(DirectDialer),
+    );
     // High port nothing listens on (claim+drop trick).
     let dead = {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -312,7 +340,15 @@ async fn hostname_atyp_03_is_sent_when_dst_ip_absent() {
     // ("localhost") itself.
     let (echo, _e) = start_echo().await;
     let (s5, _h) = start_socks5(AuthPolicy::None).await;
-    let adapter = Socks5Adapter::new("p", "127.0.0.1", s5.port(), None, false, false);
+    let adapter = Socks5Adapter::new(
+        "p",
+        "127.0.0.1",
+        s5.port(),
+        None,
+        false,
+        false,
+        Arc::new(DirectDialer),
+    );
     let mut conn = timeout(
         TIMEOUT,
         adapter.dial_tcp(&metadata_for_host("localhost", echo.port())),

@@ -8,8 +8,10 @@
 
 use base64::Engine as _;
 use meow_common::{ConnType, MeowError, Metadata, Network, ProxyAdapter};
+use meow_proxy::dialer::DirectDialer;
 use meow_proxy::HttpAdapter;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
@@ -147,7 +149,16 @@ fn metadata_for(target: SocketAddr) -> Metadata {
 async fn connect_no_auth_round_trips_payload_to_echo() {
     let (echo, _h_echo) = start_echo().await;
     let (proxy, _h_proxy) = start_proxy(None).await;
-    let adapter = HttpAdapter::new("p", "127.0.0.1", proxy.port(), None, false, false, vec![]);
+    let adapter = HttpAdapter::new(
+        "p",
+        "127.0.0.1",
+        proxy.port(),
+        None,
+        false,
+        false,
+        vec![],
+        Arc::new(DirectDialer),
+    );
 
     let mut conn = timeout(TIMEOUT, adapter.dial_tcp(&metadata_for(echo)))
         .await
@@ -176,6 +187,7 @@ async fn connect_with_correct_basic_auth_succeeds() {
         false,
         false,
         vec![],
+        Arc::new(DirectDialer),
     );
     let mut conn = timeout(TIMEOUT, adapter.dial_tcp(&metadata_for(echo)))
         .await
@@ -202,6 +214,7 @@ async fn connect_with_wrong_password_returns_proxy_auth_failed() {
         false,
         false,
         vec![],
+        Arc::new(DirectDialer),
     );
     let err = timeout(TIMEOUT, adapter.dial_tcp(&metadata_for(echo)))
         .await
@@ -219,7 +232,16 @@ async fn connect_with_missing_auth_header_when_required_returns_proxy_auth_faile
     let (echo, _e) = start_echo().await;
     let (proxy, _p) = start_proxy(Some(("u", "secret"))).await;
     // Adapter dialled WITHOUT credentials at all.
-    let adapter = HttpAdapter::new("p", "127.0.0.1", proxy.port(), None, false, false, vec![]);
+    let adapter = HttpAdapter::new(
+        "p",
+        "127.0.0.1",
+        proxy.port(),
+        None,
+        false,
+        false,
+        vec![],
+        Arc::new(DirectDialer),
+    );
     let err = timeout(TIMEOUT, adapter.dial_tcp(&metadata_for(echo)))
         .await
         .expect("dial timed out")
@@ -236,7 +258,16 @@ async fn connect_to_unreachable_target_returns_http_connect_failed() {
     // Proxy will try to dial port 1 on a localhost address that nothing listens on
     // → respond 502. Adapter must surface that as `HttpConnectFailed(502)`.
     let (proxy, _p) = start_proxy(None).await;
-    let adapter = HttpAdapter::new("p", "127.0.0.1", proxy.port(), None, false, false, vec![]);
+    let adapter = HttpAdapter::new(
+        "p",
+        "127.0.0.1",
+        proxy.port(),
+        None,
+        false,
+        false,
+        vec![],
+        Arc::new(DirectDialer),
+    );
     // Pick a SocketAddr the proxy can't reach (high random ephemeral whose
     // listener we never opened). Using IP literal so the adapter doesn't try
     // its own DNS.
@@ -301,6 +332,7 @@ async fn connect_extra_headers_are_sent_to_proxy() {
         false,
         false,
         vec![("X-Test".into(), "abc123".into())],
+        Arc::new(DirectDialer),
     );
     let _ = timeout(TIMEOUT, adapter.dial_tcp(&metadata_for(echo)))
         .await

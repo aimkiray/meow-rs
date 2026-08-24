@@ -6,6 +6,7 @@
 //! accepted `TcpStream` speaks the server side. No external binaries required.
 
 use meow_common::{MeowError, Metadata, Network, ProxyAdapter};
+use meow_proxy::dialer::DirectDialer;
 use meow_proxy::snell::protocol::{
     write_header, AppError, Snell, COMMAND_CONNECT, COMMAND_CONNECT_V2, COMMAND_UDP,
     COMMAND_UDP_FORWARD, HEADER_VERSION, RESPONSE_ERROR, RESPONSE_TUNNEL,
@@ -326,6 +327,7 @@ fn make_adapter_with_version(
         version,
         udp,
         reuse,
+        Arc::new(DirectDialer),
     )
     .expect("adapter config must be valid")
 }
@@ -855,7 +857,8 @@ fn constructor_rejects_bad_config() {
             SnellObfs::None,
             SnellVersion::V4,
             false,
-            false
+            false,
+            Arc::new(DirectDialer),
         )
         .is_err(),
         "empty psk must be rejected"
@@ -869,7 +872,8 @@ fn constructor_rejects_bad_config() {
             SnellObfs::None,
             SnellVersion::V4,
             false,
-            false
+            false,
+            Arc::new(DirectDialer),
         )
         .is_err(),
         "port 0 must be rejected"
@@ -883,7 +887,8 @@ fn constructor_rejects_bad_config() {
             SnellObfs::None,
             SnellVersion::V4,
             false,
-            false
+            false,
+            Arc::new(DirectDialer),
         )
         .is_err(),
         "empty server must be rejected"

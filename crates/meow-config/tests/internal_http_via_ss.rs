@@ -12,6 +12,7 @@
 use meow_common::adapter::Proxy;
 use meow_config::internal_http;
 use meow_config::proxy_parser::WrappedProxy;
+use meow_proxy::dialer::DirectDialer;
 use meow_proxy::ShadowsocksAdapter;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -158,6 +159,7 @@ async fn fetch_via_proxy_through_ssserver_returns_body() {
         false,
         None,
         None,
+        Arc::new(DirectDialer),
     )
     .expect("ShadowsocksAdapter::new");
     let proxy: Arc<dyn Proxy> = Arc::new(WrappedProxy::new(Box::new(adapter)));
@@ -223,6 +225,7 @@ async fn fetch_via_proxy_follows_redirect() {
         false,
         None,
         None,
+        Arc::new(DirectDialer),
     )
     .unwrap();
     let proxy: Arc<dyn Proxy> = Arc::new(WrappedProxy::new(Box::new(adapter)));

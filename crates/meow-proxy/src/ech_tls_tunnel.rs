@@ -158,6 +158,7 @@ pub async fn dial(
     tls_layer: &TlsLayer,
     server_host: &str,
     server_port: u16,
+    dialer: &dyn crate::dialer::TcpDialer,
 ) -> Result<Box<dyn meow_transport::Stream>> {
     debug!(
         "ech-tls-tunnel: dialing {}:{} sni={} path={} ech_config_len={}",
@@ -169,10 +170,12 @@ pub async fn dial(
     );
 
     // 1) Raw TCP.
-    let tcp = meow_common::connect_tcp_host(server_host, server_port)
+    let tcp = dialer
+        .dial(server_host, server_port)
         .await
         .map_err(MeowError::Io)?;
-    let _ = tcp.set_nodelay(true);
+
+
 
     // 2) TLS (with ECH). Reuse the pre-built TlsLayer — avoids rebuilding
     //    the BoringSSL SSL_CTX and re-parsing ~150 root certs per connection.

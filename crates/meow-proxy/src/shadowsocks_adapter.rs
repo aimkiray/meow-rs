@@ -59,6 +59,7 @@ struct SsCore {
     server_config: ServerConfig,
     context: shadowsocks::context::SharedContext,
     plugin: PluginKind,
+    dialer: Arc<dyn crate::dialer::TcpDialer>,
 }
 
 pub struct ShadowsocksAdapter {
@@ -83,6 +84,7 @@ impl ShadowsocksAdapter {
         udp: bool,
         plugin_name: Option<&str>,
         plugin_opts: Option<&str>,
+        dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Result<Self> {
         let cipher_kind = cipher
             .parse::<CipherKind>()
@@ -156,6 +158,7 @@ impl ShadowsocksAdapter {
             server_config,
             context,
             plugin,
+            dialer,
         });
 
         Ok(Self {
@@ -202,10 +205,13 @@ impl SsCore {
             PluginKind::Obfs(obfs) => {
                 // Open a raw TCP connection to the SS server, wrap it in the
                 // simple-obfs codec, then layer the SS crypto stream on top.
-                let tcp = meow_common::connect_tcp_host(&self.server, self.port)
+                let tcp = self
+                    .dialer
+                    .dial(&self.server, self.port)
                     .await
                     .map_err(|e| MeowError::Proxy(format!("ss obfs tcp connect: {e}")))?;
-                let _ = tcp.set_nodelay(true);
+
+                
                 match obfs.clone() {
                     BuiltinObfs::Http { host } => {
                         let wrapped = HttpObfs::new(tcp, host, self.port);
@@ -231,7 +237,8 @@ impl SsCore {
             }
             PluginKind::V2ray(cfg, tls) => {
                 let transport =
-                    v2ray_plugin::dial(cfg, tls.as_ref(), &self.server, self.port).await?;
+                    v2ray_plugin::dial(cfg, tls.as_ref(), &self.server, self.port, &*self.dialer)
+                        .await?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     transport,
@@ -242,7 +249,8 @@ impl SsCore {
             }
             #[cfg(feature = "ech-tls-tunnel")]
             PluginKind::EchTlsTunnel(cfg, tls) => {
-                let transport = ech_tls_tunnel::dial(cfg, tls, &self.server, self.port).await?;
+                let transport =
+                    ech_tls_tunnel::dial(cfg, tls, &self.server, self.port, &*self.dialer).await?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     transport,
@@ -267,10 +275,10 @@ impl SsCore {
                 // installed `HostResolver` (system DNS would loop the
                 // lookup through the VPN on Android).
                 let tcp = match self.server_config.tcp_external_addr() {
-                    ServerAddr::SocketAddr(sa) => meow_common::connect_tcp(*sa).await,
-                    ServerAddr::DomainName(host, port) => {
-                        meow_common::connect_tcp_host(host, *port).await
+                    ServerAddr::SocketAddr(sa) => {
+                        self.dialer.dial(&sa.ip().to_string(), sa.port()).await
                     }
+                    ServerAddr::DomainName(host, port) => self.dialer.dial(host, *port).await,
                 }
                 .map_err(|e| MeowError::Proxy(format!("ss tcp connect: {e}")))?;
                 let stream = ProxyClientStream::from_stream(
@@ -501,10 +509,13 @@ impl ProxyAdapter for ShadowsocksAdapter {
     }
 
     fn support_udp(&self) -> bool {
-        // With mux enabled, UDP rides the mux TCP session (unless
-        // `only-tcp` forces the plain path) — mirrors mihomo's
-        // SingMux.SupportUDP.
-        self.support_udp || {
+        // SS UDP relay uses a raw UDP socket that bypasses the TCP dialer.
+        // When a `ProxyDialer` is installed (dialer-proxy), raw UDP would
+        // leak traffic past the chain — disable the plain UDP path.  Mux
+        // UDP is safe because it rides the mux TCP session through
+        // `dialer.dial()`, so it is unaffected.
+        let plain_udp_ok = self.support_udp && !self.core.dialer.is_proxy();
+        plain_udp_ok || {
             #[cfg(feature = "mux")]
             {
                 self.mux.as_ref().is_some_and(|mux| mux.supports_udp())
