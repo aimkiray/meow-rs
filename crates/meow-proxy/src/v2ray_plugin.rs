@@ -162,7 +162,6 @@ pub async fn dial(
         .await
         .map_err(MeowError::Io)?;
 
-
     // 2) Optional TLS handshake via the pre-built TlsLayer.
     let stream: Box<dyn meow_transport::Stream> = if let Some(tls) = tls_layer {
         tls.connect(Box::new(tcp))

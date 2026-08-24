@@ -16,7 +16,6 @@ use async_trait::async_trait;
 use meow_common::{Metadata, Proxy, ProxyConn};
 use meow_transport::Stream;
 
-
 /// A pluggable dialer for the underlying connection to a proxy server.
 ///
 /// Mirrors mihomo's `C.Dialer` interface.  Adapters call `dial()` instead of
@@ -26,6 +25,16 @@ use meow_transport::Stream;
 pub trait TcpDialer: Send + Sync {
     /// Dial `host:port` and return a duplex stream.
     async fn dial(&self, host: &str, port: u16) -> io::Result<Box<dyn Stream>>;
+
+    /// Whether this dialer tunnels through another proxy (vs. direct).
+    ///
+    /// Adapters whose UDP path uses a raw socket that bypasses `dial()`
+    /// (e.g. Shadowsocks UDP relay) should check this and disable UDP when a
+    /// proxy dialer is installed, so UDP traffic does not leak past the
+    /// `dialer-proxy` chain.
+    fn is_proxy(&self) -> bool {
+        false
+    }
 }
 
 /// Direct TCP dialer — the default, equivalent to mihomo's `dialer.NewDialer()`.
@@ -38,6 +47,10 @@ pub struct DirectDialer;
 impl TcpDialer for DirectDialer {
     async fn dial(&self, host: &str, port: u16) -> io::Result<Box<dyn Stream>> {
         let tcp = meow_common::connect_tcp_host(host, port).await?;
+        // Preserve TCP_NODELAY (disable Nagle) — all call sites that
+        // previously called `tcp.set_nodelay(true)` on the raw
+        // `TcpStream` now rely on the dialer to do it once here.
+        let _ = tcp.set_nodelay(true);
         Ok(Box::new(tcp))
     }
 }
@@ -70,13 +83,15 @@ impl TcpDialer for ProxyDialer {
             .dial_tcp(&meta)
             .await
             .map_err(|e| io::Error::other(format!("dialer-proxy: {e}")))?;
-        // ProxyConn → StreamConn(Box<dyn Stream>) — StreamConn wraps a
-        // Stream, but here we have a ProxyConn.  We need the reverse: wrap
-        // the ProxyConn so it satisfies the Stream trait (AsyncRead +
-        // AsyncWrite + Unpin + Send + Sync + Any).  Box<dyn ProxyConn> is
-        // unsized so it cannot directly satisfy `Any`; ConnStream bridges
-        // that.
+        // `Box<dyn ProxyConn>` is unsized (!Sized), so it cannot satisfy
+        // the `Any` bound required by the blanket `Stream` impl.  `ConnStream`
+        // is a sized newtype that forwards `AsyncRead`/`AsyncWrite` through
+        // the boxed conn, bridging `ProxyConn` → `Stream`.
         Ok(Box::new(ConnStream(conn)))
+    }
+
+    fn is_proxy(&self) -> bool {
+        true
     }
 }
 
@@ -85,6 +100,13 @@ impl TcpDialer for ProxyDialer {
 /// `Stream` requires `Sized + Any`; `Box<dyn ProxyConn>` is `!Sized`, so it
 /// cannot use the blanket `Stream` impl.  This newtype forwards
 /// `AsyncRead`/`AsyncWrite` through the boxed conn.
+///
+/// Note: because `ConnStream` is a distinct concrete type, `as_any_mut()`
+/// downcasts to `RealityTlsStream` (or any other concrete stream type) will
+/// fail — raw-passthrough optimizations that rely on type-downcasting do not
+/// fire through a `dialer-proxy` chain.  This is a Phase-1 limitation; the
+/// underlying data still flows correctly, only the zero-copy shortcut is
+/// skipped.
 pub struct ConnStream(pub Box<dyn ProxyConn>);
 
 impl tokio::io::AsyncRead for ConnStream {
@@ -122,4 +144,3 @@ impl tokio::io::AsyncWrite for ConnStream {
 }
 
 impl Unpin for ConnStream {}
-

@@ -73,6 +73,8 @@ impl HttpAdapter {
         extra_headers: Vec<(String, String)>,
         dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Self {
+        // Hoisted out of the dial path: TlsLayer::new clones the webpki root
+        // store and builds verifier + crypto provider — per-adapter, not
         // per-connection (same pattern as TrojanAdapter::new).
         let tls_layer = tls.then(|| {
             use meow_transport::tls::{TlsConfig, TlsLayer};
@@ -93,13 +95,11 @@ impl HttpAdapter {
             tls_layer,
             extra_headers,
             health: ProxyHealth::new(),
-
             dialer,
         }
     }
 
     /// Dial TCP to the proxy server, optionally wrapping in TLS.
-
     async fn dial_stream(&self) -> Result<Box<dyn meow_transport::Stream>> {
         let tcp = self
             .dialer
@@ -117,6 +117,9 @@ impl HttpAdapter {
             Ok(Box::new(tcp))
         }
     }
+
+    /// Run the HTTP CONNECT handshake over `stream`.
+    ///
     /// On success the stream is ready for tunnelled application data.
     /// On failure returns the appropriate `MeowError` variant.
     async fn run_connect<S>(

@@ -211,7 +211,6 @@ impl SsCore {
                     .await
                     .map_err(|e| MeowError::Proxy(format!("ss obfs tcp connect: {e}")))?;
 
-                
                 match obfs.clone() {
                     BuiltinObfs::Http { host } => {
                         let wrapped = HttpObfs::new(tcp, host, self.port);
@@ -259,21 +258,12 @@ impl SsCore {
                 );
                 Ok(Box::new(SsConn(stream)))
             }
-            PluginKind::None | PluginKind::External(_) => {
-                // Hand-roll the TCP connect so the installed
-                // `meow_common::SocketProtector` sees the fd before connect —
-                // otherwise the upstream `shadowsocks` crate would dial this
-                // stream internally via plain tokio and the Android
-                // `VpnService.protect(fd)` hook would never fire, so the
-                // outbound socket would loop back into our own VPN tunnel.
-                //
-                // For `PluginKind::External`, `tcp_external_addr` returns the
-                // SIP003 plugin's local listener (typically 127.0.0.1:<port>),
-                // so the connect is loopback and `protect()` is harmless;
-                // for `PluginKind::None` it's the remote SS server. Dispatch
-                // on the variant so domain-name servers also go through the
-                // installed `HostResolver` (system DNS would loop the
-                // lookup through the VPN on Android).
+            PluginKind::None => {
+                // Dial the remote SS server through the pluggable dialer
+                // (direct or via ``dialer-proxy``).  ``connect_tcp_host`` is
+                // resolver-aware and SocketProtector-aware (Android
+                // ``VpnService.protect(fd)``), and ``DirectDialer`` preserves
+                // both of those properties.
                 let tcp = match self.server_config.tcp_external_addr() {
                     ServerAddr::SocketAddr(sa) => {
                         self.dialer.dial(&sa.ip().to_string(), sa.port()).await
@@ -281,6 +271,26 @@ impl SsCore {
                     ServerAddr::DomainName(host, port) => self.dialer.dial(host, *port).await,
                 }
                 .map_err(|e| MeowError::Proxy(format!("ss tcp connect: {e}")))?;
+                let stream = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    tcp,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(stream)))
+            }
+            PluginKind::External(_) => {
+                // SIP003 plugin subprocess: ``tcp_external_addr`` returns the
+                // plugin's local listener (typically 127.0.0.1:<port>).
+                // Always dial directly — the plugin is a local process and
+                // must NOT be tunnelled through ``dialer-proxy``.
+                let tcp = match self.server_config.tcp_external_addr() {
+                    ServerAddr::SocketAddr(sa) => meow_common::connect_tcp(*sa).await,
+                    ServerAddr::DomainName(host, port) => {
+                        meow_common::connect_tcp_host(host, *port).await
+                    }
+                }
+                .map_err(|e| MeowError::Proxy(format!("ss plugin tcp connect: {e}")))?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     tcp,

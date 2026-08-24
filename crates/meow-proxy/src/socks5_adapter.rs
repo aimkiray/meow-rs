@@ -66,6 +66,7 @@ pub struct Socks5Adapter {
     health: ProxyHealth,
     dialer: Arc<dyn crate::dialer::TcpDialer>,
 }
+
 impl Socks5Adapter {
     /// Create a `Socks5Adapter`. UDP ASSOCIATE is disabled by default; call
     /// [`Self::with_udp`] to enable it (set from `udp: true` in config).
@@ -78,6 +79,8 @@ impl Socks5Adapter {
         skip_cert_verify: bool,
         dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Self {
+        // Hoisted out of the dial path: TlsLayer::new clones the webpki root
+        // store and builds verifier + crypto provider — per-adapter, not
         // per-connection (same pattern as TrojanAdapter::new).
         let tls_layer = tls.then(|| {
             use meow_transport::tls::{TlsConfig, TlsLayer};
@@ -102,6 +105,7 @@ impl Socks5Adapter {
         }
     }
 
+    /// Enable SOCKS5 UDP ASSOCIATE (HTTP/3 / QUIC relay). Off by default.
     #[must_use]
     pub fn with_udp(mut self, udp: bool) -> Self {
         self.udp = udp;

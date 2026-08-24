@@ -67,6 +67,7 @@ pub struct SnellAdapter {
     health: ProxyHealth,
     dialer: Arc<dyn crate::dialer::TcpDialer>,
 }
+
 impl SnellAdapter {
     #[allow(
         clippy::too_many_arguments,
@@ -130,8 +131,6 @@ impl SnellAdapter {
             dialer,
         })
     }
-
-
 
     /// Open a fresh underlying byte stream (TCP, optionally wrapped in obfs)
     /// and Snell-wrap it. No CONNECT header is sent yet.

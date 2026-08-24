@@ -175,8 +175,6 @@ pub async fn dial(
         .await
         .map_err(MeowError::Io)?;
 
-
-
     // 2) TLS (with ECH). Reuse the pre-built TlsLayer — avoids rebuilding
     //    the BoringSSL SSL_CTX and re-parsing ~150 root certs per connection.
     let tls_stream = tls_layer
