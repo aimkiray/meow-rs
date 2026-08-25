@@ -98,6 +98,19 @@ pub fn parse_proxy(
     config: &HashMap<String, serde_yaml::Value>,
     ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
+    let dialer: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
+    parse_proxy_with_dialer(config, &dialer)
+}
+
+/// Like [parse_proxy] but injects a custom [meow_proxy::dialer::TcpDialer]
+/// into every adapter. Used by apply_dialer_proxies to inject a
+/// [meow_proxy::dialer::ProxyDialer] so that dialer-proxy chaining works
+/// for all protocols without requiring connect_over.
+pub fn parse_proxy_with_dialer(
+    config: &HashMap<String, serde_yaml::Value>,
+    dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
     let name = config
         .get("name")
         .and_then(|v| v.as_str())
@@ -140,7 +153,7 @@ pub fn parse_proxy(
                 udp,
                 plugin,
                 plugin_opts_str.as_deref(),
-                std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
+                Arc::clone(dialer),
             )
             .map_err(|e| format!("ss: {e}"))?;
             #[cfg(feature = "mux")]
@@ -182,8 +195,16 @@ pub fn parse_proxy(
                 .unwrap_or(false);
 
             #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
-            let mut adapter =
-                TrojanAdapter::new(name, server, port, password, sni, skip_verify, udp, std::sync::Arc::new(meow_proxy::dialer::DirectDialer));
+            let mut adapter = TrojanAdapter::new(
+                name,
+                server,
+                port,
+                password,
+                sni,
+                skip_verify,
+                udp,
+                Arc::clone(dialer),
+            );
             #[cfg(feature = "mux")]
             if let Some(mux_options) = parse_mux_options(name, config)? {
                 // muxcool rides VLESS CommandMux; trojan has no equivalent
@@ -203,15 +224,15 @@ pub fn parse_proxy(
         }
         #[cfg(feature = "vless")]
         "vless" => {
-            let adapter = parse_vless(name, config)?;
+            let adapter = parse_vless(name, config, dialer)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         "http" => {
-            let adapter = parse_http(name, config)?;
+            let adapter = parse_http(name, config, dialer)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         "socks5" => {
-            let adapter = parse_socks5(name, config)?;
+            let adapter = parse_socks5(name, config, dialer)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         "direct" => {
@@ -230,12 +251,12 @@ pub fn parse_proxy(
         }
         #[cfg(feature = "vmess")]
         "vmess" => {
-            let adapter = parse_vmess(name, config)?;
+            let adapter = parse_vmess(name, config, dialer)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "snell")]
         "snell" => {
-            let adapter = parse_snell(name, config)?;
+            let adapter = parse_snell(name, config, dialer)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(not(feature = "ss"))]
@@ -309,6 +330,7 @@ fn feature_gated_proxy_type(proxy_type: &str) -> String {
 fn parse_snell(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
+    dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<meow_proxy::SnellAdapter, String> {
     use meow_proxy::{SnellAdapter, SnellObfs, SnellVersion};
 
@@ -390,8 +412,18 @@ fn parse_snell(
         SnellObfs::None
     };
 
-    SnellAdapter::new(name, server, port, psk, obfs, version, udp, reuse, std::sync::Arc::new(meow_proxy::dialer::DirectDialer))
-        .map_err(|e| format!("snell[{name}]: {e}"))
+    SnellAdapter::new(
+        name,
+        server,
+        port,
+        psk,
+        obfs,
+        version,
+        udp,
+        reuse,
+        Arc::clone(dialer),
+    )
+    .map_err(|e| format!("snell[{name}]: {e}"))
 }
 
 /// Parse a `type: http` proxy config block into an `HttpAdapter`.
@@ -408,6 +440,7 @@ fn parse_snell(
 fn parse_http(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
+    dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<HttpAdapter, String> {
     let server = config
         .get("server")
@@ -453,7 +486,7 @@ fn parse_http(
         tls,
         skip_cert_verify,
         extra_headers,
-        std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
+        Arc::clone(dialer),
     ))
 }
 
@@ -469,6 +502,7 @@ fn parse_http(
 fn parse_socks5(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
+    dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<Socks5Adapter, String> {
     let server = config
         .get("server")
@@ -502,7 +536,16 @@ fn parse_socks5(
         .and_then(serde_yaml::Value::as_bool)
         .unwrap_or(false);
 
-    Ok(Socks5Adapter::new(name, server, port, auth, tls, skip_cert_verify, std::sync::Arc::new(meow_proxy::dialer::DirectDialer)).with_udp(udp))
+    Ok(Socks5Adapter::new(
+        name,
+        server,
+        port,
+        auth,
+        tls,
+        skip_cert_verify,
+        Arc::clone(dialer),
+    )
+    .with_udp(udp))
 }
 
 /// Parse a `type: direct` proxy block into a [`DirectAdapter`].
@@ -1117,6 +1160,7 @@ fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, 
 fn parse_vless(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
+    dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<VlessAdapter, String> {
     let server = config
         .get("server")
@@ -1457,7 +1501,16 @@ fn parse_vless(
     }
 
     #[cfg_attr(not(feature = "vless-encryption"), allow(unused_mut))]
-    let mut adapter = VlessAdapter::new(name, server, port, uuid_bytes, flow, udp, chain, std::sync::Arc::new(meow_proxy::dialer::DirectDialer));
+    let mut adapter = VlessAdapter::new(
+        name,
+        server,
+        port,
+        uuid_bytes,
+        flow,
+        udp,
+        chain,
+        Arc::clone(dialer),
+    );
     #[cfg(feature = "vless-encryption")]
     adapter.set_encryption(vless_encryption);
 
@@ -1934,6 +1987,7 @@ fn serialize_plugin_opts(opts: &serde_yaml::Value) -> Option<String> {
 fn parse_vmess(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
+    dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<meow_proxy::VmessAdapter, String> {
     use meow_proxy::vmess::header::Security;
 
@@ -2085,7 +2139,7 @@ fn parse_vmess(
         security,
         udp,
         chain,
-        std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
+        Arc::clone(dialer),
     );
     #[cfg(feature = "mux")]
     if let Some(mux_options) = parse_mux_options(name, config)? {

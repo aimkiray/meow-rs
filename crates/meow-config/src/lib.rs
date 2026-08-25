@@ -504,14 +504,18 @@ pub fn rebuild_from_raw_with_cache_dir(
     rebuild_from_raw_impl(raw, cache_dir, resolver, &HashMap::new(), None, None, None)
 }
 
-/// Apply per-outbound `dialer-proxy` wrappers in place (issue #210).
+/// Apply per-outbound `dialer-proxy` in place (issue #210).
 ///
 /// For every proxy that declares `dialer-proxy: <name>`, its registry entry is
-/// replaced by a [`meow_proxy::DialerProxyAdapter`] that dials the inner
-/// outbound through `<name>`. Nested dialer-proxies are wrapped deepest-first so
-/// each layer sees its dialer's final (already-wrapped) form, and dialer-proxy
-/// cycles are detected and skipped with a warning (the outbound then dials
-/// directly).
+/// re-parsed from the raw config with a [`meow_proxy::dialer::ProxyDialer`]
+/// injected, so the adapter dials its server through `<name>` transparently
+/// (mihomo `proxyDialer` model). If re-parsing fails (e.g. incomplete test
+/// configs or unsupported protocol types), it falls back to wrapping the
+/// existing entry with a [`meow_proxy::DialerProxyAdapter`] (relay chain).
+///
+/// Nested dialer-proxies are resolved deepest-first so each layer sees its
+/// dialer's final (already-rebuilt) form, and dialer-proxy cycles are detected
+/// and skipped with a warning (the outbound then dials directly).
 ///
 /// Note: this rewrites the registry entry, so direct rule references
 /// (`…,<proxy>`) and dialers that are groups both work. A proxy that is also a
@@ -568,10 +572,29 @@ fn apply_dialer_proxies(
                 continue;
             };
             // The inner outbound may have failed to parse earlier; skip if so.
-            if let Some(inner) = proxies.get(&name).cloned() {
-                let wrapped: Arc<dyn Proxy> =
-                    Arc::new(meow_proxy::DialerProxyAdapter::new(inner, dialer_proxy));
-                proxies.insert(name.clone(), wrapped);
+            // Re-parse with ProxyDialer injected (mihomo model).
+            // Falls back to DialerProxyAdapter wrapper if re-parsing fails
+            // (e.g. incomplete test configs or unsupported protocol types).
+            let raw_proxy = raw_proxies
+                .iter()
+                .find(|rp| rp.get("name").and_then(|v| v.as_str()) == Some(&*name));
+            if let Some(raw) = raw_proxy {
+                let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> = Arc::new(
+                    meow_proxy::dialer::ProxyDialer::new(Arc::clone(&dialer_proxy)),
+                );
+                match proxy_parser::parse_proxy_with_dialer(raw, &proxy_dialer) {
+                    Ok(rebuilt) => {
+                        proxies.insert(name.clone(), rebuilt);
+                    }
+                    Err(_) => {
+                        // Fallback: wrap with DialerProxyAdapter (relay_tcp path).
+                        if let Some(inner) = proxies.get(&name).cloned() {
+                            let wrapped: Arc<dyn Proxy> =
+                                Arc::new(meow_proxy::DialerProxyAdapter::new(inner, dialer_proxy));
+                            proxies.insert(name.clone(), wrapped);
+                        }
+                    }
+                }
             }
             resolved.insert(name);
         }
@@ -1981,6 +2004,109 @@ mod dialer_proxy_tests {
         assert!(was_wrapped(&before, &proxies, "A"));
         assert!(was_wrapped(&before, &proxies, "B"));
         assert!(!was_wrapped(&before, &proxies, "C"));
+    }
+
+    /// Raw config for a `type: socks5` proxy with optional `dialer-proxy` and
+    /// `udp` fields — exercises the re-parse path (vs. the fallback
+    /// `DialerProxyAdapter` wrapper used by the bare `raw_proxy` helper).
+    fn raw_socks5_proxy(
+        name: &str,
+        dialer: Option<&str>,
+        udp: bool,
+    ) -> HashMap<String, serde_yaml::Value> {
+        let mut m = HashMap::new();
+        m.insert(
+            "name".to_string(),
+            serde_yaml::Value::String(name.to_string()),
+        );
+        m.insert(
+            "type".to_string(),
+            serde_yaml::Value::String("socks5".to_string()),
+        );
+        m.insert(
+            "server".to_string(),
+            serde_yaml::Value::String("127.0.0.1".to_string()),
+        );
+        m.insert(
+            "port".to_string(),
+            serde_yaml::Value::Number(serde_yaml::Number::from(1080)),
+        );
+        if udp {
+            m.insert("udp".to_string(), serde_yaml::Value::Bool(true));
+        }
+        if let Some(d) = dialer {
+            m.insert(
+                "dialer-proxy".to_string(),
+                serde_yaml::Value::String(d.to_string()),
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn re_parse_injects_proxy_dialer_for_real_protocol() {
+        // A socks5 proxy with `dialer-proxy: front` should be re-parsed with
+        // a ProxyDialer injected (the primary mihomo-model path), not wrapped
+        // with the DialerProxyAdapter fallback.
+        //
+        // Distinguishing the two paths: Socks5Adapter::support_udp() returns
+        // true for `udp: true`, while DialerProxyAdapter::support_udp() always
+        // returns false. If the re-parse path is taken, support_udp is true;
+        // if the fallback is taken, it is false.
+        let mut proxies = registry(&["A", "front"]);
+        // Parse a real socks5 adapter so the initial registry entry has the
+        // correct adapter type (the re-parse replaces it).
+        let parsed_a =
+            proxy_parser::parse_proxy(&raw_socks5_proxy("A", None, true)).expect("parse socks5");
+        proxies.insert(SmolStr::from("A"), parsed_a);
+        let before = proxies.clone();
+
+        apply_dialer_proxies(&mut proxies, &[raw_socks5_proxy("A", Some("front"), true)]);
+
+        assert!(was_wrapped(&before, &proxies, "A"), "A should be re-parsed");
+        assert!(
+            !was_wrapped(&before, &proxies, "front"),
+            "front is the dialer, not re-parsed"
+        );
+
+        let rebuilt = proxies.get("A").expect("present after");
+        assert_eq!(
+            rebuilt.adapter_type(),
+            meow_common::AdapterType::Socks5,
+            "rebuilt proxy should still be Socks5"
+        );
+        assert!(
+            rebuilt.support_udp(),
+            "re-parse path should preserve udp: true (ProxyDialer injected, \
+             not DialerProxyAdapter fallback which always returns false)"
+        );
+    }
+
+    #[test]
+    fn fallback_wraps_when_re_parse_fails() {
+        // A raw proxy with no `type` field cannot be re-parsed — the fallback
+        // DialerProxyAdapter wrapper should be used instead. We verify this
+        // by checking that support_udp is false (DialerProxyAdapter always
+        // returns false, even if the inner proxy supported UDP).
+        let mut proxies = registry(&["A", "front"]);
+        // Give "A" a real socks5 adapter so the fallback has something to wrap.
+        let parsed_a =
+            proxy_parser::parse_proxy(&raw_socks5_proxy("A", None, true)).expect("parse socks5");
+        proxies.insert(SmolStr::from("A"), parsed_a);
+        let before = proxies.clone();
+
+        // raw_proxy has no `type` → parse_proxy_with_dialer fails → fallback.
+        apply_dialer_proxies(&mut proxies, &[raw_proxy("A", Some("front"))]);
+
+        assert!(
+            was_wrapped(&before, &proxies, "A"),
+            "A should be wrapped via fallback"
+        );
+        let rebuilt = proxies.get("A").expect("present after");
+        assert!(
+            !rebuilt.support_udp(),
+            "DialerProxyAdapter fallback should disable UDP even if inner supports it"
+        );
     }
 }
 
