@@ -599,6 +599,14 @@ async fn anytls_auth_record_arrives_in_single_tls_record() {
     // server-side: did the whole auth come over in one TLS record? Run the
     // dial on a detached task so the test isn't held hostage to the
     // client's post-auth timeout.
+    //
+    // Invariant this test depends on: a *freshly constructed* adapter has
+    // an empty session pool, so the first `dial_tcp` opens a brand-new
+    // session — i.e. performs the TLS handshake and calls
+    // `send_authentication` (the very thing we're guarding). Reusing an
+    // adapter across tests, or any future pool change that served a cached
+    // session instead of dialing, would skip auth and silently
+    // false-pass. Keep the adapter test-local and one-shot.
     let adapter = AnytlsAdapter::new(
         "regress-single-tls-record",
         &server_addr.ip().to_string(),
