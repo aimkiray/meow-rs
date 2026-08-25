@@ -1393,3 +1393,142 @@ listeners:
         "error should name the bad type: {msg}"
     );
 }
+
+// ── shadowsocks listener config parsing ────────────────────────────────────
+
+use meow_config::{ObfsMode, SsListenerConfig};
+
+fn ss_listener_yaml(body: &str) -> String {
+    format!(
+        r#"mode: direct
+proxies:
+  - name: d
+    type: direct
+rules:
+  - MATCH,d
+listeners:
+  - name: ss-in
+    type: shadowsocks
+    listen: 127.0.0.1:18388
+{body}
+"#
+    )
+}
+
+#[tokio::test]
+async fn test_ss_listener_valid_defaults() {
+    // cipher + password required; udp defaults to true (upstream parity).
+    let yaml = ss_listener_yaml("    cipher: aes-256-gcm\n    password: secret\n");
+    let config = load_config_from_str(&yaml).await.unwrap();
+    let nl = &config.listeners.named[0];
+    let ListenerSpec::Shadowsocks(ss) = &nl.spec else {
+        panic!("expected Shadowsocks spec, got {:?}", nl.spec);
+    };
+    assert_eq!(ss.cipher, "aes-256-gcm");
+    assert_eq!(ss.password, "secret");
+    assert!(ss.udp, "udp should default to true");
+    assert!(ss.simple_obfs.is_none());
+}
+
+#[tokio::test]
+async fn test_ss_listener_ss_alias() {
+    // `type: ss` is the short alias for `shadowsocks`.
+    let yaml = ss_listener_yaml("    cipher: aes-256-gcm\n    password: secret\n")
+        .replace("shadowsocks", "ss");
+    let config = load_config_from_str(&yaml).await.unwrap();
+    assert!(matches!(
+        config.listeners.named[0].spec,
+        ListenerSpec::Shadowsocks(_)
+    ));
+}
+
+#[tokio::test]
+async fn test_ss_listener_missing_cipher_errors() {
+    let yaml = ss_listener_yaml("    password: secret\n");
+    let Err(err) = load_config_from_str(&yaml).await else {
+        panic!("missing cipher must hard-error");
+    };
+    assert!(
+        format!("{err:#}").contains("cipher"),
+        "msg should mention cipher"
+    );
+}
+
+#[tokio::test]
+async fn test_ss_listener_missing_password_errors() {
+    let yaml = ss_listener_yaml("    cipher: aes-256-gcm\n");
+    let Err(err) = load_config_from_str(&yaml).await else {
+        panic!("missing password must hard-error");
+    };
+    assert!(format!("{err:#}").contains("password"));
+}
+
+#[tokio::test]
+async fn test_ss_listener_invalid_obfs_mode_errors() {
+    let yaml = ss_listener_yaml(
+        "    cipher: aes-256-gcm\n    password: secret\n    simple-obfs:\n      enable: true\n      mode: quic\n",
+    );
+    let Err(err) = load_config_from_str(&yaml).await else {
+        panic!("invalid obfs mode must hard-error");
+    };
+    assert!(format!("{err:#}").contains("quic"));
+}
+
+#[tokio::test]
+async fn test_ss_listener_obfs_http_tls_parsed() {
+    for mode in ["http", "tls"] {
+        let yaml = ss_listener_yaml(&format!(
+            "    cipher: aes-256-gcm\n    password: secret\n    simple-obfs:\n      enable: true\n      mode: {mode}\n"
+        ));
+        let config = load_config_from_str(&yaml).await.unwrap();
+        let ListenerSpec::Shadowsocks(SsListenerConfig {
+            simple_obfs: Some(o),
+            ..
+        }) = &config.listeners.named[0].spec
+        else {
+            panic!("expected obfs");
+        };
+        let expected = if mode == "http" {
+            ObfsMode::Http
+        } else {
+            ObfsMode::Tls
+        };
+        assert_eq!(o.mode, expected, "mode {mode}");
+    }
+}
+
+#[tokio::test]
+async fn test_ss_listener_obfs_disabled_when_enable_false() {
+    let yaml = ss_listener_yaml(
+        "    cipher: aes-256-gcm\n    password: secret\n    simple-obfs:\n      enable: false\n      mode: http\n",
+    );
+    let config = load_config_from_str(&yaml).await.unwrap();
+    let ListenerSpec::Shadowsocks(ss) = &config.listeners.named[0].spec else {
+        panic!("expected ss");
+    };
+    assert!(ss.simple_obfs.is_none(), "enable:false must not set obfs");
+}
+
+#[tokio::test]
+async fn test_ss_listener_unsupported_suboption_warns_not_errors() {
+    // ADR-0002: unsupported upstream sub-options (shadow-tls, res-tls, …)
+    // must warn and be ignored, not hard-error, so mihomo configs still boot.
+    let yaml = ss_listener_yaml(
+        "    cipher: aes-256-gcm\n    password: secret\n    shadow-tls:\n      version: v3\n",
+    );
+    let config = load_config_from_str(&yaml).await.unwrap();
+    let ListenerSpec::Shadowsocks(ss) = &config.listeners.named[0].spec else {
+        panic!("expected ss");
+    };
+    assert_eq!(ss.cipher, "aes-256-gcm");
+}
+
+#[tokio::test]
+async fn test_ss_listener_udp_explicit_false() {
+    let yaml = ss_listener_yaml("    cipher: aes-256-gcm\n    password: secret\n    udp: false\n");
+    let config = load_config_from_str(&yaml).await.unwrap();
+    let ListenerSpec::Shadowsocks(ss) = &config.listeners.named[0].spec else {
+        panic!("expected ss");
+    };
+    assert!(!ss.udp);
+}

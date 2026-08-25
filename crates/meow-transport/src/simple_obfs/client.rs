@@ -197,6 +197,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for HttpObfs<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for HttpObfs<S> {
+    /// # `pending_input` invariant
+    ///
+    /// When a previous `poll_write` returned `Pending` (its framed bytes are
+    /// still draining), the next call finishes the drain and reports
+    /// `Ok(pending_input)` — the length of the *previous* buffer. This is
+    /// correct only when the caller retries with the same (unconsumed)
+    /// buffer, which is the `AsyncWriteExt::write_all` contract. Callers that
+    /// drop a pending `poll_write` and call again with a *different* buffer
+    /// would see the wrong consumed count. All in-tree callers use
+    /// `write_all`, so this is safe.
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -392,17 +402,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsObfs<S> {
                     if space == 0 {
                         return Poll::Ready(Ok(()));
                     }
-                    // Stage into a small temp slice, then memcpy into the
-                    // caller's buffer. Avoids juggling `ReadBuf::take` /
-                    // `assume_init` invariants.
-                    let mut tmp = vec![0u8; space];
-                    let mut rb = ReadBuf::new(&mut tmp);
-                    ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
-                    let added = rb.filled().len();
+                    // Read directly into the caller's buffer (zero heap
+                    // allocation). `initialize_unfilled` borrows `buf`
+                    // mutably; the borrow ends when the block scope closes,
+                    // so `buf.advance` below is free to borrow again.
+                    let added = {
+                        let unfilled = buf.initialize_unfilled();
+                        let mut rb = ReadBuf::new(&mut unfilled[..space]);
+                        ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+                        rb.filled().len()
+                    };
                     if added == 0 {
                         return Poll::Ready(Ok(())); // EOF mid-frame
                     }
-                    buf.put_slice(&tmp[..added]);
+                    buf.advance(added);
                     this.read_phase = TlsReadPhase::Payload(remaining - added);
                     return Poll::Ready(Ok(()));
                 }
@@ -412,6 +425,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsObfs<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsObfs<S> {
+    /// Same `pending_input` invariant as `HttpObfs::poll_write` — see that
+    /// method's doc comment.
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

@@ -278,6 +278,32 @@ pub struct RawListener {
     /// Per-listener override of the global `max-connections` cap. `0`
     /// disables the cap for this listener.
     pub max_connections: Option<usize>,
+
+    // ── shadowsocks-listener fields (only meaningful when `type: shadowsocks`) ──
+    pub cipher: Option<String>,
+    pub password: Option<String>,
+    #[serde(default)]
+    pub udp: Option<bool>,
+    pub simple_obfs: Option<RawSimpleObfs>,
+
+    // ── upstream sub-options not yet supported by meow-rs ──
+    // Captured as opaque `Value`s so their mere presence can be warned about
+    // (ADR-0002: never silently ignore a mihomo flag) without modelling the
+    // full schema. `None` when absent.
+    pub shadow_tls: Option<serde_yaml::Value>,
+    pub res_tls: Option<serde_yaml::Value>,
+    pub jls_config: Option<serde_yaml::Value>,
+    pub kcp_tun: Option<serde_yaml::Value>,
+    pub mux_option: Option<serde_yaml::Value>,
+}
+
+/// Raw `simple-obfs:` block for a shadowsocks listener.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct RawSimpleObfs {
+    #[serde(default)]
+    pub enable: bool,
+    pub mode: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

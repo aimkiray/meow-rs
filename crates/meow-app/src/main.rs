@@ -15,6 +15,8 @@ use meow_config::proxy_provider::ProxyProvider;
 use meow_dns::DnsServer;
 #[cfg(feature = "listener-mixed")]
 use meow_listener::MixedListener;
+#[cfg(feature = "listener-shadowsocks")]
+use meow_listener::ShadowsocksListener;
 use meow_listener::SnifferRuntime;
 #[cfg(feature = "listener-tproxy")]
 use meow_listener::TProxyListener;
@@ -987,6 +989,55 @@ async fn run(
                     let _ = sni;
                     tracing::warn!(
                         "listener '{}': TProxy requires feature 'listener-tproxy'",
+                        nl.name
+                    );
+                }
+            }
+            ListenerSpec::Shadowsocks(cfg) => {
+                #[cfg(feature = "listener-shadowsocks")]
+                {
+                    use meow_config::ObfsMode as CfgObfsMode;
+                    use meow_listener::SsObfsMode;
+
+                    let socket = match tokio::net::TcpListener::bind(addr).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("listener '{}': bind {} failed: {}", nl.name, addr, e);
+                            continue;
+                        }
+                    };
+                    let bound = socket.local_addr().unwrap_or(addr);
+                    nl.port = bound.port();
+                    let obfs = cfg.simple_obfs.as_ref().map(|o| match o.mode {
+                        CfgObfsMode::Http => SsObfsMode::Http,
+                        CfgObfsMode::Tls => SsObfsMode::Tls,
+                    });
+                    let listener = match ShadowsocksListener::new(
+                        tunnel.clone(),
+                        bound,
+                        nl.name.clone(),
+                        &cfg.cipher,
+                        &cfg.password,
+                        cfg.udp,
+                        obfs,
+                    ) {
+                        Ok(l) => l.with_max_connections(nl.max_connections),
+                        Err(e) => {
+                            error!("listener '{}': invalid shadowsocks config: {}", nl.name, e);
+                            continue;
+                        }
+                    };
+                    tokio::spawn(async move {
+                        if let Err(e) = listener.run_on(socket).await {
+                            error!("Shadowsocks listener error: {}", e);
+                        }
+                    });
+                }
+                #[cfg(not(feature = "listener-shadowsocks"))]
+                {
+                    let _ = cfg;
+                    tracing::warn!(
+                        "listener '{}': shadowsocks requires feature 'listener-shadowsocks'",
                         nl.name
                     );
                 }

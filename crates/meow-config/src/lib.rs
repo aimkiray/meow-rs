@@ -125,10 +125,6 @@ pub struct DnsConfig {
 /// makes "a `TProxy` listener always has a `sni` flag" a compile-time invariant
 /// instead of a runtime `Option::expect`, and keeps `NamedListener` from
 /// accumulating one `Option<ProtoConfig>` per future listener type.
-///
-/// Only the four pre-existing inbound kinds are modelled here; the
-/// `shadowsocks` encrypted-server inbound (and others) will join this enum as
-/// data-carrying variants when implemented.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ListenerSpec {
@@ -140,6 +136,49 @@ pub enum ListenerSpec {
     TProxy {
         sni: bool,
     },
+    /// Shadowsocks encrypted-server inbound. The listener terminates SS
+    /// encryption (TCP stream cipher / AEAD, UDP relay), reads the SOCKS
+    /// target address, and hands the decrypted flow to the tunnel. Mirrors
+    /// upstream mihomo's `type: shadowsocks` listener.
+    Shadowsocks(SsListenerConfig),
+}
+
+/// Per-listener config for the `shadowsocks` inbound (`ListenerSpec::Shadowsocks`).
+///
+/// `cipher` and `password` are required and validated at config-build time.
+/// `udp` defaults to `true` (matching upstream `ShadowSocksOption{UDP: true}`).
+/// `simple_obfs` enables the SIP004 HTTP/TLS obfuscation wrapper; the server
+/// codec lives in `meow_transport::simple_obfs::server`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SsListenerConfig {
+    pub cipher: String,
+    pub password: String,
+    #[serde(default = "default_ss_udp")]
+    pub udp: bool,
+    pub simple_obfs: Option<SimpleObfsConfig>,
+}
+
+fn default_ss_udp() -> bool {
+    true
+}
+
+/// `simple-obfs` sub-config for a shadowsocks listener.
+///
+/// Only `mode` is needed on the server side: the HTTP/TLS obfuscation codec
+/// strips fake framing without reference to a host name (the client-supplied
+/// fake `Host`/SNI is discarded). The outbound adapter keeps its own
+/// host-bearing obfs config in `meow-proxy`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleObfsConfig {
+    pub mode: ObfsMode,
+}
+
+/// Obfuscation mode for `simple-obfs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ObfsMode {
+    Http,
+    Tls,
 }
 
 impl ListenerSpec {
@@ -151,6 +190,7 @@ impl ListenerSpec {
             Self::Http => "http",
             Self::Socks5 => "socks5",
             Self::TProxy { .. } => "tproxy",
+            Self::Shadowsocks(_) => "shadowsocks",
         }
     }
 }
@@ -1607,7 +1647,8 @@ pub(crate) fn resolve_listener_bind(
 /// `per_listener_sni` / `global_tproxy_sni` are folded into the `TProxy`
 /// variant here so the returned spec is always complete — callers never
 /// need to overwrite a placeholder `sni` value. Both parameters are ignored
-/// for non-TProxy types.
+/// for non-TProxy types. `Shadowsocks` returns a placeholder spec;
+/// `build_named_listeners` completes it via `build_ss_listener_spec`.
 fn parse_listener_spec(
     s: &str,
     per_listener_sni: Option<bool>,
@@ -1620,10 +1661,79 @@ fn parse_listener_spec(
         "tproxy" => Ok(ListenerSpec::TProxy {
             sni: per_listener_sni.unwrap_or(global_tproxy_sni),
         }),
+        "shadowsocks" | "ss" => Ok(ListenerSpec::Shadowsocks(SsListenerConfig {
+            cipher: String::new(),
+            password: String::new(),
+            udp: true,
+            simple_obfs: None,
+        })),
         other => anyhow::bail!(
-            "unknown listener type '{other}'; expected mixed, http, socks5, or tproxy"
+            "unknown listener type '{other}'; expected mixed, http, socks5, tproxy, or shadowsocks"
         ),
     }
+}
+
+/// Build a validated `SsListenerConfig` from a raw `listeners:` entry.
+///
+/// `cipher` and `password` are required (Class A). `udp` defaults to `true`
+/// (upstream `ShadowSocksOption{UDP: true}`). Unsupported upstream sub-options
+/// (`shadow-tls` / `res-tls` / `jls-config` / `kcp-tun` / `mux-option`) are
+/// warned about and ignored — never silently, matching the `tun` field policy
+/// (ADR-0002) — rather than hard-erroring, so mihomo configs that carry them
+/// still boot.
+fn build_ss_listener_spec(raw_l: &raw::RawListener) -> Result<SsListenerConfig, anyhow::Error> {
+    for (name, val) in [
+        ("shadow-tls", &raw_l.shadow_tls),
+        ("res-tls", &raw_l.res_tls),
+        ("jls-config", &raw_l.jls_config),
+        ("kcp-tun", &raw_l.kcp_tun),
+        ("mux-option", &raw_l.mux_option),
+    ] {
+        if val.is_some() {
+            warn!(
+                "listeners[{}].{name}: not supported in meow-rs shadowsocks listener, ignored; \
+                 remove it to suppress this warning",
+                raw_l.name
+            );
+        }
+    }
+
+    let cipher = raw_l.cipher.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "listeners[{}]: shadowsocks listener requires 'cipher'",
+            raw_l.name
+        )
+    })?;
+    let password = raw_l.password.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "listeners[{}]: shadowsocks listener requires 'password'",
+            raw_l.name
+        )
+    })?;
+
+    let simple_obfs = match raw_l.simple_obfs.as_ref() {
+        Some(o) if o.enable => {
+            let mode = o.mode.as_deref().unwrap_or("");
+            Some(SimpleObfsConfig {
+                mode: match mode {
+                    "http" => ObfsMode::Http,
+                    "tls" => ObfsMode::Tls,
+                    other => anyhow::bail!(
+                        "listeners[{}]: simple-obfs mode '{other}' invalid; expected http or tls",
+                        raw_l.name
+                    ),
+                },
+            })
+        }
+        _ => None,
+    };
+
+    Ok(SsListenerConfig {
+        cipher,
+        password,
+        udp: raw_l.udp.unwrap_or(true),
+        simple_obfs,
+    })
 }
 
 /// Build the authoritative list of named listeners from the raw config.
@@ -1725,6 +1835,15 @@ fn build_named_listeners(
             }
         });
         let (listen, port) = resolve_listener_bind(listen_raw, raw_l.port)?;
+        // `parse_listener_spec` returns a placeholder for `Shadowsocks`; fold
+        // the real cipher/password/udp/simple-obfs fields in here. TProxy's
+        // `sni` is already resolved inside `parse_listener_spec`.
+        let spec = match spec {
+            ListenerSpec::Shadowsocks(_) => {
+                ListenerSpec::Shadowsocks(build_ss_listener_spec(raw_l)?)
+            }
+            other => other,
+        };
         let max_connections = raw_l.max_connections.unwrap_or(global_max_conns);
         add(&raw_l.name, spec, port, &listen, max_connections)?;
     }

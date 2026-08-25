@@ -25,6 +25,15 @@ listener-tun = [
     "dep:meow-dns",
     "dep:ipnet",
 ]
+# Shadowsocks encrypted-server inbound. Reuses the `shadowsocks` crate's
+# server-side ProxyListener/ProxySocket (the same crate already used by the
+# outbound `ss` adapter) and the shared simple-obfs codec from meow-transport.
+# Off by default (server scenario); bundled into the app `full` profile.
+listener-shadowsocks = [
+    "dep:shadowsocks",
+    "dep:meow-transport",
+    "meow-transport/simple-obfs",
+]
 
 [dependencies]
 meow-common = { workspace = true }
@@ -41,12 +50,20 @@ futures = { workspace = true, optional = true }
 route_manager = { workspace = true, optional = true }
 meow-dns = { workspace = true, optional = true }
 ipnet = { workspace = true, optional = true }
+# listener-shadowsocks
+shadowsocks = { workspace = true, optional = true }
+meow-transport = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 meow-dns = { workspace = true }
 meow-trie = { workspace = true }
 ipnet = { workspace = true }
+shadowsocks = { workspace = true }
+
+[[test]]
+name = "ss_listener_integration"
+required-features = ["listener-shadowsocks"]
 
 [lints]
 workspace = true

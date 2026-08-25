@@ -105,13 +105,23 @@ pub async fn handle_tcp(tunnel: &TunnelInner, mut conn: Box<dyn ProxyConn>, meta
 /// `TunnelInner` type, so the function is not intended for external consumers —
 /// hence `#[doc(hidden)]`, which keeps it out of the public rustdoc surface
 /// without restricting the workspace-internal call path (review low item).
+///
+/// The bound is the relay's actual needs (`AsyncRead + AsyncWrite + Unpin +
+/// Send`) rather than `ProxyConn`: `ProxyConn` is defined in `meow-common`
+/// and cannot be implemented for a foreign type like the `shadowsocks` crate's
+/// `ProxyServerStream` from outside `meow-common` (orphan rule). `Sync` is not
+/// required — the connection lives in a single spawned task. `handle_tcp`
+/// still passes its `Box<dyn ProxyConn>`, which satisfies this bound via
+/// tokio's `Box<?Sized + AsyncRead + Unpin>` impls.
 #[doc(hidden)]
-pub async fn route_inbound_tcp<C: ProxyConn>(
+pub async fn route_inbound_tcp<C>(
     inner: &TunnelInner,
     conn: &mut C,
     mut metadata: Metadata,
     prefix: &[u8],
-) {
+) where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     // Fake-IP → host rewrite (no-op outside fake-IP mode aside from a
     // snooping-cache hostname fill-in).
     inner.pre_handle_metadata(&mut metadata);

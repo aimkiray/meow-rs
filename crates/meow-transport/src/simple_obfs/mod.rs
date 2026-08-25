@@ -10,7 +10,7 @@
 //!   adapters in `meow-proxy` when the YAML config sets `plugin: obfs`.
 //! * `server` — inbound (proxy-server) wrappers, the counterpart that strips
 //!   the fake HTTP request / fake TLS ClientHello. Used by the shadowsocks
-//!   *listener* (added in a follow-up PR).
+//!   *listener*.
 //!
 //! Both halves share the same fake-TLS record and ClientHello framing, so a
 //! single round-trip test (`client` writes → `server` reads) guards the pair
@@ -18,3 +18,4 @@
 //! duplicated in `meow-proxy` and `meow-listener`.
 
 pub mod client;
+pub mod server;

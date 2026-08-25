@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use meow_common::{ConnType, Metadata, Network, ProxyAdapter, ProxyPacketConn};
 use meow_tunnel::Tunnel;
@@ -28,6 +28,8 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::debug;
+
+use crate::monotonic_ms;
 
 const SOCKS5_VERSION: u8 = 0x05;
 const REP_SUCCESS: u8 = 0x00;
@@ -43,11 +45,6 @@ struct Session {
     last_activity_ms: Arc<AtomicU>,
     /// Reply task (server→client); aborted when the session is dropped.
     reply_task: tokio::task::AbortHandle,
-}
-
-fn monotonic_ms() -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 impl Drop for Session {
