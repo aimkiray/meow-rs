@@ -771,12 +771,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_client_times_out_on_unroutable() {
-        // 192.0.2.1/24 is TEST-NET-1, guaranteed not to respond.
-        let client = DnsClient::udp("192.0.2.1:53".parse().unwrap())
-            .with_timeout(Duration::from_millis(200));
+    async fn udp_client_times_out_when_no_response() {
+        // A silent loopback peer makes the timeout path deterministic
+        // regardless of the host network. Using a "guaranteed unroutable"
+        // address like 192.0.2.1 is non-hermetic: many ISPs/routers hijack
+        // outbound UDP/53 and answer with a spoofed source (Ok/NXDOMAIN) or
+        // return ICMP unreachable (an Io error), so the client never reaches
+        // Timeout.
+        //
+        // The sink is never read and never writes a reply. It only has to stay
+        // bound for the duration of the query: a closed port would yield
+        // ECONNREFUSED on the client's connected socket instead of a timeout.
+        // The client sends a single datagram, so the kernel recv buffer never
+        // fills and no drain task is needed.
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sink.local_addr().unwrap();
+        let client = DnsClient::udp(addr).with_timeout(Duration::from_millis(200));
         let r = client.query("example.test", RecordType::A).await;
         assert!(matches!(r, Err(ClientError::Timeout(_))));
+        drop(sink);
     }
 
     #[tokio::test]
