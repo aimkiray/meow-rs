@@ -424,11 +424,12 @@ impl DnsClient {
 
     /// Unified entry point for the resolver pipeline (review issue J). For a
     /// single family (`IPV4`/`IPV6`) this is a per-family query that preserves
-    /// the NXDOMAIN/NODATA distinction the DNS server needs; for `BOTH` it is
-    /// the prefer-IPv4 A-then-AAAA path that returns every enabled address for
-    /// `resolve_ips`. `Err` means the client could not produce *any* answer for
-    /// the requested set (e.g. both families timed out); the resolver keeps
-    /// racing the remaining clients.
+    /// the NXDOMAIN/NODATA distinction the DNS server needs; for `BOTH` it
+    /// queries A and AAAA concurrently and returns every enabled address
+    /// (IPv4 first) for `resolve_ips`, so `DirectAdapter` retains IPv6
+    /// fallback when IPv4 connectivity fails. `Err` means the client could
+    /// not produce *any* answer for the requested set (e.g. both families
+    /// timed out); the resolver keeps racing the remaining clients.
     pub(crate) async fn lookup_set(
         &self,
         name: &str,
@@ -478,65 +479,71 @@ impl DnsClient {
         name: &str,
         ipv6_enabled: bool,
     ) -> Result<IpLookupResult, ClientError> {
-        // Prefer IPv4: query A first and fall back to AAAA only when A has no
-        // address. Keep the per-family answer here because the aggregate IP
-        // list alone cannot distinguish NODATA from NXDOMAIN when it is later
+        // Query A and AAAA in parallel when IPv6 is enabled so callers
+        // (notably `resolve_ips` → `DirectAdapter::dial_tcp`) receive *both*
+        // address families and can fall back to IPv6 when IPv4 connectivity
+        // fails. IPv4 addresses are placed first in the result list to
+        // preserve prefer-IPv4 ordering — `dial_tcp` iterates in list order,
+        // so IPv4 is tried before IPv6.
+        //
+        // Per-family answers are retained because the aggregate IP list
+        // alone cannot distinguish NODATA from NXDOMAIN when it is later
         // written to the shared cache.
+        if !ipv6_enabled {
+            // IPv4-only path: a single A query, no AAAA.
+            let answer = match self.query_inner(name, RecordType::A).await {
+                Ok(message) => classify_family_message(&message),
+                Err(error) => return Err(error),
+            };
+            let (ips, ttl) = match &answer {
+                FamilyAnswer::Answer { ips, ttl } => (ips.clone(), *ttl),
+                FamilyAnswer::NoData(ttl) | FamilyAnswer::NxDomain(ttl) => (Vec::new(), *ttl),
+                FamilyAnswer::Failed => {
+                    return Err(ClientError::Protocol("no response"));
+                }
+            };
+            return Ok(IpLookupResult {
+                ips,
+                ttl,
+                v4: Some(answer),
+                v6: None,
+            });
+        }
+
+        // Dual-stack path: race A and AAAA concurrently.
+        let (v4_result, v6_result) = tokio::join!(
+            self.query_inner(name, RecordType::A),
+            self.query_inner(name, RecordType::AAAA)
+        );
+
+        let v4 = v4_result.ok().map(|msg| classify_family_message(&msg));
+        let v6 = v6_result.ok().map(|msg| classify_family_message(&msg));
+
+        // NXDOMAIN from A means the name does not exist at all — propagate
+        // to both families (mirrors the old sequential behaviour).
+        if let Some(FamilyAnswer::NxDomain(ttl)) = &v4 {
+            return Ok(IpLookupResult {
+                ips: Vec::new(),
+                ttl: *ttl,
+                v4: v4.clone(),
+                v6: Some(FamilyAnswer::NxDomain(*ttl)),
+            });
+        }
+
+        // Collect addresses with IPv4 first (prefer-IPv4 ordering).
         let mut addrs = Vec::new();
         let mut min_ttl: Option<Duration> = None;
-        let mut first_err: Option<ClientError> = None;
-        let mut v4 = None;
-        let mut v6 = None;
-
-        let got_v4 = match self.query_inner(name, RecordType::A).await {
-            Ok(message) => {
-                let answer = classify_family_message(&message);
-                let got_address =
-                    matches!(&answer, FamilyAnswer::Answer { ips, .. } if !ips.is_empty());
-                if let FamilyAnswer::Answer { ips, ttl } = &answer {
-                    addrs.extend_from_slice(ips);
-                    min_ttl = Some(min_ttl.map_or(*ttl, |current| current.min(*ttl)));
-                }
-                v4 = Some(answer.clone());
-                if let FamilyAnswer::NxDomain(ttl) = answer {
-                    if ipv6_enabled {
-                        v6 = Some(FamilyAnswer::NxDomain(ttl));
-                    }
-                    return Ok(IpLookupResult {
-                        ips: addrs,
-                        ttl,
-                        v4,
-                        v6,
-                    });
-                }
-                got_address
-            }
-            Err(error) => {
-                first_err = Some(error);
-                false
-            }
-        };
-
-        if !got_v4 && ipv6_enabled {
-            match self.query_inner(name, RecordType::AAAA).await {
-                Ok(message) => {
-                    let answer = classify_family_message(&message);
-                    if let FamilyAnswer::Answer { ips, ttl } = &answer {
-                        addrs.extend_from_slice(ips);
-                        min_ttl = Some(min_ttl.map_or(*ttl, |current| current.min(*ttl)));
-                    }
-                    v6 = Some(answer);
-                }
-                Err(error) => {
-                    if first_err.is_none() {
-                        first_err = Some(error);
-                    }
-                }
-            }
+        if let Some(FamilyAnswer::Answer { ips, ttl }) = &v4 {
+            addrs.extend_from_slice(ips);
+            min_ttl = Some(*ttl);
+        }
+        if let Some(FamilyAnswer::Answer { ips, ttl }) = &v6 {
+            addrs.extend_from_slice(ips);
+            min_ttl = Some(min_ttl.map_or(*ttl, |current| current.min(*ttl)));
         }
 
         if v4.is_none() && v6.is_none() {
-            return Err(first_err.unwrap_or(ClientError::Protocol("no response")));
+            return Err(ClientError::Protocol("no response"));
         }
         Ok(IpLookupResult {
             ips: addrs,
@@ -890,6 +897,44 @@ async fn dot_exchange(
     read_lp(&mut stream).await
 }
 
+/// Maximum DoH response size (HTTP/1.1 headers + DNS body), in bytes.
+///
+/// DNS wire messages are inherently capped at 65535 bytes — the 2-octet
+/// length prefix used by DNS-over-TCP and DNS-over-TLS (`read_lp`) enforces
+/// it structurally. DoH, however, frames the DNS message inside an HTTP
+/// response and this client reads the whole response with `Connection:
+/// close` (no `Transfer-Encoding` parsing). An unbounded `read_to_end` there
+/// let a misbehaving or hostile upstream stream an arbitrarily large body and
+/// drive unbounded heap growth (low-risk review item). Cap the total response
+/// at the DNS message maximum plus generous room for HTTP/1.1 headers; a
+/// well-formed DoH answer always fits while an oversized response is rejected.
+#[cfg(feature = "encrypted")]
+const MAX_DOH_RESPONSE_BYTES: usize = 65535 + 16 * 1024;
+
+/// Read an HTTP/1.1 response to EOF (the server uses `Connection: close`),
+/// rejecting responses whose total size exceeds [`MAX_DOH_RESPONSE_BYTES`].
+/// Extracted from [`doh_exchange`] so the bounded-read behaviour is unit
+/// testable without standing up a TLS DoH server.
+#[cfg(feature = "encrypted")]
+async fn read_bounded_http_response<R>(stream: &mut R) -> Result<Vec<u8>, ClientError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
+    let mut all = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        all.extend_from_slice(&chunk[..n]);
+        if all.len() > MAX_DOH_RESPONSE_BYTES {
+            return Err(ClientError::Protocol("doh: response exceeds maximum size"));
+        }
+    }
+    Ok(all)
+}
+
 #[cfg(feature = "encrypted")]
 async fn doh_exchange(
     addr: SocketAddr,
@@ -925,8 +970,11 @@ async fn doh_exchange(
     stream.write_all(wire).await?;
     stream.flush().await?;
 
-    let mut all = Vec::with_capacity(1024);
-    stream.read_to_end(&mut all).await?;
+    // Read the full HTTP/1.1 response with a bounded buffer. `Connection:
+    // close` means the server EOFs after the body, so reading to EOF is
+    // correct — but we cap the total to `MAX_DOH_RESPONSE_BYTES` so a
+    // misbehaving upstream cannot stream an unbounded body into memory.
+    let all = read_bounded_http_response(&mut stream).await?;
     let split = find_subseq(&all, b"\r\n\r\n")
         .ok_or(ClientError::Protocol("doh: missing header terminator"))?;
     let head_bytes = &all[..split];
@@ -1029,6 +1077,29 @@ mod tests {
         assert_eq!(find_subseq(b"abc\r\n\r\nbody", b"\r\n\r\n"), Some(3));
         assert_eq!(find_subseq(b"abcdef", b"\r\n\r\n"), None);
         assert_eq!(find_subseq(b"", b"x"), None);
+    }
+
+    /// A DoH response at exactly the cap is accepted; one byte over the cap
+    /// is rejected with a protocol error. Guards the low-risk review fix
+    /// that bounds the previously unbounded `read_to_end`.
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_bounded_read_enforces_response_size_cap() {
+        let at_cap = vec![0u8; MAX_DOH_RESPONSE_BYTES];
+        let mut reader = at_cap.as_slice();
+        let got = read_bounded_http_response(&mut reader).await.unwrap();
+        assert_eq!(got.len(), MAX_DOH_RESPONSE_BYTES);
+
+        let over_cap = vec![0u8; MAX_DOH_RESPONSE_BYTES + 1];
+        let mut reader = over_cap.as_slice();
+        let err = read_bounded_http_response(&mut reader).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClientError::Protocol("doh: response exceeds maximum size")
+            ),
+            "expected oversized-rejection, got {err:?}"
+        );
     }
 
     #[tokio::test]

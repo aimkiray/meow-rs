@@ -21,7 +21,7 @@ Use it as a pre-flight check.
 | `allow-lan` | bool | `false` | Accept connections from non-loopback addresses |
 | `mode` | string | `rule` | Tunnel mode: `rule`, `global`, or `direct` |
 | `log-level` | string | `info` | `trace` · `debug` · `info` · `warn` · `error` · `off` |
-| `ipv6` | bool | `false` | Enable IPv6 support |
+| `ipv6` | bool | `true` | Enable IPv6 support |
 | `external-controller` | string | — | REST API listen address, e.g. `127.0.0.1:9090` |
 | `secret` | string | — | API bearer-token secret (empty = no auth) |
 | `external-ui` | string | — | Directory of static dashboard files served at `/ui` |

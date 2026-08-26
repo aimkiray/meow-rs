@@ -397,11 +397,22 @@ impl FamilySet {
     }
 }
 
+/// Grace period after receiving the first definitive negative from one
+/// upstream in a tier before committing to it. A slower upstream may still
+/// deliver a positive answer (split-horizon DNS, mixed upstream quality), so
+/// we race the remaining futures briefly rather than cancelling them
+/// immediately. The period is short enough that a truly dead upstream (5 s
+/// client timeout) does not stall the lookup — the definitive-negative test
+/// still completes well under 1 s.
+const NEGATIVE_GRACE_PERIOD: Duration = Duration::from_millis(300);
+
 /// Query a pool of clients in parallel for the requested family set `want`,
-/// returning the first positive resolution or the first definitive negative
-/// (review issue C: a fast NODATA/NXDOMAIN from a healthy upstream no longer
-/// waits out a dead upstream's full 5 s timeout). `Err` (network failure) is
-/// not definitive — keep racing the remaining clients.
+/// returning the first positive resolution or, after a short grace period, the
+/// first definitive negative (review issue C: a fast NODATA/NXDOMAIN from a
+/// healthy upstream no longer waits out a dead upstream's full 5 s timeout).
+/// `Err` (network failure) is not definitive — keep racing the remaining
+/// clients. The grace period prevents a fast negative from suppressing a slow
+/// positive in split-horizon / multi-upstream configurations.
 async fn query_pool_set(
     clients: &[Arc<DnsClient>],
     host: &str,
@@ -416,19 +427,44 @@ async fn query_pool_set(
         pending.push(async move { client.lookup_set(host, want, ipv6_enabled).await });
     }
     let mut negative: Option<FamilySet> = None;
-    while let Some(result) = pending.next().await {
+    let mut negative_deadline: Option<tokio::time::Instant> = None;
+    loop {
+        // Once we have a definitive negative, wait for the remaining futures
+        // with a bounded grace period instead of blocking indefinitely on a
+        // dead upstream.
+        let next = if let Some(deadline) = negative_deadline {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return negative;
+            }
+            match tokio::time::timeout_at(deadline, pending.next()).await {
+                Ok(result) => result,
+                Err(_) => return negative, // grace period elapsed
+            }
+        } else {
+            pending.next().await
+        };
+        let Some(result) = next else {
+            break;
+        };
         let set = match result {
             Ok(set) => set.clamped(),
             Err(_) => continue,
         };
-        if set.has_positive() || set.is_definitive_negative(want) {
-            // First positive OR first definitive negative wins; the remaining
-            // futures are dropped (cancelled) on return.
+        if set.has_positive() {
+            // A positive answer always wins, regardless of grace state.
             return Some(set);
         }
-        // Partial failure (some family Failed, none positive): remember the
-        // first as a last-resort answer but keep racing for a complete one.
-        if negative.is_none() {
+        if set.is_definitive_negative(want) && negative.is_none() {
+            negative = Some(set);
+            // Don't return yet: a slower upstream in this tier may still
+            // deliver a positive answer. Start the grace timer so we don't
+            // stall on a dead upstream (review issue C + P2 fix).
+            negative_deadline = Some(tokio::time::Instant::now() + NEGATIVE_GRACE_PERIOD);
+        } else if negative.is_none() {
+            // Partial failure (some family Failed, none positive): remember
+            // the first as a last-resort answer but keep racing for a
+            // complete one.
             negative = Some(set);
         }
     }
@@ -912,11 +948,14 @@ impl Resolver {
         // Only query the families the cache cannot already answer. Fresh
         // families (Answer or NoData) are dropped from the query set so a
         // short-TTL AAAA re-query doesn't redundantly re-fetch a still-fresh A.
+        //
+        // We must NOT short-circuit when *some* enabled IPs are cached but a
+        // required family is still `Miss` — doing so would starve
+        // `DirectAdapter` of the missing family's addresses and remove its
+        // connection-fallback capability (e.g. A cached, AAAA not yet queried
+        // → only IPv4 returned → IPv6 fallback lost).
         let mut want = required;
         if let Some(cached) = self.cache.get_lookup(lookup_host) {
-            if let Some(enabled) = self.filter_enabled_ips(&cached.ips) {
-                return Some(enabled);
-            }
             if cached.v4.is_fresh() && required.contains(QueryFamilies::IPV4) {
                 want = want.minus(QueryFamilies::IPV4);
             }
@@ -1118,7 +1157,27 @@ impl Resolver {
             }
         }
 
-        let Some(set) = self.run_pipeline(host, family).await else {
+        let result = self.run_pipeline(host, family).await;
+        // `run_pipeline` returns `None` either when no upstream produced an
+        // answer, or when the single-flight broadcast was missed (the publisher
+        // sent and closed before this subscriber subscribed). In the latter
+        // case the publisher has already merged the result into the cache —
+        // re-read it here so a missed broadcast doesn't surface as a transient
+        // `Failed` (which would make the DNS server return SERVFAIL).
+        let Some(set) = result else {
+            if let Some(cached) = self.cache.get_lookup(host) {
+                let hit = if family == QueryFamilies::IPV4 {
+                    &cached.v4
+                } else {
+                    &cached.v6
+                };
+                return match hit {
+                    FamilyCacheHit::Answer(ips, ttl) => AddressLookupResult::Answer(ips[0], *ttl),
+                    FamilyCacheHit::NoData => AddressLookupResult::NoData,
+                    FamilyCacheHit::NxDomain => AddressLookupResult::NxDomain,
+                    FamilyCacheHit::Miss => AddressLookupResult::Failed,
+                };
+            }
             return AddressLookupResult::Failed;
         };
         let answer = if family == QueryFamilies::IPV4 {
@@ -1180,8 +1239,8 @@ impl Resolver {
     /// now share domain-gate → policy → main → fallback, single-flight, and
     /// symmetric negative bookkeeping.
     ///
-    /// `want` selects which families to fetch: `BOTH` uses the prefer-IPv4
-    /// A-then-AAAA client path (for `resolve_ips`); a single family uses the
+    /// `want` selects which families to fetch: `BOTH` uses the concurrent
+    /// A+AAAA client path (for `resolve_ips`); a single family uses the
     /// per-family client path (for the DNS server's A/AAAA answers, which must
     /// distinguish NXDOMAIN/NODATA). The publisher merges positives and NODATA
     /// into the cache (per-family expiry) before broadcasting; subscribers
@@ -1910,6 +1969,227 @@ mod tests {
         assert_eq!(
             resolver.lookup_ipv6("dual.example").await,
             Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+    }
+
+    /// Regression: `resolve_ips` must query the missing family when one family
+    /// is already cached. The old code short-circuited on the first available
+    /// enabled IP, so an A-only cache prevented AAAA from being queried —
+    /// starving `DirectAdapter` of IPv6 fallback addresses.
+    #[tokio::test]
+    async fn resolve_ips_queries_missing_family_after_a_only_cache() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let query_count = Arc::new(AtomicUsize::new(0));
+        let qc = Arc::clone(&query_count);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok(Ok((len, peer))) =
+                    tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buf))
+                        .await
+                else {
+                    break;
+                };
+                qc.fetch_add(1, Ordering::SeqCst);
+                let request = Message::from_bytes(&buf[..len]).unwrap();
+                let query = request.queries[0].clone();
+                let mut response =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                response.add_query(query.clone());
+                match query.query_type {
+                    RecordType::A => {
+                        response.add_answer(Record::from_rdata(
+                            query.name,
+                            60,
+                            RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
+                        ));
+                    }
+                    RecordType::AAAA => {
+                        response.add_answer(Record::from_rdata(
+                            query.name,
+                            60,
+                            RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
+                        ));
+                    }
+                    _ => {}
+                }
+                socket
+                    .send_to(&response.to_bytes().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let resolver = Resolver::new(
+            vec![addr],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            true,
+        );
+
+        // Step 1: cache only A via the single-family path.
+        assert_eq!(
+            resolver.lookup_ipv4("dual.example").await,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
+        );
+        let queries_after_ipv4 = query_count.load(Ordering::SeqCst);
+        assert_eq!(queries_after_ipv4, 1, "lookup_ipv4 should query only A");
+
+        // Step 2: resolve_ips with ipv6=true should query the missing AAAA,
+        // not short-circuit on the cached A.
+        let ips = resolver.resolve_ips("dual.example").await;
+        let has_v6 = ips.as_ref().is_some_and(|v| v.iter().any(IpAddr::is_ipv6));
+        assert!(has_v6, "resolve_ips must return both families, got {ips:?}");
+        let queries_after_resolve = query_count.load(Ordering::SeqCst);
+        assert!(
+            queries_after_resolve > queries_after_ipv4,
+            "resolve_ips must have queried the missing AAAA family"
+        );
+    }
+
+    /// Regression: `resolve_ips` with `ipv6: true` must return both IPv4 and
+    /// IPv6 addresses for a dual-stack domain, with IPv4 first (prefer-IPv4
+    /// ordering). This is the address list `DirectAdapter::dial_tcp` iterates
+    /// to try connection fallback.
+    #[tokio::test]
+    async fn resolve_ips_returns_both_families_for_dual_stack() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok(Ok((len, peer))) =
+                    tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buf))
+                        .await
+                else {
+                    break;
+                };
+                let request = Message::from_bytes(&buf[..len]).unwrap();
+                let query = request.queries[0].clone();
+                let mut response =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                response.add_query(query.clone());
+                match query.query_type {
+                    RecordType::A => {
+                        response.add_answer(Record::from_rdata(
+                            query.name,
+                            60,
+                            RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
+                        ));
+                    }
+                    RecordType::AAAA => {
+                        response.add_answer(Record::from_rdata(
+                            query.name,
+                            60,
+                            RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
+                        ));
+                    }
+                    _ => {}
+                }
+                socket
+                    .send_to(&response.to_bytes().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let resolver = Resolver::new(
+            vec![addr],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            true,
+        );
+
+        let ips = resolver.resolve_ips("dual.example").await.unwrap();
+        let has_v4 = ips.iter().any(IpAddr::is_ipv4);
+        let has_v6 = ips.iter().any(IpAddr::is_ipv6);
+        assert!(has_v4, "must include IPv4: {ips:?}");
+        assert!(has_v6, "must include IPv6: {ips:?}");
+        // Prefer-IPv4: the first address should be IPv4.
+        assert!(
+            ips.first().is_some_and(IpAddr::is_ipv4),
+            "IPv4 must come first (prefer-IPv4): {ips:?}"
+        );
+    }
+
+    /// Regression (P2): a fast NXDOMAIN from one upstream in a tier must not
+    /// suppress a slow positive answer from another. `query_pool_set` now
+    /// waits briefly (grace period) after the first definitive negative
+    /// before committing, so a split-horizon upstream that returns a real
+    /// address slightly later wins.
+    #[tokio::test]
+    async fn fast_negative_does_not_suppress_slow_positive() {
+        // Fast upstream: returns NXDOMAIN immediately.
+        let fast = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fast_addr = fast.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok(Ok((len, peer))) =
+                    tokio::time::timeout(Duration::from_millis(500), fast.recv_from(&mut buf))
+                        .await
+                else {
+                    break;
+                };
+                let request = Message::from_bytes(&buf[..len]).unwrap();
+                let query = request.queries[0].clone();
+                let mut response =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                response.metadata.response_code = ResponseCode::NXDomain;
+                response.add_query(query);
+                fast.send_to(&response.to_bytes().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        // Slow upstream: returns a positive A answer after a short delay.
+        let slow = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let slow_addr = slow.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok(Ok((len, peer))) =
+                    tokio::time::timeout(Duration::from_millis(500), slow.recv_from(&mut buf))
+                        .await
+                else {
+                    break;
+                };
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let request = Message::from_bytes(&buf[..len]).unwrap();
+                let query = request.queries[0].clone();
+                let mut response =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                response.add_query(query.clone());
+                response.add_answer(Record::from_rdata(
+                    query.name,
+                    60,
+                    RData::A(A(Ipv4Addr::new(192, 0, 2, 99))),
+                ));
+                slow.send_to(&response.to_bytes().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let resolver = Resolver::new(
+            vec![fast_addr, slow_addr],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            true,
+        );
+
+        let result = resolver.lookup_ipv4_result("split.example").await;
+        assert!(
+            matches!(result, AddressLookupResult::Answer(ip, _) if ip == IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99))),
+            "slow positive must win over fast NXDOMAIN, got {result:?}"
         );
     }
 
@@ -2767,7 +3047,8 @@ mod tests {
             resolver.lookup_ipv4_result("missing.example").await,
             AddressLookupResult::NxDomain
         ));
-        // v6 was propagated from the A NXDOMAIN without a separate AAAA query.
+        // v6 NXDOMAIN is cached from the parallel A+AAAA query — both
+        // families return NXDOMAIN and are cached per-family.
         assert!(matches!(
             resolver.lookup_ipv6_result("missing.example").await,
             AddressLookupResult::NxDomain
@@ -2776,6 +3057,8 @@ mod tests {
             resolver.lookup_ipv4_result("missing.example").await,
             AddressLookupResult::NxDomain
         ));
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        // Both A and AAAA were queried once (parallel dual-stack path);
+        // subsequent lookups are served from cache.
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 }

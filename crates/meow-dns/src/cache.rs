@@ -621,7 +621,11 @@ impl DnsCache {
             // Preserve the OTHER family's fresh IPs and, crucially, its own
             // expiry — the bug was `min()` over both families, letting a
             // short-TTL family evict a still-fresh long-TTL one.
-            merged_queried = existing.queried.union(family);
+            //
+            // Only mark the sibling as queried when its answer is still fresh.
+            // An expired sibling left in `queried` with the incoming family's
+            // fresh expiry and no IPs would be misread by `family_hit()` as a
+            // fresh NoData, suppressing re-resolution of that family.
             if existing.queried.contains(other) {
                 let other_fresh = if other == QueryFamilies::IPV4 {
                     existing.expire_v4 > now
@@ -629,6 +633,7 @@ impl DnsCache {
                     existing.expire_v6 > now
                 };
                 if other_fresh {
+                    merged_queried = merged_queried.union(other);
                     merged.extend(
                         existing
                             .ips
@@ -720,16 +725,26 @@ impl DnsCache {
                 // Display the entry's overall remaining lifetime: the latest
                 // fresh family's expiry, so the panel reflects how long the
                 // entry as a whole stays cache-resolvable.
+                let v4_fresh = entry.queried.contains(QueryFamilies::IPV4) && entry.expire_v4 > now;
+                let v6_fresh = entry.queried.contains(QueryFamilies::IPV6) && entry.expire_v6 > now;
                 let mut latest = now;
-                if entry.queried.contains(QueryFamilies::IPV4) && entry.expire_v4 > latest {
+                if v4_fresh && entry.expire_v4 > latest {
                     latest = entry.expire_v4;
                 }
-                if entry.queried.contains(QueryFamilies::IPV6) && entry.expire_v6 > latest {
+                if v6_fresh && entry.expire_v6 > latest {
                     latest = entry.expire_v6;
                 }
+                // Only show IPs belonging to families that are still fresh —
+                // an expired family's stale IPs must not appear in the panel.
+                let visible_ips: Vec<IpAddr> = entry
+                    .ips
+                    .iter()
+                    .copied()
+                    .filter(|ip| if ip.is_ipv4() { v4_fresh } else { v6_fresh })
+                    .collect();
                 DnsCacheSnapshotEntry {
                     name: name.to_string(),
-                    ips: entry.ips.to_vec(),
+                    ips: visible_ips,
                     ttl: latest.saturating_duration_since(now),
                     source: entry.source.as_ref().map(std::string::ToString::to_string),
                 }
@@ -1345,6 +1360,123 @@ mod tests {
         let hit = c.get_lookup("nope.example").unwrap();
         assert!(matches!(hit.v4, FamilyCacheHit::NxDomain));
         assert!(matches!(hit.v6, FamilyCacheHit::NxDomain));
+    }
+
+    /// Regression: `merge_family` must NOT revive an expired sibling family.
+    ///
+    /// Scenario: an entry has a fresh A and an expired AAAA (TTL already
+    /// elapsed). A new A query arrives. The old code unconditionally unioned
+    /// `existing.queried` (which included the expired AAAA) into the merged
+    /// entry's `queried` set, while the AAAA's expiry was overwritten with the
+    /// incoming A's fresh expiry and its (empty) IPs were not preserved. The
+    /// result: `family_hit()` saw a "fresh" AAAA with zero IPs and returned
+    /// `NoData`, suppressing re-resolution of AAAA.
+    ///
+    /// The fix: only mark the sibling as `queried` when its own answer is
+    /// still fresh. An expired sibling stays a `Miss` so the resolver
+    /// re-queries it on demand.
+    #[test]
+    fn merge_family_does_not_revive_expired_sibling() {
+        let c = DnsCache::new(64);
+        let v4 = ipv4(192, 0, 2, 1);
+
+        // Step 1: cache a dual-stack entry — fresh A, fresh AAAA.
+        c.merge_family(
+            "dual.example",
+            QueryFamilies::IPV4,
+            &[v4],
+            Duration::from_secs(60),
+            None,
+            FamilyNeg::None,
+        );
+        c.merge_family(
+            "dual.example",
+            QueryFamilies::IPV6,
+            &[IpAddr::V6(Ipv6Addr::LOCALHOST)],
+            Duration::from_millis(10),
+            None,
+            FamilyNeg::None,
+        );
+
+        // Step 2: wait for the AAAA to expire (v4 is still fresh at 60 s).
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Verify: A is still fresh, AAAA is expired (Miss).
+        let before = c.get_lookup("dual.example").unwrap();
+        assert!(matches!(before.v4, FamilyCacheHit::Answer(..)));
+        assert!(matches!(before.v6, FamilyCacheHit::Miss));
+
+        // Step 3: a new A query arrives and merges into the entry.
+        c.merge_family(
+            "dual.example",
+            QueryFamilies::IPV4,
+            &[v4],
+            Duration::from_secs(60),
+            None,
+            FamilyNeg::None,
+        );
+
+        // The AAAA must NOT be revived as fresh NoData — it must stay a Miss
+        // so the resolver re-queries it.
+        let after = c.get_lookup("dual.example").unwrap();
+        assert!(
+            matches!(after.v4, FamilyCacheHit::Answer(..)),
+            "A should still be fresh, got {:?}",
+            after.v4
+        );
+        assert!(
+            matches!(after.v6, FamilyCacheHit::Miss),
+            "expired AAAA must not be revived as fresh NoData, got {:?}",
+            after.v6
+        );
+    }
+
+    /// Regression: `snapshot()` must hide IPs belonging to an expired family.
+    /// When one family is still fresh and the other has expired, only the
+    /// fresh family's IPs should appear in the snapshot.
+    #[test]
+    fn snapshot_hides_expired_family_ips() {
+        let c = DnsCache::new(64);
+        let v4 = ipv4(192, 0, 2, 1);
+        let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
+        // Cache a dual-stack entry with a short AAAA TTL.
+        c.merge_family(
+            "dual.example",
+            QueryFamilies::IPV4,
+            &[v4],
+            Duration::from_secs(60),
+            None,
+            FamilyNeg::None,
+        );
+        c.merge_family(
+            "dual.example",
+            QueryFamilies::IPV6,
+            &[v6],
+            Duration::from_millis(10),
+            None,
+            FamilyNeg::None,
+        );
+
+        // Wait for AAAA to expire.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let snap = c.snapshot();
+        let entry = snap
+            .iter()
+            .find(|e| e.name == "dual.example")
+            .expect("entry must be in snapshot");
+        // Only the fresh v4 IP should be visible.
+        assert!(
+            entry.ips.contains(&v4),
+            "fresh A IP must be in snapshot: {:?}",
+            entry.ips
+        );
+        assert!(
+            !entry.ips.contains(&v6),
+            "expired AAAA IP must NOT be in snapshot: {:?}",
+            entry.ips
+        );
     }
 
     /// ADR-0011 size invariant (review issue G): `CacheEntry` must fit the M2

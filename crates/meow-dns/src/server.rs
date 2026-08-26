@@ -120,15 +120,17 @@ impl DnsServer {
             .await;
         }
 
-        if qtype == 28 && !resolver.ipv6_enabled() {
-            return Ok(Self::build_noerror_empty(id, data, flags, question_len));
-        }
-
         // Check hosts trie first. If the domain is present in the hosts table
         // but has no IPs of the queried family, return NOERROR with zero answers
         // rather than NXDOMAIN — clients may retry on NXDOMAIN but not on an
         // empty-answer NOERROR response.
         if let Some(all_ips) = resolver.lookup_hosts_all(&domain) {
+            // When IPv6 is disabled, an AAAA query for a hosts entry that
+            // *does* have a v6 address still returns that address — the
+            // hosts file is an explicit user override that takes priority
+            // over the global ipv6 toggle. Only fall through to the
+            // empty-answer short-circuit below when the hosts table has no
+            // matching entry at all.
             let ip = if qtype == 1 {
                 all_ips.iter().find(|ip| ip.is_ipv4()).copied()
             } else {
@@ -146,6 +148,14 @@ impl DnsServer {
                 ),
                 None => Self::build_noerror_empty(id, data, flags, question_len),
             });
+        }
+
+        // AAAA short-circuit when IPv6 is disabled: return an empty NOERROR
+        // so clients don't wait for an upstream response that would be
+        // filtered anyway. This comes *after* the hosts check so a hosts
+        // override for the disabled family is still honored.
+        if qtype == 28 && !resolver.ipv6_enabled() {
+            return Ok(Self::build_noerror_empty(id, data, flags, question_len));
         }
 
         // Resolve using our resolver (cache + upstream + fake-IP synthesis).

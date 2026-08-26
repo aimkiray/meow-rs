@@ -629,7 +629,7 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .bind_address
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string()),
-        ipv6: raw.ipv6.unwrap_or(false),
+        ipv6: raw.ipv6.unwrap_or(true),
         tun_enable: state.tunnel.has_tun(),
     })
 }
