@@ -241,7 +241,7 @@ Upstream config keys documented at https://wiki.metacubex.one/. Checking `crates
 
 ### Supported
 
-`port`, `socks-port`, `mixed-port`, `allow-lan`, `bind-address`, `mode`, `log-level`, `ipv6`, `external-controller`, `secret`, `external-ui` / `external-ui-name` (serves a static third-party dashboard at `/ui`; `external-ui-url` is parsed but auto-download is not performed), `dns`, `proxies`, `proxy-groups`, `rules`, `rule-providers`, `tproxy-port`, `tproxy-sni`, `routing-mark`, and the custom `subscriptions`. Per-outbound `dialer-proxy` (chained dialing via any proxy/group, TCP) is supported on every outbound type.
+`port`, `socks-port`, `mixed-port`, `allow-lan`, `bind-address`, `mode`, `log-level`, `ipv6`, `external-controller`, `secret`, `external-ui` / `external-ui-name` (serves a static third-party dashboard at `/ui`; `external-ui-url` is parsed but auto-download is not performed), `dns`, `proxies`, `proxy-groups`, `rules`, `rule-providers`, `tproxy-port`, `tproxy-sni`, `routing-mark`, and the custom `subscriptions`. Per-outbound `dialer-proxy` (chained dialing via any proxy/group, TCP) is supported on the stream-based outbound types — `ss`, `trojan`, `vless`, `vmess`, `snell`, `http`, `socks5` — where an injected `TcpDialer` carries the adapter's own handshake. `anytls` and `hysteria2` own their transport (QUIC) and do not honour it; nor does `ss` with an external SIP003 plugin. Those fall back to the relay-based wrapper, which fails loudly rather than dialing direct. UDP over a raw socket (Shadowsocks plain relay, SOCKS5 UDP ASSOCIATE) is refused instead of leaking; mux-carried UDP traverses the chain. See [the migration guide](migration-from-go-mihomo.md) for details.
 
 ### Missing top-level keys (gaps)
 

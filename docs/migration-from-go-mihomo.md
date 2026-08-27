@@ -638,10 +638,20 @@ The following are unsupported or intentionally rejected:
   of static files and it is served at `/ui` in place of the built-in dashboard.
   You must download/extract the dashboard yourself; the zip is not fetched
   automatically (avoids an unzip dependency against the binary-size caps).
-- **`dialer-proxy` UDP** — the per-outbound `dialer-proxy` field is supported for
-  TCP on every outbound (chained dialing through any proxy/group, with cycle
-  detection). UDP is not routed through the dialer; such associations are
-  refused rather than leaking the real source path.
+- **`dialer-proxy`** — supported for TCP via an injected `TcpDialer`, so the
+  outbound's own TLS/Reality/protocol handshake runs on the tunneled stream
+  (mihomo's `proxyDialer` model). Chains through any proxy or group and nests,
+  with cycle detection. Two carve-outs:
+  - *Adapter types that own their transport* — `anytls` and `hysteria2` (QUIC)
+    do not dial through the pluggable dialer, and `ss` with an **external**
+    SIP003 plugin always reaches that plugin over loopback. These fall back to
+    the relay-based wrapper, which works only where `connect_over` is
+    implemented (`http`, `socks5`, `snell` without TLS) and otherwise fails
+    loudly at dial time. It never degrades to a silent direct dial.
+  - *UDP* — associations whose datagrams ride a raw socket cannot follow the TCP
+    chain (Shadowsocks plain relay, SOCKS5 UDP ASSOCIATE) and are refused
+    rather than leaking the real source path. UDP carried inside a mux session
+    (`smux`/`yamux`/`h2mux`) does traverse the chain and keeps working.
 
 ---
 
