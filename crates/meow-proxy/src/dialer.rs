@@ -10,6 +10,7 @@
 //! upstream: mihomo `component/proxydialer` + `BasicOption.NewDialer`.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -25,6 +26,17 @@ use meow_transport::Stream;
 pub trait TcpDialer: Send + Sync {
     /// Dial `host:port` and return a duplex stream.
     async fn dial(&self, host: &str, port: u16) -> io::Result<Box<dyn Stream>>;
+
+    /// Dial an already-resolved [`SocketAddr`].
+    ///
+    /// Callers holding a literal address should prefer this over
+    /// `dial(&addr.ip().to_string(), addr.port())`, which allocates a `String`
+    /// only for the callee to parse it straight back into an `IpAddr`.
+    /// The default implementation does exactly that round-trip, so
+    /// implementors that can dial an address directly should override it.
+    async fn dial_addr(&self, addr: SocketAddr) -> io::Result<Box<dyn Stream>> {
+        self.dial(&addr.ip().to_string(), addr.port()).await
+    }
 
     /// Whether this dialer tunnels through another proxy (vs. direct).
     ///
@@ -53,6 +65,14 @@ impl TcpDialer for DirectDialer {
         let _ = tcp.set_nodelay(true);
         Ok(Box::new(tcp))
     }
+
+    async fn dial_addr(&self, addr: SocketAddr) -> io::Result<Box<dyn Stream>> {
+        // Skip the default's `to_string()` + re-parse: `connect_tcp` takes the
+        // `SocketAddr` as-is and keeps the SocketProtector hook.
+        let tcp = meow_common::connect_tcp(addr).await?;
+        let _ = tcp.set_nodelay(true);
+        Ok(Box::new(tcp))
+    }
 }
 
 /// Proxy dialer — tunnels through another proxy.  Equivalent to mihomo's
@@ -68,16 +88,9 @@ impl ProxyDialer {
     pub fn new(proxy: Arc<dyn Proxy>) -> Self {
         Self { proxy }
     }
-}
 
-#[async_trait]
-impl TcpDialer for ProxyDialer {
-    async fn dial(&self, host: &str, port: u16) -> io::Result<Box<dyn Stream>> {
-        let meta = Metadata {
-            host: host.into(),
-            dst_port: port,
-            ..Default::default()
-        };
+    /// Dial the front proxy with a fully-formed [`Metadata`] target.
+    async fn dial_metadata(&self, meta: Metadata) -> io::Result<Box<dyn Stream>> {
         let conn = self
             .proxy
             .dial_tcp(&meta)
@@ -88,6 +101,42 @@ impl TcpDialer for ProxyDialer {
         // is a sized newtype that forwards `AsyncRead`/`AsyncWrite` through
         // the boxed conn, bridging `ProxyConn` → `Stream`.
         Ok(Box::new(ConnStream(conn)))
+    }
+}
+
+#[async_trait]
+impl TcpDialer for ProxyDialer {
+    async fn dial(&self, host: &str, port: u16) -> io::Result<Box<dyn Stream>> {
+        // An IP-literal `host` becomes a typed `dst_ip` so the front proxy
+        // encodes an IP address rather than a domain name that happens to look
+        // like one.
+        let meta = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => Metadata {
+                dst_ip: Some(ip),
+                dst_port: port,
+                ..Default::default()
+            },
+            Err(_) => Metadata {
+                host: host.into(),
+                dst_port: port,
+                ..Default::default()
+            },
+        };
+        self.dial_metadata(meta).await
+    }
+
+    async fn dial_addr(&self, addr: SocketAddr) -> io::Result<Box<dyn Stream>> {
+        // Carry the literal address in `dst_ip` instead of rendering it into
+        // `host`: adapters that encode the target for the front proxy then emit
+        // an IP-typed address rather than a domain-typed one holding a
+        // dotted-quad, which is what mihomo does and what SOCKS5/Trojan/VLESS
+        // address encoding expects.
+        let meta = Metadata {
+            dst_ip: Some(addr.ip()),
+            dst_port: addr.port(),
+            ..Default::default()
+        };
+        self.dial_metadata(meta).await
     }
 
     fn is_proxy(&self) -> bool {
@@ -101,12 +150,12 @@ impl TcpDialer for ProxyDialer {
 /// cannot use the blanket `Stream` impl.  This newtype forwards
 /// `AsyncRead`/`AsyncWrite` through the boxed conn.
 ///
-/// Note: because `ConnStream` is a distinct concrete type, `as_any_mut()`
-/// downcasts to `RealityTlsStream` (or any other concrete stream type) will
-/// fail — raw-passthrough optimizations that rely on type-downcasting do not
-/// fire through a `dialer-proxy` chain.  This is a Phase-1 limitation; the
-/// underlying data still flows correctly, only the zero-copy shortcut is
-/// skipped.
+/// Downcast-based optimizations are unaffected: the transport layers wrap
+/// whatever they are handed in their own concrete type (e.g.
+/// `RealityTlsStream` holds its inner stream as a `Box<dyn Stream>`), so
+/// `as_any_mut()` still sees that outer type and the Reality raw-passthrough
+/// shortcut fires the same whether the bottom of the stack is a `TcpStream` or
+/// a `ConnStream`.
 pub struct ConnStream(pub Box<dyn ProxyConn>);
 
 impl tokio::io::AsyncRead for ConnStream {
