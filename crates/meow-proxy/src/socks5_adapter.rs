@@ -535,7 +535,10 @@ impl ProxyAdapter for Socks5Adapter {
     }
 
     fn support_udp(&self) -> bool {
-        self.udp
+        // UDP ASSOCIATE sends datagrams to the server-provided relay endpoint
+        // over a raw socket that bypasses the TCP dialer, so it cannot ride a
+        // `dialer-proxy` chain — see `dial_udp` for the enforcement.
+        self.udp && !self.dialer.is_proxy()
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
@@ -559,6 +562,21 @@ impl ProxyAdapter for Socks5Adapter {
         if !self.udp {
             return Err(MeowError::NotSupported(
                 "socks5: UDP ASSOCIATE not enabled (set `udp: true`)".into(),
+            ));
+        }
+
+        // Only the TCP control connection below goes through `self.dialer`.
+        // The datagram socket is bound raw and connected straight to the
+        // relay endpoint the server advertises, so with a `ProxyDialer`
+        // installed the UDP payload would egress from the real source path
+        // while TCP rides the front proxy.  Refuse rather than leak
+        // (Class A, ADR-0002).  Enforced here because the tunnel's UDP
+        // dispatch calls `dial_udp` without consulting `support_udp`.
+        if self.dialer.is_proxy() {
+            return Err(MeowError::NotSupported(
+                "socks5: UDP ASSOCIATE bypasses `dialer-proxy` (raw relay \
+                 socket); refusing to leak the real source path"
+                    .into(),
             ));
         }
 
@@ -857,6 +875,67 @@ mod tests {
             false,
             Arc::new(crate::dialer::DirectDialer),
         )
+    }
+
+    /// Reports itself as proxied without needing a real front proxy.
+    struct FakeProxyDialer;
+
+    #[async_trait]
+    impl crate::dialer::TcpDialer for FakeProxyDialer {
+        async fn dial(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> std::io::Result<Box<dyn meow_transport::Stream>> {
+            Err(std::io::Error::other("test dialer never connects"))
+        }
+
+        fn is_proxy(&self) -> bool {
+            true
+        }
+    }
+
+    /// Regression: only the TCP control connection follows the dialer. The
+    /// datagram socket is bound raw and connected to the server-advertised
+    /// relay, so under a proxy dialer the association must be refused rather
+    /// than egressing from the real source path.
+    ///
+    /// Enforced in `dial_udp` because the tunnel's UDP dispatch calls it
+    /// directly without consulting `support_udp()`.
+    #[tokio::test]
+    async fn udp_associate_is_refused_under_proxy_dialer() {
+        let adapter = Socks5Adapter::new(
+            "front",
+            "127.0.0.1",
+            1080,
+            None,
+            false,
+            false,
+            Arc::new(FakeProxyDialer),
+        )
+        .with_udp(true);
+
+        // `ProxyPacketConn` is not `Debug`, so match rather than `expect_err`.
+        match adapter.dial_udp(&meta_with_host("example.com", 443)).await {
+            Err(MeowError::NotSupported(m)) => assert!(
+                m.contains("dialer-proxy"),
+                "refusal should name dialer-proxy, got: {m}"
+            ),
+            Err(other) => panic!("expected NotSupported, got: {other:?}"),
+            Ok(_) => panic!("UDP ASSOCIATE must be refused under a proxy dialer"),
+        }
+
+        assert!(
+            !adapter.support_udp(),
+            "advertised capability must agree with the refusal"
+        );
+    }
+
+    #[test]
+    fn udp_still_advertised_under_direct_dialer() {
+        assert!(make_adapter("127.0.0.1", 1080, None)
+            .with_udp(true)
+            .support_udp());
     }
 
     fn meta_with_host(host: &str, port: u16) -> Metadata {

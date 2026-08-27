@@ -265,9 +265,7 @@ impl SsCore {
                 // ``VpnService.protect(fd)``), and ``DirectDialer`` preserves
                 // both of those properties.
                 let tcp = match self.server_config.tcp_external_addr() {
-                    ServerAddr::SocketAddr(sa) => {
-                        self.dialer.dial(&sa.ip().to_string(), sa.port()).await
-                    }
+                    ServerAddr::SocketAddr(sa) => self.dialer.dial_addr(*sa).await,
                     ServerAddr::DomainName(host, port) => self.dialer.dial(host, *port).await,
                 }
                 .map_err(|e| MeowError::Proxy(format!("ss tcp connect: {e}")))?;
@@ -521,9 +519,15 @@ impl ProxyAdapter for ShadowsocksAdapter {
     fn support_udp(&self) -> bool {
         // SS UDP relay uses a raw UDP socket that bypasses the TCP dialer.
         // When a `ProxyDialer` is installed (dialer-proxy), raw UDP would
-        // leak traffic past the chain — disable the plain UDP path.  Mux
-        // UDP is safe because it rides the mux TCP session through
-        // `dialer.dial()`, so it is unaffected.
+        // leak traffic past the chain — advertise the plain UDP path as
+        // unsupported.  Mux UDP is safe because it rides the mux TCP session
+        // through `dialer.dial()`, so it is unaffected.
+        //
+        // This is the *advertised* capability only (LoadBalance member
+        // filtering, the `udp` field in `GET /proxies`).  It is NOT the
+        // enforcement point: `meow-tunnel`'s UDP path calls `dial_udp`
+        // directly without consulting `support_udp`, so the refusal is
+        // re-checked there.  Keep the two in sync.
         let plain_udp_ok = self.support_udp && !self.core.dialer.is_proxy();
         plain_udp_ok || {
             #[cfg(feature = "mux")]
@@ -564,6 +568,23 @@ impl ProxyAdapter for ShadowsocksAdapter {
             if let Some(conn) = mux.open_packet_stream_for(metadata, "ss").await? {
                 return Ok(conn);
             }
+        }
+
+        // Enforcement point for the dialer-proxy UDP leak (not `support_udp`,
+        // which the tunnel's UDP dispatch never consults).  The plain SS UDP
+        // relay below binds a raw socket and connects straight to the SS
+        // server, so with a `ProxyDialer` installed it would egress from the
+        // real source path while TCP goes through the front proxy.  Refuse
+        // loudly (Class A, ADR-0002) instead of leaking.  Reached only after
+        // the mux branch above, which tunnels UDP over `dialer.dial()` and is
+        // therefore safe.
+        if self.core.dialer.is_proxy() {
+            return Err(MeowError::NotSupported(
+                "ss: plain UDP relay bypasses `dialer-proxy` (raw socket); \
+                 refusing to leak the real source path — enable `smux`/`yamux` \
+                 mux for UDP over the chain"
+                    .into(),
+            ));
         }
 
         if matches!(self.core.plugin, PluginKind::V2ray(..)) {
@@ -747,6 +768,76 @@ mod tests {
             "non-transport mode must not change Mode"
         );
         assert_eq!(o.as_deref(), Some("mode=quic;host=a.com"));
+    }
+
+    /// A dialer that reports itself as proxied without needing a real front
+    /// proxy — stands in for `ProxyDialer` in the leak-refusal tests.
+    struct FakeProxyDialer;
+
+    #[async_trait]
+    impl crate::dialer::TcpDialer for FakeProxyDialer {
+        async fn dial(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> std::io::Result<Box<dyn meow_transport::Stream>> {
+            Err(std::io::Error::other("test dialer never connects"))
+        }
+
+        fn is_proxy(&self) -> bool {
+            true
+        }
+    }
+
+    fn ss_adapter(udp: bool, dialer: Arc<dyn crate::dialer::TcpDialer>) -> ShadowsocksAdapter {
+        ShadowsocksAdapter::new(
+            "ss-test",
+            "127.0.0.1",
+            8388,
+            "password",
+            "aes-256-gcm",
+            udp,
+            None,
+            None,
+            dialer,
+        )
+        .expect("adapter builds")
+    }
+
+    /// Regression: the plain SS UDP relay binds a raw socket and connects
+    /// straight to the SS server, bypassing the TCP dialer. With a proxy dialer
+    /// installed it must refuse, not egress from the real source path.
+    ///
+    /// `dial_udp` is the enforcement point on purpose: the tunnel's UDP
+    /// dispatch (`meow-tunnel/src/udp.rs`) calls it directly and never consults
+    /// `support_udp()`, so gating only the latter would leave the leak open for
+    /// any rule that references the outbound by name.
+    #[tokio::test]
+    async fn plain_udp_is_refused_under_proxy_dialer() {
+        let adapter = ss_adapter(true, Arc::new(FakeProxyDialer));
+
+        // `ProxyPacketConn` is not `Debug`, so match rather than `expect_err`.
+        match adapter.dial_udp(&Metadata::default()).await {
+            Err(MeowError::NotSupported(m)) => assert!(
+                m.contains("dialer-proxy"),
+                "refusal should name dialer-proxy, got: {m}"
+            ),
+            Err(other) => panic!("expected NotSupported, got: {other:?}"),
+            Ok(_) => panic!("plain UDP must be refused under a proxy dialer"),
+        }
+
+        assert!(
+            !adapter.support_udp(),
+            "advertised capability must agree with the refusal"
+        );
+    }
+
+    /// The same adapter with the default direct dialer keeps advertising UDP —
+    /// the guard must not regress the non-chained path.
+    #[test]
+    fn plain_udp_still_advertised_under_direct_dialer() {
+        assert!(ss_adapter(true, Arc::new(crate::dialer::DirectDialer)).support_udp());
+        assert!(!ss_adapter(false, Arc::new(crate::dialer::DirectDialer)).support_udp());
     }
 
     #[test]
