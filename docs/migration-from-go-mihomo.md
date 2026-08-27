@@ -112,7 +112,7 @@ These fields parse without error but behave differently from Go mihomo:
 | `fallback-filter` GeoIP/CIDR gates | Only on primary failure | Also on poisoned responses (non-CN IP, bogon) | A |
 | `fallback-filter.geoip: true` with no MMDB | Startup error | Warn-once, gate disabled | B |
 | `nameserver-policy` key with `geosite:` prefix | Resolved via geosite DB | Same — resolved via geosite DB (needs geosite DB; warn-skip if absent) | — |
-| `nameserver-policy` key with `rule-set:` prefix | Resolved via rule-provider | Same — resolved via rule-provider (domain/classical); `ipcidr` behavior and missing provider are hard errors | — |
+| `nameserver-policy` key with `rule-set:` prefix | Resolved via rule-provider | Same — resolved via rule-provider (domain/classical; only domain-family rules matched for classical). `ipcidr` behavior and an undeclared provider name are hard errors; a declared provider that failed to load is warn-skipped (graceful, like the `rules:` path) | — |
 | `IN-TYPE` with unknown value (e.g. `IN-TYPE,QUIC`) | Silently no-match | Hard parse error | A |
 | `PUT /configs` in-flight connections | Graceful handover | Cold reload, connections dropped + logged | A |
 | `PUT /configs` payload with raw YAML (not base64) | Accepted in some versions | 400 with helpful message | B |

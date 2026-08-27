@@ -118,6 +118,14 @@ pub async fn parse_dns(
             None
         } else {
             let bootstrap_clients = build_policy_bootstrap_clients(&default_ns_urls, &main_urls);
+            // Names of providers declared in `rule-providers:`. A `rule-set:`
+            // entry referencing a name that's declared but failed to load
+            // degrades gracefully; a name that's not declared at all is a
+            // hard error (typo). See `build_nameserver_policy`.
+            let declared_rule_provider_names: std::collections::HashSet<String> = raw
+                .rule_providers
+                .as_ref()
+                .map_or_else(Default::default, |m| m.keys().cloned().collect());
             Some(
                 build_nameserver_policy(
                     nsp_map,
@@ -125,6 +133,7 @@ pub async fn parse_dns(
                     &bootstrap_clients,
                     proxy_registry,
                     rule_providers,
+                    &declared_rule_provider_names,
                 )
                 .await?,
             )
@@ -318,6 +327,19 @@ fn parse_nameserver_urls(servers: &[String]) -> Result<Vec<NameServerUrl>, anyho
 /// background refreshes take effect automatically.
 /// Other prefixed patterns (anything with `:`) warn once and skip.
 ///
+/// `rule-set:` provider-name resolution distinguishes two cases so a
+/// transient provider load failure can't take the whole daemon down:
+///   - the name is **not** among the declared `rule-providers` → hard error
+///     (genuine typo / misreference, ADR-0002 Class A);
+///   - the name is declared but absent from `rule_providers` (its load failed
+///     at startup with a `warn!`) → warn and skip just this entry's matcher,
+///     matching the graceful degradation the `rules:` path already applies.
+///
+/// Entries are visited in sorted key order so that, when two matchers
+/// (e.g. overlapping `rule-set:`/`geosite:` entries) both hit a domain, the
+/// chosen nameserver is deterministic rather than dependent on `HashMap`
+/// iteration order.
+///
 /// An entry with no valid nameservers after skipping → hard error.
 /// Class A per ADR-0002: DNS leakage risk for internal/corporate domains.
 async fn build_nameserver_policy(
@@ -326,12 +348,20 @@ async fn build_nameserver_policy(
     bootstrap_clients: &[Arc<DnsClient>],
     proxy_registry: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
     rule_providers: &HashMap<String, Arc<RuleProvider>>,
+    declared_rule_provider_names: &std::collections::HashSet<String>,
 ) -> Result<NameserverPolicy, anyhow::Error> {
     let mut policy = NameserverPolicy::new();
     let mut warned_unsupported_prefix = false;
     let mut warned_missing_geosite = false;
+    let mut warned_failed_provider = std::collections::HashSet::new();
 
-    for (key, value) in map {
+    // Deterministic iteration: sort by key so overlapping matchers resolve
+    // to a stable nameserver regardless of HashMap order.
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+
+    for key in keys {
+        let value = &map[key];
         let mut patterns = Vec::new();
         for expanded_key in expand_policy_keys(key) {
             let key_lower = expanded_key.to_ascii_lowercase();
@@ -365,9 +395,24 @@ async fn build_nameserver_policy(
                 if name.is_empty() {
                     continue;
                 }
-                let provider = rule_providers.get(name).ok_or_else(|| {
-                    anyhow::anyhow!("nameserver-policy: not found rule-set: {name}")
-                })?;
+                if !declared_rule_provider_names.contains(name) {
+                    // Not declared at all — a typo or stale reference. Hard
+                    // error so silent DNS leakage can't hide (ADR-0002 A).
+                    anyhow::bail!("nameserver-policy: unknown rule-set '{name}'");
+                }
+                let Some(provider) = rule_providers.get(name) else {
+                    // Declared but failed to load at startup (the loader
+                    // already warned). Degrade gracefully — skip just this
+                    // matcher — instead of hard-failing the whole config,
+                    // matching the `rules:` path's tolerance.
+                    if warned_failed_provider.insert(name.to_string()) {
+                        warn!(
+                            "nameserver-policy: rule-set '{name}' failed to load; \
+                             skipping its matcher (queries for its domains fall back to global)"
+                        );
+                    }
+                    continue;
+                };
                 match provider.behavior {
                     RuleSetBehavior::IpCidr => {
                         anyhow::bail!(
@@ -376,8 +421,8 @@ async fn build_nameserver_policy(
                         );
                     }
                     RuleSetBehavior::Classical => {
-                        // Warn once per entry; upstream only matches domain
-                        // rules inside a classical set.
+                        // Warn once per entry; only domain-family rules within
+                        // a classical set are matched (see matches_domain).
                         warn!(
                             "nameserver-policy: rule-set '{name}' is classical; \
                              only domain rules within it will be matched"
@@ -1083,8 +1128,15 @@ mod tests {
             "geosite:cn".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let result =
-            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new()).await;
+        let result = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &declared(&[]),
+        )
+        .await;
         assert!(result.is_ok(), "geosite: prefix must not hard-error");
         let pol = result.unwrap();
         assert!(
@@ -1106,9 +1158,16 @@ mod tests {
             "geosite:cn,private".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let pol = build_nameserver_policy(&map, Some(&db), &[], &HashMap::new(), &HashMap::new())
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &map,
+            Some(&db),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &declared(&[]),
+        )
+        .await
+        .unwrap();
         assert!(pol.lookup("example.cn").is_some());
         assert!(pol.lookup("lan").is_some());
         assert!(pol.lookup("example.com").is_none());
@@ -1125,8 +1184,15 @@ mod tests {
             "corp.example".to_string(),
             RawNspValue::Many(vec!["quic://bad.example".to_string()]),
         );
-        let result =
-            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new()).await;
+        let result = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &declared(&[]),
+        )
+        .await;
         assert!(
             result.is_err(),
             "policy entry with no valid servers must be a hard error"
@@ -1142,9 +1208,16 @@ mod tests {
             "+.corp.internal".to_string(),
             RawNspValue::One("192.168.1.53".to_string()),
         );
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new())
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &declared(&[]),
+        )
+        .await
+        .unwrap();
         assert!(pol.lookup("foo.corp.internal").is_some());
         assert!(pol.lookup("corp.internal").is_some());
         assert!(pol.lookup("other.example").is_none());
@@ -1175,6 +1248,12 @@ mod tests {
         crate::rule_provider::load_providers(&raw, None, &ctx, None)
     }
 
+    // Helper: the set of declared provider names a test wants visible to
+    // `build_nameserver_policy` (mirrors `raw.rule_providers` keys).
+    fn declared(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
     // rule-set: domain behavior compiles into a matcher that hits the
     // provider's domains.
     #[tokio::test]
@@ -1190,9 +1269,16 @@ mod tests {
             "rule-set:cn".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers)
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &providers,
+            &declared(&["cn"]),
+        )
+        .await
+        .unwrap();
         assert!(pol.lookup("example.cn").is_some());
         assert!(pol.lookup("foo.cn").is_some());
         assert!(pol.lookup("example.com").is_none());
@@ -1208,10 +1294,12 @@ mod tests {
             "rule-set:missing".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let result = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers).await;
+        let result =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, &declared(&[]))
+                .await;
         assert!(result.is_err());
         let msg = result.err().unwrap().to_string();
-        assert!(msg.contains("not found rule-set"), "msg was: {msg}");
+        assert!(msg.contains("unknown rule-set"), "msg was: {msg}");
     }
 
     // rule-set: IpCidr behavior is rejected (expect domain/classical).
@@ -1224,7 +1312,15 @@ mod tests {
             "rule-set:ips".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let result = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers).await;
+        let result = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &providers,
+            &declared(&["ips"]),
+        )
+        .await;
         assert!(result.is_err());
         let msg = result.err().unwrap().to_string();
         assert!(msg.contains("IpCidr"), "msg was: {msg}");
@@ -1244,9 +1340,16 @@ mod tests {
             "rule-set:cls".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers)
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &providers,
+            &declared(&["cls"]),
+        )
+        .await
+        .unwrap();
         assert!(pol.lookup("mail.google.com").is_some());
         assert!(pol.lookup("example.org").is_none());
     }
@@ -1264,9 +1367,16 @@ mod tests {
             "rule-set:a,b".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers)
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &providers,
+            &declared(&["a", "b"]),
+        )
+        .await
+        .unwrap();
         assert!(pol.lookup("a.example").is_some());
         assert!(pol.lookup("b.example").is_some());
         assert!(pol.lookup("c.example").is_none());
@@ -1282,10 +1392,119 @@ mod tests {
             "rule-set:CN".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers)
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &providers,
+            &declared(&["CN"]),
+        )
+        .await
+        .unwrap();
+        assert!(pol.lookup("example.cn").is_some());
+    }
+
+    // rule-set: a *declared* provider that failed to load must NOT hard-error
+    // the whole config — the matcher is skipped and queries for its domains
+    // fall back to global. (Consistent with the `rules:` path, which warns and
+    // drops the RULE-SET line.) Only an undeclared name (typo) hard-errors.
+    #[tokio::test]
+    async fn parse_nameserver_policy_rule_set_declared_but_unloaded_skips() {
+        use crate::raw::RawNspValue;
+        // "broken" is declared but absent from the loaded providers map.
+        let providers: HashMap<String, Arc<RuleProvider>> = HashMap::new();
+        let mut map = HashMap::new();
+        map.insert(
+            "rule-set:broken".to_string(),
+            RawNspValue::One("rcode://success".to_string()),
+        );
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &providers,
+            &declared(&["broken"]),
+        )
+        .await
+        .unwrap();
+        // No matcher inserted → no match; query falls through to global.
+        assert!(pol.lookup("anything.example").is_none());
+    }
+
+    // rule-set: a classical provider containing a default-matching rule
+    // (NETWORK,tcp) must not hijack unrelated domains to this policy.
+    #[tokio::test]
+    async fn parse_nameserver_policy_rule_set_classical_no_default_match_leak() {
+        use crate::raw::RawNspValue;
+        let providers = inline_rule_providers(&[(
+            "cls",
+            "classical",
+            vec![
+                "DOMAIN-SUFFIX,probe.example".to_string(),
+                "NETWORK,tcp".to_string(),
+            ],
+        )]);
+        let mut map = HashMap::new();
+        map.insert(
+            "rule-set:cls".to_string(),
+            RawNspValue::One("rcode://success".to_string()),
+        );
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &providers,
+            &declared(&["cls"]),
+        )
+        .await
+        .unwrap();
+        assert!(pol.lookup("a.probe.example").is_some());
+        // An unrelated domain must NOT match the NETWORK,tcp rule.
+        assert!(pol.lookup("totally-unrelated.example").is_none());
+    }
+
+    // Two overlapping rule-set entries must resolve to a deterministic
+    // nameserver (sorted-key priority), independent of HashMap order.
+    #[tokio::test]
+    async fn parse_nameserver_policy_rule_set_overlapping_is_deterministic() {
+        use crate::raw::RawNspValue;
+        // Both providers cover "overlap.example"; the winning entry must be
+        // the same across runs. With sorted keys, "rule-set:aaa" sorts before
+        // "rule-set:zzz", so aaa's nameserver wins.
+        let providers = inline_rule_providers(&[
+            ("aaa", "domain", vec!["overlap.example".to_string()]),
+            ("zzz", "domain", vec!["overlap.example".to_string()]),
+        ]);
+        let mut map = HashMap::new();
+        map.insert(
+            "rule-set:zzz".to_string(),
+            RawNspValue::One("rcode://name_error".to_string()),
+        );
+        map.insert(
+            "rule-set:aaa".to_string(),
+            RawNspValue::One("rcode://refused".to_string()),
+        );
+        // Run several times; rcode is stateless so we can't observe which
+        // nameserver won via lookup(), but the build must never panic and the
+        // matcher must consistently hit. Determinism of *which* entry is
+        // guaranteed by sorted insertion order; verified structurally by the
+        // sorting in build_nameserver_policy.
+        for _ in 0..5 {
+            let pol = build_nameserver_policy(
+                &map,
+                None,
+                &[],
+                &HashMap::new(),
+                &providers,
+                &declared(&["aaa", "zzz"]),
+            )
             .await
             .unwrap();
-        assert!(pol.lookup("example.cn").is_some());
+            assert!(pol.lookup("overlap.example").is_some());
+        }
     }
 
     // Fallback-filter defaults when no raw config provided.

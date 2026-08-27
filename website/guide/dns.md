@@ -81,9 +81,12 @@ dns:
 ```
 
 `rule-set:` references a rule-provider by name. The provider behavior must be `domain`
-(or `classical`, in which case only its domain rules are matched); an `ipcidr` provider or
-a missing provider is a config error. The matcher reads the provider live, so background
-refreshes apply automatically.
+(or `classical`, in which case only its domain-family rules are matched — `NETWORK`/`IN-TYPE`/
+`DST-PORT`/`MATCH`/logic rules are ignored so they can't hijack unrelated queries). An `ipcidr`
+provider, or a name that isn't declared in `rule-providers:` at all, is a config error; a
+declared provider that failed to load at startup is warn-skipped (queries for its domains fall
+back to global). The matcher reads the provider live, so background refreshes apply
+automatically.
 
 ## Fallback filter
 

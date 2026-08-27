@@ -15,7 +15,7 @@ use std::str::FromStr;
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iprange::IpRange;
-use meow_common::{Metadata, Rule, RuleMatchHelper};
+use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 use meow_trie::DomainTrie;
 use tracing::warn;
 
@@ -444,17 +444,29 @@ impl RuleSet for ClassicalRuleSet {
     }
 
     fn matches_domain(&self, domain: &str) -> bool {
-        // Host-only metadata: IP/port/process/rules needing a resolver won't
-        // match, matching upstream's "only domain rules" semantics for
-        // classical sets. dst_port stays at the default 0 so DST-PORT rules
-        // never fire on a domain-only query.
+        // Nameserver-policy `rule-set:` dispatch only has the query domain,
+        // so we restrict classical sets to their domain-family rules. This is
+        // a *rule-type whitelist*, not a host-only `Metadata` probe: rules such
+        // as `NETWORK,TCP`, `IN-TYPE,HTTP`, or `DST-PORT,0` match the default
+        // `Metadata` (network = Tcp, conn_type = Http, ports = 0) and would
+        // otherwise hijack *every* query to this policy — a DNS leak. Logic
+        // rules (`AND`/`OR`/`NOT`) and `MATCH` are excluded too: they either
+        // re-derive from those default-matching leaves or match everything.
         let metadata = Metadata {
             host: domain.into(),
             ..Default::default()
         };
-        self.rules
-            .iter()
-            .any(|r| r.match_metadata(&metadata, &RuleMatchHelper))
+        self.rules.iter().any(|r| {
+            matches!(
+                r.rule_type(),
+                RuleType::Domain
+                    | RuleType::DomainSuffix
+                    | RuleType::DomainKeyword
+                    | RuleType::DomainRegex
+                    | RuleType::DomainWildcard
+                    | RuleType::GeoSite,
+            ) && r.match_metadata(&metadata, &RuleMatchHelper)
+        })
     }
 }
 
@@ -618,6 +630,43 @@ mod tests {
         // IP and port rules must not fire on a domain-only query.
         assert!(!set.matches_domain("10.0.0.1"));
         assert!(!set.matches_domain("example.org"));
+    }
+
+    // Rules that match the *default* `Metadata` (network = Tcp,
+    // conn_type = Http, ports = 0) but ignore the host would otherwise
+    // hijack every query to this policy. The rule-type whitelist must
+    // exclude them so nameserver-policy `rule-set:` cannot leak DNS.
+    #[test]
+    fn classical_rule_set_matches_domain_ignores_default_matching_rules() {
+        let ctx = ParserContext::empty();
+        let cases: &[(&str, &str)] = &[
+            ("NETWORK,tcp", "totally-unrelated.example"),
+            ("IN-TYPE,HTTP", "totally-unrelated.example"),
+            ("DST-PORT,0", "totally-unrelated.example"),
+            ("SRC-PORT,0", "totally-unrelated.example"),
+            ("MATCH,DIRECT", "totally-unrelated.example"),
+        ];
+        for (rule, domain) in cases {
+            let set = ClassicalRuleSet::from_entries(&[rule.to_string()], &ctx);
+            assert!(
+                !set.matches_domain(domain),
+                "matches_domain must be false for '{rule}' against '{domain}'"
+            );
+        }
+    }
+
+    #[test]
+    fn classical_rule_set_matches_domain_matches_geosite() {
+        // GEOSITE is a domain-family rule and stays in the whitelist.
+        let ctx = ParserContext::empty();
+        let set = ClassicalRuleSet::from_entries(
+            &["GEOSITE,google".to_string(), "NETWORK,tcp".to_string()],
+            &ctx,
+        );
+        // GEOSITE matching needs a loaded geosite DB; with none present it
+        // simply does not match, but the NETWORK,tcp line still must not
+        // hijack an unrelated domain.
+        assert!(!set.matches_domain("totally-unrelated.example"));
     }
 
     #[test]

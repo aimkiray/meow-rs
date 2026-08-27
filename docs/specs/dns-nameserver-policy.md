@@ -93,7 +93,7 @@ Field reference — `nameserver-policy`:
 | `"exact.domain": [servers]` | Exact match on `exact.domain`. |
 | `"+.sub.domain": [servers]` | Matches `sub.domain` and all subdomains (`*.sub.domain`). |
 | `"geosite:<cat>[,<cat>]": [servers]` | Matches domains in the geosite DB category/ies. Requires a loaded geosite DB; skipped with a warning if absent. |
-| `"rule-set:<name>[,<name>]": [servers]` | Matches domains in the named rule-provider. Provider behavior must be `domain` (or `classical`, warned); `ipcidr` is a hard error; a missing provider is a hard error. |
+| `"rule-set:<name>[,<name>]": [servers]` | Matches domains in the named rule-provider. Provider behavior must be `domain` (or `classical`, warned — only its domain-family rules are matched); `ipcidr` is a hard error. A name that is **not** declared in `rule-providers:` is a hard error (typo); a name that **is** declared but failed to load at startup is skipped with a warning (queries for its domains fall back to global), matching the graceful degradation of the `rules:` path. |
 | Value is a string | Treated as a single-element list. |
 | Value is a list | Multiple nameservers for this policy; first responding wins. |
 
@@ -113,7 +113,7 @@ Field reference — `fallback-filter`:
 
 | # | Case | Class | Rationale |
 |---|------|:-----:|-----------|
-| 1 | `geosite:`/`rule-set:` patterns in nameserver-policy — upstream supports | — | **Implemented.** `geosite:` compiles into a matcher from the loaded geosite DB (issue #299 / #237). `rule-set:` compiles into a matcher from the loaded rule-providers: `Domain` behavior matches directly, `Classical` warns once and matches only its domain rules, `IpCidr` is a hard error, and a missing provider is a hard error (`not found rule-set: <name>`). The matcher snapshots the provider on each lookup, so background refreshes take effect automatically. Other unknown `:`-prefixed patterns still warn-once and skip. |
+| 1 | `geosite:`/`rule-set:` patterns in nameserver-policy — upstream supports | — | **Implemented.** `geosite:` compiles into a matcher from the loaded geosite DB (issue #299 / #237). `rule-set:` compiles into a matcher from the loaded rule-providers: `Domain` behavior matches directly, `Classical` warns once and matches only its **domain-family** rules (a rule-type whitelist, so `NETWORK`/`IN-TYPE`/`DST-PORT`/`MATCH`/logic rules cannot hijack unrelated queries), `IpCidr` is a hard error. A name **not** declared in `rule-providers:` is a hard error (`unknown rule-set: <name>`); a name declared but failed to load is skipped with a warning (graceful, like `rules:`). The matcher snapshots the provider on each lookup, so background refreshes take effect automatically. Entries are visited in sorted-key order so overlapping matchers resolve deterministically. Other unknown `:`-prefixed patterns still warn-once and skip. |
 | 2 | `dhcp://` nameserver — upstream supports | B | Warn-once at parse time; entry skipped. |
 | 3 | `fallback-filter.geoip: true` with no MMDB — upstream errors at startup | B | We treat as `geoip: false` with `warn!`. Single-resolver configs are valid without a GeoIP DB. NOT a startup error. |
 | 4 | nameserver-policy entry with no valid nameservers (all skipped) → upstream panics | A | Hard parse error: "nameserver-policy entry 'KEY' has no valid nameservers after skipping unsupported prefixes." A policy entry with zero valid nameservers silently routes the configured domain to global nameservers — a potential DNS leakage for internal/corporate domains. Fail loudly. |
