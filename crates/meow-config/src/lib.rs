@@ -509,9 +509,20 @@ pub fn rebuild_from_raw_with_cache_dir(
 /// For every proxy that declares `dialer-proxy: <name>`, its registry entry is
 /// re-parsed from the raw config with a [`meow_proxy::dialer::ProxyDialer`]
 /// injected, so the adapter dials its server through `<name>` transparently
-/// (mihomo `proxyDialer` model). If re-parsing fails (e.g. incomplete test
-/// configs or unsupported protocol types), it falls back to wrapping the
-/// existing entry with a [`meow_proxy::DialerProxyAdapter`] (relay chain).
+/// (mihomo `proxyDialer` model).
+///
+/// Adapter types that do not establish their underlying connection through the
+/// pluggable dialer — `anytls`, `hysteria2` (QUIC), and `ss` with an external
+/// SIP003 plugin — reject the injected dialer at parse time. Those fall back to
+/// wrapping the existing entry with a [`meow_proxy::DialerProxyAdapter`] (relay
+/// chain), which works where `connect_over` is implemented (HTTP/SOCKS5/Snell)
+/// and fails loudly at dial time otherwise. The fallback never degrades to a
+/// direct dial, so a configured chain cannot be silently bypassed.
+///
+/// UDP: paths that use a raw datagram socket bypass the TCP dialer entirely
+/// (Shadowsocks plain relay, SOCKS5 UDP ASSOCIATE). Those refuse the
+/// association rather than leaking the real source path; mux-based UDP rides
+/// the dialer over TCP and is unaffected.
 ///
 /// Nested dialer-proxies are resolved deepest-first so each layer sees its
 /// dialer's final (already-rebuilt) form, and dialer-proxy cycles are detected
@@ -571,12 +582,17 @@ fn apply_dialer_proxies(
                 resolved.insert(name);
                 continue;
             };
-            // The inner outbound may have failed to parse earlier; skip if so.
-            // Re-parse with ProxyDialer injected (mihomo model).
-            // Falls back to DialerProxyAdapter wrapper if re-parsing fails
-            // (e.g. incomplete test configs or unsupported protocol types).
+            // Re-parse the raw block with a `ProxyDialer` injected (mihomo
+            // model), so the adapter's own dial + handshake runs on the
+            // tunneled stream.
+            //
+            // `rev()` matters: the registry-building loop above uses `insert`,
+            // so for a config with duplicate `name:` entries the *last* block
+            // wins. A forward `find` here would resurrect the *first* block and
+            // silently swap the running definition out from under the user.
             let raw_proxy = raw_proxies
                 .iter()
+                .rev()
                 .find(|rp| rp.get("name").and_then(|v| v.as_str()) == Some(&*name));
             if let Some(raw) = raw_proxy {
                 let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> = Arc::new(
@@ -586,15 +602,39 @@ fn apply_dialer_proxies(
                     Ok(rebuilt) => {
                         proxies.insert(name.clone(), rebuilt);
                     }
-                    Err(_) => {
-                        // Fallback: wrap with DialerProxyAdapter (relay_tcp path).
+                    Err(e) => {
+                        // The adapter type cannot carry an injected dialer
+                        // (anytls, hysteria2, SS-with-external-SIP003-plugin) or
+                        // the block is otherwise unparseable. Fall back to the
+                        // relay-based `DialerProxyAdapter`, which preserves the
+                        // pre-dialer behaviour: it works for the protocols that
+                        // implement `connect_over` (HTTP/SOCKS5/Snell) and fails
+                        // loudly at dial time for the rest — never silently
+                        // dialing direct and leaking past the chain.
+                        //
+                        // The inner outbound may itself have failed to parse
+                        // earlier, in which case there is nothing to wrap.
                         if let Some(inner) = proxies.get(&name).cloned() {
+                            warn!(
+                                "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
+                                 ({e}); falling back to the relay-based wrapper"
+                            );
                             let wrapped: Arc<dyn Proxy> =
                                 Arc::new(meow_proxy::DialerProxyAdapter::new(inner, dialer_proxy));
                             proxies.insert(name.clone(), wrapped);
+                        } else {
+                            warn!(
+                                "proxy '{name}': dialer-proxy '{dialer}' not applied \
+                                 ({e}); the outbound itself failed to parse"
+                            );
                         }
                     }
                 }
+            } else {
+                warn!(
+                    "proxy '{name}': dialer-proxy '{dialer}' not applied; no raw \
+                     config block found for this name"
+                );
             }
             resolved.insert(name);
         }
@@ -2044,18 +2084,13 @@ mod dialer_proxy_tests {
     }
 
     #[test]
-    fn re_parse_injects_proxy_dialer_for_real_protocol() {
-        // A socks5 proxy with `dialer-proxy: front` should be re-parsed with
-        // a ProxyDialer injected (the primary mihomo-model path), not wrapped
-        // with the DialerProxyAdapter fallback.
-        //
-        // Distinguishing the two paths: Socks5Adapter::support_udp() returns
-        // true for `udp: true`, while DialerProxyAdapter::support_udp() always
-        // returns false. If the re-parse path is taken, support_udp is true;
-        // if the fallback is taken, it is false.
+    fn re_parse_replaces_entry_and_keeps_adapter_type() {
+        // A socks5 proxy with `dialer-proxy: front` is re-parsed with a
+        // ProxyDialer injected (the mihomo-model path). The entry is replaced
+        // and still presents as Socks5 — a DialerProxyAdapter wrapper would
+        // also report the inner type, so `chain_reaches_target_through_front`
+        // below is what actually distinguishes the two paths.
         let mut proxies = registry(&["A", "front"]);
-        // Parse a real socks5 adapter so the initial registry entry has the
-        // correct adapter type (the re-parse replaces it).
         let parsed_a =
             proxy_parser::parse_proxy(&raw_socks5_proxy("A", None, true)).expect("parse socks5");
         proxies.insert(SmolStr::from("A"), parsed_a);
@@ -2068,17 +2103,110 @@ mod dialer_proxy_tests {
             !was_wrapped(&before, &proxies, "front"),
             "front is the dialer, not re-parsed"
         );
-
-        let rebuilt = proxies.get("A").expect("present after");
         assert_eq!(
-            rebuilt.adapter_type(),
+            proxies.get("A").expect("present after").adapter_type(),
             meow_common::AdapterType::Socks5,
             "rebuilt proxy should still be Socks5"
         );
+    }
+
+    /// A raw `type: <ty>` block with a `server`/`port` and optional
+    /// `dialer-proxy` — for the types that cannot carry an injected dialer.
+    fn raw_typed_proxy(
+        name: &str,
+        ty: &str,
+        dialer: Option<&str>,
+    ) -> HashMap<String, serde_yaml::Value> {
+        let mut m = raw_socks5_proxy(name, dialer, false);
+        m.insert(
+            "type".to_string(),
+            serde_yaml::Value::String(ty.to_string()),
+        );
+        m
+    }
+
+    /// `anytls` / `hysteria2` establish their own transport and never call the
+    /// pluggable dialer. Accepting the injected dialer there would silently
+    /// drop the user's `dialer-proxy` and egress from the real source path, so
+    /// the parser rejects it and the relay-based wrapper takes over — which
+    /// fails loudly at dial time rather than dialing direct.
+    #[test]
+    fn types_that_cannot_carry_a_dialer_fall_back_to_the_wrapper() {
+        for ty in ["anytls", "hysteria2"] {
+            let mut proxies = registry(&["A", "front"]);
+            let before = proxies.clone();
+
+            apply_dialer_proxies(&mut proxies, &[raw_typed_proxy("A", ty, Some("front"))]);
+
+            let after = proxies.get("A").expect("entry survives");
+            assert!(
+                was_wrapped(&before, &proxies, "A"),
+                "{ty}: entry must be replaced by the relay wrapper, not left \
+                 dialing direct"
+            );
+            assert!(
+                !after.support_udp(),
+                "{ty}: the wrapper must not advertise UDP over the chain"
+            );
+        }
+    }
+
+    /// `ss` with an *external* SIP003 plugin must not be re-parsed: the
+    /// constructor spawns the plugin subprocess, so a second parse would leave
+    /// two copies running whenever a group still holds the original Arc.
+    #[test]
+    fn external_sip003_plugin_is_not_re_parsed() {
+        let mut proxies = registry(&["A", "front"]);
+        let mut raw = raw_typed_proxy("A", "ss", Some("front"));
+        raw.insert(
+            "cipher".to_string(),
+            serde_yaml::Value::String("aes-256-gcm".to_string()),
+        );
+        raw.insert(
+            "password".to_string(),
+            serde_yaml::Value::String("pw".to_string()),
+        );
+        // A plugin name that is not one of the built-ins → external subprocess.
+        raw.insert(
+            "plugin".to_string(),
+            serde_yaml::Value::String("obfs-local-does-not-exist".to_string()),
+        );
+
+        // Must not panic and must not spawn: the parse is rejected before
+        // `ShadowsocksAdapter::new` runs, so the fallback wrapper is used.
+        apply_dialer_proxies(&mut proxies, &[raw]);
+
         assert!(
-            rebuilt.support_udp(),
-            "re-parse path should preserve udp: true (ProxyDialer injected, \
-             not DialerProxyAdapter fallback which always returns false)"
+            proxies.contains_key("A"),
+            "the entry must survive the rejected re-parse"
+        );
+    }
+
+    /// Duplicate `name:` blocks: the registry-building loop uses `insert`, so
+    /// the *last* block wins. The re-parse lookup must agree, or it resurrects
+    /// the first definition and swaps the running proxy out from under the user.
+    #[test]
+    fn duplicate_names_re_parse_the_last_block() {
+        let mut proxies = registry(&["A", "front"]);
+
+        let mut first = raw_socks5_proxy("A", Some("front"), false);
+        first.insert(
+            "port".to_string(),
+            serde_yaml::Value::Number(serde_yaml::Number::from(1111)),
+        );
+        let mut last = raw_socks5_proxy("A", Some("front"), false);
+        last.insert(
+            "port".to_string(),
+            serde_yaml::Value::Number(serde_yaml::Number::from(2222)),
+        );
+
+        apply_dialer_proxies(&mut proxies, &[first, last]);
+
+        let rebuilt = proxies.get("A").expect("present after");
+        assert_eq!(
+            rebuilt.addr(),
+            "127.0.0.1:2222",
+            "the last duplicate block must win, matching registry insert order"
         );
     }
 
@@ -2106,6 +2234,154 @@ mod dialer_proxy_tests {
         assert!(
             !rebuilt.support_udp(),
             "DialerProxyAdapter fallback should disable UDP even if inner supports it"
+        );
+    }
+
+    /// End-to-end proof that the injected dialer is actually used: stand up two
+    /// mock SOCKS5 servers, chain `inner` behind `front` via `dialer-proxy`,
+    /// and assert `front` was asked to CONNECT to *inner's server address*
+    /// (not to the final target).  This is the assertion that distinguishes the
+    /// re-parse path from the relay wrapper, and it catches a silently dropped
+    /// dialer that a type-only check would miss.
+    #[tokio::test]
+    async fn chain_dials_inner_server_through_front_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Minimal SOCKS5 server: no-auth handshake, records the requested
+        /// target, replies success, then echoes.  Returns the CONNECT target
+        /// as `host:port`.
+        async fn mock_socks5(
+            listener: tokio::net::TcpListener,
+        ) -> tokio::sync::oneshot::Receiver<String> {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                // Greeting: VER NMETHODS METHODS…
+                let mut head = [0u8; 2];
+                if sock.read_exact(&mut head).await.is_err() {
+                    return;
+                }
+                let mut methods = vec![0u8; head[1] as usize];
+                if sock.read_exact(&mut methods).await.is_err() {
+                    return;
+                }
+                // Select no-auth.
+                if sock.write_all(&[0x05, 0x00]).await.is_err() {
+                    return;
+                }
+                // Request: VER CMD RSV ATYP …
+                let mut req = [0u8; 4];
+                if sock.read_exact(&mut req).await.is_err() {
+                    return;
+                }
+                let target = match req[3] {
+                    0x01 => {
+                        let mut ip = [0u8; 4];
+                        let mut port = [0u8; 2];
+                        if sock.read_exact(&mut ip).await.is_err()
+                            || sock.read_exact(&mut port).await.is_err()
+                        {
+                            return;
+                        }
+                        format!(
+                            "{}.{}.{}.{}:{}",
+                            ip[0],
+                            ip[1],
+                            ip[2],
+                            ip[3],
+                            u16::from_be_bytes(port)
+                        )
+                    }
+                    0x03 => {
+                        let mut len = [0u8; 1];
+                        if sock.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut host = vec![0u8; len[0] as usize];
+                        let mut port = [0u8; 2];
+                        if sock.read_exact(&mut host).await.is_err()
+                            || sock.read_exact(&mut port).await.is_err()
+                        {
+                            return;
+                        }
+                        format!(
+                            "{}:{}",
+                            String::from_utf8_lossy(&host),
+                            u16::from_be_bytes(port)
+                        )
+                    }
+                    other => format!("unsupported-atyp-{other}"),
+                };
+                let _ = tx.send(target);
+                // Success reply with a dummy BND.ADDR.
+                let _ = sock
+                    .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await;
+                // Keep the conn alive long enough for the inner handshake.
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+            });
+            rx
+        }
+
+        let front_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind front");
+        let front_port = front_listener.local_addr().expect("addr").port();
+        let front_target = mock_socks5(front_listener).await;
+
+        // `inner`'s server address is never bound — the point is that the dial
+        // is routed to `front` instead, so nothing should ever connect to it.
+        let inner_port = 59_999;
+
+        let mut raw_front = raw_socks5_proxy("front", None, false);
+        raw_front.insert(
+            "port".to_string(),
+            serde_yaml::Value::Number(serde_yaml::Number::from(front_port)),
+        );
+        let mut raw_inner = raw_socks5_proxy("inner", Some("front"), false);
+        raw_inner.insert(
+            "port".to_string(),
+            serde_yaml::Value::Number(serde_yaml::Number::from(inner_port)),
+        );
+
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert(
+            SmolStr::from("front"),
+            proxy_parser::parse_proxy(&raw_front).expect("parse front"),
+        );
+        proxies.insert(
+            SmolStr::from("inner"),
+            proxy_parser::parse_proxy(&raw_inner).expect("parse inner"),
+        );
+
+        apply_dialer_proxies(&mut proxies, &[raw_front, raw_inner]);
+
+        // Dial a final target through `inner`; `inner` must reach its own
+        // server (127.0.0.1:inner_port) *via* `front`.
+        let meta = meow_common::Metadata {
+            host: "example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let _ = proxies
+            .get("inner")
+            .expect("inner present")
+            .dial_tcp(&meta)
+            .await;
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), front_target)
+            .await
+            .expect("front proxy should have received a CONNECT")
+            .expect("front proxy task should report the target");
+
+        assert_eq!(
+            observed,
+            format!("127.0.0.1:{inner_port}"),
+            "front must be asked to reach inner's *server*, not the final \
+             target — otherwise the injected dialer was dropped"
         );
     }
 }
