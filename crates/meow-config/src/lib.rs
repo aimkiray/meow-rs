@@ -536,6 +536,7 @@ pub fn rebuild_from_raw_with_cache_dir(
 fn apply_dialer_proxies(
     proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
     raw_proxies: &[HashMap<String, serde_yaml::Value>],
+    ipv6: bool,
 ) {
     // Collect proxy -> dialer edges from the raw config.
     let mut pending: Vec<(SmolStr, SmolStr)> = Vec::new();
@@ -598,7 +599,7 @@ fn apply_dialer_proxies(
                 let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> = Arc::new(
                     meow_proxy::dialer::ProxyDialer::new(Arc::clone(&dialer_proxy)),
                 );
-                match proxy_parser::parse_proxy_with_dialer(raw, &proxy_dialer) {
+                match proxy_parser::parse_proxy_with_dialer(raw, &proxy_dialer, ipv6) {
                     Ok(rebuilt) => {
                         proxies.insert(name.clone(), rebuilt);
                     }
@@ -784,7 +785,7 @@ fn rebuild_from_raw_impl(
 
     // Apply per-outbound `dialer-proxy` wrappers (issue #210). Runs after both
     // leaf proxies and groups are built so a dialer may reference either.
-    apply_dialer_proxies(&mut proxies, raw.proxies.as_deref().unwrap_or(&[]));
+    apply_dialer_proxies(&mut proxies, raw.proxies.as_deref().unwrap_or(&[]), ipv6);
 
     let download_proxy = internal_http::first_named_proxy(raw.proxies.as_deref(), &proxies);
     // Per-provider `proxy:` overrides resolve against the full registry —
@@ -1999,7 +2000,7 @@ mod dialer_proxy_tests {
     fn wraps_proxy_with_dialer() {
         let mut proxies = registry(&["A", "fast"]);
         let before = proxies.clone();
-        apply_dialer_proxies(&mut proxies, &[raw_proxy("A", Some("fast"))]);
+        apply_dialer_proxies(&mut proxies, &[raw_proxy("A", Some("fast"))], true);
         assert!(was_wrapped(&before, &proxies, "A"));
         assert!(!was_wrapped(&before, &proxies, "fast"));
     }
@@ -2008,7 +2009,7 @@ mod dialer_proxy_tests {
     fn self_reference_is_skipped() {
         let mut proxies = registry(&["A"]);
         let before = proxies.clone();
-        apply_dialer_proxies(&mut proxies, &[raw_proxy("A", Some("A"))]);
+        apply_dialer_proxies(&mut proxies, &[raw_proxy("A", Some("A"))], true);
         assert!(!was_wrapped(&before, &proxies, "A"));
     }
 
@@ -2016,7 +2017,7 @@ mod dialer_proxy_tests {
     fn missing_dialer_is_skipped() {
         let mut proxies = registry(&["A"]);
         let before = proxies.clone();
-        apply_dialer_proxies(&mut proxies, &[raw_proxy("A", Some("ghost"))]);
+        apply_dialer_proxies(&mut proxies, &[raw_proxy("A", Some("ghost"))], true);
         assert!(!was_wrapped(&before, &proxies, "A"));
     }
 
@@ -2027,6 +2028,7 @@ mod dialer_proxy_tests {
         apply_dialer_proxies(
             &mut proxies,
             &[raw_proxy("A", Some("B")), raw_proxy("B", Some("A"))],
+            true,
         );
         assert!(!was_wrapped(&before, &proxies, "A"));
         assert!(!was_wrapped(&before, &proxies, "B"));
@@ -2040,6 +2042,7 @@ mod dialer_proxy_tests {
         apply_dialer_proxies(
             &mut proxies,
             &[raw_proxy("A", Some("B")), raw_proxy("B", Some("C"))],
+            true,
         );
         assert!(was_wrapped(&before, &proxies, "A"));
         assert!(was_wrapped(&before, &proxies, "B"));
@@ -2092,11 +2095,11 @@ mod dialer_proxy_tests {
         // below is what actually distinguishes the two paths.
         let mut proxies = registry(&["A", "front"]);
         let parsed_a =
-            proxy_parser::parse_proxy(&raw_socks5_proxy("A", None, true)).expect("parse socks5");
+            proxy_parser::parse_proxy(&raw_socks5_proxy("A", None, true), true).expect("parse socks5");
         proxies.insert(SmolStr::from("A"), parsed_a);
         let before = proxies.clone();
 
-        apply_dialer_proxies(&mut proxies, &[raw_socks5_proxy("A", Some("front"), true)]);
+        apply_dialer_proxies(&mut proxies, &[raw_socks5_proxy("A", Some("front"), true)], true);
 
         assert!(was_wrapped(&before, &proxies, "A"), "A should be re-parsed");
         assert!(
@@ -2136,7 +2139,7 @@ mod dialer_proxy_tests {
             let mut proxies = registry(&["A", "front"]);
             let before = proxies.clone();
 
-            apply_dialer_proxies(&mut proxies, &[raw_typed_proxy("A", ty, Some("front"))]);
+            apply_dialer_proxies(&mut proxies, &[raw_typed_proxy("A", ty, Some("front"))], true);
 
             let after = proxies.get("A").expect("entry survives");
             assert!(
@@ -2174,7 +2177,7 @@ mod dialer_proxy_tests {
 
         // Must not panic and must not spawn: the parse is rejected before
         // `ShadowsocksAdapter::new` runs, so the fallback wrapper is used.
-        apply_dialer_proxies(&mut proxies, &[raw]);
+        apply_dialer_proxies(&mut proxies, &[raw], true);
 
         assert!(
             proxies.contains_key("A"),
@@ -2200,7 +2203,7 @@ mod dialer_proxy_tests {
             serde_yaml::Value::Number(serde_yaml::Number::from(2222)),
         );
 
-        apply_dialer_proxies(&mut proxies, &[first, last]);
+        apply_dialer_proxies(&mut proxies, &[first, last], true);
 
         let rebuilt = proxies.get("A").expect("present after");
         assert_eq!(
@@ -2219,12 +2222,12 @@ mod dialer_proxy_tests {
         let mut proxies = registry(&["A", "front"]);
         // Give "A" a real socks5 adapter so the fallback has something to wrap.
         let parsed_a =
-            proxy_parser::parse_proxy(&raw_socks5_proxy("A", None, true)).expect("parse socks5");
+            proxy_parser::parse_proxy(&raw_socks5_proxy("A", None, true), true).expect("parse socks5");
         proxies.insert(SmolStr::from("A"), parsed_a);
         let before = proxies.clone();
 
         // raw_proxy has no `type` → parse_proxy_with_dialer fails → fallback.
-        apply_dialer_proxies(&mut proxies, &[raw_proxy("A", Some("front"))]);
+        apply_dialer_proxies(&mut proxies, &[raw_proxy("A", Some("front"))], true);
 
         assert!(
             was_wrapped(&before, &proxies, "A"),
@@ -2350,14 +2353,14 @@ mod dialer_proxy_tests {
         let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
         proxies.insert(
             SmolStr::from("front"),
-            proxy_parser::parse_proxy(&raw_front).expect("parse front"),
+            proxy_parser::parse_proxy(&raw_front, true).expect("parse front"),
         );
         proxies.insert(
             SmolStr::from("inner"),
-            proxy_parser::parse_proxy(&raw_inner).expect("parse inner"),
+            proxy_parser::parse_proxy(&raw_inner, true).expect("parse inner"),
         );
 
-        apply_dialer_proxies(&mut proxies, &[raw_front, raw_inner]);
+        apply_dialer_proxies(&mut proxies, &[raw_front, raw_inner], true);
 
         // Dial a final target through `inner`; `inner` must reach its own
         // server (127.0.0.1:inner_port) *via* `front`.
