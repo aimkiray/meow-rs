@@ -1288,3 +1288,202 @@ port: 0
     let config = load_config_from_str(yaml).await.unwrap();
     assert!(config.listeners.named.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// M11/N5: HTTP rule providers must fetch their payload *through* the
+// configured `proxy:` chain, whose `server:` may itself be a hostname.
+// ---------------------------------------------------------------------------
+
+/// Spawn a minimal no-auth SOCKS5 relay on its own OS thread (own
+/// current-thread runtime — it must not depend on the test runtime, which is
+/// synchronously blocked inside `load_config` while the blocking provider
+/// fetch runs). Counts accepted control connections via `accepted`; each
+/// CONNECT is relayed to the requested target. Returns the listen port via
+/// `ready_tx`.
+fn spawn_socks5_relay(
+    ready_tx: std::sync::mpsc::Sender<u16>,
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            ready_tx
+                .send(listener.local_addr().unwrap().port())
+                .unwrap();
+            loop {
+                let Ok((mut client, _)) = listener.accept().await else {
+                    break;
+                };
+                accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2];
+                    client.read_exact(&mut buf).await.unwrap();
+                    assert_eq!(buf[0], 0x05, "expected SOCKS5 greeting");
+                    let mut methods = vec![0u8; buf[1] as usize];
+                    client.read_exact(&mut methods).await.unwrap();
+                    client
+                        .write_all(&[0x05, 0x00]) // no auth required
+                        .await
+                        .unwrap();
+
+                    // CONNECT request: VER CMD RSV ATYP ADDR PORT
+                    let mut head = [0u8; 4];
+                    client.read_exact(&mut head).await.unwrap();
+                    assert_eq!(head[0], 0x05);
+                    assert_eq!(head[1], 0x01, "expected CONNECT");
+                    let target: SocketAddr = match head[3] {
+                        0x01 => {
+                            let mut a = [0u8; 6];
+                            client.read_exact(&mut a).await.unwrap();
+                            let ip = std::net::IpAddr::from([a[0], a[1], a[2], a[3]]);
+                            SocketAddr::new(ip, u16::from_be_bytes([a[4], a[5]]))
+                        }
+                        0x03 => {
+                            let mut l = [0u8; 1];
+                            client.read_exact(&mut l).await.unwrap();
+                            let mut domain = vec![0u8; l[0] as usize];
+                            client.read_exact(&mut domain).await.unwrap();
+                            let host = String::from_utf8(domain).unwrap();
+                            let mut p = [0u8; 2];
+                            client.read_exact(&mut p).await.unwrap();
+                            let port = u16::from_be_bytes(p);
+                            // The provider URL host is an IP literal in this
+                            // test; resolve defensively for the domain case.
+                            let ip = host
+                                .parse()
+                                .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+                            SocketAddr::new(ip, port)
+                        }
+                        0x04 => {
+                            let mut a = [0u8; 18];
+                            client.read_exact(&mut a).await.unwrap();
+                            let ip =
+                                std::net::IpAddr::from(<[u8; 16]>::try_from(&a[..16]).unwrap());
+                            SocketAddr::new(ip, u16::from_be_bytes([a[16], a[17]]))
+                        }
+                        other => panic!("unexpected atyp {other}"),
+                    };
+                    // Success reply: bound addr 0.0.0.0:0.
+                    client
+                        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .unwrap();
+                    let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                });
+            }
+        });
+    });
+}
+
+/// Spawn a tiny HTTP server on its own OS thread (same reasoning as
+/// `spawn_socks5_relay`) that answers every connection with a 200 + `body`.
+/// Returns the listen port via `ready_tx`.
+fn spawn_payload_http_server(ready_tx: std::sync::mpsc::Sender<u16>, body: &'static str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            ready_tx
+                .send(listener.local_addr().unwrap().port())
+                .unwrap();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let _ = async move {
+                    // Drain the request head; the canned response ignores it.
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/yaml\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(resp.as_bytes()).await?;
+                    stream.shutdown().await
+                }
+                .await;
+            }
+        });
+    });
+}
+
+// The full M11 risk path, end to end: an `type: http` rule-provider whose
+// payload must be fetched *through* the `proxy: remote` chain — where
+// `remote` is a SOCKS5 proxy whose own `server:` is the hostname
+// `localhost`, resolved only at dial time (never at load time). The
+// provider must also load before the DNS subsystem is built, or the
+// `nameserver-policy` `rule-set:ads` entry hard-errors. The file-based
+// test above pins the ordering in isolation; this one additionally proves
+// the payload traverses the proxy relay (the SOCKS5 dial counter must
+// advance) rather than being fetched direct.
+#[tokio::test]
+async fn test_http_rule_provider_fetches_payload_through_hostname_proxied_relay() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (socks_tx, socks_rx) = mpsc::channel();
+    spawn_socks5_relay(socks_tx, Arc::clone(&accepted));
+    let (http_tx, http_rx) = mpsc::channel();
+    spawn_payload_http_server(http_tx, "payload:\n  - '+.ads.example'\n");
+    let socks_port = socks_rx.recv().unwrap();
+    let http_port = http_rx.recv().unwrap();
+
+    let yaml = format!(
+        r#"
+mixed-port: 7890
+dns:
+  enable: true
+  nameserver:
+    - 8.8.8.8
+  nameserver-policy:
+    "rule-set:ads":
+      - 8.8.4.4
+proxies:
+  - name: "remote"
+    type: socks5
+    server: "localhost"
+    port: {socks_port}
+rule-providers:
+  ads:
+    type: http
+    behavior: domain
+    format: yaml
+    url: "http://127.0.0.1:{http_port}/ads.yaml"
+    proxy: remote
+rules:
+  - RULE-SET,ads,REJECT
+  - MATCH,DIRECT
+"#
+    );
+
+    let config = load_config_from_str(&yaml).await.unwrap();
+
+    // The payload was fetched through the SOCKS5 relay, not dialed direct.
+    let dials = accepted.load(Ordering::SeqCst);
+    assert!(
+        dials >= 1,
+        "provider payload must be relayed through the proxy; relay saw {dials} connections"
+    );
+    // The fetched payload parsed into a live provider, registered before
+    // the DNS build (a regression makes the whole load hard-error).
+    assert!(config.rule_providers.contains_key("ads"));
+    assert!(config.dns.enabled);
+}
