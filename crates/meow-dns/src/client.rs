@@ -783,13 +783,14 @@ mod tests {
         // bound for the duration of the query: a closed port would yield
         // ECONNREFUSED on the client's connected socket instead of a timeout.
         // The client sends a single datagram, so the kernel recv buffer never
-        // fills and no drain task is needed.
+        // fills and no drain task is needed. Binding for the whole test scope
+        // covers that; the sink needs no explicit drop at the end — the query
+        // has already completed by then (review low item).
         let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sink.local_addr().unwrap();
         let client = DnsClient::udp(addr).with_timeout(Duration::from_millis(200));
         let r = client.query("example.test", RecordType::A).await;
         assert!(matches!(r, Err(ClientError::Timeout(_))));
-        drop(sink);
     }
 
     #[tokio::test]
