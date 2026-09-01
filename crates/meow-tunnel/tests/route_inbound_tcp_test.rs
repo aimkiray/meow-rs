@@ -18,12 +18,15 @@ use tokio::net::{TcpListener, TcpStream};
 /// test servers.
 fn direct_tunnel() -> Tunnel {
     let hosts = DomainTrie::new();
+    let use_hosts = false;
+    let ipv6 = false;
     let resolver = Arc::new(Resolver::new(
         vec![],
         vec![],
         meow_common::DnsMode::Normal,
         hosts,
-        false,
+        use_hosts,
+        ipv6,
     ));
     let tunnel = Tunnel::new(resolver);
     tunnel.set_mode(meow_common::TunnelMode::Direct);
