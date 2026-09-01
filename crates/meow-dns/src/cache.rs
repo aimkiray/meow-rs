@@ -49,8 +49,8 @@ pub type IpList = SmallVec<[IpAddr; 2]>;
 ///                                     + source 16 + queried 1 + pad 7
 ///   i.e. 56 B -> 72 B (at the M2 72 B per-`CacheEntry` cap — the `.val`
 ///   of each `LruEntry`; the full slot incl. `Arc<str>` key + LRU links is
-///   ~104 B on macOS). On Linux (`Instant` = 8 B) the same change is
-///   48 B -> 56 B (under the cap). The `queried` bitset stays a single `u8`;
+///   ~104 B on macOS). On 64-bit Linux (`Instant` = 16 B) the same change is
+///   56 B -> 72 B (also at the cap). The `queried` bitset stays a single `u8`;
 ///   the size-regression test below guards the cap. Packing `queried` into
 ///   the `Option<Arc<str>>` niche is not viable here: `preload_cache` inserts
 ///   entries with `source = None` yet `queried = BOTH`, so the null niche is
@@ -58,11 +58,10 @@ pub type IpList = SmallVec<[IpAddr; 2]>;
 ///
 /// The `neg` field (RFC 2308 negative-answer kind, 2 bits/family) occupies the
 /// trailing padding slot alongside `queried` and so does not grow the struct:
-/// on macOS both sit in the 7-byte pad tail (offset 64..72), and on Linux the
-/// 56 B layout already has room. The size-regression test asserts
-/// `size_of::<CacheEntry>() <= 72` plus the documented per-platform size
-/// (72 B macOS / 56 B Linux) so growth fails on every platform, not only
-/// where the cap has no slack.
+/// both sit in the 7-byte pad tail (offset 64..72) on macOS and 64-bit Linux.
+/// The size-regression test asserts `size_of::<CacheEntry>() <= 72` plus the
+/// documented per-platform size (72 B on both macOS and 64-bit Linux) so
+/// growth fails on every platform, not only where the cap has no slack.
 struct CacheEntry {
     ips: Box<[IpAddr]>,
     expire_v4: Instant,
@@ -1529,10 +1528,10 @@ mod tests {
     /// before/after byte counts. The added `neg` (negative-kind) byte sits in
     /// the trailing padding alongside `queried` and must not grow the struct.
     ///
-    /// The universal 72 B cap has 16 B of slack on Linux (`Instant` = 8 B), so
-    /// a regression that stays under the cap would only fail on macOS CI.
-    /// Lock the documented per-platform size too, so *any* growth (beyond
-    /// padding) fails on every platform (review M5).
+    /// Both macOS and 64-bit Linux sit exactly at the 72 B cap (`Instant` =
+    /// 16 B on each), so a field addition has no slack on either. Lock the
+    /// documented per-platform size too, so *any* growth (beyond padding)
+    /// fails on every platform (review M5).
     #[test]
     fn cache_entry_fits_m2_size_cap() {
         use std::mem::size_of;
@@ -1541,8 +1540,8 @@ mod tests {
             size <= 72,
             "CacheEntry {size} B exceeded the 72 B M2 per-slot cap"
         );
-        // macOS sits exactly at the cap — zero headroom — and Linux has the
-        // 16 B `Instant` slack documented on the struct.
+        // Both macOS and 64-bit Linux sit exactly at the 72 B cap (`Instant`
+        // = 16 B on each) — zero headroom on either.
         #[cfg(target_os = "macos")]
         assert_eq!(
             size, 72,
@@ -1550,8 +1549,8 @@ mod tests {
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
-            size, 56,
-            "CacheEntry grew on Linux (expected 56 B with 8 B Instants)"
+            size, 72,
+            "CacheEntry grew on Linux (expected 72 B with 16 B Instants)"
         );
     }
 }
