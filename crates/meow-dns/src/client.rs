@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::Mutex as AsyncMutex;
 
 #[cfg(feature = "encrypted")]
 use {rustls::pki_types::ServerName, std::convert::TryFrom, tokio_rustls::TlsConnector};
@@ -25,18 +25,18 @@ use {rustls::pki_types::ServerName, std::convert::TryFrom, tokio_rustls::TlsConn
 /// Default per-query timeout (matches the hickory-resolver value previously
 /// used in `Resolver::build_*`).
 pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
-/// Maximum number of pooled *and* concurrently active `tcp://` streams per
-/// `DnsClient`.
+/// Maximum number of *idle* pooled `tcp://` streams per [`DnsClient`].
 ///
-/// The `Semaphore` in [`TcpPool`] uses this value for two purposes: it bounds
-/// the idle pool size (a stream is only pushed while a permit is held) and,
-/// as a side effect, limits concurrent exchanges to the same number. The
-/// pool-size bound is the intended effect; the concurrency cap is an
-/// acceptable consequence for this low-frequency path — plain `tcp://` DNS
-/// carries truncated responses and zone transfers, not the bulk of
-/// resolution traffic. If a future workload needs higher concurrency without
-/// a larger pool, split this into separate `POOL_SIZE` / `MAX_CONCURRENCY`
-/// constants.
+/// This bounds only the keep-alive pool: a stream is pushed on return
+/// only while the pool is below this size (see [`TcpPool::push`]).
+/// Concurrent exchanges are **not** capped by this value — a `tcp://`
+/// nameserver can be a user's primary resolver (a common way to dodge
+/// UDP truncation/pollution), and capping concurrent exchanges at the
+/// pool size would queue bursts into the 5 s outer timeout and
+/// reintroduce intermittent DNS timeouts (issue #460). Every
+/// concurrent exchange beyond the pool simply opens its own
+/// connection, and surplus validated streams are closed on return
+/// instead of being pooled.
 const TCP_POOL_CAPACITY: usize = 4;
 /// How long a pooled `tcp://` stream may sit idle before it is closed rather
 /// than reused.
@@ -146,7 +146,6 @@ struct TcpPool {
     /// Pushed and popped at the end, so the freshest stream is reused first
     /// and the staler ones age out instead of being handed to a query.
     idle: AsyncMutex<Vec<(TcpStream, Instant)>>,
-    permits: Semaphore,
     idle_timeout: Duration,
 }
 
@@ -154,9 +153,23 @@ impl TcpPool {
     fn new() -> Self {
         Self {
             idle: AsyncMutex::new(Vec::with_capacity(TCP_POOL_CAPACITY)),
-            permits: Semaphore::new(TCP_POOL_CAPACITY),
             idle_timeout: TCP_POOL_IDLE_TIMEOUT,
         }
+    }
+
+    /// Return a validated stream to the idle pool, closing it instead when
+    /// the pool is already at capacity.
+    ///
+    /// The size bound is enforced *here*, on the push side — it is not an
+    /// emergent property of the exchange path — so any future caller
+    /// (e.g. a background reaper returning streams) cannot silently grow
+    /// the pool beyond [`TCP_POOL_CAPACITY`].
+    async fn push(&self, stream: TcpStream) {
+        let mut idle = self.idle.lock().await;
+        if idle.len() < TCP_POOL_CAPACITY {
+            idle.push((stream, Instant::now()));
+        }
+        // else: `stream` drops here, closing the connection.
     }
 }
 
@@ -403,23 +416,24 @@ impl DnsClient {
     /// Checked-out streams stay local to this future, so cancellation drops a
     /// partially consumed stream instead of returning it to the pool.
     ///
-    /// Concurrency is bounded by a `Semaphore` (`TCP_POOL_CAPACITY`); the async
-    /// mutex only guards the idle-slot pop/push, so up to four exchanges run
-    /// concurrently on separate streams while a fifth caller waits for a
-    /// permit.
+    /// Concurrency is **not** capped: each in-flight exchange either reuses a
+    /// pooled stream or opens its own connection, and validated streams are
+    /// returned to the pool only while it is below
+    /// [`TCP_POOL_CAPACITY`] (see [`TcpPool::push`]); surplus streams are
+    /// closed. The async mutex only guards the idle-slot pop/push.
     ///
-    /// The pooled (reused) attempt runs under a *short* read deadline — half
-    /// the per-query timeout. A reused stream that has been idle-half-closed
-    /// by an upstream or NAT (write succeeds, peer never answers) would
-    /// otherwise block in `read_lp` until the outer deadline is nearly
-    /// exhausted, leaving the fresh-connect retry almost no budget. RST/EOF
-    /// still fail fast; only the silent half-close case is bounded here, so a
-    /// query that would succeed in ~30 ms on a fresh connection no longer
-    /// spuriously times out. That deadline is the second line of defence:
-    /// [`TCP_POOL_IDLE_TIMEOUT`] closes a stream before it has been idle long
-    /// enough to be silently dropped, so the common path after a quiet period
-    /// is a plain connect rather than a reuse attempt that has to time out
-    /// first. Pooling is intentionally scoped to plain
+    /// The pooled (reused) attempt runs under a *short* read deadline — at
+    /// most half the per-query timeout, and never more than 250 ms: a
+    /// healthy reused stream answers in about one RTT, so a longer budget
+    /// only helps a stream that has been idle-half-closed by an upstream or
+    /// NAT (write succeeds, peer never answers). Capping the deadline keeps
+    /// a stale-reuse discovery from cutting the fresh-connect retry budget
+    /// in half. RST/EOF still fail fast; only the silent half-close case is
+    /// bounded here. That deadline is the second line of defence:
+    /// [`TCP_POOL_IDLE_TIMEOUT`] closes a stream before it has been idle
+    /// long enough to be silently dropped, so the common path after a quiet
+    /// period is a plain connect rather than a reuse attempt that has to
+    /// time out first. Pooling is intentionally scoped to plain
     /// `tcp://`; DoT/DoH keep a full TLS handshake per query and are out of
     /// scope.
     /// Test hook: shorten the pooled-stream idle window so reaping can be
@@ -436,28 +450,21 @@ impl DnsClient {
         wire: &[u8],
         expected: &ExpectedResponse,
     ) -> Result<Message, ClientError> {
-        let _permit = self
-            .tcp_pool
-            .permits
-            .acquire()
-            .await
-            .map_err(|_| ClientError::Protocol("TCP pool closed"))?;
         let pooled = {
             let mut idle = self.tcp_pool.idle.lock().await;
             take_fresh(&mut idle, Instant::now(), self.tcp_pool.idle_timeout)
         };
-        // Half the budget for the reused-stream attempt, half in reserve for a
-        // fresh connect + full exchange if the pooled stream turns out stale.
+        // A reused stream should answer within about one RTT; anything
+        // slower is presumed a silently half-closed stream. Bounding the
+        // discovery attempt to at most half the query timeout (and 250 ms)
+        // preserves a full budget for the fresh connect + exchange below.
         let pooled_budget = self.timeout / 2;
+        let pooled_budget = pooled_budget.min(Duration::from_millis(250));
 
         if let Some(mut stream) = pooled {
             let attempt = tcp_message_exchange(&mut stream, wire, expected);
             if let Ok(Ok(response)) = tokio::time::timeout(pooled_budget, attempt).await {
-                self.tcp_pool
-                    .idle
-                    .lock()
-                    .await
-                    .push((stream, Instant::now()));
+                self.tcp_pool.push(stream).await;
                 return Ok(response);
             }
             // Timeout or error: drop the (possibly desynced/half-closed)
@@ -467,11 +474,7 @@ impl DnsClient {
 
         let mut stream = factory().connect_tcp(addr).await?;
         let response = tcp_message_exchange(&mut stream, wire, expected).await?;
-        self.tcp_pool
-            .idle
-            .lock()
-            .await
-            .push((stream, Instant::now()));
+        self.tcp_pool.push(stream).await;
         Ok(response)
     }
 
@@ -728,17 +731,14 @@ async fn udp_exchange(
             continue;
         };
         if response.metadata.truncation {
-            let response = tcp_exchange(addr, wire).await?;
-            return decode_validated_response(&response, expected);
+            // RFC 7766 §0: retry a truncated UDP answer over TCP with a
+            // one-off connection (the truncation fallback is intentionally
+            // not pooled).
+            let mut stream = factory().connect_tcp(addr).await?;
+            return tcp_message_exchange(&mut stream, wire, expected).await;
         }
         return Ok(response);
     }
-}
-
-async fn tcp_exchange(addr: SocketAddr, wire: &[u8]) -> Result<Vec<u8>, ClientError> {
-    let mut stream = factory().connect_tcp(addr).await?;
-    write_lp(&mut stream, wire).await?;
-    read_lp(&mut stream).await
 }
 
 async fn write_lp<W: AsyncWriteExt + Unpin>(w: &mut W, payload: &[u8]) -> io::Result<()> {
@@ -1238,7 +1238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_pool_bounds_concurrency_and_reuses_connections() {
+    async fn tcp_pool_reuses_connections_without_capping_concurrency() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -1278,7 +1278,11 @@ mod tests {
         });
 
         let client = Arc::new(DnsClient::tcp(addr).with_timeout(Duration::from_secs(2)));
-        let queries: Vec<_> = (0..6)
+        // Deliberately more concurrent queries than TCP_POOL_CAPACITY:
+        // a `tcp://` nameserver can be the primary resolver, and the
+        // exchange path must never queue a burst behind the pool size.
+        let burst = 2 * TCP_POOL_CAPACITY;
+        let queries: Vec<_> = (0..burst)
             .map(|index| {
                 let client = Arc::clone(&client);
                 tokio::spawn(async move {
@@ -1290,23 +1294,40 @@ mod tests {
             .collect();
 
         tokio::time::timeout(Duration::from_secs(1), async {
-            while active.load(Ordering::SeqCst) < TCP_POOL_CAPACITY {
+            while active.load(Ordering::SeqCst) < burst {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("four TCP exchanges should run concurrently");
-        assert_eq!(accepted.load(Ordering::SeqCst), TCP_POOL_CAPACITY);
+        .expect("every concurrent TCP exchange should dial immediately");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            burst,
+            "concurrency must not be capped at the pool size"
+        );
 
         released.store(true, Ordering::SeqCst);
-        gate.add_permits(TCP_POOL_CAPACITY);
+        gate.add_permits(burst);
         for query in queries {
             query.await.unwrap().unwrap();
         }
+        assert!(
+            client.tcp_pool.idle.lock().await.len() <= TCP_POOL_CAPACITY,
+            "the idle pool must stay bounded at TCP_POOL_CAPACITY"
+        );
+
+        // Every burst connection was returned; the surplus was closed
+        // instead of pooled, and the next query must reuse a pooled
+        // stream rather than dial again.
+        let accepted_before = accepted.load(Ordering::SeqCst);
+        client
+            .query("pool-reuse.example", RecordType::A)
+            .await
+            .unwrap();
         assert_eq!(
             accepted.load(Ordering::SeqCst),
-            TCP_POOL_CAPACITY,
-            "queued queries should reuse the four established connections"
+            accepted_before,
+            "a query right after the burst should reuse a pooled connection"
         );
     }
     #[test]
