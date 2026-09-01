@@ -395,6 +395,36 @@ impl RuleSet for IpCidrRuleSet {
 
 pub struct ClassicalRuleSet {
     rules: Vec<Box<dyn Rule>>,
+    /// Indices into `rules` of the domain-family subset, pre-filtered once
+    /// at construction (review H4): the DNS `nameserver-policy` hot path
+    /// runs `matches_domain` on **every query**, so it must not re-test the
+    /// rule-type whitelist against all `n` rules per call — it scans only
+    /// these indices.
+    domain_rule_indices: Vec<usize>,
+}
+
+/// Rule types eligible for DNS `nameserver-policy` domain dispatch. This is
+/// a *rule-type whitelist*, not a host-only `Metadata` probe: rules such as
+/// `NETWORK,TCP`, `IN-TYPE,HTTP`, or `DST-PORT,0` match the default
+/// `Metadata` (network = Tcp, conn_type = Http, ports = 0) and would
+/// otherwise hijack *every* query to this policy — a DNS leak. Logic rules
+/// (`AND`/`OR`/`NOT`) and `MATCH` are excluded too: they either re-derive
+/// from those default-matching leaves or match everything.
+///
+/// The whitelist is also the reentrancy guard (review H4): every eligible
+/// type is host-only — `should_resolve_ip()` is false for all of them — so
+/// matching can never trigger a nested DNS lookup even though
+/// `RuleMatchHelper` carries no resolver.
+fn is_domain_family_rule_type(t: RuleType) -> bool {
+    matches!(
+        t,
+        RuleType::Domain
+            | RuleType::DomainSuffix
+            | RuleType::DomainKeyword
+            | RuleType::DomainRegex
+            | RuleType::DomainWildcard
+            | RuleType::GeoSite,
+    )
 }
 
 impl ClassicalRuleSet {
@@ -416,7 +446,16 @@ impl ClassicalRuleSet {
                 Err(e) => warn!("rule-set (classical): skipping '{}': {}", entry, e),
             }
         }
-        Self { rules }
+        let domain_rule_indices = rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| is_domain_family_rule_type(r.rule_type()))
+            .map(|(i, _)| i)
+            .collect();
+        Self {
+            rules,
+            domain_rule_indices,
+        }
     }
 }
 
@@ -445,27 +484,34 @@ impl RuleSet for ClassicalRuleSet {
 
     fn matches_domain(&self, domain: &str) -> bool {
         // Nameserver-policy `rule-set:` dispatch only has the query domain,
-        // so we restrict classical sets to their domain-family rules. This is
-        // a *rule-type whitelist*, not a host-only `Metadata` probe: rules such
-        // as `NETWORK,TCP`, `IN-TYPE,HTTP`, or `DST-PORT,0` match the default
-        // `Metadata` (network = Tcp, conn_type = Http, ports = 0) and would
-        // otherwise hijack *every* query to this policy — a DNS leak. Logic
-        // rules (`AND`/`OR`/`NOT`) and `MATCH` are excluded too: they either
-        // re-derive from those default-matching leaves or match everything.
+        // so we restrict classical sets to their domain-family rules (see
+        // `is_domain_family_rule_type`). The subset was pre-filtered at
+        // construction, so this is O(domain rules) per query — not O(all
+        // rules) with a type test each (review H4). Cost note: a large
+        // classical set still pays a linear scan over its domain rules on
+        // *every DNS query* that reaches this policy entry; prefer a
+        // `behavior: domain` provider for large sets.
+        //
+        // Reentrancy: every eligible rule type is host-only
+        // (`should_resolve_ip()` = false), so matching cannot trigger a
+        // nested DNS lookup through `RuleMatchHelper` (which is a bare
+        // marker with no resolver access).
+        if self.domain_rule_indices.is_empty() {
+            // Fast path: no domain-family rules (e.g. an IP-only classical
+            // set) — also skips the ~272 B `Metadata` construction.
+            return false;
+        }
         let metadata = Metadata {
             host: domain.into(),
             ..Default::default()
         };
-        self.rules.iter().any(|r| {
-            matches!(
-                r.rule_type(),
-                RuleType::Domain
-                    | RuleType::DomainSuffix
-                    | RuleType::DomainKeyword
-                    | RuleType::DomainRegex
-                    | RuleType::DomainWildcard
-                    | RuleType::GeoSite,
-            ) && r.match_metadata(&metadata, &RuleMatchHelper)
+        self.domain_rule_indices.iter().any(|&index| {
+            let rule = &self.rules[index];
+            debug_assert!(
+                is_domain_family_rule_type(rule.rule_type()),
+                "domain_rule_indices must only hold domain-family rules"
+            );
+            rule.match_metadata(&metadata, &RuleMatchHelper)
         })
     }
 }
@@ -674,6 +720,46 @@ mod tests {
         let set = IpCidrRuleSet::from_entries(&["10.0.0.0/8".to_string()]);
         assert!(!set.matches_domain("10.0.0.1"));
         assert!(!set.matches_domain("foo.com"));
+    }
+
+    // Reentrancy guard (review H4): an `IP-CIDR` rule without
+    // `no-resolve` demands IP resolution at match time — on the full
+    // metadata path it can trigger a nested DNS lookup. The DNS-policy
+    // domain whitelist must exclude it entirely, so `matches_domain` can
+    // never re-enter the resolver through `RuleMatchHelper`.
+    #[test]
+    fn classical_rule_set_matches_domain_excludes_resolver_requiring_rules() {
+        let ctx = ParserContext::empty();
+        let set = ClassicalRuleSet::from_entries(
+            &[
+                "IP-CIDR,10.0.0.0/8".to_string(),
+                "DOMAIN-SUFFIX,example.com".to_string(),
+            ],
+            &ctx,
+        );
+        // The IP-CIDR rule is present and resolver-requiring on the full
+        // metadata path…
+        assert!(
+            set.should_resolve_ip(),
+            "IP-CIDR without no-resolve must stay resolver-requiring on the full path"
+        );
+        // …but the DNS domain dispatch subset holds only the DOMAIN-SUFFIX
+        // rule, and matching never fires the IP-CIDR rule (so it cannot
+        // trigger a nested lookup).
+        assert_eq!(set.domain_rule_indices.len(), 1);
+        assert!(set.matches_domain("www.example.com"));
+        assert!(!set.matches_domain("unrelated.test"));
+    }
+
+    // The domain subset is pre-filtered at construction (review H4): an
+    // IP-only classical set must take the empty fast path and never match.
+    #[test]
+    fn classical_rule_set_matches_domain_ip_only_set_never_matches() {
+        let ctx = ParserContext::empty();
+        let set =
+            ClassicalRuleSet::from_entries(&["IP-CIDR,10.0.0.0/8,no-resolve".to_string()], &ctx);
+        assert!(set.domain_rule_indices.is_empty());
+        assert!(!set.matches_domain("anything.example"));
     }
 
     #[test]

@@ -995,6 +995,62 @@ rules:
     assert!(!config.rules[0].match_metadata(&meta_miss, &helper));
 }
 
+// Startup-order regression (review M11): rule-providers load *before* the
+// DNS subsystem is built, so a `nameserver-policy` `rule-set:` entry can
+// resolve against them. The provider's `proxy:` must resolve against the
+// step-1 proxy registry even when the named proxy's `server:` is a
+// hostname that would itself need DNS — server-name resolution is
+// deferred to dial time, so the moved load order must not regress
+// startup for hostname-based proxies. If the ordering ever regresses,
+// the `rule-set:ads` policy entry hard-errors ("unknown rule-set") and
+// this test fails.
+#[tokio::test]
+async fn test_rule_provider_with_proxy_hostname_server_loads_before_dns() {
+    let dir = tempfile::tempdir().unwrap();
+    let list_path = dir.path().join("ads.yaml");
+    std::fs::write(&list_path, "payload:\n  - '+.ads.example'\n").unwrap();
+
+    let yaml = r#"
+mixed-port: 7890
+dns:
+  enable: true
+  nameserver:
+    - 8.8.8.8
+proxies:
+  - name: "remote"
+    type: ss
+    server: "hostname-needs-resolving.example"
+    port: 443
+    cipher: aes-128-gcm
+    password: "pass"
+rule-providers:
+  ads:
+    type: file
+    behavior: domain
+    format: yaml
+    path: ads.yaml
+    proxy: remote
+nameserver-policy:
+  "rule-set:ads":
+    - 8.8.4.4
+rules:
+  - RULE-SET,ads,REJECT
+  - MATCH,DIRECT
+"#;
+    let config_path = dir.path().join("config.yaml");
+    std::fs::write(&config_path, yaml).unwrap();
+
+    let config = meow_config::load_config(config_path.to_str().unwrap())
+        .await
+        .unwrap();
+    // DNS built successfully after the provider load.
+    assert!(config.dns.enabled);
+    // The provider itself loaded and its `proxy:` name resolved against
+    // the step-1 registry (a hostname `server:` is legal there).
+    assert!(config.rule_providers.contains_key("ads"));
+    assert!(config.proxies.contains_key("remote"));
+}
+
 #[tokio::test]
 async fn test_missing_rule_provider_is_skipped() {
     // Referencing an undefined rule-set should warn and skip, not panic.
