@@ -434,3 +434,237 @@ async fn anytls_udp_is_refused_when_not_enabled() {
     };
     assert!(err.to_string().contains("udp: true"), "msg: {err}");
 }
+
+// ─── Regression: auth record must fit in one TLS record (#469 / #470) ───────
+//
+// The owner (madeye) asked for a regression test for the single-TLS-record
+// auth fix. The unit test added in `meow-anytls/src/util/auth.rs`
+// (`send_authentication_writes_whole_record_in_one_call`) pins the property
+// on `send_authentication` directly, but it lives inside the *vendored*
+// crate — a future re-vendor of `meow-anytls` would wipe it out and
+// silently reintroduce the 3-write bug. This integration test lives in
+// `meow-proxy` (a consumer of the vendored crate), so it survives
+// re-vendoring, and it exercises the real `AnytlsAdapter` end to end
+// through a real TLS stack.
+
+/// Drive a raw `rustls` server over a tokio `TcpStream`, feeding it
+/// ciphertext **one TLS record at a time**, and return the plaintext of the
+/// first application-data record the client sends.
+///
+/// The reference anytls server (anytls-go / sing-anytls / sing-box)
+/// authenticates with a *single* read off the TLS connection
+/// (`ReadOnceFrom`), then parses `SHA256(password) (32) + padding0 length
+/// (2) + padding0` from that one buffer. On a rustls TLS stream each
+/// `write_all` is its own TLS record, so splitting the auth across multiple
+/// `write_all`s produces multiple TLS records: the server's single read
+/// returns only the first one and EOFs on the 2-byte padding length (`EOF:
+/// read padding length: fallback disabled`), tearing the session down
+/// before SYNACK (#469).
+///
+/// A naive "single `poll_read`" test is *not* a reliable guard here: rustls
+/// coalesces already-arrived records into one `poll_read`, so it would
+/// false-pass under the old multi-write code. Driving the server
+/// record-by-record — parse the 5-byte TLS record header, feed exactly one
+/// record to `read_tls`, decrypt, read its plaintext — pins the true
+/// invariant ("the auth is one TLS record") with no timing or coalescing
+/// dependency. It works for both TLS 1.2 and 1.3: in 1.3 the client's
+/// Finished travels in a type-23 record on the wire but yields *no*
+/// application plaintext, so `reader().read()` returns 0 for it and the
+/// loop skips it; the first non-empty plaintext is the auth.
+fn invalid_data<E: std::fmt::Display>(e: E) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+}
+
+async fn capture_first_appdata_plaintext(
+    mut tcp: tokio::net::TcpStream,
+    config: Arc<rustls::ServerConfig>,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut raw: Vec<u8> = Vec::with_capacity(8192);
+    let mut acceptor = rustls::server::Acceptor::default();
+    let mut conn: Option<rustls::server::ServerConnection> = None;
+
+    loop {
+        // Ensure `raw` holds at least one complete TLS record: a 5-byte
+        // header (type, version[2], length[2]) followed by `length` bytes.
+        while raw.len() < 5 || raw.len() < 5 + usize::from(u16::from_be_bytes([raw[3], raw[4]])) {
+            let mut chunk = [0u8; 4096];
+            let n = tcp.read(&mut chunk).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "anytls regression server: EOF before first app-data record",
+                ));
+            }
+            raw.extend_from_slice(&chunk[..n]);
+        }
+        let rec_len = usize::from(u16::from_be_bytes([raw[3], raw[4]]));
+        let record: Vec<u8> = raw.drain(..5 + rec_len).collect();
+
+        // Feed exactly this one record to rustls.
+        {
+            let mut cur = std::io::Cursor::new(&record[..]);
+            if let Some(c) = conn.as_mut() {
+                c.read_tls(&mut cur)?;
+            } else {
+                acceptor.read_tls(&mut cur)?;
+            }
+        }
+
+        // Promote the Acceptor to a ServerConnection once the ClientHello
+        // has been received.
+        if conn.is_none() {
+            if let Some(accepted) = acceptor.accept().map_err(|(e, _)| invalid_data(e))? {
+                conn = Some(
+                    accepted
+                        .into_connection(Arc::clone(&config))
+                        .map_err(|(e, _)| invalid_data(e))?,
+                );
+            }
+        }
+
+        // Decrypt / advance state, flush any queued TLS bytes, and — once
+        // the handshake is done — look for the first application plaintext.
+        if let Some(c) = conn.as_mut() {
+            c.process_new_packets().map_err(invalid_data)?;
+
+            while c.wants_write() {
+                let mut out = Vec::new();
+                let written = c.write_tls(&mut out)?;
+                if written == 0 {
+                    break;
+                }
+                tcp.write_all(&out).await?;
+            }
+
+            if !c.is_handshaking() {
+                let mut plain = vec![0u8; 65535];
+                // rustls' `Reader::read` returns `WouldBlock` when a record
+                // carries no application plaintext (e.g. the TLS 1.3 client
+                // Finished, which rides in a type-23 record on the wire).
+                // Treat that as "zero bytes for this record" and keep
+                // scanning; the first non-empty plaintext is the auth.
+                let n = {
+                    let mut r = c.reader();
+                    match r.read(&mut plain) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                        Err(e) => return Err(e),
+                    }
+                };
+                if n > 0 {
+                    plain.truncate(n);
+                    return Ok(plain);
+                }
+            }
+        }
+    }
+}
+
+/// Regression for #469: the AnyTLS auth record must arrive in a *single* TLS
+/// record, because the reference anytls server authenticates with one read
+/// off the TLS connection. The `anytls_rs::server::Server`-based tests above
+/// use `read_exact` (incremental) auth and so never caught the multi-write
+/// bug; this test drives a record-granular TLS server (see
+/// [`capture_first_appdata_plaintext`]) and asserts the first application
+/// record carries the *entire* auth header. It lives in `meow-proxy`, not
+/// the vendored `meow-anytls` crate, so a future re-vendor cannot silently
+/// drop it.
+#[tokio::test]
+async fn anytls_auth_record_arrives_in_single_tls_record() {
+    install_crypto_provider();
+    let (cert, key) = self_signed_cert();
+    let server_config = Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let server_h = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept regression client");
+        let result = capture_first_appdata_plaintext(tcp, server_config).await;
+        let _ = tx.send(result);
+    });
+
+    // Real adapter: it dials, completes the TLS handshake, and emits the
+    // auth record. We don't care whether `dial_tcp` ultimately succeeds —
+    // the regression server closes right after capturing auth, so the
+    // client's post-auth SYNACK wait may error. The assertion is purely
+    // server-side: did the whole auth come over in one TLS record? Run the
+    // dial on a detached task so the test isn't held hostage to the
+    // client's post-auth timeout.
+    //
+    // Invariant this test depends on: a *freshly constructed* adapter has
+    // an empty session pool, so the first `dial_tcp` opens a brand-new
+    // session — i.e. performs the TLS handshake and calls
+    // `send_authentication` (the very thing we're guarding). Reusing an
+    // adapter across tests, or any future pool change that served a cached
+    // session instead of dialing, would skip auth and silently
+    // false-pass. Keep the adapter test-local and one-shot.
+    let adapter = AnytlsAdapter::new(
+        "regress-single-tls-record",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        true,
+    )
+    .expect("adapter must build");
+
+    let dial_h = tokio::spawn(async move {
+        let metadata = Metadata {
+            network: Network::Tcp,
+            host: smol_str::SmolStr::from("127.0.0.1"),
+            // Unused: the regression server closes before any relay happens.
+            dst_port: 1,
+            ..Default::default()
+        };
+        // Drive the dial; ignore the outcome.
+        let _ = timeout(T, adapter.dial_tcp(&metadata)).await;
+    });
+
+    let record = timeout(T, rx)
+        .await
+        .expect("regression server must report in time")
+        .expect("regression server channel must not close prematurely")
+        .expect("regression server handshake/capture must not error");
+
+    // Under the old 3-write code the first TLS record carried only the
+    // 32-byte password hash; the reference server's single read then EOF'd
+    // on the 2-byte padding length. Require the full header at minimum.
+    assert!(
+        record.len() >= 34,
+        "first TLS record must carry the entire auth header (>= 34 bytes: \
+         32-byte password hash + 2-byte padding0 length); got only {} bytes — \
+         the auth was split across multiple TLS records (regression of #469)",
+        record.len(),
+    );
+
+    let expected_hash = anytls_rs::hash_password(PASSWORD);
+    assert_eq!(
+        &record[..32],
+        expected_hash.as_slice(),
+        "password-hash prefix must match the adapter's password",
+    );
+    let padding_len = usize::from(u16::from_be_bytes([record[32], record[33]]));
+    assert_eq!(
+        record.len(),
+        32 + 2 + padding_len,
+        "record length must equal 32 (hash) + 2 (length) + padding0 length",
+    );
+    assert!(
+        record[34..].iter().all(|&b| b == 0),
+        "padding0 bytes must be zero-filled",
+    );
+
+    // Best-effort cleanup; the tasks are likely already settled.
+    server_h.abort();
+    dial_h.abort();
+}

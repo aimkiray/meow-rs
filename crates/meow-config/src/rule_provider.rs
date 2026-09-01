@@ -206,7 +206,7 @@ fn read_payload_bytes(
 ) -> Result<Option<Vec<u8>>> {
     match cfg.provider_type.as_str() {
         "file" => {
-            let path = resolve_path(cfg, cache_dir, name)?
+            let path = resolve_path(cfg, cache_dir, name, false)?
                 .ok_or_else(|| anyhow!("file provider '{name}' requires a 'path'"))?;
             let bytes = std::fs::read(&path)
                 .with_context(|| format!("reading provider file {}", path.display()))?;
@@ -217,7 +217,7 @@ fn read_payload_bytes(
                 .url
                 .as_deref()
                 .ok_or_else(|| anyhow!("http provider '{name}' requires a 'url'"))?;
-            let cache_path = resolve_path(cfg, cache_dir, name)?;
+            let cache_path = resolve_path(cfg, cache_dir, name, false)?;
             let prefer_cache = cfg.interval.unwrap_or(0) > 0;
             let bytes = fetch_http_blocking_with_cache(
                 url,
@@ -378,7 +378,7 @@ fn load_file(
              (Class B per ADR-0002)"
         );
     }
-    let path = resolve_path(cfg, cache_dir, name)?
+    let path = resolve_path(cfg, cache_dir, name, false)?
         .ok_or_else(|| anyhow!("file provider '{name}' requires a 'path'"))?;
     let bytes = match prefetched {
         Some(b) => b.to_vec(),
@@ -412,7 +412,7 @@ fn load_http(
         .url
         .as_deref()
         .ok_or_else(|| anyhow!("http provider '{name}' requires a 'url'"))?;
-    let cache_path = resolve_path(cfg, cache_dir, name)?;
+    let cache_path = resolve_path(cfg, cache_dir, name, false)?;
     let explicit_format = parse_explicit_format(cfg)?;
     let interval = cfg.interval.unwrap_or(0);
     let bytes = match prefetched {
@@ -533,25 +533,47 @@ fn parse_text_payload(raw: &str) -> Vec<String> {
 /// `path:` is attacker-influenced whenever the config arrives over the REST
 /// API (`PUT /configs`), and for http providers it is a **write** target, so:
 ///
+/// - provider types that never read a path (`inline`) ignore a stray `path:`
+///   entirely — mihomo parity: a harmless leftover field must not fail a
+///   whole rebuild;
 /// - with a `cache_dir`, the resolved path (absolute or relative, `..` and
 ///   symlinks included) must stay inside it — anything else is a hard error;
 /// - without a `cache_dir` (runtime rebuilds such as `PUT /configs` or
 ///   `--config-string`) there is no containment root, so a `path:` is never
 ///   honoured: http providers fall back to fetching into memory, file
 ///   providers hard-error.
+///
+/// `emit_warnings` gates the ignoring-`path` warns. Every (re)build calls
+/// [`validate_paths`] exactly once before any fetch/load pass, so only that
+/// call passes `true` — otherwise the same warn would fire up to three times
+/// per provider per rebuild (validate, prefetch, and load all resolve).
 fn resolve_path(
     cfg: &RawRuleProvider,
     cache_dir: Option<&Path>,
     name: &str,
+    emit_warnings: bool,
 ) -> Result<Option<PathBuf>> {
+    // Only file (payload location) and http (on-disk cache) providers ever
+    // read the resolved path; other types must not fail on a stray `path:`.
+    if !matches!(cfg.provider_type.as_str(), "file" | "http") {
+        if cfg.path.is_some() && emit_warnings {
+            warn!(
+                "rule-provider '{}': ignoring 'path' — {} providers never read it",
+                name, cfg.provider_type
+            );
+        }
+        return Ok(None);
+    }
     if let Some(p) = cfg.path.as_deref() {
         let Some(dir) = cache_dir else {
             if cfg.provider_type == "http" {
-                warn!(
-                    "rule-provider '{}': ignoring 'path' (no provider cache directory in this \
-                     context); fetching to memory without an on-disk cache",
-                    name
-                );
+                if emit_warnings {
+                    warn!(
+                        "rule-provider '{}': ignoring 'path' (no provider cache directory in \
+                         this context); fetching to memory without an on-disk cache",
+                        name
+                    );
+                }
                 return Ok(None);
             }
             return Err(anyhow!(
@@ -577,12 +599,16 @@ fn resolve_path(
 /// fails hard before any fetch or write happens (issue #429). Called by
 /// `rebuild_from_raw_impl` for every path into a (re)build: startup,
 /// `PUT`/`PATCH /configs`, and subscription refresh.
+///
+/// This is the one pass that emits the ignoring-`path` warns, so they fire
+/// once per provider per rebuild (the prefetch and load passes resolve the
+/// same paths again, silently).
 pub(crate) fn validate_paths(
     raw_providers: &HashMap<String, RawRuleProvider>,
     cache_dir: Option<&Path>,
 ) -> Result<()> {
     for (name, cfg) in raw_providers {
-        resolve_path(cfg, cache_dir, name)?;
+        resolve_path(cfg, cache_dir, name, true)?;
     }
     Ok(())
 }
@@ -739,7 +765,7 @@ mod tests {
     fn direct_proxy() -> Arc<dyn Proxy> {
         let cfg: HashMap<String, serde_yaml::Value> =
             serde_yaml::from_str("name: d\ntype: direct").unwrap();
-        crate::proxy_parser::parse_proxy(&cfg).unwrap()
+        crate::proxy_parser::parse_proxy(&cfg, true).unwrap()
     }
 
     #[test]
@@ -1077,7 +1103,7 @@ mod tests {
         for p in ["../../etc/pwned", "/etc/cron.d/pwned", "a/../../b"] {
             let mut cfg = http_cfg(None);
             cfg.path = Some(p.to_string());
-            let err = resolve_path(&cfg, Some(dir.path()), "x")
+            let err = resolve_path(&cfg, Some(dir.path()), "x", true)
                 .expect_err("escaping path must be rejected");
             assert!(err.to_string().contains("escapes"), "path {p}: {err}");
         }
@@ -1088,12 +1114,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = http_cfg(None);
         cfg.path = Some("sub/rules.yaml".to_string());
-        let got = resolve_path(&cfg, Some(dir.path()), "x").unwrap().unwrap();
+        let got = resolve_path(&cfg, Some(dir.path()), "x", true)
+            .unwrap()
+            .unwrap();
         assert!(got.starts_with(dir.path()), "unexpected: {}", got.display());
 
         // Absolute paths are fine as long as they stay inside the cache dir.
         cfg.path = Some(dir.path().join("rules.yaml").to_string_lossy().to_string());
-        assert!(resolve_path(&cfg, Some(dir.path()), "x").unwrap().is_some());
+        assert!(resolve_path(&cfg, Some(dir.path()), "x", true)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -1102,7 +1132,8 @@ mod tests {
         cfg.provider_type = "file".to_string();
         cfg.url = None;
         cfg.path = Some("/etc/passwd".to_string());
-        let err = resolve_path(&cfg, None, "x").expect_err("file path without root must fail");
+        let err =
+            resolve_path(&cfg, None, "x", true).expect_err("file path without root must fail");
         assert!(
             err.to_string().contains("cache directory"),
             "unexpected: {err}"
@@ -1113,9 +1144,43 @@ mod tests {
     fn implicit_path_from_hostile_provider_name_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = http_cfg(None); // no `path:` — implicit location from the name
-        let err = resolve_path(&cfg, Some(dir.path()), "../../evil")
+        let err = resolve_path(&cfg, Some(dir.path()), "../../evil", true)
             .expect_err("traversal via provider name must be rejected");
         assert!(err.to_string().contains("escapes"), "unexpected: {err}");
+    }
+
+    /// PR #444 review follow-up: a stray `path:` on an inline provider must
+    /// never fail a rebuild — inline providers never read it (mihomo ignores
+    /// it too), so it is warn-and-ignored in every context.
+    #[test]
+    fn stray_path_on_inline_provider_is_ignored() {
+        let inline_cfg = |path: &str| RawRuleProvider {
+            provider_type: "inline".to_string(),
+            behavior: "domain".to_string(),
+            format: None,
+            url: None,
+            path: Some(path.to_string()),
+            interval: None,
+            proxy: None,
+            payload: Some(vec!["example.com".to_string()]),
+        };
+
+        // No cache dir (the `PUT /configs` rebuild context): previously a
+        // hard error, now ignored.
+        let mut providers = HashMap::new();
+        providers.insert("i".to_string(), inline_cfg("leftover.yaml"));
+        validate_paths(&providers, None).expect("stray inline path must not fail validation");
+
+        // Even an escaping path is irrelevant on a provider type that never
+        // reads it.
+        let dir = tempfile::tempdir().unwrap();
+        providers.insert("i".to_string(), inline_cfg("../../etc/pwned"));
+        validate_paths(&providers, Some(dir.path()))
+            .expect("stray inline path must not be containment-checked");
+
+        // And the provider itself still loads normally.
+        let out = load_providers(&providers, Some(dir.path()), &ctx(), None);
+        assert_eq!(out.get("i").expect("inline must load").rule_count(), 1);
     }
 
     /// Regression test for issue #429: an http provider with a
@@ -1177,6 +1242,39 @@ mod tests {
         assert!(
             !victim.parent().unwrap().exists(),
             "parent of the attacker-controlled path was created"
+        );
+    }
+
+    /// PR #437 review follow-up: pin the body-size-cap *wiring* end to end —
+    /// `fetch_http_async` (the direct, no-proxy fetch every rule-provider
+    /// load/refresh goes through) must route its body read through
+    /// `internal_http::response_bytes_with_limit`. The unit tests on
+    /// `response_bytes_capped` cover the cap logic itself; here a local
+    /// server declares a `Content-Length` above `MAX_BODY_BYTES` (so nothing
+    /// close to 256 MiB is actually transferred) and the fetch must fail
+    /// with the cap error before buffering the body.
+    #[tokio::test]
+    async fn fetch_http_async_rejects_oversized_response_end_to_end() {
+        let oversized = internal_http::MAX_BODY_BYTES as u64 + 1;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let head =
+                format!("HTTP/1.1 200 OK\r\ncontent-length: {oversized}\r\n\r\ntiny-partial-body");
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let err = fetch_http_async(&format!("http://{addr}/rules.yaml"), None)
+            .await
+            .expect_err("oversized response must be rejected");
+        assert!(
+            err.to_string().contains("exceeds max body size"),
+            "unexpected error: {err:#}"
         );
     }
 }

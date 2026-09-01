@@ -12,11 +12,11 @@
 
 use std::io;
 use std::pin::Pin;
+use std::task::ready;
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use futures::ready;
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 

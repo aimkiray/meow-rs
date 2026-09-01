@@ -15,7 +15,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::debug;
 
-use crate::simple_obfs::{HttpObfs, TlsObfs};
+use meow_transport::simple_obfs::client::{HttpObfs, TlsObfs};
 
 use super::pool::{drain_for_reuse, Pool, PoolStream};
 use super::protocol::{write_header, write_udp_header, Snell};

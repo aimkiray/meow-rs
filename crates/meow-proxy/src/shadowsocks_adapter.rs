@@ -1,11 +1,11 @@
 #[cfg(feature = "ech-tls-tunnel")]
 use crate::ech_tls_tunnel::{self, EchTlsTunnelConfig};
-use crate::simple_obfs::{HttpObfs, TlsObfs};
 use crate::v2ray_plugin::{self, V2rayPluginConfig};
 use async_trait::async_trait;
 use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
+use meow_transport::simple_obfs::client::{HttpObfs, TlsObfs};
 use meow_transport::tls::TlsLayer;
 use shadowsocks::config::{Mode, ServerAddr, ServerConfig, ServerType};
 use shadowsocks::context::Context;

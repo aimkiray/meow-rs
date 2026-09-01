@@ -1,3 +1,9 @@
+//! Outbound proxy protocol implementations and groups for the meow-rs kernel.
+//!
+//! Adapters for Shadowsocks, Trojan, VLESS, VMess, Hysteria2, Snell, AnyTLS,
+//! HTTP, SOCKS5, Direct, and Reject, plus Selector, URLTest, Fallback,
+//! LoadBalance, and Relay groups.
+
 pub mod direct;
 pub mod group;
 pub mod health;
@@ -13,10 +19,6 @@ pub mod transport_chain;
 pub mod ech_tls_tunnel;
 #[cfg(feature = "ss")]
 pub mod shadowsocks_adapter;
-// simple-obfs is shared with the snell adapter (which reuses the
-// http / tls obfuscation codecs verbatim).
-#[cfg(any(feature = "ss", feature = "snell"))]
-pub mod simple_obfs;
 #[cfg(feature = "ss")]
 pub mod v2ray_plugin;
 

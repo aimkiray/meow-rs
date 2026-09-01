@@ -913,7 +913,7 @@ async fn run(
     // (ephemeral) listener resolves to its OS-assigned port up front; the
     // resolved ports are patched into `named_listeners`, which feeds the
     // startup logs and the API snapshot (`GET /listeners`) below.
-    use meow_config::ListenerType;
+    use meow_config::ListenerSpec;
 
     let mut named_listeners = config.listeners.named.clone();
     for nl in &mut named_listeners {
@@ -922,8 +922,8 @@ async fn run(
         // Suppress unused-variable warning: addr is consumed only inside
         // feature-gated match arms below.
         let _ = addr;
-        match nl.listener_type {
-            ListenerType::Mixed | ListenerType::Http | ListenerType::Socks5 => {
+        match &nl.spec {
+            ListenerSpec::Mixed | ListenerSpec::Http | ListenerSpec::Socks5 => {
                 #[cfg(feature = "listener-mixed")]
                 {
                     let socket = match tokio::net::TcpListener::bind(addr).await {
@@ -949,10 +949,10 @@ async fn run(
                 tracing::warn!(
                     "listener '{}': type {:?} requires feature 'listener-mixed'",
                     nl.name,
-                    nl.listener_type
+                    nl.spec
                 );
             }
-            ListenerType::TProxy => {
+            ListenerSpec::TProxy { sni } => {
                 #[cfg(feature = "listener-tproxy")]
                 {
                     let socket = match tokio::net::TcpListener::bind(addr).await {
@@ -967,7 +967,7 @@ async fn run(
                     let listener = TProxyListener::new(
                         tunnel.clone(),
                         bound,
-                        nl.tproxy_sni,
+                        *sni,
                         config.listeners.routing_mark,
                         nl.name.clone(),
                     )
@@ -980,10 +980,16 @@ async fn run(
                     });
                 }
                 #[cfg(not(feature = "listener-tproxy"))]
-                tracing::warn!(
-                    "listener '{}': TProxy requires feature 'listener-tproxy'",
-                    nl.name
-                );
+                {
+                    // `sni` is only consumed by the `listener-tproxy` build
+                    // above; mark it used so the binding doesn't trip
+                    // `-D warnings` on tproxy-less feature sets.
+                    let _ = sni;
+                    tracing::warn!(
+                        "listener '{}': TProxy requires feature 'listener-tproxy'",
+                        nl.name
+                    );
+                }
             }
         }
     }

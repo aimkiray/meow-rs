@@ -117,22 +117,21 @@ jobs:
 
       - name: Build minimal release binary (stripped, for size check)
         if: matrix.minimal_budget_bytes != 0 && runner.os == 'Linux'
+        env:
+          # Keep the size-check build separate from the full release artifact.
+          # Cargo otherwise reuses target/<triple>/release/meow and the
+          # minimal build replaces the binary that is packaged below.
+          CARGO_TARGET_DIR: target/minimal
         run: |
           cargo zigbuild --release --locked \
             --no-default-features --features minimal \
             --target ${{ matrix.target }} \
             --bin meow
-          # Copy minimal binary aside before default binary overwrites artifact.
-          # Binary is already stripped via [profile.release] strip = true in
-          # the workspace Cargo.toml — no post-build strip needed (and the
-          # host `strip` cannot read aarch64 ELF anyway).
-          cp "target/${{ matrix.target }}/release/meow" \
-             "target/${{ matrix.target }}/release/meow-minimal"
 
       - name: Minimal binary size check
         if: matrix.minimal_budget_bytes != 0 && runner.os == 'Linux'
         run: |
-          SIZE=$(stat -c%s "target/${{ matrix.target }}/release/meow-minimal")
+          SIZE=$(stat -c%s "target/minimal/${{ matrix.target }}/release/meow")
           BUDGET=${{ matrix.minimal_budget_bytes }}
           echo "Minimal binary size: ${SIZE} bytes (budget: ${BUDGET} bytes)"
           if [ "${SIZE}" -gt "${BUDGET}" ]; then

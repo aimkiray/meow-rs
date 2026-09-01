@@ -1,7 +1,9 @@
 use crate::sniffer::SnifferRuntime;
 use base64::Engine;
 use meow_common::{AuthConfig, ConnType, Metadata, Network};
-use meow_tunnel::{copy_bidirectional_buf_tracked, ConnectionGuard, Tunnel, RELAY_BUF_SIZE};
+use meow_tunnel::{
+    copy_bidirectional_buf_tracked, route_inbound_tcp, ConnectionGuard, Tunnel, RELAY_BUF_SIZE,
+};
 use smallvec::smallvec;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -46,11 +48,6 @@ async fn handle_http_inner(
     in_name: &str,
     in_port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Relay scratch buffers on the future's stack — zero per-relay heap allocation
-    // (ADR-0011 T6). Declared up front so both the CONNECT and plain-HTTP paths share them.
-    let mut relay_buf_up = [0u8; RELAY_BUF_SIZE];
-    let mut relay_buf_dn = [0u8; RELAY_BUF_SIZE];
-
     // Read the HTTP request line and headers in chunks until we find
     // \r\n\r\n. Reading one byte at a time costs ~100 syscalls per CONNECT;
     // chunked reads cap the syscall count at ceil(headers / 1024).
@@ -204,75 +201,12 @@ async fn handle_http_inner(
             rt.sniff(stream, &mut metadata).await;
         }
 
-        // Hand off to tunnel
+        // Hand off to the shared inbound routing+relay path. `leftover`
+        // holds any application bytes the client pipelined ahead of the
+        // 200 OK (RFC 7230 forbids this but real clients do it); the shared
+        // path re-emits them to the remote before the bidirectional copy.
         let inner = tunnel.inner();
-        inner.pre_handle_metadata(&mut metadata);
-        let Some((proxy, rule_name, rule_payload)) = inner.resolve_proxy_lazy(&mut metadata).await
-        else {
-            return Err("no matching rule".into());
-        };
-
-        info!(
-            "{} --> {} match {}({}) using {}",
-            metadata.source_address(),
-            metadata.remote_address(),
-            rule_name,
-            rule_payload,
-            proxy.name()
-        );
-
-        let _guard = ConnectionGuard::track(
-            &inner.stats,
-            metadata.pure(),
-            rule_name,
-            rule_payload,
-            smallvec![Arc::from(proxy.name())],
-        );
-
-        match proxy.dial_tcp(&metadata).await {
-            Ok(mut remote) => {
-                // Per RFC 7230 the client must wait for 200 OK before sending
-                // application data, but if a client pipelined bytes ahead of
-                // that we already read them — forward before relaying.
-                let up = Arc::clone(_guard.counters());
-                let dn = Arc::clone(_guard.counters());
-                if !leftover.is_empty() {
-                    remote.write_all(&leftover).await?;
-                    inner
-                        .stats
-                        .record_upload(&up, leftover.len() as meow_common::atomic::Int);
-                }
-                match copy_bidirectional_buf_tracked(
-                    stream,
-                    &mut remote,
-                    &mut relay_buf_up,
-                    &mut relay_buf_dn,
-                    |n| {
-                        inner
-                            .stats
-                            .record_upload(&up, n as meow_common::atomic::Int);
-                    },
-                    |n| {
-                        inner
-                            .stats
-                            .record_download(&dn, n as meow_common::atomic::Int);
-                    },
-                )
-                .await
-                {
-                    Ok((up, down)) => {
-                        debug!("HTTP CONNECT relay closed: up={up} down={down}");
-                    }
-                    Err(e) => debug!("HTTP CONNECT relay error: {}", e),
-                }
-            }
-            Err(e) => warn!(
-                "{} HTTP CONNECT dial error: {}",
-                metadata.remote_address(),
-                e
-            ),
-        }
-        // _guard drops here, removing the entry from Statistics.
+        route_inbound_tcp(inner, stream, metadata, &leftover).await;
     } else {
         // Plain HTTP proxy (GET/POST/etc via proxy)
         let url = target;
@@ -343,6 +277,13 @@ async fn handle_http_inner(
                 remote.write_all(&rewritten).await?;
                 let up = Arc::clone(_guard.counters());
                 let dn = Arc::clone(_guard.counters());
+                // Relay scratch buffers live on this plain-HTTP path's stack —
+                // zero per-relay heap allocation (ADR-0008). Declared here
+                // (not at the top of handle_http_inner) so the dominant CONNECT
+                // path, which relays via the shared `route_inbound_tcp` helper
+                // and its own stack buffers, does not carry these 8 KiB.
+                let mut relay_buf_up = [0u8; RELAY_BUF_SIZE];
+                let mut relay_buf_dn = [0u8; RELAY_BUF_SIZE];
                 // Keep the response-head scratch out of `handle_http_inner`'s
                 // async frame. CONNECT is the dominant path and must not pay
                 // for storage used only by plain HTTP exchanges.

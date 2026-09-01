@@ -21,7 +21,7 @@ Use it as a pre-flight check.
 | `allow-lan` | bool | `false` | Accept connections from non-loopback addresses |
 | `mode` | string | `rule` | Tunnel mode: `rule`, `global`, or `direct` |
 | `log-level` | string | `info` | `trace` · `debug` · `info` · `warn` · `error` · `off` |
-| `ipv6` | bool | `false` | Enable IPv6 support |
+| `ipv6` | bool | `false` | Enable IPv6 (AAAA) resolution |
 | `external-controller` | string | — | REST API listen address, e.g. `127.0.0.1:9090` |
 | `secret` | string | — | API bearer-token secret (empty = no auth) |
 | `external-ui` | string | — | Directory of static dashboard files served at `/ui` |
@@ -118,7 +118,7 @@ rules:
   - MATCH,Proxy
 ```
 
-The repository ships a fuller [`config.example.yaml`](https://github.com/madeye/meow-rs/blob/main/config.example.yaml)
+The repository ships a fuller [`config.example.yaml`](https://github.com/meow-rs/meow-rs/blob/main/config.example.yaml)
 you can copy as a starting point.
 
 ## Compatibility notes

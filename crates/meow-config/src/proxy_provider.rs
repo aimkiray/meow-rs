@@ -29,6 +29,7 @@ pub struct ProxyProvider {
     pub health_check: Option<HealthCheckConfig>,
     updated_at: AtomicU,
     header: HashMap<String, String>,
+    ipv6: bool,
     /// Group-level filtered views of `slot` (issue #358), re-populated on
     /// every refresh. Weak: each view is kept alive by the group built from
     /// it, so views belonging to dropped or rebuilt groups get pruned here.
@@ -123,6 +124,7 @@ impl ProxyProvider {
         name: &str,
         raw: &RawProxyProvider,
         cache_dir: Option<&Path>,
+        ipv6: bool,
     ) -> Result<Self, String> {
         // Any on-disk location (read or write) must stay inside `cache_dir`
         // (issue #429): `path:` — and the provider *name* feeding the implicit
@@ -196,6 +198,7 @@ impl ProxyProvider {
             health_check,
             updated_at: AtomicU::new(0),
             header,
+            ipv6,
             derived: RwLock::new(Vec::new()),
         })
     }
@@ -342,7 +345,7 @@ impl ProxyProvider {
                 continue;
             }
 
-            match proxy_parser::parse_proxy(raw_map) {
+            match proxy_parser::parse_proxy(raw_map, self.ipv6) {
                 Ok(proxy) => result.push(proxy),
                 Err(e) => {
                     warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
@@ -394,13 +397,49 @@ impl ProxyProvider {
     }
 }
 
+/// Validate every proxy-provider's on-disk path up front, so a path escaping
+/// the provider cache directory fails the whole (re)build loudly — matching
+/// `rule_provider::validate_paths` — instead of the provider being silently
+/// warn-skipped and every group referencing it degrading (PR #444 review
+/// follow-up).
+///
+/// Scope is containment only: paths that resolve outside `cache_dir`
+/// (explicit `path:` or the implicit name-derived cache location). Other
+/// per-provider problems (missing fields, unknown type, fetch failures) keep
+/// their historical warn-and-skip semantics in [`ProxyProvider::new`] /
+/// [`load_proxy_providers`]. Must stay in sync with the path resolution in
+/// [`ProxyProvider::new`].
+pub(crate) fn validate_paths(
+    raw_map: &HashMap<String, RawProxyProvider>,
+    cache_dir: Option<&Path>,
+) -> Result<(), String> {
+    // No containment root: no on-disk path is honoured at all, so there is
+    // nothing to contain (`ProxyProvider::new` errors/warns per provider).
+    let Some(dir) = cache_dir else {
+        return Ok(());
+    };
+    for (name, raw) in raw_map {
+        let requested = match (raw.provider_type.as_str(), raw.path.as_deref()) {
+            ("file" | "http", Some(p)) => PathBuf::from(p),
+            // The implicit http cache location is derived from the provider
+            // *name* (a YAML map key, also attacker-influenced).
+            ("http", None) => PathBuf::from(format!("provider_{name}.yaml")),
+            _ => continue,
+        };
+        crate::safe_path::resolve_contained(dir, &requested)
+            .map_err(|e| format!("proxy-provider '{name}': {e}"))?;
+    }
+    Ok(())
+}
+
 pub async fn load_proxy_providers(
     raw_map: &HashMap<String, RawProxyProvider>,
     cache_dir: Option<&Path>,
+    ipv6: bool,
 ) -> HashMap<String, Arc<ProxyProvider>> {
     let mut result = HashMap::new();
     for (name, raw) in raw_map {
-        match ProxyProvider::new(name, raw, cache_dir) {
+        match ProxyProvider::new(name, raw, cache_dir, ipv6) {
             Ok(provider) => {
                 let provider = Arc::new(provider);
                 let _ = provider.refresh().await;
@@ -483,7 +522,7 @@ mod tests {
     fn file_provider_new_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let raw = raw_file_provider("proxies.yaml");
-        let p = ProxyProvider::new("test", &raw, Some(dir.path())).unwrap();
+        let p = ProxyProvider::new("test", &raw, Some(dir.path()), true).unwrap();
         assert_eq!(p.name, "test");
         assert_eq!(p.vehicle_type, "File");
         assert!(p.header.is_empty());
@@ -492,7 +531,7 @@ mod tests {
     #[test]
     fn file_provider_requires_cache_dir_for_path() {
         let raw = raw_file_provider("/tmp/proxies.yaml");
-        let Err(err) = ProxyProvider::new("test", &raw, None) else {
+        let Err(err) = ProxyProvider::new("test", &raw, None, true) else {
             panic!("file path without a cache dir must fail");
         };
         assert!(err.contains("cache directory"), "unexpected: {err}");
@@ -503,7 +542,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for path in ["../../etc/pwned", "/etc/pwned"] {
             let raw = raw_file_provider(path);
-            let Err(err) = ProxyProvider::new("test", &raw, Some(dir.path())) else {
+            let Err(err) = ProxyProvider::new("test", &raw, Some(dir.path()), true) else {
                 panic!("escaping path {path} must be rejected");
             };
             assert!(err.contains("escapes"), "path {path}: unexpected: {err}");
@@ -524,10 +563,50 @@ mod tests {
             health_check: None,
             header: None,
         };
-        let Err(err) = ProxyProvider::new("test", &raw, Some(dir.path())) else {
+        let Err(err) = ProxyProvider::new("test", &raw, Some(dir.path()), true) else {
             panic!("escaping http cache path must be rejected");
         };
         assert!(err.contains("escapes"), "unexpected: {err}");
+    }
+
+    // PR #444 review follow-up: a proxy-provider path escaping the cache dir
+    // must fail the whole rebuild loudly (rule-provider parity), not just
+    // warn-skip the provider and silently degrade the groups using it.
+    #[test]
+    fn validate_paths_rejects_escaping_provider_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["../../etc/pwned", "/etc/cron.d/pwned"] {
+            let mut map = HashMap::new();
+            map.insert("evil".to_string(), raw_file_provider(path));
+            let err = validate_paths(&map, Some(dir.path()))
+                .expect_err("escaping path must fail validation");
+            assert!(err.contains("evil"), "must name the provider: {err}");
+            assert!(err.contains("escapes"), "path {path}: unexpected: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_paths_accepts_contained_and_pathless_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut map = HashMap::new();
+        map.insert("f".to_string(), raw_file_provider("sub/proxies.yaml"));
+        map.insert(
+            "h".to_string(),
+            RawProxyProvider {
+                provider_type: "http".to_string(),
+                url: Some("http://127.0.0.1:1/proxies.yaml".to_string()),
+                path: None, // implicit cache location from the name
+                interval: None,
+                filter: None,
+                exclude_filter: None,
+                exclude_type: None,
+                health_check: None,
+                header: None,
+            },
+        );
+        validate_paths(&map, Some(dir.path())).expect("contained paths must validate");
+        // Rootless context: nothing on disk is honoured, nothing to contain.
+        validate_paths(&map, None).expect("no cache dir means nothing to validate");
     }
 
     #[test]
@@ -545,7 +624,7 @@ mod tests {
             health_check: None,
             header: Some(headers),
         };
-        let p = ProxyProvider::new("airport", &raw, None).unwrap();
+        let p = ProxyProvider::new("airport", &raw, None, true).unwrap();
         assert_eq!(p.vehicle_type, "HTTP");
         assert_eq!(p.header.get("X-Token").map(String::as_str), Some("secret"));
     }
@@ -574,7 +653,7 @@ header:
         let yaml = "type: file\npath: proxies.yaml\n";
         let raw: RawProxyProvider = serde_yaml::from_str(yaml).unwrap();
         assert!(raw.header.is_none());
-        let p = ProxyProvider::new("p", &raw, Some(dir.path())).unwrap();
+        let p = ProxyProvider::new("p", &raw, Some(dir.path()), true).unwrap();
         assert!(p.header.is_empty());
     }
 
@@ -615,7 +694,7 @@ header:
     async fn file_provider(path: &std::path::Path) -> ProxyProvider {
         let raw = raw_file_provider(path.to_str().unwrap());
         let cache_dir = path.parent().expect("temp file has a parent dir");
-        let p = ProxyProvider::new("airport", &raw, Some(cache_dir)).unwrap();
+        let p = ProxyProvider::new("airport", &raw, Some(cache_dir), true).unwrap();
         p.refresh().await.unwrap();
         p
     }

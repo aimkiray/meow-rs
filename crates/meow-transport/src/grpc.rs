@@ -288,7 +288,9 @@ struct GunStream {
     /// exactly once per logical write.  A retry after `Pending` must pass
     /// the same buffer (the `AsyncWrite` contract); `poll_write` enforces
     /// this via [`gun_frame_matches`] and rejects a changed buffer with
-    /// `InvalidInput` instead of silently sending the stale frame.
+    /// `InvalidInput` instead of silently sending the stale frame.  A frame
+    /// still stashed at `poll_shutdown` (i.e. the parked write was cancelled)
+    /// is flushed together with the closing EOS frame, never discarded.
     pending_write: Option<Bytes>,
 }
 
@@ -399,6 +401,14 @@ impl AsyncWrite for GunStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        // Mirror H2Stream: an empty write is a no-op reported as `Ok(0)`,
+        // checked *before* the changed-buffer guard so `write(&[])` while a
+        // frame is stashed does not trip `InvalidInput` (it is a distinct
+        // logical write, not a retry).  It also avoids sending a useless
+        // zero-payload gun frame.
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         let this = self.get_mut();
 
         // Encode buf into a gun frame exactly once per logical write.
@@ -458,10 +468,18 @@ impl AsyncWrite for GunStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        // Send empty DATA+EOS to signal end of the request stream.
-        this.send
-            .send_data(Bytes::new(), true)
-            .map_err(io::Error::other)?;
+        // Flush a frame stashed by a write that was cancelled at its Pending
+        // await before signalling end-of-stream: the caller handed those
+        // bytes to `write()` and they were encoded, so discarding them here
+        // would silently truncate the stream behind an empty DATA+EOS.  Only
+        // a cancelled write can leave `pending_write` set — the
+        // changed-buffer guard clears it before returning `InvalidInput`, so
+        // shutdown never resurrects a rejected frame.  `send_data` queues
+        // beyond the granted flow-control window inside h2, so this completes
+        // in a single poll (cancellation-safe) and is bounded to one frame.
+        let frame = this.pending_write.take().unwrap_or_default();
+        // DATA (possibly empty) + EOS signals end of the request stream.
+        this.send.send_data(frame, true).map_err(io::Error::other)?;
         Poll::Ready(Ok(()))
     }
 }

@@ -629,7 +629,7 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .bind_address
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string()),
-        ipv6: raw.ipv6.unwrap_or(false),
+        ipv6: meow_config::effective_ipv6(raw.ipv6),
         tun_enable: state.tunnel.has_tun(),
     })
 }
@@ -2545,7 +2545,7 @@ async fn get_listeners(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         .map(|l| {
             serde_json::json!({
                 "name": l.name,
-                "type": l.listener_type.to_string(),
+                "type": l.spec.type_name(),
                 "port": l.port,
                 "listen": l.listen,
             })

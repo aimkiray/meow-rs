@@ -5,6 +5,7 @@
 //! `protect()` before the socket is used. This is the reason the project
 //! ships its own DNS client instead of relying on `hickory-resolver`.
 
+use crate::cache::QueryFamilies;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
@@ -195,6 +196,56 @@ fn take_fresh<T>(idle: &mut Vec<(T, Instant)>, now: Instant, idle_timeout: Durat
     idle.pop().map(|(stream, _)| stream)
 }
 
+pub(crate) struct IpLookupResult {
+    pub(crate) ips: Vec<IpAddr>,
+    pub(crate) ttl: Duration,
+    /// Preserve the per-family result for the BOTH path. The aggregate IP list
+    /// is sufficient for callers that only need addresses, but the resolver
+    /// cache also needs to retain NXDOMAIN versus NODATA.
+    pub(crate) v4: Option<FamilyAnswer>,
+    pub(crate) v6: Option<FamilyAnswer>,
+}
+
+pub(crate) enum FamilyLookupResult {
+    Response(IpLookupResult),
+    /// Authoritative "name does not exist". Carries the RFC 2308 negative
+    /// cache TTL — `min(SOA.TTL, SOA.MINIMUM)` from the authority section, or
+    /// `0` when the upstream omitted the SOA (the resolver's clamp floor
+    /// still gives it a short cache lifetime).
+    NxDomain(Duration),
+}
+
+/// One family's answer within a [`FamilySet`]. The resolver/cache consume this
+/// unified shape so the per-family and "all enabled families" lookup paths
+/// share one pipeline (review issue J). TTLs are the raw upstream values; the
+/// resolver clamps them once before use.
+#[derive(Clone, Debug)]
+pub(crate) enum FamilyAnswer {
+    /// NOERROR with at least one address record of this family.
+    Answer { ips: Vec<IpAddr>, ttl: Duration },
+    /// NOERROR with zero address records of this family (NODATA). Carries the
+    /// upstream TTL so the cache can expire the negative on its own schedule.
+    NoData(Duration),
+    /// The upstream authoritatively said the name does not exist. Carries the
+    /// RFC 2308 negative cache TTL (SOA-derived) so the cache can serve the
+    /// NXDOMAIN rcode from cache for that family until its own expiry fires,
+    /// damping DGA/retry-loop load (aligns with mihomo `putMsgToCache`).
+    NxDomain(Duration),
+    /// A network/timeout failure for this family — not a definitive answer.
+    Failed,
+}
+
+/// A client's resolution result across the requested family set. `None` for a
+/// family means "not queried" (e.g. the prefer-IPv4 path skips AAAA once A has
+/// addresses); the resolver treats that as a cache miss for the family and
+/// re-queries on demand.
+#[derive(Clone, Debug)]
+pub(crate) struct FamilySet {
+    pub(crate) v4: Option<FamilyAnswer>,
+    pub(crate) v6: Option<FamilyAnswer>,
+    pub(crate) source: String,
+}
+
 enum Transport {
     Udp {
         addr: SocketAddr,
@@ -368,6 +419,16 @@ impl DnsClient {
     /// question must match the request before any response flags or records
     /// are used.
     pub async fn query(&self, name: &str, record_type: RecordType) -> Result<Message, ClientError> {
+        tokio::time::timeout(self.timeout, self.query_inner(name, record_type))
+            .await
+            .map_err(|_| ClientError::Timeout(self.timeout))?
+    }
+
+    async fn query_inner(
+        &self,
+        name: &str,
+        record_type: RecordType,
+    ) -> Result<Message, ClientError> {
         let id: u16 = rand::random();
         let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
         msg.metadata.recursion_desired = true;
@@ -386,42 +447,201 @@ impl DnsClient {
         msg.add_query(query.clone());
         let wire = msg.to_bytes()?;
         let expected = ExpectedResponse { id, query };
-        tokio::time::timeout(self.timeout, self.exchange(&wire, &expected))
-            .await
-            .map_err(|_| ClientError::Timeout(self.timeout))?
+        self.exchange(&wire, &expected).await
     }
 
-    /// Convenience: query `A` and `AAAA` in parallel, merge addresses, return
-    /// (addrs, min_ttl).  Empty answer set returns `Ok((vec![], _))`; upstream
-    /// SERVFAIL surfaces as `ClientError::Rcode`.
+    /// Convenience: resolve every enabled address for `name`. A and AAAA are
+    /// queried **concurrently** (IPv4 ordered first in the result) under one
+    /// overall timeout; AAAA is skipped entirely when `ipv6_enabled` is
+    /// false. Returns the addresses and minimum answer TTL.
     pub async fn lookup_ip(&self, name: &str) -> Result<(Vec<IpAddr>, Duration), ClientError> {
-        let (a, aaaa) = tokio::join!(
-            self.query(name, RecordType::A),
-            self.query(name, RecordType::AAAA),
-        );
-        let mut addrs = Vec::new();
-        let mut min_ttl: Option<u32> = None;
-        let mut had_any_ok = false;
-        let mut last_err: Option<ClientError> = None;
-        for r in [a, aaaa] {
-            match r {
-                Ok(msg) => {
-                    had_any_ok = true;
-                    let (response_addrs, response_ttl) = relevant_ip_answers(&msg);
-                    addrs.extend(response_addrs);
-                    if let Some(ttl) = response_ttl {
-                        min_ttl = Some(min_ttl.map_or(ttl, |current| current.min(ttl)));
-                    }
-                }
-                Err(e) => {
-                    last_err = Some(e);
+        let result = self.lookup_ip_with_ipv6(name, true).await?;
+        Ok((result.ips, result.ttl))
+    }
+
+    pub(crate) async fn lookup_ip_with_ipv6(
+        &self,
+        name: &str,
+        ipv6_enabled: bool,
+    ) -> Result<IpLookupResult, ClientError> {
+        tokio::time::timeout(
+            self.timeout,
+            self.lookup_ip_with_ipv6_inner(name, ipv6_enabled),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout(self.timeout))?
+    }
+
+    pub(crate) async fn lookup_family(
+        &self,
+        name: &str,
+        record_type: RecordType,
+    ) -> Result<FamilyLookupResult, ClientError> {
+        let queried = QueryFamilies::from_record_type(record_type);
+        if queried.is_empty() {
+            return Err(ClientError::Protocol(
+                "address family query must be A or AAAA",
+            ));
+        }
+        let message = self.query(name, record_type).await?;
+        match message.metadata.response_code {
+            ResponseCode::NoError => {}
+            ResponseCode::NXDomain => {
+                // RFC 2308: a negative response's cache lifetime is
+                // `min(SOA.TTL, SOA.MINIMUM)` from the authority section. Cache
+                // it so repeat queries for a bogus name don't re-query upstream
+                // on every attempt (DGA / retry loops). `0` when no SOA is
+                // present; the resolver clamp floor still yields a short life.
+                let ttl = negative_ttl(&message);
+                return Ok(FamilyLookupResult::NxDomain(ttl));
+            }
+            code => return Err(ClientError::Rcode(code)),
+        }
+        let (ips, answer_ttl) = relevant_ip_answers(&message);
+        let ttl = if ips.is_empty() {
+            // RFC 2308: NODATA uses the SOA negative TTL, not a CNAME or
+            // address-answer TTL accidentally found in the response.
+            negative_ttl(&message)
+        } else {
+            Duration::from_secs(u64::from(answer_ttl.unwrap_or(0)))
+        };
+        Ok(FamilyLookupResult::Response(IpLookupResult {
+            ips,
+            ttl,
+            v4: None,
+            v6: None,
+        }))
+    }
+
+    /// Unified entry point for the resolver pipeline (review issue J). For a
+    /// single family (`IPV4`/`IPV6`) this is a per-family query that preserves
+    /// the NXDOMAIN/NODATA distinction the DNS server needs; for `BOTH` it
+    /// queries A and AAAA concurrently and returns every enabled address
+    /// (IPv4 first) for `resolve_ips`, so `DirectAdapter` retains IPv6
+    /// fallback when IPv4 connectivity fails. `Err` means the client could
+    /// not produce *any* answer for the requested set (e.g. both families
+    /// timed out); the resolver keeps racing the remaining clients.
+    pub(crate) async fn lookup_set(
+        &self,
+        name: &str,
+        want: QueryFamilies,
+        ipv6_enabled: bool,
+    ) -> Result<FamilySet, ClientError> {
+        let source = self.upstream_label();
+        if want == QueryFamilies::BOTH {
+            let result = self.lookup_ip_with_ipv6(name, ipv6_enabled).await?;
+            return Ok(family_set_from_ip_lookup(&result, source));
+        }
+        let family = if want == QueryFamilies::IPV4 {
+            QueryFamilies::IPV4
+        } else if want == QueryFamilies::IPV6 {
+            QueryFamilies::IPV6
+        } else {
+            return Err(ClientError::Protocol(
+                "lookup_set requires a single family or BOTH",
+            ));
+        };
+        let record_type = match family {
+            QueryFamilies::IPV4 => RecordType::A,
+            _ => RecordType::AAAA,
+        };
+        let answer = match self.lookup_family(name, record_type).await {
+            Ok(FamilyLookupResult::Response(r)) => {
+                let ttl = r.ttl;
+                if r.ips.is_empty() {
+                    FamilyAnswer::NoData(ttl)
+                } else {
+                    FamilyAnswer::Answer { ips: r.ips, ttl }
                 }
             }
+            Ok(FamilyLookupResult::NxDomain(ttl)) => FamilyAnswer::NxDomain(ttl),
+            Err(_) => FamilyAnswer::Failed,
+        };
+        let (v4, v6) = if family == QueryFamilies::IPV4 {
+            (Some(answer), None)
+        } else {
+            (None, Some(answer))
+        };
+        Ok(FamilySet { v4, v6, source })
+    }
+
+    async fn lookup_ip_with_ipv6_inner(
+        &self,
+        name: &str,
+        ipv6_enabled: bool,
+    ) -> Result<IpLookupResult, ClientError> {
+        // Query A and AAAA in parallel when IPv6 is enabled so callers
+        // (notably `resolve_ips` → `DirectAdapter::dial_tcp`) receive *both*
+        // address families and can fall back to IPv6 when IPv4 connectivity
+        // fails. IPv4 addresses are placed first in the result list to
+        // preserve prefer-IPv4 ordering — `dial_tcp` iterates in list order,
+        // so IPv4 is tried before IPv6.
+        //
+        // Per-family answers are retained because the aggregate IP list
+        // alone cannot distinguish NODATA from NXDOMAIN when it is later
+        // written to the shared cache.
+        if !ipv6_enabled {
+            // IPv4-only path: a single A query, no AAAA.
+            let answer = match self.query_inner(name, RecordType::A).await {
+                Ok(message) => classify_family_message(&message),
+                Err(error) => return Err(error),
+            };
+            let (ips, ttl) = match &answer {
+                FamilyAnswer::Answer { ips, ttl } => (ips.clone(), *ttl),
+                FamilyAnswer::NoData(ttl) | FamilyAnswer::NxDomain(ttl) => (Vec::new(), *ttl),
+                FamilyAnswer::Failed => {
+                    return Err(ClientError::Protocol("no response"));
+                }
+            };
+            return Ok(IpLookupResult {
+                ips,
+                ttl,
+                v4: Some(answer),
+                v6: None,
+            });
         }
-        if !had_any_ok {
-            return Err(last_err.unwrap_or(ClientError::Protocol("no response")));
+
+        // Dual-stack path: race A and AAAA concurrently.
+        let (v4_result, v6_result) = tokio::join!(
+            self.query_inner(name, RecordType::A),
+            self.query_inner(name, RecordType::AAAA)
+        );
+
+        let v4 = v4_result.ok().map(|msg| classify_family_message(&msg));
+        let v6 = v6_result.ok().map(|msg| classify_family_message(&msg));
+
+        // NXDOMAIN from A means the name does not exist at all — propagate
+        // to both families (mirrors the old sequential behaviour).
+        if let Some(FamilyAnswer::NxDomain(ttl)) = &v4 {
+            return Ok(IpLookupResult {
+                ips: Vec::new(),
+                ttl: *ttl,
+                v4: v4.clone(),
+                v6: Some(FamilyAnswer::NxDomain(*ttl)),
+            });
         }
-        Ok((addrs, Duration::from_secs(u64::from(min_ttl.unwrap_or(0)))))
+
+        // Collect addresses with IPv4 first (prefer-IPv4 ordering).
+        let mut addrs = Vec::new();
+        let mut min_ttl: Option<Duration> = None;
+        if let Some(FamilyAnswer::Answer { ips, ttl }) = &v4 {
+            addrs.extend_from_slice(ips);
+            min_ttl = Some(*ttl);
+        }
+        if let Some(FamilyAnswer::Answer { ips, ttl }) = &v6 {
+            addrs.extend_from_slice(ips);
+            min_ttl = Some(min_ttl.map_or(*ttl, |current| current.min(*ttl)));
+        }
+
+        if v4.is_none() && v6.is_none() {
+            return Err(ClientError::Protocol("no response"));
+        }
+        Ok(IpLookupResult {
+            ips: addrs,
+            ttl: min_ttl.unwrap_or(Duration::ZERO),
+            v4,
+            v6,
+        })
     }
 
     /// Send a direct `tcp://` query through a bounded keep-alive pool.
@@ -639,6 +859,44 @@ fn canonical_name(name: &Name) -> Name {
     canonical
 }
 
+/// RFC 2308 negative-cache TTL for an NXDOMAIN/NODATA response: the minimum of
+/// the SOA record's own TTL and its MINIMUM field, taken from the authority
+/// (`authorities`) section. Returns `0` when no SOA is present — the
+/// resolver's clamp floor still gives such a negative a short cache life.
+/// Mirrors mihomo's `minimalTTL(concat(Answer, Ns, Extra))` for negative
+/// responses (the SOA lives in the authority section).
+fn negative_ttl(message: &Message) -> Duration {
+    let mut best: Option<u32> = None;
+    for record in &message.authorities {
+        let RData::SOA(soa) = &record.data else {
+            continue;
+        };
+        let ttl = record.ttl.min(soa.minimum);
+        best = Some(best.map_or(ttl, |b| b.min(ttl)));
+    }
+    Duration::from_secs(u64::from(best.unwrap_or(0)))
+}
+
+fn classify_family_message(message: &Message) -> FamilyAnswer {
+    match message.metadata.response_code {
+        ResponseCode::NoError => {
+            let (ips, ttl) = relevant_ip_answers(message);
+            if ips.is_empty() {
+                // NODATA uses the SOA negative TTL even when the response
+                // contains a CNAME with its own TTL but no terminal address.
+                FamilyAnswer::NoData(negative_ttl(message))
+            } else {
+                FamilyAnswer::Answer {
+                    ips,
+                    ttl: Duration::from_secs(u64::from(ttl.unwrap_or(0))),
+                }
+            }
+        }
+        ResponseCode::NXDomain => FamilyAnswer::NxDomain(negative_ttl(message)),
+        _ => FamilyAnswer::Failed,
+    }
+}
+
 struct CnameLink {
     target: Name,
     ttl: u32,
@@ -725,6 +983,17 @@ fn relevant_ip_answers(message: &Message) -> (Vec<IpAddr>, Option<u32>) {
     (addrs, min_ttl)
 }
 
+/// Convert the prefer-IPv4 A-then-AAAA result into a [`FamilySet`]. The
+/// family answers retain NXDOMAIN versus NODATA so the shared cache cannot
+/// downgrade the upstream RCODE.
+fn family_set_from_ip_lookup(result: &IpLookupResult, source: String) -> FamilySet {
+    FamilySet {
+        v4: result.v4.clone(),
+        v6: result.v6.clone(),
+        source,
+    }
+}
+
 async fn udp_exchange(
     addr: SocketAddr,
     wire: &[u8],
@@ -789,6 +1058,44 @@ async fn dot_exchange(
     read_lp(&mut stream).await
 }
 
+/// Maximum DoH response size (HTTP/1.1 headers + DNS body), in bytes.
+///
+/// DNS wire messages are inherently capped at 65535 bytes — the 2-octet
+/// length prefix used by DNS-over-TCP and DNS-over-TLS (`read_lp`) enforces
+/// it structurally. DoH, however, frames the DNS message inside an HTTP
+/// response and this client reads the whole response with `Connection:
+/// close` (no `Transfer-Encoding` parsing). An unbounded `read_to_end` there
+/// let a misbehaving or hostile upstream stream an arbitrarily large body and
+/// drive unbounded heap growth (low-risk review item). Cap the total response
+/// at the DNS message maximum plus generous room for HTTP/1.1 headers; a
+/// well-formed DoH answer always fits while an oversized response is rejected.
+#[cfg(feature = "encrypted")]
+const MAX_DOH_RESPONSE_BYTES: usize = 65535 + 16 * 1024;
+
+/// Read an HTTP/1.1 response to EOF (the server uses `Connection: close`),
+/// rejecting responses whose total size exceeds [`MAX_DOH_RESPONSE_BYTES`].
+/// Extracted from [`doh_exchange`] so the bounded-read behaviour is unit
+/// testable without standing up a TLS DoH server.
+#[cfg(feature = "encrypted")]
+async fn read_bounded_http_response<R>(stream: &mut R) -> Result<Vec<u8>, ClientError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
+    let mut all = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        all.extend_from_slice(&chunk[..n]);
+        if all.len() > MAX_DOH_RESPONSE_BYTES {
+            return Err(ClientError::Protocol("doh: response exceeds maximum size"));
+        }
+    }
+    Ok(all)
+}
+
 #[cfg(feature = "encrypted")]
 async fn doh_exchange(
     addr: SocketAddr,
@@ -824,8 +1131,11 @@ async fn doh_exchange(
     stream.write_all(wire).await?;
     stream.flush().await?;
 
-    let mut all = Vec::with_capacity(1024);
-    stream.read_to_end(&mut all).await?;
+    // Read the full HTTP/1.1 response with a bounded buffer. `Connection:
+    // close` means the server EOFs after the body, so reading to EOF is
+    // correct — but we cap the total to `MAX_DOH_RESPONSE_BYTES` so a
+    // misbehaving upstream cannot stream an unbounded body into memory.
+    let all = read_bounded_http_response(&mut stream).await?;
     let split = find_subseq(&all, b"\r\n\r\n")
         .ok_or(ClientError::Protocol("doh: missing header terminator"))?;
     let head_bytes = &all[..split];
@@ -930,11 +1240,53 @@ mod tests {
         assert_eq!(find_subseq(b"", b"x"), None);
     }
 
+    /// A DoH response at exactly the cap is accepted; one byte over the cap
+    /// is rejected with a protocol error. Guards the low-risk review fix
+    /// that bounds the previously unbounded `read_to_end`.
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
-    async fn udp_client_times_out_on_unroutable() {
-        // 192.0.2.1/24 is TEST-NET-1, guaranteed not to respond.
-        let client = DnsClient::udp("192.0.2.1:53".parse().unwrap())
-            .with_timeout(Duration::from_millis(200));
+    async fn doh_bounded_read_enforces_response_size_cap() {
+        let at_cap = vec![0u8; MAX_DOH_RESPONSE_BYTES];
+        let mut reader = at_cap.as_slice();
+        let got = read_bounded_http_response(&mut reader).await.unwrap();
+        assert_eq!(got.len(), MAX_DOH_RESPONSE_BYTES);
+
+        let over_cap = vec![0u8; MAX_DOH_RESPONSE_BYTES + 1];
+        let mut reader = over_cap.as_slice();
+        let err = read_bounded_http_response(&mut reader).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClientError::Protocol("doh: response exceeds maximum size")
+            ),
+            "expected oversized-rejection, got {err:?}"
+        );
+    }
+
+    // NOTE (review B3): the hermetic-silent-loopback version of this test
+    // lives in its own PR (#476, `udp_client_times_out_when_no_response`).
+    // This branch deliberately keeps main's original hunk untouched so the
+    // two PRs do not both modify the same hunk; whichever lands second
+    // rebases cleanly.
+    #[tokio::test]
+    async fn udp_client_times_out_when_no_response() {
+        // A silent loopback peer makes the timeout path deterministic
+        // regardless of the host network. Using a "guaranteed unroutable"
+        // address like 192.0.2.1 is non-hermetic: many ISPs/routers hijack
+        // outbound UDP/53 and answer with a spoofed source (Ok/NXDOMAIN) or
+        // return ICMP unreachable (an Io error), so the client never reaches
+        // Timeout.
+        //
+        // The sink is never read and never writes a reply. It only has to stay
+        // bound for the duration of the query: a closed port would yield
+        // ECONNREFUSED on the client's connected socket instead of a timeout.
+        // The client sends a single datagram, so the kernel recv buffer never
+        // fills and no drain task is needed. Binding for the whole test scope
+        // covers that; the sink needs no explicit drop at the end — the query
+        // has already completed by then (review low item).
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sink.local_addr().unwrap();
+        let client = DnsClient::udp(addr).with_timeout(Duration::from_millis(200));
         let r = client.query("example.test", RecordType::A).await;
         assert!(matches!(r, Err(ClientError::Timeout(_))));
     }
@@ -1137,6 +1489,50 @@ mod tests {
             result,
             Err(ClientError::Protocol("response ID mismatch"))
         ));
+    }
+
+    #[tokio::test]
+    async fn lookup_ip_shares_one_timeout_across_a_and_aaaa() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        tokio::spawn(async move {
+            // A and AAAA ride separate connections (no pooling here), so the
+            // server accepts twice. The point under test is that the *client*
+            // covers both queries — issued concurrently, each on its own
+            // socket — with one overall timeout, not that they share a
+            // socket.
+            for expected in [RecordType::A, RecordType::AAAA] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_lp(&mut stream).await.unwrap();
+                let request = Message::from_bytes(&request).unwrap();
+                assert_eq!(request.queries[0].query_type, expected);
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                if expected == RecordType::A {
+                    // Empty NOERROR (no address records) after 250 ms, so the
+                    // prefer-IPv4 path falls back to AAAA.
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    let response = response_for(&request, request.metadata.id);
+                    write_lp(&mut stream, &response.to_bytes().unwrap())
+                        .await
+                        .unwrap();
+                } else {
+                    // AAAA never answers within the client budget.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        });
+
+        let client = DnsClient::tcp(addr).with_timeout(Duration::from_millis(400));
+        let result = tokio::time::timeout(
+            Duration::from_millis(550),
+            client.lookup_ip_with_ipv6("dual.example", true),
+        )
+        .await
+        .expect("A and AAAA must share the client's overall timeout");
+        assert!(matches!(result, Err(ClientError::Timeout(_))));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(feature = "encrypted")]
@@ -1561,5 +1957,96 @@ mod tests {
             2,
             "a stream idle past the timeout must be closed, not reused"
         );
+    /// RFC 2308: the negative cache TTL of an NXDOMAIN/NODATA response is
+    /// `min(SOA.TTL, SOA.MINIMUM)` from the authority section. Verifies the
+    /// helper used by the NXDOMAIN-cache path picks the smaller of the record
+    /// TTL and the SOA MINIMUM field, and falls back to 0 when no SOA is
+    /// present (the resolver clamp floor still gives it a short life).
+    fn soa_record(name: &str, ttl: u32, minimum: u32) -> Record {
+        use hickory_proto::rr::rdata::SOA;
+        Record::from_rdata(
+            name.parse().unwrap(),
+            ttl,
+            RData::SOA(SOA::new(
+                "ns.example".parse().unwrap(),
+                "hostmaster.example".parse().unwrap(),
+                1,
+                3600,
+                900,
+                1209600,
+                minimum,
+            )),
+        )
+    }
+
+    #[test]
+    fn negative_ttl_uses_min_of_soa_ttl_and_minimum() {
+        let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+        // SOA TTL 600, MINIMUM 300 → negative TTL 300.
+        msg.add_authority(soa_record("example.", 600, 300));
+        assert_eq!(negative_ttl(&msg), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn negative_ttl_picks_the_soa_record_ttl_when_smaller_than_minimum() {
+        let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+        // SOA TTL 120, MINIMUM 3600 → negative TTL 120.
+        msg.add_authority(soa_record("example.", 120, 3600));
+        assert_eq!(negative_ttl(&msg), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn negative_ttl_is_zero_when_no_soa_in_authority() {
+        let msg = Message::new(1, MessageType::Response, OpCode::Query);
+        assert_eq!(negative_ttl(&msg), Duration::ZERO);
+    }
+
+    /// `classify_family_message` is the BOTH-path classifier. Verify its four
+    /// branches: NoError+addresses → Answer, NoError+empty → NoData(SOA TTL),
+    /// NXDOMAIN → NxDomain(SOA TTL), other rcode → Failed.
+    #[test]
+    fn classify_family_message_branches() {
+        use hickory_proto::op::ResponseCode;
+
+        // NoError with an A record → Answer.
+        let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NoError;
+        msg.add_query(Query::query("a.example".parse().unwrap(), RecordType::A));
+        msg.add_answer(Record::from_rdata(
+            "a.example".parse().unwrap(),
+            60,
+            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+        ));
+        let ans = classify_family_message(&msg);
+        assert!(matches!(
+            ans,
+            FamilyAnswer::Answer { ips, ttl } if ips == vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))] && ttl == Duration::from_secs(60)
+        ));
+
+        // NoError with zero address records → NoData(SOA TTL).
+        let mut msg = Message::new(2, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NoError;
+        msg.add_query(Query::query(
+            "empty.example".parse().unwrap(),
+            RecordType::A,
+        ));
+        msg.add_authority(soa_record("example.", 600, 300));
+        let ans = classify_family_message(&msg);
+        assert!(matches!(ans, FamilyAnswer::NoData(t) if t == Duration::from_secs(300)));
+
+        // NXDOMAIN → NxDomain(SOA TTL).
+        let mut msg = Message::new(3, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NXDomain;
+        msg.add_query(Query::query("gone.example".parse().unwrap(), RecordType::A));
+        msg.add_authority(soa_record("example.", 600, 300));
+        let ans = classify_family_message(&msg);
+        assert!(matches!(ans, FamilyAnswer::NxDomain(t) if t == Duration::from_secs(300)));
+
+        // SERVFAIL → Failed.
+        let mut msg = Message::new(4, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::ServFail;
+        msg.add_query(Query::query("fail.example".parse().unwrap(), RecordType::A));
+        let ans = classify_family_message(&msg);
+        assert!(matches!(ans, FamilyAnswer::Failed));
     }
 }

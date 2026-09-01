@@ -69,6 +69,14 @@ h2 = [
 httpupgrade = [
     "dep:httparse",
 ]
+# simple-obfs (SIP004): a stream-wrapper codec that frames shadowsocks traffic
+# as fake HTTP / TLS so a passive observer sees plain web traffic. Used by both
+# the outbound SS/Snell adapters (client side, here as `simple_obfs::client`)
+# and — in a follow-up — the inbound shadowsocks listener (server side). The
+# client and server share the same fake-TLS record / ClientHello framing, so
+# keeping them in one module lets a single round-trip test guard both halves
+# against framing drift.
+simple-obfs = ["dep:base64", "dep:rand"]
 
 [dependencies]
 async-trait = { workspace = true }

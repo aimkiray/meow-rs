@@ -14,6 +14,9 @@
 //! | E  | `grpc_round_trip_with_deferred_response` — server withholds response HEADERS until the first client hunk (issue #377) |
 //! | F  | `grpc_poll_write_rejects_changed_buffer_after_pending` — changed-buffer guard (issue #433) |
 //! | G  | `grpc_poll_write_same_buffer_retry_succeeds_after_pending` — legitimate same-buffer retry still completes (issue #433) |
+//! | H  | `grpc_shutdown_flushes_stashed_frame_before_eos` — shutdown flushes a frame stashed by a cancelled write (PR #440 follow-up) |
+//! | I  | `grpc_shutdown_after_rejected_buffer_does_not_resurrect_frame` — shutdown never resends a frame cleared by the changed-buffer rejection (PR #440 follow-up) |
+//! | J  | `grpc_empty_write_is_noop_even_with_stashed_frame` — `write(&[])` returns `Ok(0)` without tripping the changed-buffer guard (PR #440 follow-up) |
 
 mod support;
 
@@ -327,10 +330,17 @@ async fn grpc_round_trip_with_deferred_response() {
 /// a message on `release_rx` (if ever), after which it drains and releases
 /// everything. Keeping the window shut forces the client's `poll_write` into
 /// the `Pending` + stashed-frame state that issue #433 is about.
+///
+/// The collected request-body bytes are sent through the returned receiver
+/// once the client half-closes with a clean end-of-stream. Reading the body
+/// to completion inside the task (instead of `std::mem::forget`-ing it) both
+/// keeps the h2 stream alive while the client has a write outstanding and
+/// lets tests H/I assert exactly which frames reached the wire.
 fn spawn_capacity_hoarding_server(
     server_io: tokio::io::DuplexStream,
     release_rx: tokio::sync::oneshot::Receiver<()>,
-) {
+) -> tokio::sync::oneshot::Receiver<Vec<u8>> {
+    let (body_tx, body_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let Ok(mut conn) = h2::server::handshake(server_io).await else {
             return;
@@ -351,27 +361,47 @@ fn spawn_capacity_hoarding_server(
         // send window (65535 initial) empties and stays empty.
         let mut body = request.into_body();
         let mut release_rx = release_rx;
-        let mut held: usize = 0;
+        let mut received = Vec::new();
         loop {
             tokio::select! {
                 chunk = body.data() => match chunk {
-                    Some(Ok(chunk)) => held += chunk.len(),
-                    _ => return, // EOS or stream error — client went away
+                    Some(Ok(chunk)) => received.extend_from_slice(&chunk),
+                    Some(Err(_)) => return, // stream error — client went away
+                    None => {
+                        let _ = body_tx.send(received);
+                        return;
+                    }
                 },
                 _ = &mut release_rx => break,
             }
         }
         // Reopen the window: release everything held so far, then keep
-        // draining + releasing so the retried write completes.
-        let _ = body.flow_control().release_capacity(held);
-        while let Some(Ok(chunk)) = body.data().await {
-            let _ = body.flow_control().release_capacity(chunk.len());
+        // draining + releasing so the retried write completes; the body stays
+        // alive in this loop until end-of-stream or a reset.
+        let _ = body.flow_control().release_capacity(received.len());
+        loop {
+            match body.data().await {
+                Some(Ok(chunk)) => {
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    received.extend_from_slice(&chunk);
+                }
+                Some(Err(_)) => return,
+                None => {
+                    let _ = body_tx.send(received);
+                    return;
+                }
+            }
         }
-        // Keep the body alive so the stream is not reset while the client
-        // still has a write outstanding.
-        std::mem::forget(body);
     });
+    body_rx
 }
+
+/// Payload that fills the initial h2 send window: 65535 bytes of 0xAA encode
+/// to a 65544-byte gun frame — larger than the 65535-byte window — so after
+/// writing it the window is fully exhausted.  Tests H/I rebuild the expected
+/// wire bytes from these constants.
+const WINDOW_FILL_BYTE: u8 = 0xAA;
+const WINDOW_FILL_LEN: usize = 65535;
 
 /// Exhaust the client's h2 send window so the next write stashes its frame and
 /// returns `Pending`, then interrupt that write, leaving `pending_write` set.
@@ -386,10 +416,9 @@ async fn gun_stream_with_stashed_frame(
         .await
         .expect("grpc connect");
 
-    // One 65535-byte payload encodes to a 65544-byte gun frame — larger than
-    // the initial 65535-byte h2 send window — so after this write the window
-    // is fully exhausted (the server never releases capacity on its own).
-    let fill = vec![0xAA; 65535];
+    // Fully exhaust the send window (the server never releases capacity on
+    // its own).
+    let fill = vec![WINDOW_FILL_BYTE; WINDOW_FILL_LEN];
     tokio::time::timeout(Duration::from_secs(5), stream.write(&fill))
         .await
         .expect("window-filling write must complete")
@@ -420,7 +449,7 @@ async fn gun_stream_with_stashed_frame(
 async fn grpc_poll_write_rejects_changed_buffer_after_pending() {
     let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
     let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
-    spawn_capacity_hoarding_server(server_io, release_rx);
+    let _body_rx = spawn_capacity_hoarding_server(server_io, release_rx);
 
     let pending = vec![0xBB; 100];
     let mut stream = gun_stream_with_stashed_frame(client_io, &pending).await;
@@ -450,7 +479,7 @@ async fn grpc_poll_write_rejects_changed_buffer_after_pending() {
 async fn grpc_poll_write_same_buffer_retry_succeeds_after_pending() {
     let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    spawn_capacity_hoarding_server(server_io, release_rx);
+    let _body_rx = spawn_capacity_hoarding_server(server_io, release_rx);
 
     let pending = vec![0xBB; 100];
     let mut stream = gun_stream_with_stashed_frame(client_io, &pending).await;
@@ -466,5 +495,135 @@ async fn grpc_poll_write_same_buffer_retry_succeeds_after_pending() {
         n,
         pending.len(),
         "retry must report the full payload length"
+    );
+}
+
+// ─── H/I: Shutdown with a stashed frame (PR #440 review follow-up) ────────────
+
+/// H: `grpc_shutdown_flushes_stashed_frame_before_eos`
+///
+/// Follow-up to the PR #440 review: `poll_shutdown` used to send an empty
+/// DATA+EOS while an encoded frame from a cancelled write still sat in
+/// `pending_write`, silently truncating the stream. Shutdown must flush the
+/// stashed frame together with the EOS instead of discarding it.
+#[tokio::test]
+async fn grpc_shutdown_flushes_stashed_frame_before_eos() {
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let body_rx = spawn_capacity_hoarding_server(server_io, release_rx);
+
+    let pending = vec![0xBB; 100];
+    let mut stream = gun_stream_with_stashed_frame(client_io, &pending).await;
+
+    // Shutdown with the frame still stashed (the parked write was cancelled,
+    // never retried). h2 queues the flushed frame beyond the closed window,
+    // so this completes even before the server releases capacity.
+    tokio::time::timeout(Duration::from_secs(5), stream.shutdown())
+        .await
+        .expect("shutdown must not block on flow control")
+        .expect("shutdown");
+
+    // Reopen the window so the queued frames can reach the server.
+    release_tx.send(()).expect("server task alive");
+
+    let received = tokio::time::timeout(Duration::from_secs(5), body_rx)
+        .await
+        .expect("server must observe end-of-stream")
+        .expect("server sent collected body");
+
+    let mut expected = encode_gun_frame(&vec![WINDOW_FILL_BYTE; WINDOW_FILL_LEN]);
+    expected.extend_from_slice(&encode_gun_frame(&pending));
+    assert_eq!(
+        received, expected,
+        "the stashed frame must be delivered before EOS"
+    );
+}
+
+/// I: `grpc_shutdown_after_rejected_buffer_does_not_resurrect_frame`
+///
+/// Companion to H: only a frame stashed by a *cancelled* write gets flushed.
+/// A frame cleared by the changed-buffer `InvalidInput` rejection (test F)
+/// must not reappear on the wire when the stream is later shut down.
+#[tokio::test]
+async fn grpc_shutdown_after_rejected_buffer_does_not_resurrect_frame() {
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let body_rx = spawn_capacity_hoarding_server(server_io, release_rx);
+
+    let pending = vec![0xBB; 100];
+    let mut stream = gun_stream_with_stashed_frame(client_io, &pending).await;
+
+    // Trip the changed-buffer guard: the stashed frame is cleared and the
+    // write fails with InvalidInput.
+    let different = vec![0xCC; 50];
+    let err = tokio::time::timeout(Duration::from_secs(5), stream.write(&different))
+        .await
+        .expect("changed-buffer write must fail fast")
+        .expect_err("changed buffer after Pending must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    tokio::time::timeout(Duration::from_secs(5), stream.shutdown())
+        .await
+        .expect("shutdown must not block on flow control")
+        .expect("shutdown");
+    release_tx.send(()).expect("server task alive");
+
+    let received = tokio::time::timeout(Duration::from_secs(5), body_rx)
+        .await
+        .expect("server must observe end-of-stream")
+        .expect("server sent collected body");
+    assert_eq!(
+        received,
+        encode_gun_frame(&vec![WINDOW_FILL_BYTE; WINDOW_FILL_LEN]),
+        "a frame cleared by the changed-buffer rejection must not be resurrected at shutdown"
+    );
+}
+
+/// J: `grpc_empty_write_is_noop_even_with_stashed_frame`
+///
+/// Follow-up to the PR #440 review: `poll_write` lacked `H2Stream`'s
+/// empty-buffer early return, so `write(&[])` while a frame was stashed was
+/// misread as a changed-buffer retry and failed with `InvalidInput` (and an
+/// empty write on an idle stream sent a useless zero-payload gun frame). An
+/// empty write must report `Ok(0)`, leave the stash intact, and send nothing.
+#[tokio::test]
+async fn grpc_empty_write_is_noop_even_with_stashed_frame() {
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let body_rx = spawn_capacity_hoarding_server(server_io, release_rx);
+
+    let pending = vec![0xBB; 100];
+    let mut stream = gun_stream_with_stashed_frame(client_io, &pending).await;
+
+    // An empty write is a distinct logical write, not a retry: Ok(0).
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.write(&[]))
+        .await
+        .expect("empty write must not block")
+        .expect("empty write must succeed");
+    assert_eq!(n, 0, "empty write must report Ok(0)");
+
+    // The stash must survive it: the contract-conforming same-buffer retry
+    // still completes once capacity is released, and exactly the fill frame
+    // plus the stashed frame reach the wire (no zero-payload frame).
+    release_tx.send(()).expect("server task alive");
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.write(&pending))
+        .await
+        .expect("same-buffer retry must complete once capacity is released")
+        .expect("same-buffer retry must succeed");
+    assert_eq!(n, pending.len());
+
+    tokio::time::timeout(Duration::from_secs(5), stream.shutdown())
+        .await
+        .expect("shutdown must not block")
+        .expect("shutdown");
+    let received = tokio::time::timeout(Duration::from_secs(5), body_rx)
+        .await
+        .expect("server must observe end-of-stream")
+        .expect("server sent collected body");
+    let mut expected = encode_gun_frame(&vec![WINDOW_FILL_BYTE; WINDOW_FILL_LEN]);
+    expected.extend_from_slice(&encode_gun_frame(&pending));
+    assert_eq!(
+        received, expected,
+        "an empty write must put nothing on the wire"
     );
 }

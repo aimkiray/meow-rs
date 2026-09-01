@@ -96,6 +96,7 @@ impl Proxy for WrappedProxy {
 
 pub fn parse_proxy(
     config: &HashMap<String, serde_yaml::Value>,
+    ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let name = config
         .get("name")
@@ -213,7 +214,7 @@ pub fn parse_proxy(
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         "direct" => {
-            let adapter = parse_direct(name, config)?;
+            let adapter = parse_direct(name, config, ipv6)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "anytls")]
@@ -517,6 +518,7 @@ fn parse_socks5(
 fn parse_direct(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
+    ipv6: bool,
 ) -> std::result::Result<DirectAdapter, String> {
     use meow_common::DnsMode;
     use meow_dns::Resolver;
@@ -579,6 +581,7 @@ fn parse_direct(
             DnsMode::Normal,
             DomainTrie::new(),
             false,
+            ipv6,
         ));
         adapter = adapter.with_resolver(resolver);
     }
@@ -1095,14 +1098,19 @@ fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, 
 /// - `uuid` invalid
 /// - `server` domain > 255 bytes
 /// - `vless-vision` feature absent + `flow: xtls-rprx-vision`
-/// - `flow: xtls-rprx-vision` + `smux`/`mux` protocol `smux`/`yamux`/`h2mux`
-///   — sing-box and Xray reject XTLS + sing-mux (`protocol: muxcool` is fine)
+/// - `flow: xtls-rprx-vision` + a `smux`/`mux` block using sing-mux
+///   (`protocol: smux`/`yamux`/`h2mux`) — sing-box and Xray reject XTLS +
+///   sing-mux (`protocol: muxcool` is fine)
 ///
 /// # Warn-once (Class B per ADR-0002)
 ///
 /// - `tls: false` with plain VLESS — plaintext, but correct destination
 /// - `mux: { enabled: true }` — sing-mux multiplexing (server must be sing-box/mihomo)
 /// - `flow: xtls-rprx-vision` + `udp: true` — Vision is TCP-only; UDP uses plain VLESS
+/// - `reality-opts.short-id` given as a bare YAML number (e.g. `0x1f`) —
+///   coerced to its decimal digits before hex-decoding (matching mihomo),
+///   which can silently reinterpret the value; quote it to preserve the
+///   literal digits
 #[cfg(feature = "vless")]
 fn parse_vless(
     name: &str,
@@ -1160,7 +1168,7 @@ fn parse_vless(
     let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
 
     // ── Reality opts ──────────────────────────────────────────────────────
-    let reality = parse_vless_reality_opts(config)?;
+    let reality = parse_vless_reality_opts(name, config)?;
     if reality.is_some() {
         if !tls {
             return Err("vless: reality-opts requires `tls: true`".into());
@@ -1761,6 +1769,7 @@ fn default_transport_alpn(network: &str, alpn: Vec<String>) -> Vec<String> {
 /// for future fingerprint-specific ClientHello work.
 #[cfg(feature = "vless")]
 fn parse_vless_reality_opts(
+    name: &str,
     config: &HashMap<String, serde_yaml::Value>,
 ) -> std::result::Result<Option<meow_transport::tls::RealityConfig>, String> {
     let Some(opts) = config.get("reality-opts") else {
@@ -1792,14 +1801,41 @@ fn parse_vless_reality_opts(
     // a subscription that yields a valid node on mihomo yields one here too
     // (#408). Note this only round-trips cleanly when the short-id happens to
     // be all decimal digits, e.g. `0x1f` parses as the number 31 and becomes
-    // `"31"`, not `"1f"` — the same lossy coercion mihomo performs.
+    // `"31"`, not `"1f"` — the same lossy coercion mihomo performs. (An
+    // all-decimal literal with a leading zero like `0012` is *not* affected:
+    // YAML's core-schema int resolver only matches decimal scalars without a
+    // leading zero, so `0012` parses as the plain string `"0012"` and never
+    // reaches this branch at all — verified by
+    // `parse_vless_reality_opts_leading_zero_short_id_preserved_no_warn`.)
+    // We warn on the Number coercion (see below) so operators who wrote a
+    // notation like `0x1f` expecting it to be read as literal hex digits
+    // know to quote the value instead.
     let short_id_str = match opts.get("short-id") {
         None | Some(serde_yaml::Value::Null) => String::new(),
-        Some(serde_yaml::Value::Number(n)) => n
-            .as_u64()
-            .map(|u| u.to_string())
-            .or_else(|| n.as_i64().map(|i| i.to_string()))
-            .ok_or_else(|| "vless: reality-opts.short-id must be a hex string".to_string())?,
+        Some(serde_yaml::Value::Number(n)) => {
+            let coerced = n
+                .as_u64()
+                .map(|u| u.to_string())
+                .or_else(|| n.as_i64().map(|i| i.to_string()))
+                .ok_or_else(|| "vless: reality-opts.short-id must be a hex string".to_string())?;
+            // A bare numeric short-id (e.g. `short-id: 0x1f`) is reinterpreted
+            // through YAML's own notation before we ever see it — `0x1f`
+            // arrives here as the decimal integer 31, which then hex-decodes
+            // to a different byte than the literal hex digits "1f" would.
+            // mihomo's decoder has the same lossy behavior, so we match it
+            // for the decoded value, but warn so operators who meant the
+            // literal digits know to quote the value instead of leaving it
+            // as a bare YAML number.
+            tracing::warn!(
+                proxy = %name,
+                "reality-opts.short-id was given as an unquoted YAML number \
+                 and coerced to its decimal digits \"{coerced}\" before hex-decoding; \
+                 if you wrote a different notation (e.g. `0x1f`) expecting it to be \
+                 read as literal hex digits, quote the value instead \
+                 (e.g. short-id: \"1f\")"
+            );
+            coerced
+        }
         Some(value) => value
             .as_str()
             .ok_or_else(|| "vless: reality-opts.short-id must be a hex string".to_string())?
@@ -2277,6 +2313,17 @@ fn parse_relay_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::op::{Message, MessageType, OpCode};
+    use hickory_proto::rr::rdata::AAAA;
+    use hickory_proto::rr::{RData, Record, RecordType};
+    use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+    use std::net::Ipv6Addr;
+
+    fn parse_proxy(
+        config: &HashMap<String, serde_yaml::Value>,
+    ) -> std::result::Result<Arc<dyn Proxy>, String> {
+        super::parse_proxy(config, true)
+    }
 
     fn proxy_config(yaml: &str) -> HashMap<String, serde_yaml::Value> {
         serde_yaml::from_str(yaml).unwrap()
@@ -2367,16 +2414,24 @@ tls: true
 
     #[cfg(feature = "ss")]
     #[test]
-    fn test_serialize_plugin_opts_empty_map() {
-        let yaml = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        assert!(serialize_plugin_opts(&yaml).is_none());
-    }
-
-    #[cfg(feature = "ss")]
-    #[test]
-    fn test_serialize_plugin_opts_null() {
-        let yaml = serde_yaml::Value::Null;
-        assert!(serialize_plugin_opts(&yaml).is_none());
+    fn test_serialize_plugin_opts_none_cases() {
+        // Every empty-ish YAML value must serialize to None. `empty mapping`
+        // exercises the `parts.is_empty()` branch; `null` exercises the
+        // catch-all arm of serialize_plugin_opts.
+        let cases: [(&str, serde_yaml::Value); 2] = [
+            (
+                "empty mapping",
+                serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+            ),
+            ("null", serde_yaml::Value::Null),
+        ];
+        for (label, yaml) in cases {
+            assert!(
+                serialize_plugin_opts(&yaml).is_none(),
+                "{label}: expected None, got {:?}",
+                serialize_plugin_opts(&yaml)
+            );
+        }
     }
 
     #[cfg(feature = "ss")]
@@ -2411,6 +2466,46 @@ tls: true
         assert!(parse_proxy(&cfg).is_ok());
     }
 
+    #[tokio::test]
+    async fn direct_dns_inherits_disabled_ipv6_policy() {
+        let dns = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns_addr = dns.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for _ in 0..2 {
+                let (len, peer) = dns.recv_from(&mut buf).await.unwrap();
+                let request = Message::from_bytes(&buf[..len]).unwrap();
+                let query = request.queries[0].clone();
+                let mut response =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                response.add_query(query.clone());
+                if query.query_type == RecordType::AAAA {
+                    response.add_answer(Record::from_rdata(
+                        query.name,
+                        60,
+                        RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
+                    ));
+                }
+                dns.send_to(&response.to_bytes().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let target = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let cfg = proxy_config(&format!(
+            "name: direct-v6\ntype: direct\ndns: '{dns_addr}'\n"
+        ));
+        let proxy = super::parse_proxy(&cfg, false).unwrap();
+        let metadata = Metadata {
+            host: "v6-only.example".into(),
+            dst_port: target.local_addr().unwrap().port(),
+            ..Default::default()
+        };
+
+        assert!(proxy.dial_tcp(&metadata).await.is_err());
+    }
+
     #[test]
     fn parse_direct_rejects_invalid_dns_entry() {
         let cfg = direct_config("name: bad\ntype: direct\ndns: not-an-ip\n");
@@ -2432,7 +2527,7 @@ tls: true
     #[test]
     fn parse_direct_with_connect_timeout_wires_adapter() {
         let cfg = direct_config("name: d\ntype: direct\nconnect-timeout: 7\n");
-        let adapter = parse_direct("d", &cfg).unwrap();
+        let adapter = parse_direct("d", &cfg, true).unwrap();
         assert_eq!(
             adapter.connect_timeout(),
             Some(std::time::Duration::from_secs(7))
@@ -2442,7 +2537,7 @@ tls: true
     #[test]
     fn parse_direct_without_connect_timeout_is_unbounded() {
         let cfg = direct_config("name: d\ntype: direct\n");
-        let adapter = parse_direct("d", &cfg).unwrap();
+        let adapter = parse_direct("d", &cfg, true).unwrap();
         assert_eq!(adapter.connect_timeout(), None);
     }
 
@@ -2548,24 +2643,82 @@ tls: true
 
     #[cfg(feature = "hysteria2")]
     #[test]
-    fn parse_hysteria2_rejects_missing_password() {
-        let cfg = hy2_config("name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("missing password"), "msg: {err}");
-    }
+    fn parse_hysteria2_rejects_invalid_configs() {
+        // (label, yaml, expected error substring)
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "missing password",
+                "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\n",
+                "missing password",
+            ),
+            (
+                "zero port without ports",
+                "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\npassword: secret\n",
+                "port must be non-zero",
+            ),
+            (
+                "missing both port and ports",
+                "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\npassword: secret\n",
+                "missing port",
+            ),
+            (
+                "wildcard ports without port",
+                "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '*'\npassword: secret\n",
+                "missing port",
+            ),
+            (
+                "empty password",
+                "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\npassword: ''\n",
+                "password must not be empty",
+            ),
+            (
+                "gecko obfs (mihomo divergence: unsupported)",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 obfs: gecko\n\
+                 obfs-password: secret\n",
+                "gecko",
+            ),
+            (
+                "obfs without obfs-password",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 obfs: salamander\n",
+                "missing obfs-password",
+            ),
+            (
+                "mTLS client certificate (mihomo divergence: unsupported)",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 certificate: ./client.crt\n",
+                "certificate",
+            ),
+        ];
 
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_zero_port() {
-        let cfg = hy2_config(
-            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\npassword: secret\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("port must be non-zero"), "msg: {err}");
+        // Collect every failure instead of asserting inline so one bad row does
+        // not mask the rest of the table.
+        let mut failures: Vec<String> = Vec::new();
+        for &(label, yaml, expected) in cases {
+            match parse_proxy(&hy2_config(yaml)) {
+                Ok(_) => failures.push(format!("[{label}] must hard-error (Class A), got Ok")),
+                Err(err) if !err.contains(expected) => {
+                    failures.push(format!(
+                        "[{label}] error must contain {expected:?}, got: {err}"
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[cfg(feature = "hysteria2")]
@@ -2586,39 +2739,6 @@ tls: true
             "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\nports: '443,8443'\npassword: secret\n",
         );
         assert!(parse_proxy(&cfg).is_ok());
-    }
-
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_missing_port_and_ports() {
-        let cfg = hy2_config("name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\npassword: secret\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("missing port"), "msg: {err}");
-    }
-
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_wildcard_ports_without_port() {
-        let cfg = hy2_config(
-            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '*'\npassword: secret\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("missing port"), "msg: {err}");
-    }
-
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_empty_password() {
-        let cfg =
-            hy2_config("name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\npassword: ''\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("password must not be empty"), "msg: {err}");
     }
 
     #[cfg(feature = "hysteria2")]
@@ -2653,58 +2773,6 @@ tls: true
         assert_eq!(parse_hy2_bandwidth("8 MBps").unwrap(), 8_000_000);
         assert_eq!(parse_hy2_bandwidth("10").unwrap(), 1_250_000);
         assert_eq!(parse_hy2_bandwidth("").unwrap(), 0);
-    }
-
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_gecko_obfs() {
-        let cfg = hy2_config(
-            "name: jp-hy2\n\
-             type: hysteria2\n\
-             server: 1.2.3.4\n\
-             port: 443\n\
-             password: secret\n\
-             obfs: gecko\n\
-             obfs-password: secret\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("gecko"), "msg: {err}");
-    }
-
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_obfs_without_password() {
-        let cfg = hy2_config(
-            "name: jp-hy2\n\
-             type: hysteria2\n\
-             server: 1.2.3.4\n\
-             port: 443\n\
-             password: secret\n\
-             obfs: salamander\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("missing obfs-password"), "msg: {err}");
-    }
-
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_unsupported_mtls() {
-        let cfg = hy2_config(
-            "name: jp-hy2\n\
-             type: hysteria2\n\
-             server: 1.2.3.4\n\
-             port: 443\n\
-             password: secret\n\
-             certificate: ./client.crt\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("certificate"), "msg: {err}");
     }
 
     #[cfg(feature = "hysteria2")]
@@ -2907,7 +2975,8 @@ tls: true
         };
         let cache_dir = path.parent().expect("temp file has a parent dir");
         let provider =
-            crate::proxy_provider::ProxyProvider::new("airport", &raw, Some(cache_dir)).unwrap();
+            crate::proxy_provider::ProxyProvider::new("airport", &raw, Some(cache_dir), true)
+                .unwrap();
         provider.refresh().await.unwrap();
         let mut providers = HashMap::new();
         providers.insert("airport".to_string(), Arc::new(provider));
@@ -3001,52 +3070,53 @@ tls: true
 
     #[cfg(feature = "snell")]
     #[test]
-    fn parse_snell_missing_psk() {
-        let cfg = snell_config("name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("missing psk must hard-error (Class A)");
-        };
-        assert!(err.contains("missing psk"), "msg: {err}");
-    }
+    fn parse_snell_rejects_invalid_fields() {
+        // (label, yaml, expected error substring). Every row is a Class A hard
+        // error: a required field is missing or invalid, and parsing must fail
+        // with a message naming that field.
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "missing psk",
+                "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\n",
+                "missing psk",
+            ),
+            (
+                "missing server",
+                "name: sn\ntype: snell\nport: 8388\npsk: secret\n",
+                "missing server",
+            ),
+            (
+                "missing port",
+                "name: sn\ntype: snell\nserver: 1.2.3.4\npsk: secret\n",
+                "missing port",
+            ),
+            (
+                "port zero",
+                "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 0\npsk: secret\n",
+                "port must be non-zero",
+            ),
+            (
+                "empty psk (caught by SnellAdapter::new)",
+                "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: ''\n",
+                "psk must not be empty",
+            ),
+        ];
 
-    #[cfg(feature = "snell")]
-    #[test]
-    fn parse_snell_missing_server() {
-        let cfg = snell_config("name: sn\ntype: snell\nport: 8388\npsk: secret\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("missing server must hard-error (Class A)");
-        };
-        assert!(err.contains("missing server"), "msg: {err}");
-    }
-
-    #[cfg(feature = "snell")]
-    #[test]
-    fn parse_snell_missing_port() {
-        let cfg = snell_config("name: sn\ntype: snell\nserver: 1.2.3.4\npsk: secret\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("missing port must hard-error (Class A)");
-        };
-        assert!(err.contains("missing port"), "msg: {err}");
-    }
-
-    #[cfg(feature = "snell")]
-    #[test]
-    fn parse_snell_rejects_port_zero() {
-        let cfg = snell_config("name: sn\ntype: snell\nserver: 1.2.3.4\nport: 0\npsk: secret\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("port 0 must hard-error (Class A)");
-        };
-        assert!(err.contains("port must be non-zero"), "msg: {err}");
-    }
-
-    #[cfg(feature = "snell")]
-    #[test]
-    fn parse_snell_rejects_empty_psk() {
-        let cfg = snell_config("name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: ''\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("empty psk must hard-error (Class A)");
-        };
-        assert!(err.contains("psk must not be empty"), "msg: {err}");
+        // Collect every failure instead of asserting inline so one bad row does
+        // not mask the rest of the table.
+        let mut failures: Vec<String> = Vec::new();
+        for &(label, yaml, expected) in cases {
+            match parse_proxy(&snell_config(yaml)) {
+                Ok(_) => failures.push(format!("[{label}] must hard-error (Class A), got Ok")),
+                Err(err) if !err.contains(expected) => {
+                    failures.push(format!(
+                        "[{label}] error must contain {expected:?}, got: {err}"
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[cfg(feature = "snell")]

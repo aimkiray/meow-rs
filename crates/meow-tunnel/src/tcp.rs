@@ -5,6 +5,7 @@ use meow_common::{Metadata, ProxyConn};
 use smallvec::{smallvec, SmallVec};
 use smol_str::SmolStr;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
 /// RAII wrapper around `Statistics::track_connection` /
@@ -63,20 +64,67 @@ impl Drop for ConnectionGuard<'_> {
     }
 }
 
-pub async fn handle_tcp(
-    tunnel: &TunnelInner,
-    mut conn: Box<dyn ProxyConn>,
+pub async fn handle_tcp(tunnel: &TunnelInner, mut conn: Box<dyn ProxyConn>, metadata: Metadata) {
+    route_inbound_tcp(tunnel, &mut conn, metadata, &[]).await;
+}
+
+/// Route a decrypted inbound TCP connection through the rule engine and relay
+/// it to the matched proxy.
+///
+/// This is the shared tail of every blind-tunnel listener (SOCKS5 CONNECT,
+/// HTTP CONNECT, the `handle_tcp` entry point, and — once added — the
+/// shadowsocks inbound). It owns the four pieces that were previously
+/// copy-pasted into each listener:
+///
+/// 1. fake-IP / snooping rewrite (`pre_handle_metadata`),
+/// 2. lazy rule match + connection tracking,
+/// 3. dial the matched proxy,
+/// 4. bidirectional relay with byte counters.
+///
+/// `prefix` carries any bytes the listener already buffered ahead of the
+/// relay (e.g. HTTP CONNECT pipelined application data); they are written to
+/// the remote before the copy loop and counted as upload. Pass `&[]` when the
+/// listener hands over a clean stream.
+///
+/// Relay scratch buffers are stack-allocated in this frame — zero
+/// per-relay-setup heap allocation (ADR-0008 HP-1/HP-2/HP-3). The generic
+/// parameter keeps the relay monomorphised per concrete stream type so the
+/// hot copy loop stays dispatch-free.
+///
+/// Listeners whose relay is *not* a blind tunnel (e.g. the plain-HTTP proxy
+/// path that rewrites the request line and wraps the client in a bounded
+/// `SingleRequestClient`, or the TProxy path that uses eager rule
+/// resolution) keep their own inline routing — this helper only targets the
+/// `pre_handle_metadata` + `resolve_proxy_lazy` + blind-relay shape.
+///
+/// # Visibility
+///
+/// Exported as `pub` from `meow-tunnel` so that `meow-listener` can call it
+/// directly from the SOCKS5/HTTP-CONNECT handlers. This is a workspace-internal
+/// API contract: both crates are in the same workspace and share the
+/// `TunnelInner` type, so the function is not intended for external consumers —
+/// hence `#[doc(hidden)]`, which keeps it out of the public rustdoc surface
+/// without restricting the workspace-internal call path (review low item).
+#[doc(hidden)]
+pub async fn route_inbound_tcp<C: ProxyConn>(
+    inner: &TunnelInner,
+    conn: &mut C,
     mut metadata: Metadata,
+    prefix: &[u8],
 ) {
     // Fake-IP → host rewrite (no-op outside fake-IP mode aside from a
     // snooping-cache hostname fill-in).
-    tunnel.pre_handle_metadata(&mut metadata);
+    inner.pre_handle_metadata(&mut metadata);
 
     // Match rules with lazy enrichment: DNS pre-resolution and process
     // lookup run only if the scan reaches a rule that demands them.
-    let Some((proxy, rule_name, rule_payload)) = tunnel.resolve_proxy_lazy(&mut metadata).await
+    let Some((proxy, rule_name, rule_payload)) = inner.resolve_proxy_lazy(&mut metadata).await
     else {
-        warn!("no matching rule for {}", metadata.remote_address());
+        warn!(
+            "{} no matching rule for {}",
+            metadata.conn_type,
+            metadata.remote_address()
+        );
         return;
     };
 
@@ -94,7 +142,7 @@ pub async fn handle_tcp(
     // `rule_name` / `rule_payload` are moved in (already `SmolStr`); the
     // chains vec carries one `Arc<str>` for the proxy name.
     let guard = ConnectionGuard::track(
-        &tunnel.stats,
+        &inner.stats,
         metadata.pure(),
         rule_name,
         rule_payload,
@@ -111,18 +159,39 @@ pub async fn handle_tcp(
         Ok(mut remote) => {
             let up = Arc::clone(guard.counters());
             let dn = Arc::clone(guard.counters());
+            // Re-emit any bytes the listener already read past the handshake
+            // (e.g. pipelined TLS ClientHello after a CONNECT 200). Counted
+            // as upload so the connection stats stay accurate. A failure
+            // here kills the connection (the remote half is unusable), so it
+            // must be visible at `warn` — the pre-refactor code propagated
+            // it to the caller instead of swallowing it at `debug`
+            // (review M9).
+            if !prefix.is_empty() {
+                if let Err(e) = remote.write_all(prefix).await {
+                    warn!(
+                        "{} {} prefix write error: {}",
+                        metadata.conn_type,
+                        metadata.remote_address(),
+                        e
+                    );
+                    return;
+                }
+                inner
+                    .stats
+                    .record_upload(&up, prefix.len() as meow_common::atomic::Int);
+            }
             match copy_bidirectional_buf_tracked(
-                &mut conn,
+                conn,
                 &mut remote,
                 &mut buf_up,
                 &mut buf_dn,
                 |n| {
-                    tunnel
+                    inner
                         .stats
                         .record_upload(&up, n as meow_common::atomic::Int);
                 },
                 |n| {
-                    tunnel
+                    inner
                         .stats
                         .record_download(&dn, n as meow_common::atomic::Int);
                 },
@@ -131,19 +200,30 @@ pub async fn handle_tcp(
             {
                 Ok((up, down)) => {
                     debug!(
-                        "{} closed: up={} down={}",
+                        "{} {} relay closed: up={} down={}",
+                        metadata.conn_type,
                         metadata.remote_address(),
                         up,
                         down
                     );
                 }
                 Err(e) => {
-                    debug!("{} relay error: {}", metadata.remote_address(), e);
+                    debug!(
+                        "{} {} relay error: {}",
+                        metadata.conn_type,
+                        metadata.remote_address(),
+                        e
+                    );
                 }
             }
         }
         Err(e) => {
-            warn!("{} dial error: {}", metadata.remote_address(), e);
+            warn!(
+                "{} {} dial error: {}",
+                metadata.conn_type,
+                metadata.remote_address(),
+                e
+            );
         }
     }
 }

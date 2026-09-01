@@ -1,3 +1,8 @@
+//! YAML configuration parsing for the meow-rs proxy kernel.
+//!
+//! Turns a Clash Meta-style `config.yaml` into typed structs consumed by
+//! the tunnel, listeners, DNS, and API.
+
 pub mod auth;
 pub mod dns_parser;
 pub mod ech_dns;
@@ -86,6 +91,20 @@ pub struct GeneralConfig {
     pub bind_address: String,
 }
 
+/// Single source of truth for the effective `ipv6` setting of a config
+/// whose `ipv6:` key is unset. The literal was previously scattered
+/// across six `unwrap_or(...)` call sites (review), which is how the
+/// parser and `GET /configs` ended up disagreeing in the first place.
+///
+/// Defaults to **`false`**, matching Go mihomo / Clash: an operator must
+/// opt in to IPv6 resolution explicitly. (The temporary flip to `true`
+/// was reverted to stay consistent with the upstream ecosystem; see the
+/// CHANGELOG.) When `false`, AAAA lookups are skipped and the resolver
+/// answers IPv4-only — set `ipv6: true` for dual-stack resolution.
+pub fn effective_ipv6(raw_ipv6: Option<bool>) -> bool {
+    raw_ipv6.unwrap_or(false)
+}
+
 pub struct DnsConfig {
     pub resolver: Arc<Resolver>,
     pub listen_addr: Option<SocketAddr>,
@@ -100,24 +119,45 @@ pub struct DnsConfig {
     pub proxy_resolver: Option<Arc<Resolver>>,
 }
 
-/// Listener protocol type — mirrors the `type:` field in the YAML `listeners:` array.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Listener specification — the `type:` field of a `listeners:` entry together
+/// with the per-type parameters that used to live as loose fields on
+/// `NamedListener` (e.g. `tproxy_sni`). Carrying the data inside the variant
+/// makes "a `TProxy` listener always has a `sni` flag" a compile-time invariant
+/// instead of a runtime `Option::expect`, and keeps `NamedListener` from
+/// accumulating one `Option<ProtoConfig>` per future listener type.
+///
+/// Only the four pre-existing inbound kinds are modelled here; the
+/// `shadowsocks` encrypted-server inbound (and others) will join this enum as
+/// data-carrying variants when implemented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ListenerType {
+pub enum ListenerSpec {
     Mixed,
     Http,
     Socks5,
-    TProxy,
+    /// Transparent-proxy listener; `sni` is the per-listener override of the
+    /// global `tproxy-sni` sniffer default (resolved at config-build time).
+    TProxy {
+        sni: bool,
+    },
 }
 
-impl std::fmt::Display for ListenerType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ListenerSpec {
+    /// Canonical lowercase `type:` string used by the API (`GET /listeners`)
+    /// and startup logs. Equivalent to the upstream mihomo `type:` value.
+    pub fn type_name(&self) -> &'static str {
         match self {
-            ListenerType::Mixed => write!(f, "mixed"),
-            ListenerType::Http => write!(f, "http"),
-            ListenerType::Socks5 => write!(f, "socks5"),
-            ListenerType::TProxy => write!(f, "tproxy"),
+            Self::Mixed => "mixed",
+            Self::Http => "http",
+            Self::Socks5 => "socks5",
+            Self::TProxy { .. } => "tproxy",
         }
+    }
+}
+
+impl std::fmt::Display for ListenerSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.type_name())
     }
 }
 
@@ -125,11 +165,10 @@ impl std::fmt::Display for ListenerType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedListener {
     pub name: String,
-    #[serde(rename = "type")]
-    pub listener_type: ListenerType,
+    /// Protocol kind + per-type parameters (e.g. `TProxy { sni }`).
+    pub spec: ListenerSpec,
     pub port: u16,
     pub listen: String,
-    pub tproxy_sni: bool,
     /// Cap on concurrent in-flight inbound connections for this listener.
     /// `0` explicitly disables the cap; the default is 256. Resolved from the per-listener
     /// `max-connections` field, falling back to the global `max-connections`.
@@ -555,6 +594,7 @@ fn rebuild_from_raw_impl(
     shared_ctx: Option<&meow_rules::ParserContext>,
     prefetched_payloads: Option<&rule_provider::PrefetchedPayloads>,
 ) -> Result<RebuildResult, anyhow::Error> {
+    let ipv6 = effective_ipv6(raw.ipv6);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
     // Built-in proxies
     let mut direct = meow_proxy::DirectAdapter::new();
@@ -585,7 +625,7 @@ fn rebuild_from_raw_impl(
     );
 
     for raw_proxy in raw.proxies.as_deref().unwrap_or(&[]) {
-        match proxy_parser::parse_proxy(raw_proxy) {
+        match proxy_parser::parse_proxy(raw_proxy, ipv6) {
             Ok(proxy) => {
                 // Prefer the YAML `name:` as the registry key. `proxy.name()`
                 // is fine for SS/Trojan/VLESS (their parsers thread the name
@@ -688,12 +728,17 @@ fn rebuild_from_raw_impl(
     // groups and provider-sourced proxies included (issue #377).
     let registry_lookup = |name: &str| proxies.get(name).cloned();
 
-    // Fail hard on any rule-provider path that would escape the provider
-    // cache directory — before any fetch or on-disk write happens, so a
-    // hostile `PUT /configs` is rejected without touching the filesystem
-    // (issue #429).
+    // Fail hard on any rule- or proxy-provider path that would escape the
+    // provider cache directory — before any fetch or on-disk write happens,
+    // so a hostile `PUT /configs` is rejected without touching the
+    // filesystem (issue #429). Proxy-providers get the same loud failure as
+    // rule-providers (PR #444 review follow-up) instead of being warn-skipped
+    // with every group referencing them silently degrading.
     if let Some(map) = raw.rule_providers.as_ref() {
         rule_provider::validate_paths(map, cache_dir)?;
+    }
+    if let Some(map) = raw.proxy_providers.as_ref() {
+        proxy_provider::validate_paths(map, cache_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
     // Fetch/read rule-provider payload bytes once — the parser-context build
@@ -802,12 +847,13 @@ async fn prefetch_rule_provider_payloads_async(
         return HashMap::new();
     };
     let raw_providers = raw_providers.clone();
+    let ipv6 = effective_ipv6(raw.ipv6);
     let raw_proxies: Vec<HashMap<String, serde_yaml::Value>> =
         raw.proxies.clone().unwrap_or_default();
     spawn_blocking_with_current_dispatcher(move || {
         let default_proxy: Option<Arc<dyn Proxy>> = raw_proxies
             .iter()
-            .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy).ok());
+            .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy, ipv6).ok());
         // Pre-registry `proxy:` resolution parses the named leaf out of the
         // raw `proxies:` block; group names don't resolve here, so their
         // providers skip prefetch and fetch during the registry-backed load.
@@ -815,7 +861,7 @@ async fn prefetch_rule_provider_payloads_async(
             raw_proxies
                 .iter()
                 .filter(|p| p.get("name").and_then(serde_yaml::Value::as_str) == Some(wanted))
-                .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy).ok())
+                .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy, ipv6).ok())
         };
         rule_provider::prefetch_payloads(
             &raw_providers,
@@ -1039,7 +1085,7 @@ async fn ensure_geodata(raw: &raw::RawConfig, geo: &GeoDataConfig, scan_lines: &
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy).ok());
+        .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy, effective_ipv6(raw.ipv6)).ok());
 
     let mut downloads = Vec::new();
     if geoip_missing {
@@ -1473,14 +1519,25 @@ pub(crate) fn resolve_listener_bind(
     )
 }
 
-/// Parse `type:` string from a `listeners:` entry into `ListenerType`.
+/// Parse `type:` string from a `listeners:` entry into a `ListenerSpec`.
 /// Hard errors on unknown types (Class A per ADR-0002).
-fn parse_listener_type(s: &str) -> Result<ListenerType, anyhow::Error> {
+///
+/// `per_listener_sni` / `global_tproxy_sni` are folded into the `TProxy`
+/// variant here so the returned spec is always complete — callers never
+/// need to overwrite a placeholder `sni` value. Both parameters are ignored
+/// for non-TProxy types.
+fn parse_listener_spec(
+    s: &str,
+    per_listener_sni: Option<bool>,
+    global_tproxy_sni: bool,
+) -> Result<ListenerSpec, anyhow::Error> {
     match s.to_lowercase().as_str() {
-        "mixed" => Ok(ListenerType::Mixed),
-        "http" => Ok(ListenerType::Http),
-        "socks5" => Ok(ListenerType::Socks5),
-        "tproxy" => Ok(ListenerType::TProxy),
+        "mixed" => Ok(ListenerSpec::Mixed),
+        "http" => Ok(ListenerSpec::Http),
+        "socks5" => Ok(ListenerSpec::Socks5),
+        "tproxy" => Ok(ListenerSpec::TProxy {
+            sni: per_listener_sni.unwrap_or(global_tproxy_sni),
+        }),
         other => anyhow::bail!(
             "unknown listener type '{other}'; expected mixed, http, socks5, or tproxy"
         ),
@@ -1502,10 +1559,9 @@ fn build_named_listeners(
     let global_max_conns = raw.max_connections.unwrap_or(256);
 
     let mut add = |name: &str,
-                   ltype: ListenerType,
+                   spec: ListenerSpec,
                    port: u16,
                    listen: &str,
-                   tproxy_sni: bool,
                    max_connections: usize|
      -> Result<(), anyhow::Error> {
         // Port 0 is "OS assigns an ephemeral port" — each such listener binds
@@ -1525,10 +1581,9 @@ fn build_named_listeners(
         }
         result.push(NamedListener {
             name: name.to_string(),
-            listener_type: ltype,
+            spec,
             port,
             listen: listen.to_string(),
-            tproxy_sni,
             max_connections,
         });
         Ok(())
@@ -1541,66 +1596,55 @@ fn build_named_listeners(
     if let Some(port) = raw.mixed_port.filter(|p| *p != 0) {
         add(
             "mixed",
-            ListenerType::Mixed,
+            ListenerSpec::Mixed,
             port,
             default_bind,
-            false,
             global_max_conns,
         )?;
     }
     if let Some(port) = raw.socks_port.filter(|p| *p != 0) {
         add(
             "socks",
-            ListenerType::Socks5,
+            ListenerSpec::Socks5,
             port,
             default_bind,
-            false,
             global_max_conns,
         )?;
     }
     if let Some(port) = raw.port.filter(|p| *p != 0) {
         add(
             "http",
-            ListenerType::Http,
+            ListenerSpec::Http,
             port,
             default_bind,
-            false,
             global_max_conns,
         )?;
     }
     if let Some(port) = raw.tproxy_port.filter(|p| *p != 0) {
         add(
             "tproxy",
-            ListenerType::TProxy,
+            ListenerSpec::TProxy {
+                sni: global_tproxy_sni,
+            },
             port,
             "127.0.0.1",
-            global_tproxy_sni,
             global_max_conns,
         )?;
     }
 
     // Explicit `listeners:` entries
     for raw_l in raw.listeners.as_deref().unwrap_or(&[]) {
-        let ltype = parse_listener_type(&raw_l.listener_type)?;
-        let listen_raw = raw_l
-            .listen
-            .as_deref()
-            .unwrap_or(if ltype == ListenerType::TProxy {
+        let spec = parse_listener_spec(&raw_l.listener_type, raw_l.tproxy_sni, global_tproxy_sni)?;
+        let listen_raw = raw_l.listen.as_deref().unwrap_or({
+            if matches!(spec, ListenerSpec::TProxy { .. }) {
                 "127.0.0.1"
             } else {
                 default_bind
-            });
+            }
+        });
         let (listen, port) = resolve_listener_bind(listen_raw, raw_l.port)?;
-        let tproxy_sni = raw_l.tproxy_sni.unwrap_or(global_tproxy_sni);
         let max_connections = raw_l.max_connections.unwrap_or(global_max_conns);
-        add(
-            &raw_l.name,
-            ltype,
-            port,
-            &listen,
-            tproxy_sni,
-            max_connections,
-        )?;
+        add(&raw_l.name, spec, port, &listen, max_connections)?;
     }
 
     Ok(result)
@@ -1642,7 +1686,7 @@ async fn build_config(
     let general = GeneralConfig {
         mode,
         log_level,
-        ipv6: raw.ipv6.unwrap_or(false),
+        ipv6: effective_ipv6(raw.ipv6),
         allow_lan: raw.allow_lan.unwrap_or(false),
         bind_address,
     };
@@ -1652,7 +1696,7 @@ async fn build_config(
         if raw_pp.is_empty() {
             HashMap::new()
         } else {
-            proxy_provider::load_proxy_providers(raw_pp, cache_dir).await
+            proxy_provider::load_proxy_providers(raw_pp, cache_dir, general.ipv6).await
         }
     } else {
         HashMap::new()
@@ -1712,6 +1756,26 @@ async fn build_config(
     )
     .await?;
 
+    // Load rule-providers before DNS so that `nameserver-policy` `rule-set:`
+    // entries can resolve against them. This uses the step-1 proxy registry;
+    // step-2 only differs in DIRECT's resolver field (see ADR-0012), which
+    // does not affect provider `proxy:` resolution or HTTP fetches.
+    let download_proxy = internal_http::first_named_proxy(raw.proxies.as_deref(), &proxies);
+    let rule_providers = match raw.rule_providers.as_ref() {
+        Some(map) if !map.is_empty() => {
+            load_rule_providers_async(
+                map.clone(),
+                cache_dir_buf.clone(),
+                ctx.clone(),
+                download_proxy,
+                proxies.clone(),
+                Arc::clone(&provider_payloads),
+            )
+            .await?
+        }
+        _ => HashMap::new(),
+    };
+
     // DNS — pass the explicit mmdb path so fallback-filter GeoIP uses the
     // same path as the rule engine, plus the proxy registry from step 1
     // so #PROXY-tagged nameservers can resolve their referenced adapter.
@@ -1721,6 +1785,7 @@ async fn build_config(
         cache_dir,
         &proxies,
         ctx.geosite.clone(),
+        &rule_providers,
     )
     .await?;
 
@@ -1734,22 +1799,6 @@ async fn build_config(
         Arc::clone(&provider_payloads),
     )
     .await?;
-
-    let download_proxy = internal_http::first_named_proxy(raw.proxies.as_deref(), &proxies);
-    let rule_providers = match raw.rule_providers.as_ref() {
-        Some(map) if !map.is_empty() => {
-            load_rule_providers_async(
-                map.clone(),
-                cache_dir_buf.clone(),
-                ctx.clone(),
-                download_proxy,
-                proxies.clone(),
-                provider_payloads,
-            )
-            .await?
-        }
-        _ => HashMap::new(),
-    };
 
     // Listener config
     let bind_addr = if general.allow_lan {
@@ -2559,6 +2608,36 @@ rules:
             panic!("escaping rule-provider path must fail the rebuild");
         };
         assert!(err.to_string().contains("escapes"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rebuild_rejects_proxy_provider_path_escaping_cache_dir() {
+        // PR #444 review follow-up: proxy-provider containment violations
+        // fail the rebuild loudly (rule-provider parity) instead of the
+        // provider being warn-skipped and its groups silently degrading.
+        let dir = tempfile::tempdir().unwrap();
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            r#"
+proxy-providers:
+  evil:
+    type: http
+    url: "http://127.0.0.1:1/proxies.yaml"
+    path: "/etc/cron.d/pwned"
+proxy-groups:
+  - name: g
+    type: select
+    use: [evil]
+rules:
+  - "MATCH,DIRECT"
+"#,
+        )
+        .unwrap();
+        let Err(err) = rebuild_from_raw_with_cache_dir(&raw, Some(dir.path()), None) else {
+            panic!("escaping proxy-provider path must fail the rebuild");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("evil"), "must name the provider: {msg}");
+        assert!(msg.contains("escapes"), "unexpected: {msg}");
     }
 
     #[test]

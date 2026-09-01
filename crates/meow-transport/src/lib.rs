@@ -49,6 +49,12 @@ pub mod h2;
 #[cfg(feature = "httpupgrade")]
 pub mod httpupgrade;
 
+/// SIP004 simple-obfs HTTP/TLS obfuscation codec (client +, later, server).
+/// Gated by the `simple-obfs` feature; see [`simple_obfs::client`] for the
+/// outbound (proxy-client) wrappers used by the SS / Snell adapters.
+#[cfg(feature = "simple-obfs")]
+pub mod simple_obfs;
+
 /// A duplex byte stream — the currency passed between transport layers.
 ///
 /// Blanket-implemented for every `T: AsyncRead + AsyncWrite + Unpin + Send + Sync`,
