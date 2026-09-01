@@ -1004,6 +1004,13 @@ rules:
 // startup for hostname-based proxies. If the ordering ever regresses,
 // the `rule-set:ads` policy entry hard-errors ("unknown rule-set") and
 // this test fails.
+//
+// Known untested (review N5): this uses a `type: file` provider, so it
+// pins the *load ordering* only. The full M11 risk path — an HTTP
+// provider actually fetching its payload *through* the `proxy:` chain,
+// whose own `server:` is a hostname resolved via the step-1 registry —
+// would need a live HTTP server plus a dialable proxy and is not
+// exercised here.
 #[tokio::test]
 async fn test_rule_provider_with_proxy_hostname_server_loads_before_dns() {
     let dir = tempfile::tempdir().unwrap();

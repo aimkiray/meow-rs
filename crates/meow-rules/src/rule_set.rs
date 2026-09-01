@@ -19,6 +19,7 @@ use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 use meow_trie::DomainTrie;
 use tracing::warn;
 
+use crate::logic::{AndRule, NotRule, OrRule};
 use crate::parser::{parse_rule, ParserContext};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,9 +408,8 @@ pub struct ClassicalRuleSet {
 /// a *rule-type whitelist*, not a host-only `Metadata` probe: rules such as
 /// `NETWORK,TCP`, `IN-TYPE,HTTP`, or `DST-PORT,0` match the default
 /// `Metadata` (network = Tcp, conn_type = Http, ports = 0) and would
-/// otherwise hijack *every* query to this policy — a DNS leak. Logic rules
-/// (`AND`/`OR`/`NOT`) and `MATCH` are excluded too: they either re-derive
-/// from those default-matching leaves or match everything.
+/// otherwise hijack *every* query to this policy — a DNS leak. `MATCH`
+/// stays excluded too: it matches everything.
 ///
 /// The whitelist is also the reentrancy guard (review H4): every eligible
 /// type is host-only — `should_resolve_ip()` is false for all of them — so
@@ -425,6 +425,45 @@ fn is_domain_family_rule_type(t: RuleType) -> bool {
             | RuleType::DomainWildcard
             | RuleType::GeoSite,
     )
+}
+
+/// Whether `rule` can be decided from the query hostname alone for DNS
+/// `nameserver-policy` dispatch (review N4): either a domain-family leaf,
+/// or a logic rule (`AND`/`OR`/`NOT`) whose every leaf — recursively — is
+/// domain-family. A logic rule over host-only leaves evaluates on the
+/// hostname exactly like a plain domain leaf, so excluding it made
+/// `NOT,((DOMAIN-SUFFIX,foo.com))` silently miss and the query leak to the
+/// global nameserver. One IP-family leaf anywhere under the rule (e.g.
+/// `AND,((DOMAIN-SUFFIX,x),(IP-CIDR,10.0.0.0/8))`) disqualifies the whole
+/// rule: evaluating it on the DNS hot path would need a nested lookup.
+/// `MATCH` matches everything and stays out.
+///
+/// The children are reached via the `as_any` escape hatch — this runs once
+/// per rule at construction, never on the query path.
+fn is_domain_dispatchable(rule: &dyn Rule) -> bool {
+    match rule.rule_type() {
+        RuleType::And => rule
+            .as_any()
+            .and_then(|any| any.downcast_ref::<AndRule>())
+            .is_some_and(|r| {
+                r.sub_rules()
+                    .iter()
+                    .all(|sub| is_domain_dispatchable(sub.as_ref()))
+            }),
+        RuleType::Or => rule
+            .as_any()
+            .and_then(|any| any.downcast_ref::<OrRule>())
+            .is_some_and(|r| {
+                r.sub_rules()
+                    .iter()
+                    .all(|sub| is_domain_dispatchable(sub.as_ref()))
+            }),
+        RuleType::Not => rule
+            .as_any()
+            .and_then(|any| any.downcast_ref::<NotRule>())
+            .is_some_and(|r| is_domain_dispatchable(r.inner())),
+        _ => is_domain_family_rule_type(rule.rule_type()),
+    }
 }
 
 impl ClassicalRuleSet {
@@ -449,7 +488,7 @@ impl ClassicalRuleSet {
         let domain_rule_indices = rules
             .iter()
             .enumerate()
-            .filter(|(_, r)| is_domain_family_rule_type(r.rule_type()))
+            .filter(|(_, r)| is_domain_dispatchable(r.as_ref()))
             .map(|(i, _)| i)
             .collect();
         Self {
@@ -484,8 +523,8 @@ impl RuleSet for ClassicalRuleSet {
 
     fn matches_domain(&self, domain: &str) -> bool {
         // Nameserver-policy `rule-set:` dispatch only has the query domain,
-        // so we restrict classical sets to their domain-family rules (see
-        // `is_domain_family_rule_type`). The subset was pre-filtered at
+        // so we restrict classical sets to their domain-dispatchable rules
+        // (see `is_domain_dispatchable`). The subset was pre-filtered at
         // construction, so this is O(domain rules) per query — not O(all
         // rules) with a type test each (review H4). Cost note: a large
         // classical set still pays a linear scan over its domain rules on
@@ -508,8 +547,8 @@ impl RuleSet for ClassicalRuleSet {
         self.domain_rule_indices.iter().any(|&index| {
             let rule = &self.rules[index];
             debug_assert!(
-                is_domain_family_rule_type(rule.rule_type()),
-                "domain_rule_indices must only hold domain-family rules"
+                is_domain_dispatchable(rule.as_ref()),
+                "domain_rule_indices must only hold domain-dispatchable rules"
             );
             rule.match_metadata(&metadata, &RuleMatchHelper)
         })
@@ -518,8 +557,21 @@ impl RuleSet for ClassicalRuleSet {
 
 /// Turn `TYPE,PAYLOAD[,extra]` into `TYPE,PAYLOAD,RULE-SET-PLACEHOLDER[,extra]`
 /// so it satisfies `parse_rule`'s `type,payload,adapter[,extra]` shape.
+///
+/// Logic entries (`AND`/`OR`/`NOT`) carry a parenthesised payload whose
+/// commas must not be split: the naive `splitn(3, ',')` below would insert
+/// the placeholder into the middle of the payload and the entry would fail
+/// to parse (pre-existing upstream bug — a classical set silently dropped
+/// every logic rule). Their adapter is appended at the end instead,
+/// mirroring `splice_inner_adapter` in the parser (review N4).
 fn splice_placeholder_adapter(entry: &str) -> String {
     const PLACEHOLDER: &str = "RULE-SET-PLACEHOLDER";
+    if let Some((ty, _)) = entry.split_once(',') {
+        let upper = ty.trim().to_ascii_uppercase();
+        if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
+            return format!("{entry},{PLACEHOLDER}");
+        }
+    }
     let parts: Vec<&str> = entry.splitn(3, ',').collect();
     match parts.as_slice() {
         [ty, payload] => format!("{},{},{}", ty.trim(), payload.trim(), PLACEHOLDER),
@@ -760,6 +812,72 @@ mod tests {
             ClassicalRuleSet::from_entries(&["IP-CIDR,10.0.0.0/8,no-resolve".to_string()], &ctx);
         assert!(set.domain_rule_indices.is_empty());
         assert!(!set.matches_domain("anything.example"));
+    }
+
+    // Review N4: a logic rule whose leaves are all domain-family is
+    // decidable on the hostname alone and must join the DNS dispatch
+    // subset instead of silently leaking to the global nameserver.
+    // Parsing such an entry from a classical set also exercises the
+    // logic-aware placeholder splice (previously the entry was corrupted
+    // and skipped).
+    #[test]
+    fn classical_rule_set_matches_domain_includes_pure_domain_logic_rules() {
+        let ctx = ParserContext::empty();
+        let set = ClassicalRuleSet::from_entries(
+            &[
+                // NOT over a domain leaf: matches everything *except* the
+                // suffix — including on DNS dispatch.
+                "NOT,((DOMAIN-SUFFIX,foo.com))".to_string(),
+                // AND over two domain leaves.
+                "AND,((DOMAIN-SUFFIX,foo.com),(DOMAIN-KEYWORD,bar))".to_string(),
+            ],
+            &ctx,
+        );
+        // Both logic rules parsed (the old splice corrupted them into
+        // parse errors and the entries were dropped with a warn).
+        assert_eq!(set.len(), 2);
+        assert_eq!(set.domain_rule_indices.len(), 2);
+
+        // NOT: everything except *.foo.com dispatches to this policy.
+        assert!(set.matches_domain("other.example"));
+        assert!(!set.matches_domain("www.foo.com"));
+        // AND: needs the suffix *and* the keyword.
+        assert!(set.matches_domain("bar.foo.com"));
+        assert!(!set.matches_domain("plain.foo.com"));
+        // NOT is near-universal by construction: every host *outside*
+        // foo.com dispatches to this policy — the config author asked
+        // for exactly that, so honor it (mihomo parity).
+        assert!(set.matches_domain("bar.example.com"));
+    }
+
+    // Review N4: one IP-family leaf anywhere under a logic rule
+    // disqualifies it from DNS dispatch (evaluating it would need a
+    // nested lookup), but the rule still parses and matches on the full
+    // metadata path.
+    #[test]
+    fn classical_rule_set_matches_domain_excludes_logic_rules_with_ip_leaves() {
+        let ctx = ParserContext::empty();
+        let set = ClassicalRuleSet::from_entries(
+            &[
+                "OR,((DOMAIN-SUFFIX,foo.com),(IP-CIDR,10.0.0.0/8))".to_string(),
+                // Nested: the inner OR has an IP leaf, so the NOT over it
+                // is disqualified too.
+                "NOT,((OR,((DOMAIN-SUFFIX,baz.com),(IP-CIDR,10.0.0.0/8))))".to_string(),
+            ],
+            &ctx,
+        );
+        assert_eq!(set.len(), 2);
+        assert!(set.domain_rule_indices.is_empty());
+        assert!(!set.matches_domain("www.foo.com"));
+        assert!(!set.matches_domain("anything.example"));
+
+        // The set is still resolver-requiring on the full path (the
+        // IP-CIDR leaves are not `no-resolve`).
+        assert!(set.should_resolve_ip());
+        // And the domain leaf still matches through the full metadata
+        // path, which carries everything the leaves need.
+        let meta = meta_host("www.foo.com");
+        assert!(set.matches(&meta, &helper()));
     }
 
     #[test]
