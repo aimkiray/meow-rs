@@ -460,8 +460,8 @@ impl DnsCache {
     /// marks both families queried, suppressing re-resolution of both. Only
     /// whole-entry replacement (manual `preload_cache` seeding and the like)
     /// may pass an empty list; resolution-path negatives must go through
-    /// [`Self::merge_family`], which carries the real per-family negative
-    /// kind.
+    /// `merge_family` (crate-private), which carries the real per-family
+    /// negative kind.
     pub fn put_with_source(
         &self,
         domain: &str,
