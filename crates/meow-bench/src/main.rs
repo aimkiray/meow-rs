@@ -162,7 +162,7 @@ async fn shutdown_child(child: &mut std::process::Child) {
             match child.try_wait() {
                 Ok(Some(_)) => return, // graceful exit within the grace period
                 Ok(None) => {}
-                Err(_) => break,      // cannot wait (already reaped) — fall through
+                Err(_) => break, // cannot wait (already reaped) — fall through
             }
             if tokio::time::Instant::now() >= deadline {
                 break;
@@ -205,6 +205,15 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
+            // Error path only — the success path disarms via
+            // `shutdown()`. `kill()` precedes `wait()`, so the blocking
+            // reap returns almost immediately; std's `Child` has no
+            // async wait, so a brief block on an async worker is the
+            // accepted trade-off (review N6). Bounded worst case
+            // overall: a target that ignores SIGTERM costs up to
+            // `SHUTDOWN_GRACE` (5 s) in `shutdown_child`, and targets
+            // shut down sequentially, so a full multi-target run adds
+            // up to 5 s × N.
             let _ = child.kill();
             let _ = child.wait();
         }
