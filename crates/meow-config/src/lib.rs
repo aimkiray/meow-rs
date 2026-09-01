@@ -2094,12 +2094,16 @@ mod dialer_proxy_tests {
         // also report the inner type, so `chain_reaches_target_through_front`
         // below is what actually distinguishes the two paths.
         let mut proxies = registry(&["A", "front"]);
-        let parsed_a =
-            proxy_parser::parse_proxy(&raw_socks5_proxy("A", None, true), true).expect("parse socks5");
+        let parsed_a = proxy_parser::parse_proxy(&raw_socks5_proxy("A", None, true), true)
+            .expect("parse socks5");
         proxies.insert(SmolStr::from("A"), parsed_a);
         let before = proxies.clone();
 
-        apply_dialer_proxies(&mut proxies, &[raw_socks5_proxy("A", Some("front"), true)], true);
+        apply_dialer_proxies(
+            &mut proxies,
+            &[raw_socks5_proxy("A", Some("front"), true)],
+            true,
+        );
 
         assert!(was_wrapped(&before, &proxies, "A"), "A should be re-parsed");
         assert!(
@@ -2139,7 +2143,11 @@ mod dialer_proxy_tests {
             let mut proxies = registry(&["A", "front"]);
             let before = proxies.clone();
 
-            apply_dialer_proxies(&mut proxies, &[raw_typed_proxy("A", ty, Some("front"))], true);
+            apply_dialer_proxies(
+                &mut proxies,
+                &[raw_typed_proxy("A", ty, Some("front"))],
+                true,
+            );
 
             let after = proxies.get("A").expect("entry survives");
             assert!(
@@ -2221,8 +2229,8 @@ mod dialer_proxy_tests {
         // returns false, even if the inner proxy supported UDP).
         let mut proxies = registry(&["A", "front"]);
         // Give "A" a real socks5 adapter so the fallback has something to wrap.
-        let parsed_a =
-            proxy_parser::parse_proxy(&raw_socks5_proxy("A", None, true), true).expect("parse socks5");
+        let parsed_a = proxy_parser::parse_proxy(&raw_socks5_proxy("A", None, true), true)
+            .expect("parse socks5");
         proxies.insert(SmolStr::from("A"), parsed_a);
         let before = proxies.clone();
 
