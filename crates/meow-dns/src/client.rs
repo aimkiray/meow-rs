@@ -37,6 +37,14 @@ pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// concurrent exchange beyond the pool simply opens its own
 /// connection, and surplus validated streams are closed on return
 /// instead of being pooled.
+///
+/// Tuning note (review N1): with this design the reuse benefit applies
+/// to queries that arrive while an idle stream exists — a fully
+/// concurrent burst larger than this capacity pays a fresh connect (and,
+/// on Android, a `protect(fd)` call) per query. Raising the idle
+/// capacity to match real burst concurrency (16–32) restores reuse for
+/// bursts; the cost is a few more long-lived sockets per `tcp://`
+/// upstream. Left at 4 for the maintainer to tune.
 const TCP_POOL_CAPACITY: usize = 4;
 /// How long a pooled `tcp://` stream may sit idle before it is closed rather
 /// than reused.
@@ -45,11 +53,15 @@ const TCP_POOL_CAPACITY: usize = 4;
 /// FIN ever reaching us: the write still succeeds and the peer simply never
 /// answers, so the reuse attempt burns its whole read deadline before falling
 /// back to a fresh connect. Reaping on an idle clock keeps that worst case out
-/// of the common path — a burst of queries still shares connections, while a
-/// stream idle past this window is closed and the next query pays only a
-/// normal connect. RFC 7766 §6.2.3 recommends clients close idle connections
-/// well inside typical server timeouts; 30 s stays under the shortest of
-/// those while still covering the bursts pooling exists to serve.
+/// of the common path — queries arriving while a stream is still inside this
+/// window can reuse it (staggered bursts share connections), while a stream
+/// idle past this window is closed and the next query pays only a normal
+/// connect. Note a *fully concurrent* burst larger than [`TCP_POOL_CAPACITY`]
+/// dials fresh by design — reuse there would require capping concurrency,
+/// which is exactly what this PR removes (see [`TCP_POOL_CAPACITY`]). RFC
+/// 7766 §6.2.3 recommends clients close idle connections well inside typical
+/// server timeouts; 30 s stays under the shortest of those while still
+/// covering the bursts pooling exists to serve.
 const TCP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
