@@ -1,0 +1,82 @@
+# Deeper feature-powerset compile checks, run nightly so they never block a
+# PR. The PR-time `features` job in test.yml only checks combinations of up
+# to two features (--depth 2, the same trade-off tokio and quinn make in
+# their PR CI); this workflow pushes deeper: up to 4-feature combos for
+# meow-proxy and meow-transport, and fully exhaustive powersets for the two
+# small crates. rustls likewise keeps its powerset off the PR path
+# (daily-tests.yml).
+#
+# The per-crate depths are runner budgets, not style. Leg counts below are
+# what cargo-hack actually reports after deduplicating subsets that resolve
+# to identical builds (feature implication collapses many of them, e.g.
+# vless-vision -> vless, listener-mixed -> listener-http + listener-socks5):
+#   meow-proxy      depth 4 = 437 legs
+#   meow-transport  depth 4 = 167 legs (boring-tls excluded)
+#   meow-listener   full powerset = 22 legs
+#   meow-dns        full powerset = 5 legs
+# With a warm cache each leg costs ~10-15s of incremental `cargo check`, so
+# the heaviest job (meow-proxy) lands around ~2h worst case — inside the
+# 180-minute timeout and well under the 360-minute hosted-runner cap. An
+# unbounded powerset of meow-proxy (4096 nominal legs) cannot fit a hosted
+# runner at all, which is why depth is capped even on the nightly.
+name: Feature Powerset (daily)
+
+on:
+  schedule:
+    # 04:17 UTC daily — offset after coverage (02:17) and bench-daily (03:17)
+    # to stagger shared-runner load and avoid scheduler congestion. Note that
+    # GitHub only fires `schedule` from the default branch.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: feature-powerset-daily
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  powerset:
+    name: Powerset — ${{ matrix.crate }}
+    runs-on: ubuntu-latest
+    # Generous per-crate cap; the leg budgets above target well under this.
+    timeout-minutes: 180
+    strategy:
+      # One crate failing must not cancel the others: the point of the daily
+      # run is to report every broken combination.
+      fail-fast: false
+      matrix:
+        include:
+          - crate: meow-proxy
+            hack_args: --depth 4
+          - crate: meow-transport
+            # boring-tls vendors BoringSSL and needs a C++ toolchain; that
+            # leg is covered by clippy --all-features in test.yml's lint job.
+            hack_args: --depth 4 --exclude-features boring-tls
+          - crate: meow-listener
+            hack_args: ""
+          - crate: meow-dns
+            hack_args: ""
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: powerset-daily
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      # --no-dev-deps: dev-dependencies are irrelevant to a compile check and
+      # dominate per-leg build time (rustls and quinn do the same).
+      # --keep-going: collect every failing combination in one run instead of
+      # stopping at the first (tokio uses it the same way).
+      - name: Feature powerset — ${{ matrix.crate }}
+        run: cargo hack check -p ${{ matrix.crate }} --feature-powerset --no-dev-deps --keep-going ${{ matrix.hack_args }}

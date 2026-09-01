@@ -171,25 +171,30 @@ jobs:
       - name: Install cargo-hack
         uses: taiki-e/install-action@cargo-hack
 
-      # These powersets subsume the hand-rolled per-crate feature matrices
-      # that used to run in the test job (transport G1-G6, VLESS G1/G2/G4,
-      # DNS D1-D3): the powerset checks every feature subset with
-      # --no-default-features, including the empty set. The --all-features
-      # legs (transport G7, VLESS G3) are covered by clippy --all-features
-      # in the lint job.
-      - name: Feature powerset — meow-transport
+      # Capped powerset: --depth 2 covers the empty set, every single feature,
+      # and every pair — enough for the real-world cfg-interaction bugs while
+      # keeping the leg count ~n^2 instead of ~2^n (meow-proxy: 66 legs,
+      # ~129 across the four crates — cargo-hack dedups subsets that resolve
+      # to identical builds). Same trade-off tokio (--depth 2 --keep-going)
+      # and quinn (--depth 3 --no-dev-deps) make in their PR CI.
+      # --no-dev-deps: dev-dependencies are irrelevant to a compile check and
+      # dominate per-leg build time. Deeper combinations (3+ features) run
+      # nightly in .github/workflows/feature-powerset-daily.yml; the
+      # --all-features legs (transport G7, VLESS G3) are covered by clippy
+      # --all-features in the lint job.
+      - name: Feature powerset (depth 2) — meow-transport
         # boring-tls excluded: requires C++ toolchain at build time; covered
         # via clippy --all-features in the lint job.
-        run: cargo hack check -p meow-transport --feature-powerset --exclude-features boring-tls
+        run: cargo hack check -p meow-transport --feature-powerset --depth 2 --no-dev-deps --exclude-features boring-tls
 
-      - name: Feature powerset — meow-proxy
-        run: cargo hack check -p meow-proxy --feature-powerset
+      - name: Feature powerset (depth 2) — meow-proxy
+        run: cargo hack check -p meow-proxy --feature-powerset --depth 2 --no-dev-deps
 
-      - name: Feature powerset — meow-listener
-        run: cargo hack check -p meow-listener --feature-powerset
+      - name: Feature powerset (depth 2) — meow-listener
+        run: cargo hack check -p meow-listener --feature-powerset --depth 2 --no-dev-deps
 
-      - name: Feature powerset — meow-dns
-        run: cargo hack check -p meow-dns --feature-powerset
+      - name: Feature powerset (depth 2) — meow-dns
+        run: cargo hack check -p meow-dns --feature-powerset --depth 2 --no-dev-deps
 
   msrv:
     runs-on: ubuntu-latest

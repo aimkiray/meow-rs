@@ -50,11 +50,18 @@ Runs on Ubuntu after `lint`:
 Runs on Ubuntu after `lint`:
 
 - Installs `cargo-hack`.
-- Runs feature-powerset checks for `meow-transport`, `meow-proxy`, and
-  `meow-listener`.
+- Runs feature-powerset checks (`--feature-powerset --depth 2 --no-dev-deps`)
+  for `meow-transport`, `meow-proxy`, `meow-listener`, and `meow-dns`: the
+  empty set, every single feature, and every pair — capped at depth 2 so the
+  leg count stays ~n^2 instead of ~2^n per PR.
 - Excludes `boring-tls` from the `meow-transport` powerset because that backend
   needs a C++/BoringSSL toolchain; the broader transport matrix still covers
   the normal feature combinations.
+- Deeper combinations run nightly in
+  `.github/workflows/feature-powerset-daily.yml` instead of on every PR: up to
+  4-feature combos for `meow-proxy` and `meow-transport`, and fully
+  exhaustive powersets for `meow-listener` and `meow-dns` — depths chosen so
+  each crate fits a hosted runner's 360-minute job cap with margin.
 
 ### `msrv`
 
