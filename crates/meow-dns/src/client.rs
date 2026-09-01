@@ -361,8 +361,10 @@ impl DnsClient {
         self.exchange(&wire, &expected).await
     }
 
-    /// Convenience: query `A` first and fall back to `AAAA` when needed.
-    /// Returns the addresses and minimum answer TTL.
+    /// Convenience: resolve every enabled address for `name`. A and AAAA are
+    /// queried **concurrently** (IPv4 ordered first in the result) under one
+    /// overall timeout; AAAA is skipped entirely when `ipv6_enabled` is
+    /// false. Returns the addresses and minimum answer TTL.
     pub async fn lookup_ip(&self, name: &str) -> Result<(Vec<IpAddr>, Duration), ClientError> {
         let result = self.lookup_ip_with_ipv6(name, true).await?;
         Ok((result.ips, result.ttl))
@@ -1102,11 +1104,16 @@ mod tests {
         );
     }
 
+    // NOTE (review B3): the hermetic-silent-loopback version of this test
+    // lives in its own PR (#476, `udp_client_times_out_when_no_response`).
+    // This branch deliberately keeps main's original hunk untouched so the
+    // two PRs do not both modify the same hunk; whichever lands second
+    // rebases cleanly.
     #[tokio::test]
     async fn udp_client_times_out_on_unroutable() {
-        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let client =
-            DnsClient::udp(sink.local_addr().unwrap()).with_timeout(Duration::from_millis(200));
+        // 192.0.2.1/24 is TEST-NET-1, guaranteed not to respond.
+        let client = DnsClient::udp("192.0.2.1:53".parse().unwrap())
+            .with_timeout(Duration::from_millis(200));
         let r = client.query("example.test", RecordType::A).await;
         assert!(matches!(r, Err(ClientError::Timeout(_))));
     }
@@ -1320,8 +1327,9 @@ mod tests {
         tokio::spawn(async move {
             // A and AAAA ride separate connections (no pooling here), so the
             // server accepts twice. The point under test is that the *client*
-            // covers both sequential queries with one overall timeout, not
-            // that they share a socket.
+            // covers both queries — issued concurrently, each on its own
+            // socket — with one overall timeout, not that they share a
+            // socket.
             for expected in [RecordType::A, RecordType::AAAA] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_lp(&mut stream).await.unwrap();

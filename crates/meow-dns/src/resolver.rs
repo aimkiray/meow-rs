@@ -62,12 +62,34 @@ pub enum BootstrapError {
 /// Capacity 1 is enough — subscribers call `recv()` at most once.
 type InflightTx = tokio::sync::broadcast::Sender<Option<FamilySet>>;
 
-/// Singleflight key: `(host, queried-families)`. Keying by the family set as
-/// well as the host (review issue B) means a concurrent A query coalesces with
-/// other A queries and a concurrent AAAA query coalesces with other AAAA
-/// queries, but a genuinely different query set starts its own flight instead
-/// of being silently subsumed by a neighboring one.
-type InflightKey = (Arc<str>, QueryFamilies);
+/// Singleflight registry: one map per queried family set (keyed by
+/// `Arc<str>` so lookups go through a borrowed `&str` via
+/// `Arc<str>: Borrow<str>`).
+///
+/// Splitting by family set (review issue B: a concurrent A query
+/// coalesces with other A queries, an AAAA query with other AAAA
+/// queries, a genuinely different set starts its own flight) also
+/// removes the old `(Arc<str>, QueryFamilies)` tuple key, which had no
+/// `Borrow<(&str, QueryFamilies)>` implementation and forced an
+/// `Arc::from(host)` allocation on *every* lookup — including the
+/// subscriber fast path (review issue M1). With the split maps the
+/// `Arc<str>` is only cloned once, when a new flight is inserted.
+type InflightMap = DashMap<Arc<str>, InflightTx>;
+
+/// Index of a family set inside [`Resolver::inflight`]. Callers must
+/// ensure the set is non-empty (`run_pipeline` never runs with
+/// `QueryFamilies::NONE`).
+fn inflight_slot(want: QueryFamilies) -> usize {
+    if want == QueryFamilies::IPV4 {
+        0
+    } else if want == QueryFamilies::IPV6 {
+        1
+    } else if want == QueryFamilies::BOTH {
+        2
+    } else {
+        unreachable!("singleflight requires a non-empty family set, got {want:?}")
+    }
+}
 
 /// A single entry in `NameserverPolicy`: one or more pre-built upstream DNS
 /// clients, one per configured nameserver URL.
@@ -193,7 +215,9 @@ pub struct Resolver {
     mode: DnsMode,
     hosts: DomainTrie<HostEntry>,
     use_hosts: bool,
-    inflight: DashMap<InflightKey, InflightTx>,
+    /// Singleflight registries, one per queried family set — see
+    /// [`InflightMap`].
+    inflight: [InflightMap; 3],
     policy: Option<NameserverPolicy>,
     fallback_filter: Option<FallbackFilter>,
     /// IPv4 fake-IP pool (None when fake-ip mode is disabled or only v6 is configured).
@@ -217,14 +241,14 @@ enum HostsLookup<'a> {
 }
 
 struct InflightGuard<'a> {
-    map: &'a DashMap<InflightKey, InflightTx>,
-    key: InflightKey,
+    map: &'a InflightMap,
+    key: Arc<str>,
     _armed: (),
 }
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
-        self.map.remove(&self.key);
+        self.map.remove(self.key.as_ref());
     }
 }
 
@@ -404,6 +428,11 @@ impl FamilySet {
 /// immediately. The period is short enough that a truly dead upstream (5 s
 /// client timeout) does not stall the lookup — the definitive-negative test
 /// still completes well under 1 s.
+///
+/// The grace period is counted **per tier**: a lookup that runs the full
+/// policy → main → fallback chain and receives a fast negative in every tier
+/// accrues up to ~3× this period (≈900 ms) of extra latency before the
+/// negative is returned.
 const NEGATIVE_GRACE_PERIOD: Duration = Duration::from_millis(300);
 
 /// Query a pool of clients in parallel for the requested family set `want`,
@@ -455,16 +484,25 @@ async fn query_pool_set(
             // A positive answer always wins, regardless of grace state.
             return Some(set);
         }
-        if set.is_definitive_negative(want) && negative.is_none() {
+        let definitive = set.is_definitive_negative(want);
+        if negative.is_none() {
+            // First negative — definitive or partial. Don't return yet: a
+            // slower upstream in this tier may still deliver a positive
+            // answer. Start the grace timer for *either* kind so we don't
+            // stall on a dead upstream (review issue C + M2: a partial
+            // failure used to leave the timer unset, and a later
+            // definitive negative could then never enter this branch —
+            // the tier would wait out every upstream's full timeout).
             negative = Some(set);
-            // Don't return yet: a slower upstream in this tier may still
-            // deliver a positive answer. Start the grace timer so we don't
-            // stall on a dead upstream (review issue C + P2 fix).
             negative_deadline = Some(tokio::time::Instant::now() + NEGATIVE_GRACE_PERIOD);
-        } else if negative.is_none() {
-            // Partial failure (some family Failed, none positive): remember
-            // the first as a last-resort answer but keep racing for a
-            // complete one.
+        } else if definitive
+            && !negative
+                .as_ref()
+                .is_some_and(|kept| kept.is_definitive_negative(want))
+        {
+            // A definitive negative strictly improves on a partial failure
+            // kept as the last-resort answer. First-wins still applies
+            // between two answers of equal quality.
             negative = Some(set);
         }
     }
@@ -584,7 +622,7 @@ impl Resolver {
             mode,
             hosts,
             use_hosts,
-            inflight: DashMap::new(),
+            inflight: [DashMap::new(), DashMap::new(), DashMap::new()],
             policy: None,
             fallback_filter: None,
             fakeip_v4: None,
@@ -769,9 +807,15 @@ impl Resolver {
                     .collect()
             };
 
-            // Resolve sequentially — fail-fast on first failure. Bootstrap is
-            // intentionally dual-stack so a hostname-based encrypted upstream
-            // can fall back to whichever family its bootstrap resolver has.
+            // Resolve sequentially — fail-fast on first failure. Bootstrap
+            // is deliberately dual-stack and **ignores the `ipv6`
+            // preference** (the `true` below is not a placeholder): a
+            // hostname-based encrypted upstream must be reachable at boot
+            // even when its name only has an AAAA record, so filtering
+            // v6 answers here by the user's `ipv6: false` would make such
+            // upstreams unbootstrappable. The `ipv6` flag governs
+            // resolution for proxied/direct traffic, not DNS
+            // infrastructure connectivity.
             let mut map = HashMap::new();
             for host in &hostnames_needing_bootstrap {
                 match query_pool_set(&bootstrap_clients, host, QueryFamilies::BOTH, true).await {
@@ -824,7 +868,7 @@ impl Resolver {
             mode,
             hosts,
             use_hosts,
-            inflight: DashMap::new(),
+            inflight: [DashMap::new(), DashMap::new(), DashMap::new()],
             policy,
             fallback_filter,
             fakeip_v4: None,
@@ -963,11 +1007,34 @@ impl Resolver {
                 want = want.minus(QueryFamilies::IPV6);
             }
         }
-        if !want.is_empty() {
-            self.run_pipeline(lookup_host, want).await;
+        let pipeline_set = if want.is_empty() {
+            None
+        } else {
+            self.run_pipeline(lookup_host, want).await
+        };
+        // Prefer the pipeline's own result over re-reading the shared
+        // cache: the entry can be LRU-evicted (1024 forward entries under
+        // load) between the merge and a re-read, which would turn a
+        // just-successful lookup into "host unresolvable" (review H3).
+        // A full-set, definitive result covers every required family, so
+        // it is returned directly; anything less definitive (a subset
+        // result — some family was already fresh in the cache — or a
+        // partial failure) is combined with the cache below.
+        if let Some(set) = &pipeline_set {
+            if want == required {
+                if let Some(enabled) = self.filter_enabled_ips(&set.positive_ips()) {
+                    return Some(enabled);
+                }
+                if set.is_definitive_negative(want) {
+                    // Every required family answered definitively (no
+                    // usable addresses) — the name is genuinely
+                    // unresolvable.
+                    return None;
+                }
+            }
         }
-        // Re-read the cache: it now holds the freshly-queried families merged
-        // alongside any pre-existing fresh ones.
+        // Re-read the cache to merge the families that were already fresh
+        // (not re-queried) with the freshly queried ones.
         if let Some(cached) = self.cache.get_lookup(lookup_host) {
             if let Some(enabled) = self.filter_enabled_ips(&cached.ips) {
                 return Some(enabled);
@@ -980,6 +1047,15 @@ impl Resolver {
                 && (!required.contains(QueryFamilies::IPV6) || cached.v6.is_fresh());
             if all_required_fresh {
                 return None;
+            }
+        }
+        // The cache re-read missed (e.g. the entry was evicted between the
+        // merge and the read). If the pipeline still produced addresses for
+        // the families it queried, hand those back rather than reporting the
+        // host unresolvable.
+        if let Some(set) = &pipeline_set {
+            if let Some(enabled) = self.filter_enabled_ips(&set.positive_ips()) {
+                return Some(enabled);
             }
         }
         None
@@ -1247,18 +1323,23 @@ impl Resolver {
     /// receive the same `FamilySet` with the cache already populated.
     async fn run_pipeline(&self, host: &str, want: QueryFamilies) -> Option<FamilySet> {
         use dashmap::mapref::entry::Entry;
-        let key: InflightKey = (Arc::from(host), want);
-        if let Some(entry) = self.inflight.get(&key) {
+        debug_assert!(!want.is_empty(), "singleflight requires a non-empty set");
+        let inflight = &self.inflight[inflight_slot(want)];
+        // Borrowed-key fast path: `Arc<str>: Borrow<str>` lets both the
+        // subscriber check and the guard removal below run without ever
+        // allocating — the host is only cloned into an `Arc<str>` once a
+        // new flight is actually inserted (review issue M1).
+        if let Some(entry) = inflight.get(host) {
             let mut rx = entry.subscribe();
             drop(entry);
             return rx.recv().await.ok().flatten();
         }
-        // `entry(key)` consumes the key; clone one for the guard so it can
-        // remove the inflight slot on drop. The Arc is shared with the
-        // broadcast sender's stored key, so this is a refcount bump, not a
-        // deep copy.
-        let guard_key = key.clone();
-        let tx = match self.inflight.entry(key) {
+        // `entry()` consumes an owned key; keep one Arc for the guard so it
+        // can remove the inflight slot on drop — the map stores a second
+        // reference to the same allocation, so this is one allocation total,
+        // only on the insert path.
+        let guard_key: Arc<str> = Arc::from(host);
+        let tx = match inflight.entry(Arc::clone(&guard_key)) {
             Entry::Occupied(existing) => {
                 let mut rx = existing.get().subscribe();
                 drop(existing);
@@ -1271,7 +1352,7 @@ impl Resolver {
             }
         };
         let _guard = InflightGuard {
-            map: &self.inflight,
+            map: inflight,
             key: guard_key,
             _armed: (),
         };
@@ -2587,9 +2668,9 @@ mod tests {
         // single-flight pipeline; the inflight slot must be released on drop.
         let _ = resolver.resolve_ips("nonexistent.test").await;
         assert!(
-            resolver.inflight.is_empty(),
-            "inflight map must be empty after lookup, had {} entries",
-            resolver.inflight.len()
+            resolver.inflight.iter().all(DashMap::is_empty),
+            "inflight maps must be empty after lookup, had {} entries total",
+            resolver.inflight.iter().map(DashMap::len).sum::<usize>()
         );
     }
 
@@ -2607,14 +2688,14 @@ mod tests {
         let r1 = Arc::clone(&resolver);
         let r2 = Arc::clone(&resolver);
         // Two concurrent callers for the same host/family-set coalesce onto a
-        // single upstream flight (keyed by (host, queried families) — review
+        // single upstream flight (keyed per family set by host — review
         // issue B) and observe the same result.
         let (a, b) = tokio::join!(
             r1.resolve_ips("concurrent.test"),
             r2.resolve_ips("concurrent.test"),
         );
         assert_eq!(a, b, "concurrent callers must see the same result");
-        assert!(resolver.inflight.is_empty());
+        assert!(resolver.inflight.iter().all(DashMap::is_empty));
     }
 
     // B2: IP-literal upstreams → bootstrap never called, even with empty default_ns.

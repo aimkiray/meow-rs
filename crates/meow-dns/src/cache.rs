@@ -59,8 +59,10 @@ pub type IpList = SmallVec<[IpAddr; 2]>;
 /// The `neg` field (RFC 2308 negative-answer kind, 2 bits/family) occupies the
 /// trailing padding slot alongside `queried` and so does not grow the struct:
 /// on macOS both sit in the 7-byte pad tail (offset 64..72), and on Linux the
-/// 56 B layout already has room. The size-regression test still asserts
-/// `size_of::<CacheEntry>() <= 72`.
+/// 56 B layout already has room. The size-regression test asserts
+/// `size_of::<CacheEntry>() <= 72` plus the documented per-platform size
+/// (72 B macOS / 56 B Linux) so growth fails on every platform, not only
+/// where the cap has no slack.
 struct CacheEntry {
     ips: Box<[IpAddr]>,
     expire_v4: Instant,
@@ -452,6 +454,14 @@ impl DnsCache {
     /// recorded as a NXDOMAIN negative for both families (the only way to
     /// represent "this name has no records at all" without per-family input),
     /// keeping the NXDOMAIN-cache test contract.
+    ///
+    /// **Caller beware (review M4):** an empty list is *always* NXDOMAIN here —
+    /// this aggregate path cannot distinguish NODATA from NXDOMAIN, and it
+    /// marks both families queried, suppressing re-resolution of both. Only
+    /// whole-entry replacement (manual `preload_cache` seeding and the like)
+    /// may pass an empty list; resolution-path negatives must go through
+    /// [`Self::merge_family`], which carries the real per-family negative
+    /// kind.
     pub fn put_with_source(
         &self,
         domain: &str,
@@ -543,7 +553,22 @@ impl DnsCache {
         source: Option<&str>,
         neg: FamilyNeg,
     ) {
-        debug_assert!(family == QueryFamilies::IPV4 || family == QueryFamilies::IPV6);
+        debug_assert!(
+            ips.iter().all(|ip| family.contains_ip(*ip)),
+            "merge_family received cross-family IPs; they would become \
+             orphan cache entries no family filter can find"
+        );
+        // Not only a debug_assert: `family.other()` maps anything that is
+        // not exactly IPV4 to IPV4, so a BOTH/NONE family would silently
+        // corrupt the merged state in release builds. Refuse instead of
+        // letting `other()` fabricate the sibling (review low item).
+        if family != QueryFamilies::IPV4 && family != QueryFamilies::IPV6 {
+            debug_assert!(
+                false,
+                "merge_family requires a single family, got {family:?}"
+            );
+            return;
+        }
         let now = Instant::now();
         let expire = now + ttl;
         let reverse_expire_at = now + ttl.max(REVERSE_TTL_FLOOR);
@@ -654,8 +679,20 @@ impl DnsCache {
             }
         }
         merged.extend_from_slice(ips);
-        merged.sort_unstable();
-        merged.dedup();
+        // Deduplicate *without sorting*: upstreams return addresses in
+        // preference order (CDN geo/load-balancing), and consumers such as
+        // `lookup_real_with_ttl` hand back the first address — sorting
+        // would pin every lookup to the numerically smallest IP forever
+        // (review M6). Lists here are tiny (single-family answers), so
+        // the O(n²) order-preserving scan is cheaper than a sort.
+        let mut i = 0;
+        while i < merged.len() {
+            if merged[..i].contains(&merged[i]) {
+                merged.remove(i);
+            } else {
+                i += 1;
+            }
+        }
         cache.put(
             key,
             CacheEntry {
@@ -1485,13 +1522,30 @@ mod tests {
     /// field addition can't silently breach it. See the struct doc for the
     /// before/after byte counts. The added `neg` (negative-kind) byte sits in
     /// the trailing padding alongside `queried` and must not grow the struct.
+    ///
+    /// The universal 72 B cap has 16 B of slack on Linux (`Instant` = 8 B), so
+    /// a regression that stays under the cap would only fail on macOS CI.
+    /// Lock the documented per-platform size too, so *any* growth (beyond
+    /// padding) fails on every platform (review M5).
     #[test]
     fn cache_entry_fits_m2_size_cap() {
         use std::mem::size_of;
+        let size = size_of::<CacheEntry>();
         assert!(
-            size_of::<CacheEntry>() <= 72,
-            "CacheEntry {} B exceeded the 72 B M2 per-slot cap",
-            size_of::<CacheEntry>()
+            size <= 72,
+            "CacheEntry {size} B exceeded the 72 B M2 per-slot cap"
+        );
+        // macOS sits exactly at the cap — zero headroom — and Linux has the
+        // 16 B `Instant` slack documented on the struct.
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            size, 72,
+            "CacheEntry grew on macOS: it sat exactly at the 72 B cap with no headroom"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            size, 56,
+            "CacheEntry grew on Linux (expected 56 B with 8 B Instants)"
         );
     }
 }

@@ -345,9 +345,9 @@ async fn get_configs_returns_mode() {
 }
 
 #[tokio::test]
-async fn get_configs_returns_default_ipv6_true_when_omitted() {
+async fn get_configs_returns_default_ipv6_false_when_omitted() {
     // The raw config does not set `ipv6`, so the API must report the runtime
-    // default (`true`), matching `meow_config`'s `unwrap_or(true)`.
+    // default (`false`, matching mihomo/Clash) via `meow_config::effective_ipv6`.
     let state = test_state_default();
     let app = create_router(state);
     let resp = app
@@ -361,8 +361,8 @@ async fn get_configs_returns_default_ipv6_true_when_omitted() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(
-        json["ipv6"], true,
-        "omitted ipv6 must report the runtime default (true)"
+        json["ipv6"], false,
+        "omitted ipv6 must report the runtime default (false)"
     );
 }
 

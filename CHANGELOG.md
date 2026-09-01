@@ -10,15 +10,20 @@ the canonical, in-repo source a release is cut from.
 
 ### Changed
 
-- **`ipv6` now defaults to `true`.** Previously a config without an explicit
-  `ipv6:` key resolved the resolver to IPv4-only; it now enables IPv6 so the
-  runtime, `GET /configs`, and the documented default all agree
-  (`crates/meow-config/src/lib.rs`, `crates/meow-api/src/routes.rs`,
-  `website/guide/configuration.md`). This is a **silent behaviour change** for
-  configs that omitted `ipv6`: dual-stack domains are now queried for both A
-  and AAAA (concurrently, with IPv4 tried first as a connection fallback) and
-  `DirectAdapter` can fall back to IPv6 when IPv4 connectivity fails. Operators
-  that need the old IPv4-only behaviour must set `ipv6: false` explicitly.
+- **`ipv6` is now effective end-to-end and keeps the `false` default.** The
+  `ipv6` flag previously only gated a handful of code paths — the resolver
+  queried A and AAAA regardless — so the documented `false` default and
+  `GET /configs` disagreed with the actual runtime behaviour. The flag now
+  drives the whole resolution pipeline: with `ipv6: false` (the default,
+  matching mihomo/Clash) AAAA lookups are skipped and the resolver answers
+  IPv4-only; with `ipv6: true` dual-stack domains are queried for both A and
+  AAAA (concurrently, with IPv4 tried first as a connection fallback) and
+  `DirectAdapter` can fall back to IPv6 when IPv4 connectivity fails. The
+  default literal is now centralized in `meow_config::effective_ipv6`
+  (previously scattered across six `unwrap_or(...)` sites), and the parser,
+  `GET /configs`, and `website/guide/configuration.md` all agree on `false`.
+  **Operators who relied on the old always-dual-stack behaviour of an
+  omitted `ipv6` key must now set `ipv6: true` explicitly.**
 
 - DNS dual-stack resolution (`resolve_ips` / `lookup_ip_with_ipv6_inner`) now
   queries A and AAAA **concurrently** when IPv6 is enabled, collecting both
@@ -41,10 +46,11 @@ the canonical, in-repo source a release is cut from.
   are dropped from the query set; the missing required family is always
   fetched, preserving `DirectAdapter`'s cross-family fallback.
 
-- **`GET /configs` reports the correct `ipv6` default.** The API previously
-  reported `ipv6: false` for an unset config while the runtime actually enabled
-  IPv6, causing UIs/controllers to display a wrong state. Both now default to
-  `true`.
+- **`GET /configs` reports the same `ipv6` default the runtime uses.** The API
+  previously reported `ipv6: false` for an unset config while the runtime
+  actually queried AAAA anyway, causing UIs/controllers to display a state the
+  resolver ignored. Both sides now share `meow_config::effective_ipv6` and
+  default to `false` — and the reported value is the one actually enforced.
 
 - **A fast NXDOMAIN no longer suppresses a slow positive answer.** Within a
   single nameserver tier, the first definitive negative (NODATA/NXDOMAIN) is
@@ -68,7 +74,10 @@ the canonical, in-repo source a release is cut from.
   fresh and the other has expired, only the fresh family's IPs appear in the
   cache snapshot panel.
 
-- **Hosts-table IPv6 overrides are honoured even with `ipv6: false`.** An
-  AAAA query for a domain present in the hosts trie now returns the hosts-file
-  IPv6 address instead of being short-circuited — the hosts file is an
-  explicit user override that takes priority over the global `ipv6` toggle.
+- **Hosts-table AAAA answers follow the global `ipv6` switch.** An AAAA query
+  for a domain present in the hosts trie is gated by `ipv6` exactly like every
+  other AAAA path: with `ipv6: false` it returns NODATA even when the hosts
+  file carries an IPv6 address for the domain (the entry remains reachable for
+  A queries and for `ipv6: true` configs). This keeps the global toggle a
+  single, predictable switch — dual-stack operators who pin addresses in
+  `hosts:` must enable `ipv6: true` for the v6 entries to be served.
