@@ -1957,6 +1957,8 @@ mod tests {
             2,
             "a stream idle past the timeout must be closed, not reused"
         );
+    }
+
     /// RFC 2308: the negative cache TTL of an NXDOMAIN/NODATA response is
     /// `min(SOA.TTL, SOA.MINIMUM)` from the authority section. Verifies the
     /// helper used by the NXDOMAIN-cache path picks the smaller of the record
