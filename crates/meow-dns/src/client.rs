@@ -1342,6 +1342,119 @@ mod tests {
             "a query right after the burst should reuse a pooled connection"
         );
     }
+
+    /// Benchmark server for [`tcp_pool_burst_connection_budget`]: answers
+    /// every query immediately and counts accepted connections.
+    async fn spawn_bench_dns_server(accepted: Arc<AtomicUsize>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_accepted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                server_accepted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    while let Ok(request) = read_lp(&mut stream).await {
+                        let request = Message::from_bytes(&request).unwrap();
+                        let response = response_for(&request, request.metadata.id);
+                        if write_lp(&mut stream, &response.to_bytes().unwrap())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Review N1 benchmark: quantify the connection budget of the
+    /// `TCP_POOL_CAPACITY = 4` idle pool when a `tcp://` nameserver is the
+    /// primary resolver, under both arrival patterns a page load produces.
+    /// Run with:
+    ///
+    /// ```text
+    /// cargo test -p meow-dns --lib tcp_pool_burst -- --ignored --nocapture
+    /// ```
+    ///
+    /// Informational by design (nothing is asserted about the measured
+    /// numbers — they are environment-dependent): the behavioral
+    /// guarantees (bursts never queue behind the pool, the pool stays
+    /// bounded, a post-burst query reuses) are pinned by the reuse test
+    /// above. Each phase uses a fresh client, so every phase starts with
+    /// an empty pool.
+    #[tokio::test]
+    #[ignore]
+    async fn tcp_pool_burst_connection_budget() {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let addr = spawn_bench_dns_server(Arc::clone(&accepted)).await;
+
+        async fn run_burst(
+            addr: std::net::SocketAddr,
+            queries: usize,
+            spawn_gap: Option<Duration>,
+        ) -> usize {
+            // Fresh client per phase → the phase starts with an empty pool.
+            let client = Arc::new(DnsClient::tcp(addr).with_timeout(Duration::from_secs(10)));
+            let mut handles = Vec::with_capacity(queries);
+            for index in 0..queries {
+                if let Some(gap) = spawn_gap {
+                    tokio::time::sleep(gap).await;
+                }
+                let client = Arc::clone(&client);
+                handles.push(tokio::spawn(async move {
+                    client
+                        .query(&format!("burst-{index}.example"), RecordType::A)
+                        .await
+                        .map(|_| ())
+                }));
+            }
+            for handle in handles {
+                handle.await.unwrap().unwrap();
+            }
+            let idle = client.tcp_pool.idle.lock().await.len();
+            assert!(
+                idle <= TCP_POOL_CAPACITY,
+                "idle pool must stay bounded (saw {idle})"
+            );
+            idle
+        }
+
+        // Fully concurrent bursts — the pattern that pays one connect (and,
+        // on Android, one protect(fd) call) per query above the capacity.
+        for burst in [4usize, 16, 32, 64] {
+            let start = Instant::now();
+            let before = accepted.load(Ordering::SeqCst);
+            run_burst(addr, burst, None).await;
+            let connects = accepted.load(Ordering::SeqCst) - before;
+            let reuse = 100.0 * (1.0 - connects as f64 / burst as f64);
+            println!(
+                "concurrent burst={burst:3}: {connects:3} connects (reuse {reuse:.0}%), \
+                 {:.1} ms",
+                start.elapsed().as_secs_f64() * 1e3
+            );
+        }
+
+        // Staggered arrival — the pattern where a query lands while an idle
+        // pooled stream exists, so the pool serves it. This is the shape
+        // pooling exists for (review N1).
+        for (total, gap_ms) in [(64usize, 5u64), (64, 20)] {
+            let start = Instant::now();
+            let before = accepted.load(Ordering::SeqCst);
+            run_burst(addr, total, Some(Duration::from_millis(gap_ms))).await;
+            let connects = accepted.load(Ordering::SeqCst) - before;
+            let reuse = 100.0 * (1.0 - connects as f64 / total as f64);
+            println!(
+                "staggered  {total:3} @ {gap_ms:2} ms: {connects:3} connects \
+                 (reuse {reuse:.0}%), {:.1} ms",
+                start.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
     #[test]
     fn take_fresh_reaps_expired_and_returns_the_freshest() {
         let timeout = Duration::from_secs(30);
