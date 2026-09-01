@@ -561,11 +561,17 @@ impl DnsCache {
         // Not only a debug_assert: `family.other()` maps anything that is
         // not exactly IPV4 to IPV4, so a BOTH/NONE family would silently
         // corrupt the merged state in release builds. Refuse instead of
-        // letting `other()` fabricate the sibling (review low item).
+        // letting `other()` fabricate the sibling (review low item) — and
+        // warn, so a release-build refusal ("the cache never stores this
+        // host") leaves something to go on instead of being a silent
+        // no-op (review N3).
         if family != QueryFamilies::IPV4 && family != QueryFamilies::IPV6 {
             debug_assert!(
                 false,
                 "merge_family requires a single family, got {family:?}"
+            );
+            tracing::warn!(
+                "merge_family requires a single family (IPV4/IPV6), got {family:?}; refusing to merge"
             );
             return;
         }

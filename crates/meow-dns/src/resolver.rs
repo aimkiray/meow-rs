@@ -77,8 +77,9 @@ type InflightTx = tokio::sync::broadcast::Sender<Option<FamilySet>>;
 type InflightMap = DashMap<Arc<str>, InflightTx>;
 
 /// Index of a family set inside [`Resolver::inflight`]. Callers must
-/// ensure the set is non-empty (`run_pipeline` never runs with
-/// `QueryFamilies::NONE`).
+/// ensure the set is non-empty; `run_pipeline` early-returns on
+/// `QueryFamilies::NONE` (review N2), so the `unreachable!` below is a
+/// defensive backstop, not a reachable branch.
 fn inflight_slot(want: QueryFamilies) -> usize {
     if want == QueryFamilies::IPV4 {
         0
@@ -1323,7 +1324,16 @@ impl Resolver {
     /// receive the same `FamilySet` with the cache already populated.
     async fn run_pipeline(&self, host: &str, want: QueryFamilies) -> Option<FamilySet> {
         use dashmap::mapref::entry::Entry;
+        // Both current callers filter `want` before calling. The
+        // debug_assert keeps the invariant loud in dev; the release path
+        // returns instead of reaching `inflight_slot`'s `unreachable!()`,
+        // which would abort the whole proxy over a future unguarded
+        // call site (review N2). "Asks for nothing" maps to "no
+        // dedicated result", the same answer a cache miss gives.
         debug_assert!(!want.is_empty(), "singleflight requires a non-empty set");
+        if want.is_empty() {
+            return None;
+        }
         let inflight = &self.inflight[inflight_slot(want)];
         // Borrowed-key fast path: `Arc<str>: Borrow<str>` lets both the
         // subscriber check and the guard removal below run without ever
