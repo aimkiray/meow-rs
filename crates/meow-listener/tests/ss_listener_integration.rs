@@ -18,6 +18,7 @@ use meow_transport::simple_obfs::client::{HttpObfs, TlsObfs};
 use shadowsocks::config::{ServerConfig, ServerType};
 use shadowsocks::context::Context;
 use shadowsocks::crypto::CipherKind;
+use shadowsocks::relay::udprelay::{DatagramReceive, DatagramSend};
 use shadowsocks::relay::Address;
 use shadowsocks::ProxyClientStream;
 use shadowsocks::ProxySocket;
@@ -28,6 +29,39 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 const CIPHER: &str = "aes-256-gcm";
 const PASSWORD: &str = "test-ss-listener-password";
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Drive one send→echo exchange with retransmission. UDP has no backlog, so
+/// a datagram sent before the listener's relay socket finished binding is
+/// silently dropped by the OS — the fixed sleep in the bind helpers shrinks
+/// but does not eliminate that window (observed ~1-in-3 flake under parallel
+/// test load). Retrying the *first* exchange (250ms interval, 3s budget)
+/// makes the UDP tests deterministic; once an echo comes back the relay is
+/// proven up and later exchanges need no retry. This mirrors real SS
+/// clients, which retransmit UDP (DNS) queries.
+async fn udp_echo_with_retry<S>(
+    client: &ProxySocket<S>,
+    ss_addr: std::net::SocketAddr,
+    target: &Address,
+    payload: &[u8],
+    buf: &mut [u8],
+) -> usize
+where
+    S: DatagramSend + DatagramReceive + Send + Sync + 'static,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        client.send_to(ss_addr, target, payload).await.unwrap();
+        match tokio::time::timeout(Duration::from_millis(250), client.recv_from(buf)).await {
+            Ok(Ok((n, ..))) => return n,
+            Ok(Err(e)) => panic!("udp recv failed: {e}"),
+            Err(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("udp echo did not arrive within 3s of retransmission");
+                }
+            }
+        }
+    }
+}
 
 /// Build a shadowsocks *client* `ServerConfig` pointing at the listener.
 fn client_cfg(ss_addr: std::net::SocketAddr) -> ServerConfig {
@@ -174,7 +208,6 @@ async fn ss_udp_listener_relays_to_direct_echo() {
     let echo = spawn_udp_echo_server().await;
     let ss_addr = bind_ss_listener_udp().await;
 
-    let payload = b"hello ss udp";
     // Client-side SS UDP socket: a bound (non-connected) socket so we can use
     // `send_to`/`recv_from` (the connected-socket `send`/`recv` pair would also
     // work, but `send_to` keeps the server endpoint explicit and inspectable).
@@ -190,17 +223,17 @@ async fn ss_udp_listener_relays_to_direct_echo() {
         &cfg,
         raw,
     );
-    client
-        .send_to(ss_addr, &Address::SocketAddress(echo), payload)
-        .await
-        .unwrap();
 
+    let payload = b"hello ss udp";
     let mut buf = [0u8; 128];
-    let (n, _server_peer, _reply_addr, _recv_total) =
-        tokio::time::timeout(TIMEOUT, client.recv_from(&mut buf))
-            .await
-            .expect("udp echo timed out")
-            .expect("udp recv failed");
+    let n = udp_echo_with_retry(
+        &client,
+        ss_addr,
+        &Address::SocketAddress(echo),
+        payload,
+        &mut buf,
+    )
+    .await;
     assert_eq!(&buf[..n], payload, "echoed UDP payload must match");
 }
 
@@ -227,16 +260,19 @@ async fn ss_udp_flow_table_cap_drops_new_flows_but_keeps_existing() {
         raw,
     );
 
-    // Flow 1 fills the table (cap = 1) and must echo.
-    client
-        .send_to(ss_addr, &Address::SocketAddress(echo1), b"flow-1")
-        .await
-        .unwrap();
+    // Flow 1 fills the table (cap = 1) and must echo. Retransmission here is
+    // harmless for the cap semantics: every retry targets the same
+    // (peer, target) key, so the first datagram that gets through creates
+    // the flow and the rest hit the existing-flow fast path.
     let mut buf = [0u8; 128];
-    let (n, _, _, _) = tokio::time::timeout(TIMEOUT, client.recv_from(&mut buf))
-        .await
-        .expect("flow-1 echo timed out")
-        .expect("flow-1 recv failed");
+    let n = udp_echo_with_retry(
+        &client,
+        ss_addr,
+        &Address::SocketAddress(echo1),
+        b"flow-1",
+        &mut buf,
+    )
+    .await;
     assert_eq!(&buf[..n], b"flow-1", "first flow must relay below the cap");
 
     // A new target while saturated: dropped server-side, no echo. 300ms is
