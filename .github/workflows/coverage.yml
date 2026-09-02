@@ -51,7 +51,9 @@ jobs:
           # simple-obfs, embedded mock servers). Tests in
           # crates/meow-dns/tests/doh_dot_integration.rs require outbound
           # internet (Cloudflare/Google DoH/DoT) and are not reachable from
-          # GitHub-hosted runners — skip them by name.
+          # GitHub-hosted runners — skip them by name. The mux `live_singbox_*`
+          # interop probes require a manually started sing-box server
+          # (127.0.0.1:4411, see target/e2e/mux-interop/) — also skip.
           cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info \
             -- --include-ignored \
                --skip dot_resolves_example_com \
@@ -60,7 +62,8 @@ jobs:
                --skip doh_bogus_sni_fails_cert_validation \
                --skip dot_hostname_with_bootstrap_resolves \
                --skip geosite_rss_10k_rules_100k_queries \
-               --skip live_download_from_default_urls
+               --skip live_download_from_default_urls \
+               --skip live_singbox
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
