@@ -75,6 +75,23 @@ async fn bind_ss_listener_cfg(udp: bool, obfs: Option<SsObfsMode>) -> std::net::
     addr
 }
 
+/// Like [`bind_ss_listener_cfg`] but with an explicit `max-connections`
+/// override, so tests can exercise the TCP concurrency cap and the UDP
+/// flow-table cap (both share the value).
+async fn bind_ss_listener_udp_capped(max_connections: usize) -> std::net::SocketAddr {
+    let tunnel = direct_tunnel();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let ss = ShadowsocksListener::new(tunnel, addr, "ss-test".into(), CIPHER, PASSWORD, true, None)
+        .unwrap()
+        .with_max_connections(max_connections);
+    tokio::spawn(async move {
+        let _ = ss.run_on(listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
 /// Spawn a UDP echo server on an ephemeral port; returns its address.
 async fn spawn_udp_echo_server() -> std::net::SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -185,6 +202,70 @@ async fn ss_udp_listener_relays_to_direct_echo() {
             .expect("udp echo timed out")
             .expect("udp recv failed");
     assert_eq!(&buf[..n], payload, "echoed UDP payload must match");
+}
+
+#[tokio::test]
+async fn ss_udp_flow_table_cap_drops_new_flows_but_keeps_existing() {
+    // `max-connections: 1` also caps the UDP flow table at 1 (peer, target)
+    // flow. The first flow must relay; a datagram to a *new* target is
+    // dropped while the table is saturated; the existing flow keeps
+    // relaying (the cap only blocks new-flow creation).
+    let echo1 = spawn_udp_echo_server().await;
+    let echo2 = spawn_udp_echo_server().await;
+    let ss_addr = bind_ss_listener_udp_capped(1).await;
+
+    let ctx = Context::new_shared(ServerType::Local);
+    let cfg = client_cfg(ss_addr);
+    let raw =
+        shadowsocks::net::UdpSocket::bind(&"127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .await
+            .unwrap();
+    let client = ProxySocket::from_socket(
+        shadowsocks::relay::udprelay::proxy_socket::UdpSocketType::Client,
+        ctx,
+        &cfg,
+        raw,
+    );
+
+    // Flow 1 fills the table (cap = 1) and must echo.
+    client
+        .send_to(ss_addr, &Address::SocketAddress(echo1), b"flow-1")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 128];
+    let (n, _, _, _) = tokio::time::timeout(TIMEOUT, client.recv_from(&mut buf))
+        .await
+        .expect("flow-1 echo timed out")
+        .expect("flow-1 recv failed");
+    assert_eq!(&buf[..n], b"flow-1", "first flow must relay below the cap");
+
+    // A new target while saturated: dropped server-side, no echo. 300ms is
+    // ~100x the observed drop latency (a HashMap length check), so a pass
+    // never depends on timing luck.
+    client
+        .send_to(ss_addr, &Address::SocketAddress(echo2), b"flow-2")
+        .await
+        .unwrap();
+    let res = tokio::time::timeout(Duration::from_millis(300), client.recv_from(&mut buf)).await;
+    assert!(
+        res.is_err(),
+        "new flow must be dropped while the table is saturated"
+    );
+
+    // The existing flow is unaffected — datagrams for it still pass.
+    client
+        .send_to(ss_addr, &Address::SocketAddress(echo1), b"flow-1-again")
+        .await
+        .unwrap();
+    let (n, _, _, _) = tokio::time::timeout(TIMEOUT, client.recv_from(&mut buf))
+        .await
+        .expect("existing flow echo timed out")
+        .expect("existing flow recv failed");
+    assert_eq!(
+        &buf[..n],
+        b"flow-1-again",
+        "existing flow must keep relaying at the cap"
+    );
 }
 
 // ── simple-obfs TCP relay (HTTP + TLS) ──────────────────────────────────────

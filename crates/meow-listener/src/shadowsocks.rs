@@ -103,6 +103,7 @@ impl ShadowsocksListener {
 
     /// Override the concurrent-inbound cap (default
     /// [`crate::mixed::DEFAULT_MAX_CONNECTIONS`]). `0` disables the cap.
+    /// The same value caps the UDP relay's concurrent `(peer, target)` flows.
     pub fn with_max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
         self
@@ -159,8 +160,9 @@ impl ShadowsocksListener {
                 let tunnel = self.tunnel.clone();
                 let name = self.name.clone();
                 let in_port = bound.port();
+                let max_flows = self.max_connections;
                 tokio::spawn(async move {
-                    run_udp_relay(tunnel, udp_sock, name, in_port).await;
+                    run_udp_relay(tunnel, udp_sock, name, in_port, max_flows).await;
                 });
             }
         }
@@ -361,6 +363,13 @@ impl Drop for UdpFlow {
 /// tunnel (rule match → `dial_udp`), and relay replies back encrypted to the
 /// originating peer. Runs until the socket errors out (process lifetime).
 ///
+/// `max_flows` caps the concurrent `(peer, target)` flow table (`0` =
+/// uncapped), mirroring the TCP accept loop's `max_connections` — each flow
+/// holds a 64 KiB reply buffer, a task, and an outbound socket, so an
+/// unbounded table is a memory/FD exhaustion vector on an internet-exposed
+/// listener. Saturated new flows are dropped with a warn-once log (recovery
+/// logs at debug), exactly like the TCP saturation path.
+///
 /// Generic over the inner socket type `S` so the concrete type returned by
 /// `ProxySocket::bind` (`ShadowUdpSocket`) flows in by inference — the relay
 /// logic is identical for any `DatagramSend + DatagramReceive` socket.
@@ -369,6 +378,7 @@ async fn run_udp_relay<S>(
     sock: shadowsocks::ProxySocket<S>,
     in_name: String,
     in_port: u16,
+    max_flows: usize,
 ) where
     S: DatagramSend + DatagramReceive + Send + Sync + 'static,
 {
@@ -378,6 +388,7 @@ async fn run_udp_relay<S>(
     let mut sweeper = tokio::time::interval(UDP_NAT_SWEEP);
     sweeper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let idle_ms = DEFAULT_UDP_IDLE.as_millis() as u64;
+    let mut warned_saturated = false;
 
     loop {
         tokio::select! {
@@ -391,10 +402,18 @@ async fn run_udp_relay<S>(
                     }
                 };
                 let payload = &buf[..n];
-                if let Err(e) =
-                    handle_ss_udp_datagram(&tunnel, &sock, &mut flows, payload, peer, &target, &in_name, in_port).await
-                {
-                    debug!("ss udp '{}' datagram from {peer}: {e}", in_name);
+                match handle_ss_udp_datagram(&tunnel, &sock, &mut flows, payload, peer, &target, &in_name, in_port, max_flows).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if !warned_saturated {
+                            warn!(
+                                "ss udp '{}' flow table saturated at {} flows; new flows are dropped until idle eviction",
+                                in_name, max_flows
+                            );
+                            warned_saturated = true;
+                        }
+                    }
+                    Err(e) => debug!("ss udp '{}' datagram from {peer}: {e}", in_name),
                 }
             }
             _ = sweeper.tick() => {
@@ -408,6 +427,10 @@ async fn run_udp_relay<S>(
                     let elapsed = u64::from(now.wrapping_sub(last));
                     elapsed < idle_ms
                 });
+                if warned_saturated && (max_flows == 0 || flows.len() < max_flows) {
+                    debug!("ss udp '{}' flow table has free capacity again", in_name);
+                    warned_saturated = false;
+                }
             }
         }
     }
@@ -415,9 +438,14 @@ async fn run_udp_relay<S>(
 
 /// Decrypt is already done by `ProxySocket`; here we resolve the target,
 /// route, and forward through the (possibly new) per-flow outbound conn.
+///
+/// Returns `Ok(true)` when the datagram was handled (existing or new flow),
+/// `Ok(false)` when it was dropped because the flow table is at `max_flows`
+/// (new-flow cap only — datagrams for existing flows always pass), and
+/// `Err` with a reason for per-datagram failures.
 #[allow(
     clippy::too_many_arguments,
-    reason = "mirrors socks5_udp::handle_client_datagram's parameter set plus the shared socket"
+    reason = "mirrors socks5_udp::handle_client_datagram's parameter set plus the shared socket and flow cap"
 )]
 async fn handle_ss_udp_datagram<S>(
     tunnel: &Tunnel,
@@ -428,7 +456,8 @@ async fn handle_ss_udp_datagram<S>(
     target: &Address,
     in_name: &str,
     in_port: u16,
-) -> Result<(), String>
+    max_flows: usize,
+) -> Result<bool, String>
 where
     S: DatagramSend + DatagramReceive + Send + Sync + 'static,
 {
@@ -473,7 +502,14 @@ where
             .map_err(|e| format!("udp write {dst_addr}: {e}"))?;
         flow.last_activity_ms
             .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
-        return Ok(());
+        return Ok(true);
+    }
+
+    // Flow-table cap: a new flow costs a 64 KiB reply buffer, a task, and an
+    // outbound socket; without a cap any password holder could exhaust
+    // memory/FDs between idle sweeps. `0` disables the cap.
+    if max_flows > 0 && flows.len() >= max_flows {
+        return Ok(false);
     }
 
     // Slow path: pick an outbound and dial. Port 53 bypasses to DIRECT,
@@ -531,5 +567,5 @@ where
             reply_task,
         },
     );
-    Ok(())
+    Ok(true)
 }

@@ -1,9 +1,9 @@
 # Shadowsocks inbound listener — encrypted server inbound
 
-Last updated: 2026-08-25. Tracks the `listener-shadowsocks` feature
-(PR2). Audience: operators running meow-rs as a *server* (an encrypted
-inbound that terminates Shadowsocks AEAD/stream ciphers and forwards the
-decrypted flows through the normal routing engine).
+Tracks the `listener-shadowsocks` feature. Audience: operators running
+meow-rs as a *server* (an encrypted inbound that terminates Shadowsocks
+AEAD/stream ciphers and forwards the decrypted flows through the normal
+routing engine).
 
 meow-rs already speaks Shadowsocks on the *client* (outbound) side via the
 `shadowsocks` crate. This inbound mirrors upstream mihomo's `type:
@@ -140,9 +140,16 @@ mode) on the same resolved port. Each decrypted datagram carries a
 conns (mirroring the SOCKS5-UDP per-destination NAT, but keyed by both
 endpoints since the socket is shared across SS clients). Each flow has a
 reply task that reads server→client datagrams and re-encrypts them back to
-the originating peer. Idle flows are evicted after `udp-timeout`
-(`meow_tunnel::udp::DEFAULT_UDP_IDLE`), matching the SOCKS5-UDP behaviour. As
-with SOCKS5-UDP, port-53 traffic bypasses rule matching to DIRECT (avoiding
+the originating peer. Idle flows are evicted after 60 s
+(`meow_tunnel::udp::DEFAULT_UDP_IDLE`, the same constant SOCKS5-UDP uses;
+there is no per-listener `udp-timeout` knob — that option only applies to
+the TUN stack). The flow table is capped at the listener's
+`max-connections` value (default 256; `0` disables both the TCP and UDP
+caps): each flow holds a 64 KiB reply buffer, a task, and an outbound
+socket, so without a cap any password holder could exhaust memory/FDs
+between idle sweeps. Datagrams for existing flows always pass; only *new*
+flows are dropped (with a warn) while the table is saturated. As with
+SOCKS5-UDP, port-53 traffic bypasses rule matching to DIRECT (avoiding
 looping client DNS back through a proxy / the in-process resolver).
 
 ## Feature gating
@@ -151,3 +158,12 @@ looping client DNS back through a proxy / the in-process resolver).
 binary-size caps). It's bundled into the app `full` profile but **not**
 `minimal`. Enabling it pulls in the `shadowsocks` workspace dep and
 `meow-transport/simple-obfs`.
+
+## Differences from the other inbounds
+
+- **No sniffer**: unlike `mixed`/`socks5`, the SS inbound is not wired into
+  the TLS/HTTP sniffer — the SS header already carries a domain when the
+  client sends one, which the routing engine uses directly.
+- **UDP flow cap**: the `(peer, target)` flow table shares the listener's
+  `max-connections` cap (see above); the SOCKS5 UDP relay's table, by
+  contrast, lives and dies with its TCP control connection.
