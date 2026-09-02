@@ -57,8 +57,9 @@ listener-mixed = ["meow-listener/listener-mixed"]
 # TUN inbound (issue #326) — transparent proxy without a tproxy/REDIRECT
 # firewall; the only transparent-proxy mode available on Windows.
 listener-tun = ["meow-listener/listener-tun", "meow-api/listener-tun"]
-# Shadowsocks encrypted-server inbound. Off by default (server scenario);
-# bundled into `full` but not `minimal` (ADR-0007 binary-size caps).
+# Shadowsocks encrypted-server inbound. Fully opt-in: excluded from `full`
+# and `minimal` (server scenario; ADR-0007 binary-size caps) — enable with
+# an explicit `--features listener-shadowsocks`.
 listener-shadowsocks = ["meow-listener/listener-shadowsocks"]
 
 # Convenience bundles
@@ -66,7 +67,7 @@ minimal = ["ss", "trojan", "dns-server", "listener-mixed"]
 full = [
     "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel", "mux",
     "dns-server", "dns-encrypted",
-    "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun", "listener-shadowsocks",
+    "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
 ]
 
 [[bin]]

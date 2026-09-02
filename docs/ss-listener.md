@@ -40,16 +40,16 @@ listeners:
     udp: true                # default true (upstream parity)
 ```
 
-Run:
+Run (the feature is not part of any app bundle — build with it explicitly):
 
 ```bash
 cargo run -p meow-app --features listener-shadowsocks -- -f config.yaml
 ```
 
-or build the `full` profile (which bundles `listener-shadowsocks`):
+or for a release build:
 
 ```bash
-cargo build --release --features full
+cargo build --release --features listener-shadowsocks
 ./target/release/meow -f config.yaml
 ```
 
@@ -154,10 +154,11 @@ looping client DNS back through a proxy / the in-process resolver).
 
 ## Feature gating
 
-`listener-shadowsocks` is off by default (server scenario; ADR-0007
-binary-size caps). It's bundled into the app `full` profile but **not**
-`minimal`. Enabling it pulls in the `shadowsocks` workspace dep and
-`meow-transport/simple-obfs`.
+`listener-shadowsocks` is fully opt-in: off by default (server scenario;
+ADR-0007 binary-size caps) and excluded from both the app `full` and
+`minimal` bundles, so release binaries do not include it — build with an
+explicit `--features listener-shadowsocks`. Enabling it pulls in the
+`shadowsocks` workspace dep and `meow-transport/simple-obfs`.
 
 ## Differences from the other inbounds
 
