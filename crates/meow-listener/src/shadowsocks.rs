@@ -51,6 +51,14 @@ pub enum SsObfsMode {
 /// Convenience alias for the listener-wide obfs setting.
 type ObfsKind = Option<SsObfsMode>;
 
+/// Default cap on in-flight inbound connections (and, with `udp: true`,
+/// concurrent UDP flows) per listener when the listener config doesn't set
+/// `max-connections` (mirrors `mixed::DEFAULT_MAX_CONNECTIONS` — kept as a
+/// separate constant rather than an import so `listener-shadowsocks` stays
+/// usable without `listener-mixed` enabled, same rationale as tproxy's
+/// copy). `0` explicitly disables the cap.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+
 pub struct ShadowsocksListener {
     tunnel: Tunnel,
     listen_addr: SocketAddr,
@@ -97,13 +105,13 @@ impl ShadowsocksListener {
             ctx,
             udp,
             obfs,
-            max_connections: crate::mixed::DEFAULT_MAX_CONNECTIONS,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         })
     }
 
     /// Override the concurrent-inbound cap (default
-    /// [`crate::mixed::DEFAULT_MAX_CONNECTIONS`]). `0` disables the cap.
-    /// The same value caps the UDP relay's concurrent `(peer, target)` flows.
+    /// [`DEFAULT_MAX_CONNECTIONS`]). `0` disables the cap. The same value
+    /// caps the UDP relay's concurrent `(peer, target)` flows.
     pub fn with_max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
         self
