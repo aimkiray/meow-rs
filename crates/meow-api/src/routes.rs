@@ -1047,7 +1047,14 @@ async fn apply_raw_to_tunnel(
         cache_dir,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .map_err(|e| match e {
+        // The candidate is the caller's, so a parser rejection is a bad
+        // request — the same classification `PUT /configs` uses. This covers
+        // the proxies, groups, and rules that now fail the load instead of
+        // being warn-skipped (issue #513).
+        RebuildError::Config(msg) => (StatusCode::BAD_REQUEST, msg),
+        RebuildError::Task(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+    })?;
     if let Some(missing) = expected_groups
         .iter()
         .find(|name| !proxies.contains_key(name.as_str()))
@@ -1070,18 +1077,37 @@ async fn commit_raw_candidate(
     Ok(())
 }
 
+/// Why a candidate config did not turn into a route table. Callers classify
+/// the two cases differently: a rejected config is the caller's fault, a failed
+/// task is ours.
+enum RebuildError {
+    /// The parser refused the config — an unbuildable proxy, group, or rule
+    /// (issue #513), an escaping provider path, a bad rule-provider payload.
+    Config(String),
+    /// The blocking rebuild task panicked or was cancelled.
+    Task(String),
+}
+
+impl std::fmt::Display for RebuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(msg) | Self::Task(msg) => f.write_str(msg),
+        }
+    }
+}
+
 async fn rebuild_from_raw_with_resolver_async(
     raw: RawConfig,
     resolver: Arc<meow_dns::Resolver>,
     providers: HashMap<String, Arc<ProxyProvider>>,
     cache_dir: std::path::PathBuf,
-) -> Result<meow_config::RebuildResult, String> {
+) -> Result<meow_config::RebuildResult, RebuildError> {
     tokio::task::spawn_blocking(move || {
         meow_config::rebuild_from_raw_runtime(&raw, Some(resolver), &providers, Some(&cache_dir))
     })
     .await
-    .map_err(|e| format!("config rebuild task failed: {e}"))?
-    .map_err(|e| e.to_string())
+    .map_err(|e| RebuildError::Task(format!("config rebuild task failed: {e}")))?
+    .map_err(|e| RebuildError::Config(e.to_string()))
 }
 
 // ── Subscriptions ────────────────────────────────────────────────────

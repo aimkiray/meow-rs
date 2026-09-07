@@ -4,13 +4,13 @@ use crate::statistics::Statistics;
 use crate::udp::{self, NatTable};
 use meow_common::{Metadata, Proxy, ProxyAdapter, Rule, TunnelMode};
 use meow_dns::Resolver;
-use meow_proxy::DirectAdapter;
+use meow_proxy::{DirectAdapter, RejectAdapter};
 use parking_lot::RwLock;
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Bundled rules + domain index + proxies map, swapped as one `Arc` on
 /// config reload. Reads on the connection-setup hot path take a single
@@ -70,6 +70,12 @@ pub struct TunnelInner {
     /// when Direct/Global mode bypasses the proxies map. Pre-built with the
     /// internal resolver so hostname dials avoid the OS resolver.
     pub direct: Arc<DirectAdapter>,
+    /// Refusal adapter for a matched rule whose target is not in the
+    /// registry. Such a rule is a broken policy, and answering it with
+    /// `direct` would send traffic the operator routed through a proxy
+    /// straight out instead (issue #513). Non-drop, so the connection fails
+    /// immediately rather than black-holing for a minute.
+    pub reject: Arc<RejectAdapter>,
     pub nat_table: NatTable,
     pub stats: Arc<Statistics>,
     /// Cold-reload admission boundary. TCP setup captures this generation
@@ -266,7 +272,9 @@ impl TunnelInner {
     }
 
     /// Map a rule-match result to the public `(proxy, rule name, payload)`
-    /// tuple, recording match statistics; `None` falls through to DIRECT.
+    /// tuple, recording match statistics. No rule matching falls through to
+    /// DIRECT; a *matched* rule whose target the registry does not hold is
+    /// refused instead, never dialled out directly.
     fn materialize_rule_match(
         &self,
         route: &RouteTable,
@@ -274,23 +282,44 @@ impl TunnelInner {
     ) -> (Arc<dyn ProxyAdapter>, SmolStr, SmolStr) {
         match result {
             Some(m) => {
-                let action = if m.adapter_name == "DIRECT" {
-                    "DIRECT"
-                } else if m.adapter_name.starts_with("REJECT") {
-                    "REJECT"
-                } else {
-                    "PROXY"
+                let target = m.adapter_name;
+                // A matched rule naming something the registry does not hold is
+                // a broken policy. Upstream mihomo routes it to DIRECT, which
+                // quietly sends traffic the operator routed through a proxy
+                // straight out, so refuse it instead — and report the refusal
+                // as the REJECT it now is rather than as a proxy hop that
+                // never happened (issue #513). DIRECT needs no registry entry:
+                // the tunnel owns a direct adapter for exactly this.
+                let (proxy, action): (Arc<dyn ProxyAdapter>, &str) = match route
+                    .proxies
+                    .get(target)
+                    .map(Arc::clone)
+                {
+                    Some(p) => {
+                        let action = if target == "DIRECT" {
+                            "DIRECT"
+                        } else if target.starts_with("REJECT") {
+                            "REJECT"
+                        } else {
+                            "PROXY"
+                        };
+                        (p, action)
+                    }
+                    None if target == "DIRECT" => {
+                        (Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>, "DIRECT")
+                    }
+                    None => {
+                        warn!(
+                            target,
+                            rule = %m.rule_type.as_str(),
+                            "matched rule names a target that is not in the registry; refusing the connection instead of dialling DIRECT"
+                        );
+                        (Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>, "REJECT")
+                    }
                 };
                 self.stats
                     .rule_match
                     .increment(m.rule_type.as_str(), action);
-                let proxy = route.proxies.get(m.adapter_name).cloned().map_or_else(
-                    || {
-                        debug!("proxy '{}' not found, using DIRECT", m.adapter_name);
-                        Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>
-                    },
-                    |p| p as Arc<dyn ProxyAdapter>,
-                );
                 // `rule_type.as_str()` is a `&'static str` — wrap it
                 // inline without heap.
                 (
@@ -324,6 +353,7 @@ impl Tunnel {
                 route: RwLock::new(Arc::new(RouteTable::empty())),
                 resolver,
                 direct,
+                reject: Arc::new(RejectAdapter::new(false)),
                 nat_table: udp::new_nat_table(),
                 stats: Arc::new(Statistics::new()),
                 tcp_generation: RwLock::new(0),

@@ -3,6 +3,32 @@ use meow_config::{load_config_from_str, ListenerSpec};
 // Some tests use #[tokio::test] because ShadowsocksAdapter plugin startup
 // internally requires a tokio runtime (tokio::process::Command).
 
+/// Load `yaml` and return why it was refused.
+///
+/// A proxy, group, or rule the parser cannot build fails the whole load rather
+/// than being dropped with a warning (issue #513), so "this node is rejected"
+/// is asserted on the error text — the message names the entry — and not on a
+/// registry key that is merely absent.
+async fn load_rejection(yaml: &str) -> String {
+    match load_config_from_str(yaml).await {
+        Ok(config) => panic!(
+            "this config must not load; registry: {:?}",
+            config.proxies.keys().collect::<Vec<_>>()
+        ),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Assert `yaml` is refused and that the refusal names the proxy `name`.
+async fn assert_proxy_rejected(yaml: &str, name: &str) -> String {
+    let err = load_rejection(yaml).await;
+    assert!(
+        err.contains(&format!("proxies: '{name}'")),
+        "the load must fail on '{name}' and say why: {err}"
+    );
+    err
+}
+
 #[tokio::test]
 async fn test_minimal_config() {
     let yaml = r#"
@@ -483,8 +509,7 @@ proxies:
       enabled: "true"
 "#;
     // A string "true" must not be silently treated as disabled.
-    let config = load_config_from_str(yaml).await.unwrap();
-    assert!(!config.proxies.contains_key("trojan-bad-mux"));
+    assert_proxy_rejected(yaml, "trojan-bad-mux").await;
 }
 
 #[tokio::test]
@@ -498,8 +523,7 @@ proxies:
     password: "password123"
     smux: true
 "#;
-    let config = load_config_from_str(yaml).await.unwrap();
-    assert!(!config.proxies.contains_key("trojan-scalar-mux"));
+    assert_proxy_rejected(yaml, "trojan-scalar-mux").await;
 }
 
 #[cfg(feature = "mux")]
@@ -521,7 +545,7 @@ proxies:
 }
 
 #[tokio::test]
-async fn test_unsupported_proxy_type_skipped() {
+async fn test_unsupported_proxy_type_rejected() {
     let yaml = r#"
 proxies:
   - name: "wireguard-server"
@@ -529,8 +553,8 @@ proxies:
     server: "1.2.3.4"
     port: 443
 "#;
-    let config = load_config_from_str(yaml).await.unwrap();
-    assert!(!config.proxies.contains_key("wireguard-server"));
+    let err = assert_proxy_rejected(yaml, "wireguard-server").await;
+    assert!(err.contains("wireguard"), "must name the type: {err}");
 }
 
 #[tokio::test]
@@ -559,11 +583,7 @@ proxies:
     uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
     cipher: zero
 "#;
-    let config = load_config_from_str(yaml).await.unwrap();
-    assert!(
-        !config.proxies.contains_key("vmess-zero"),
-        "cipher:zero must be rejected"
-    );
+    assert_proxy_rejected(yaml, "vmess-zero").await;
 }
 
 #[tokio::test]
@@ -764,8 +784,9 @@ rules:
 
 #[tokio::test]
 async fn test_proxy_parsing_ss_with_plugin_missing_binary() {
-    // A non-existent plugin binary causes proxy creation to fail.
-    // The config loader logs a warning and skips the proxy (does not panic).
+    // A non-existent plugin binary makes the adapter constructor fail, and
+    // that failure now fails the load instead of dropping the node with a
+    // warning (issue #513).
     let yaml = r#"
 proxies:
   - name: "ss-missing-plugin"
@@ -779,15 +800,18 @@ proxies:
       mode: http
       host: example.com
 "#;
-    let config = load_config_from_str(yaml).await.unwrap();
-    // The proxy is skipped because the plugin binary doesn't exist
-    assert!(!config.proxies.contains_key("ss-missing-plugin"));
+    let err = assert_proxy_rejected(yaml, "ss-missing-plugin").await;
+    assert!(
+        err.contains("nonexistent-plugin-binary-xyz"),
+        "must name the plugin that failed to launch: {err}"
+    );
 }
 
 #[tokio::test]
 async fn test_proxy_parsing_ss_with_plugin_opts_string() {
-    // Plugin opts can be passed as a pre-formatted string.
-    // Uses a non-existent plugin to verify config parsing succeeds.
+    // Plugin opts can be passed as a pre-formatted string; the node is still
+    // refused for its missing plugin binary, and that refusal now fails the
+    // load rather than dropping the node (issue #513).
     let yaml = r#"
 proxies:
   - name: "ss-plugin-str"
@@ -799,26 +823,29 @@ proxies:
     plugin: nonexistent-plugin-binary-xyz
     plugin-opts: "obfs=http;obfs-host=example.com"
 "#;
-    let config = load_config_from_str(yaml).await.unwrap();
-    // Skipped because plugin binary doesn't exist, but config parsing succeeds
-    assert!(!config.proxies.contains_key("ss-plugin-str"));
+    let err = assert_proxy_rejected(yaml, "ss-plugin-str").await;
+    assert!(
+        err.contains("nonexistent-plugin-binary-xyz"),
+        "the string plugin-opts must have parsed far enough to launch the plugin: {err}"
+    );
 }
 
 #[tokio::test]
 async fn test_proxy_parsing_ss_with_builtin_obfs_table() {
     // Built-in simple-obfs (`plugin: obfs` / `plugin: simple-obfs`) needs no
     // external binary, so a well-formed node must register; a node whose obfs
-    // config cannot be resolved to a valid mode must be skipped (never
-    // silently falling back to the "external plugin" path).
+    // config cannot be resolved to a valid mode must be refused outright
+    // (never silently falling back to the "external plugin" path, and never
+    // dropped with a warning while the rest of the config loads — issue #513).
     //
     // Each case supplies the `plugin:`/`plugin-opts:` tail (and, where it
-    // matters, the `server:` value) plus the expected registration outcome.
+    // matters, the `server:` value) plus the expected outcome.
     struct Case {
         label: &'static str,
         name: &'static str,
         server: &'static str,
         plugin_block: &'static str,
-        expect_present: bool,
+        expect_registered: bool,
     }
 
     let cases = [
@@ -827,70 +854,70 @@ async fn test_proxy_parsing_ss_with_builtin_obfs_table() {
             name: "ss-obfs-http",
             server: "1.2.3.4",
             plugin_block: "    plugin: obfs\n    plugin-opts:\n      mode: http\n      host: bing.com\n",
-            expect_present: true,
+            expect_registered: true,
         },
         Case {
             label: "yaml map, mode=tls",
             name: "ss-obfs-tls",
             server: "1.2.3.4",
             plugin_block: "    plugin: obfs\n    plugin-opts:\n      mode: tls\n      host: gateway.icloud.com\n",
-            expect_present: true,
+            expect_registered: true,
         },
         Case {
             label: "SIP003 string form `obfs=tls;obfs-host=...`",
             name: "ss-obfs-str",
             server: "1.2.3.4",
             plugin_block: "    plugin: obfs\n    plugin-opts: \"obfs=tls;obfs-host=cloudflare.com\"\n",
-            expect_present: true,
+            expect_registered: true,
         },
         Case {
             label: "legacy `plugin: simple-obfs` alias",
             name: "ss-simple-obfs",
             server: "1.2.3.4",
             plugin_block: "    plugin: simple-obfs\n    plugin-opts:\n      mode: http\n      host: bing.com\n",
-            expect_present: true,
+            expect_registered: true,
         },
         Case {
             label: "yaml map with SIP003-native keys `obfs`/`obfs-host`",
             name: "ss-obfs-sip003-map",
             server: "1.2.3.4",
             plugin_block: "    plugin: obfs\n    plugin-opts:\n      obfs: tls\n      obfs-host: gateway.icloud.com\n",
-            expect_present: true,
+            expect_registered: true,
         },
         Case {
             label: "mode parsed case-insensitively (TLS)",
             name: "ss-obfs-upper",
             server: "1.2.3.4",
             plugin_block: "    plugin: obfs\n    plugin-opts:\n      mode: TLS\n      host: cloudflare.com\n",
-            expect_present: true,
+            expect_registered: true,
         },
         Case {
             label: "host omitted falls back to the ss server name",
             name: "ss-obfs-default-host",
             server: "ss.example.org",
             plugin_block: "    plugin: obfs\n    plugin-opts:\n      mode: http\n",
-            expect_present: true,
+            expect_registered: true,
         },
         Case {
-            label: "missing `mode` is invalid -> skipped",
+            label: "missing `mode` is invalid -> refused",
             name: "ss-obfs-bad",
             server: "1.2.3.4",
             plugin_block: "    plugin: obfs\n    plugin-opts:\n      host: example.com\n",
-            expect_present: false,
+            expect_registered: false,
         },
         Case {
-            label: "no plugin-opts at all -> skipped, no external fallback",
+            label: "no plugin-opts at all -> refused, no external fallback",
             name: "ss-obfs-no-opts",
             server: "1.2.3.4",
             plugin_block: "    plugin: obfs\n",
-            expect_present: false,
+            expect_registered: false,
         },
         Case {
-            label: "unknown mode `quic` -> skipped",
+            label: "unknown mode `quic` -> refused",
             name: "ss-obfs-bad-mode",
             server: "1.2.3.4",
             plugin_block: "    plugin: obfs\n    plugin-opts:\n      mode: quic\n      host: foo\n",
-            expect_present: false,
+            expect_registered: false,
         },
     ];
 
@@ -900,13 +927,33 @@ async fn test_proxy_parsing_ss_with_builtin_obfs_table() {
             "proxies:\n  - name: \"{}\"\n    type: ss\n    server: \"{}\"\n    port: 8388\n    cipher: \"aes-256-gcm\"\n    password: \"password123\"\n{}",
             case.name, case.server, case.plugin_block
         );
-        let config = load_config_from_str(&yaml).await.unwrap();
-        let present = config.proxies.contains_key(case.name);
-        if present != case.expect_present {
-            failures.push(format!(
-                "[{}] proxy `{}`: expected present={}, got present={}",
-                case.label, case.name, case.expect_present, present
-            ));
+        if case.expect_registered {
+            match load_config_from_str(&yaml).await {
+                Ok(config) if config.proxies.contains_key(case.name) => {}
+                Ok(_) => failures.push(format!(
+                    "[{}] proxy `{}`: expected to register",
+                    case.label, case.name
+                )),
+                Err(e) => failures.push(format!(
+                    "[{}] proxy `{}`: expected to register, load failed: {e}",
+                    case.label, case.name
+                )),
+            }
+        } else {
+            // A node the parser cannot build fails the whole load and names
+            // itself (issue #513) — it is no longer dropped with a warning
+            // while the rest of the config keeps routing.
+            match load_config_from_str(&yaml).await {
+                Err(e) if e.to_string().contains(&format!("proxies: '{}'", case.name)) => {}
+                Err(e) => failures.push(format!(
+                    "[{}] proxy `{}`: load failed without naming it: {e}",
+                    case.label, case.name
+                )),
+                Ok(_) => failures.push(format!(
+                    "[{}] proxy `{}`: expected the load to fail",
+                    case.label, case.name
+                )),
+            }
         }
     }
     assert!(
@@ -978,18 +1025,21 @@ rules:
 }
 
 #[tokio::test]
-async fn test_missing_rule_provider_is_skipped() {
-    // Referencing an undefined rule-set should warn and skip, not panic.
+async fn test_missing_rule_provider_fails_the_load() {
+    // Referencing an undefined rule-set used to warn and skip, which quietly
+    // deleted the operator's REJECT rule while the config still loaded; it now
+    // fails the load and quotes the offending line (issue #513).
     let yaml = r#"
 mixed-port: 7890
 rules:
   - RULE-SET,nonexistent,REJECT
   - MATCH,DIRECT
 "#;
-    let config = load_config_from_str(yaml).await.unwrap();
-    // Only the MATCH rule survives.
-    assert_eq!(config.rules.len(), 1);
-    assert_eq!(config.rules[0].rule_type().to_string(), "MATCH");
+    let err = load_rejection(yaml).await;
+    assert!(
+        err.contains("RULE-SET,nonexistent,REJECT") && err.contains("nonexistent"),
+        "the load must fail quoting the rule: {err}"
+    );
 }
 
 // ─── SUB-RULE (M1.D-7) ─────────────────────────────────────────────

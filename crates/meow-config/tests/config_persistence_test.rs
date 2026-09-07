@@ -297,7 +297,7 @@ rules:
 }
 
 #[test]
-fn rebuild_from_raw_skips_invalid_proxy() {
+fn rebuild_from_raw_rejects_invalid_proxy() {
     let mut raw = minimal_raw_config();
     let mut bad_proxy = HashMap::new();
     bad_proxy.insert("name".to_string(), serde_yaml::Value::String("bad".into()));
@@ -306,9 +306,14 @@ fn rebuild_from_raw_skips_invalid_proxy() {
         serde_yaml::Value::String("unknown_protocol".into()),
     );
     raw.proxies = Some(vec![bad_proxy]);
-    // Should not fail, just skip
-    let (proxies, _) = rebuild_from_raw(&raw).unwrap();
-    assert!(!proxies.contains_key("bad"));
+    // An entry the parser cannot build fails the load rather than being
+    // dropped with a warning (issue #513): every rule naming it would
+    // otherwise lose its target.
+    let err = match rebuild_from_raw(&raw) {
+        Ok(_) => panic!("an unbuildable proxy must fail the rebuild"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("proxies: 'bad'"), "must name it: {err}");
 }
 
 // ── RawConfig serialization tests ────────────────────────────────

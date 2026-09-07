@@ -204,16 +204,17 @@ proxies:
       enable: true
       config: "!!!definitely_not_base64!!!"
 "#;
-    let cfg = load_config_from_str(yaml)
-        .await
-        .expect("config must still load (parse_vless logs and skips bad proxy)");
-    // Top-level parse must not register the proxy with malformed ECH config —
-    // parse_vless returns Err and the loader logs+skips, leaving only the
-    // built-in proxies (DIRECT, REJECT, REJECT-DROP).
+    // parse_vless's rejection of malformed ECH base64 now reaches the caller:
+    // an entry the parser cannot build fails the load instead of being logged
+    // and skipped, which is what kept the rejection from being silently
+    // downgraded to "no ECH" (issue #513).
+    let err = match load_config_from_str(yaml).await {
+        Ok(_) => panic!("malformed ECH base64 must fail the config load"),
+        Err(e) => e.to_string(),
+    };
     assert!(
-        !cfg.proxies.contains_key("bad-ech"),
-        "proxy with invalid ECH base64 must NOT register; got: {:?}",
-        cfg.proxies.keys().collect::<Vec<_>>()
+        err.contains("proxies: 'bad-ech'"),
+        "the failure must name the rejected proxy: {err}"
     );
 }
 

@@ -103,6 +103,34 @@ where
     (result, cap_clone.captured())
 }
 
+// ─── Rejection helpers ───────────────────────────────────────────────────────
+
+/// Load `yaml` and return why it was refused.
+///
+/// A proxy the parser cannot build fails the whole load rather than being
+/// dropped with a warning (issue #513), so "this node is rejected" is asserted
+/// on the error text — which names the entry — and not on a registry key that
+/// is merely absent.
+async fn load_rejection(yaml: &str) -> String {
+    match load_config_from_str(yaml).await {
+        Ok(config) => panic!(
+            "this config must not load; registry: {:?}",
+            config.proxies.keys().collect::<Vec<_>>()
+        ),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Assert `yaml` is refused and that the refusal names the proxy `name`.
+async fn assert_proxy_rejected(yaml: &str, name: &str) -> String {
+    let err = load_rejection(yaml).await;
+    assert!(
+        err.contains(&format!("proxies: '{name}'")),
+        "the load must fail on '{name}' and say why: {err}"
+    );
+    err
+}
+
 // ─── Base YAML helpers ───────────────────────────────────────────────────────
 
 const MINIMAL_VLESS: &str = r#"
@@ -222,12 +250,11 @@ proxies:
         .expect("flow: xtls-rprx-vision with tls: true must parse OK");
 }
 
-// ─── D6: unknown flow → hard error (proxy skipped) ───────────────────────────
+// ─── D6: unknown flow → load refused ─────────────────────────────────────────
 
 /// D6: `parse_vless_flow_unknown_hard_errors`
 ///
-/// Unknown flow string → proxy parse error; proxy is absent from config.
-/// The config loader warns-and-skips (does not crash the full config load).
+/// Unknown flow string → proxy parse error, which fails the whole load.
 /// upstream: `adapter/outbound/vless.go` ignores unknown flows.
 /// NOT accepted — Class A per ADR-0002: unknown flow may skip security processing.
 #[tokio::test]
@@ -241,20 +268,18 @@ proxies:
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
     flow: "xtls-rprx-unknown"
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(yaml, "v").await;
     assert!(
-        !config.proxies.contains_key("v"),
-        "proxy with unknown flow must be skipped (not registered)"
+        err.contains("xtls-rprx-unknown"),
+        "the refusal must name the unknown flow: {err}"
     );
 }
 
-// ─── D7: flow: xtls-rprx-direct → proxy skipped ──────────────────────────────
+// ─── D7: flow: xtls-rprx-direct → load refused ───────────────────────────────
 
 /// D7: `parse_vless_flow_deprecated_direct_hard_errors`
 ///
-/// `flow: "xtls-rprx-direct"` → proxy parse error; proxy absent from config.
+/// `flow: "xtls-rprx-direct"` → proxy parse error, which fails the whole load.
 /// upstream: `adapter/outbound/vless.go` accepts this as a deprecated alias.
 /// NOT accepted — Class A per ADR-0002: security regression vs Vision.
 #[tokio::test]
@@ -268,20 +293,18 @@ proxies:
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
     flow: "xtls-rprx-direct"
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(yaml, "v").await;
     assert!(
-        !config.proxies.contains_key("v"),
-        "proxy with xtls-rprx-direct flow must be skipped (deprecated — Class A)"
+        err.contains("xtls-rprx-direct"),
+        "the refusal must name the deprecated flow: {err}"
     );
 }
 
-// ─── D8: flow: xtls-rprx-splice → proxy skipped ──────────────────────────────
+// ─── D8: flow: xtls-rprx-splice → load refused ───────────────────────────────
 
 /// D8: `parse_vless_flow_deprecated_splice_hard_errors`
 ///
-/// `flow: "xtls-rprx-splice"` → proxy parse error; proxy absent from config.
+/// `flow: "xtls-rprx-splice"` → proxy parse error, which fails the whole load.
 /// upstream: `adapter/outbound/vless.go` accepts as deprecated.
 /// NOT accepted — Class A per ADR-0002.
 #[tokio::test]
@@ -295,12 +318,10 @@ proxies:
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
     flow: "xtls-rprx-splice"
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(yaml, "v").await;
     assert!(
-        !config.proxies.contains_key("v"),
-        "proxy with xtls-rprx-splice flow must be skipped (deprecated — Class A)"
+        err.contains("xtls-rprx-splice"),
+        "the refusal must name the deprecated flow: {err}"
     );
 }
 
@@ -323,12 +344,10 @@ proxies:
     reality-opts:
       public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(yaml, "v").await;
     assert!(
-        !config.proxies.contains_key("v"),
-        "proxy with reality-opts but no client-fingerprint must be skipped"
+        err.contains("client-fingerprint"),
+        "the refusal must name the missing field: {err}"
     );
 }
 
@@ -345,17 +364,15 @@ proxies:
     reality-opts:
       public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(yaml, "v").await;
     assert!(
-        !config.proxies.contains_key("v"),
-        "proxy with reality-opts but tls=false must be skipped"
+        err.contains("reality-opts requires `tls: true`"),
+        "the refusal must demand tls: true: {err}"
     );
 }
 
 #[tokio::test]
-async fn parse_vless_reality_opts_invalid_public_key_skipped() {
+async fn parse_vless_reality_opts_invalid_public_key_rejected() {
     let yaml = r#"
 proxies:
   - name: v
@@ -368,17 +385,15 @@ proxies:
     reality-opts:
       public-key: abc123
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(yaml, "v").await;
     assert!(
-        !config.proxies.contains_key("v"),
-        "proxy with invalid REALITY public key must be skipped"
+        err.contains("invalid REALITY public key"),
+        "the refusal must name the bad public key: {err}"
     );
 }
 
 #[tokio::test]
-async fn parse_vless_reality_opts_invalid_short_id_skipped() {
+async fn parse_vless_reality_opts_invalid_short_id_rejected() {
     let yaml = r#"
 proxies:
   - name: v
@@ -392,12 +407,10 @@ proxies:
       public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
       short-id: 001122334455667788
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(yaml, "v").await;
     assert!(
-        !config.proxies.contains_key("v"),
-        "proxy with >8-byte REALITY short-id must be skipped"
+        err.contains("invalid REALITY short ID"),
+        "the refusal must name the bad short-id: {err}"
     );
 }
 
@@ -663,12 +676,12 @@ proxies:
     );
 }
 
-// ─── D12: vision + no TLS → proxy skipped ────────────────────────────────────
+// ─── D12: vision + no TLS → load refused ─────────────────────────────────────
 
 /// D12: `parse_vless_vision_without_tls_hard_errors`
 ///
 /// `flow: "xtls-rprx-vision"` with `tls: false` and no TLS-enforcing transport →
-/// proxy parse error; proxy absent from config.
+/// proxy parse error, which fails the whole load.
 /// Class A per ADR-0002: Vision without outer TLS is a no-op the user did not intend.
 #[tokio::test]
 async fn parse_vless_vision_without_tls_hard_errors() {
@@ -682,12 +695,10 @@ proxies:
     tls: false
     flow: "xtls-rprx-vision"
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(yaml, "v").await;
     assert!(
-        !config.proxies.contains_key("v"),
-        "proxy with vision + no TLS must be skipped (Vision without TLS is a no-op — Class A)"
+        err.contains("xtls-rprx-vision requires an encrypting transport"),
+        "the refusal must explain that Vision needs TLS: {err}"
     );
 }
 
@@ -717,11 +728,11 @@ proxies:
         .expect("vision + grpc (TLS-enforcing) must parse OK without tls: true");
 }
 
-// ─── D14: encryption: non-none → proxy skipped ───────────────────────────────
+// ─── D14: encryption: non-none → load refused ────────────────────────────────
 
 /// D14: `parse_vless_encryption_non_none_hard_errors`
 ///
-/// `encryption: "aes-128-gcm"` → proxy parse error; proxy absent from config.
+/// `encryption: "aes-128-gcm"` → proxy parse error, which fails the whole load.
 /// upstream: also errors on non-"none" values — this is a match, not a divergence.
 #[tokio::test]
 async fn parse_vless_encryption_non_none_hard_errors() {
@@ -734,12 +745,10 @@ proxies:
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
     encryption: "aes-128-gcm"
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(yaml, "v").await;
     assert!(
-        !config.proxies.contains_key("v"),
-        "proxy with non-none encryption must be skipped"
+        err.contains("aes-128-gcm"),
+        "the refusal must name the rejected encryption value: {err}"
     );
 }
 
@@ -769,8 +778,9 @@ proxies:
 /// The post-quantum `encryption: mlkem768x25519plus…` line from the issue #301
 /// 3x-ui config — using the reporter's exact key, whose base64 has non-canonical
 /// trailing bits (Go decodes it; strict decoders would not). The proxy builds
-/// with the `vless-encryption` feature and is skipped (with a feature-pointing
-/// error) without it.
+/// with the `vless-encryption` feature; without it the field cannot be honoured,
+/// so the load is refused with an error pointing at the missing feature
+/// (issue #513).
 ///
 /// (REALITY is exercised separately — `reality-opts` additionally needs the
 /// `boring-tls` feature, which the shipping app build enables.)
@@ -790,20 +800,25 @@ proxies:
     encryption: mlkem768x25519plus.native.0rtt.DA7B2WRj7X2zGFwMelbIbcaoUrpLjzoPpmydYW8NvQW
     client-fingerprint: chrome
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip if feature absent)");
 
     #[cfg(feature = "vless-encryption")]
-    assert!(
-        config.proxies.contains_key("vpn26"),
-        "issue #301 encryption config must build a proxy with the vless-encryption feature"
-    );
+    {
+        let config = load_config_from_str(yaml)
+            .await
+            .expect("issue #301 encryption config must build with the vless-encryption feature");
+        assert!(
+            config.proxies.contains_key("vpn26"),
+            "issue #301 encryption config must build a proxy with the vless-encryption feature"
+        );
+    }
     #[cfg(not(feature = "vless-encryption"))]
-    assert!(
-        !config.proxies.contains_key("vpn26"),
-        "mlkem768x25519plus encryption must be skipped without the vless-encryption feature"
-    );
+    {
+        let err = assert_proxy_rejected(yaml, "vpn26").await;
+        assert!(
+            err.contains("vless-encryption"),
+            "the refusal must point at the missing feature: {err}"
+        );
+    }
 }
 
 // ─── D16: mux enabled → sing-mux attached ────────────────────────────────────
@@ -867,8 +882,9 @@ proxies:
     );
 }
 
-/// D16e: unknown mux protocol → proxy rejected with a loud warn (meow's
-/// warn+skip parse semantics; mihomo hard-errors on the same input).
+/// D16e: unknown mux protocol → the load is refused, naming the proxy. mihomo
+/// hard-errors on the same input; meow used to warn and drop the node, which
+/// left every rule naming it without a target (issue #513).
 #[cfg(feature = "mux")]
 #[tokio::test]
 async fn parse_vless_mux_unknown_protocol_rejects_proxy() {
@@ -883,19 +899,10 @@ proxies:
       enabled: true
       protocol: not-a-protocol
 "#;
-    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
-    let config = result.expect("unknown mux protocol must not fail the whole config");
+    let err = assert_proxy_rejected(yaml, "v").await;
     assert!(
-        !config.proxies.contains_key("v"),
-        "proxy with unknown mux protocol must be skipped"
-    );
-    let warns = lines
-        .iter()
-        .filter(|l| l.contains("unknown mux protocol"))
-        .count();
-    assert!(
-        warns >= 1,
-        "expected an unknown-mux-protocol warn; {lines:?}"
+        err.contains("unknown mux protocol"),
+        "the refusal must name the bad protocol: {err}"
     );
 }
 
@@ -983,17 +990,10 @@ proxies:
     mux:
       enabled: true
 "#;
-    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
-    let config = result.expect("invalid proxy must not fail the whole config");
+    let err = assert_proxy_rejected(yaml, "v").await;
     assert!(
-        !config.proxies.contains_key("v"),
-        "vision + sing-mux (h2mux default) node must be skipped"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("incompatible with sing-mux")),
-        "expected a sing-mux incompatibility warn; {lines:?}"
+        err.contains("incompatible with sing-mux"),
+        "the refusal must explain the sing-mux incompatibility: {err}"
     );
 }
 
@@ -1013,17 +1013,10 @@ proxies:
       enabled: true
       protocol: muxcool
 "#;
-    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
-    let config = result.expect("invalid proxy must not fail the whole config");
+    let err = assert_proxy_rejected(yaml, "t").await;
     assert!(
-        !config.proxies.contains_key("t"),
-        "trojan node with muxcool must be skipped"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("muxcool") && l.contains("VLESS")),
-        "expected a VLESS/VMess-only warn; {lines:?}"
+        err.contains("muxcool") && err.contains("VLESS/VMess-only"),
+        "the refusal must say muxcool is VLESS/VMess-only: {err}"
     );
 }
 
@@ -1094,17 +1087,10 @@ proxies:
       enabled: true
       protocol: muxcool
 "#;
-    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
-    let config = result.expect("invalid proxy must not fail the whole config");
+    let err = assert_proxy_rejected(yaml, "s").await;
     assert!(
-        !config.proxies.contains_key("s"),
-        "ss node with muxcool must be skipped"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("muxcool") && l.contains("VLESS")),
-        "expected a VLESS/VMess-only warn; {lines:?}"
+        err.contains("muxcool") && err.contains("VLESS/VMess-only"),
+        "the refusal must say muxcool is VLESS/VMess-only: {err}"
     );
 }
 
@@ -1379,11 +1365,11 @@ proxies:
         .expect("hex-only UUID must be accepted");
 }
 
-// ─── D19: invalid UUID → proxy skipped ───────────────────────────────────────
+// ─── D19: invalid UUID → load refused ────────────────────────────────────────
 
 /// D19: `parse_vless_uuid_invalid_hard_errors`
 ///
-/// `uuid: "not-a-uuid"` → proxy parse error; proxy absent from config.
+/// `uuid: "not-a-uuid"` → proxy parse error, which fails the whole load.
 /// guard-rail: an invalid UUID would produce a zeroed or garbage auth ID with no diagnostic.
 #[tokio::test]
 async fn parse_vless_uuid_invalid_hard_errors() {
@@ -1395,20 +1381,18 @@ proxies:
     port: 443
     uuid: "not-a-uuid"
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(yaml, "v").await;
     assert!(
-        !config.proxies.contains_key("v"),
-        "proxy with invalid uuid must be skipped"
+        err.contains("invalid uuid 'not-a-uuid'"),
+        "the refusal must name the bad uuid: {err}"
     );
 }
 
-// ─── D20: server > 255 bytes → proxy skipped ─────────────────────────────────
+// ─── D20: server > 255 bytes → load refused ──────────────────────────────────
 
 /// D20: `parse_vless_server_domain_over_255_errors`
 ///
-/// `server:` is a 256-char hostname → proxy parse error; proxy absent from config.
+/// `server:` is a 256-char hostname → proxy parse error, which fails the whole load.
 /// Class A per ADR-0002: wrong destination, no diagnostic on silent truncate.
 /// upstream: `transport/vless/encoding.go` does not enforce this limit.
 /// NOT silent truncation — 256-byte domain in ATYP 0x02 wraps to 0 bytes, wrong destination.
@@ -1425,12 +1409,10 @@ proxies:
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
 "#
     );
-    let config = load_config_from_str(&yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(&yaml, "v").await;
     assert!(
-        !config.proxies.contains_key("v"),
-        "proxy with server > 255 bytes must be skipped (Class A)"
+        err.contains("256 bytes") && err.contains("max 255"),
+        "the refusal must report the length limit: {err}"
     );
 }
 
@@ -1476,7 +1458,7 @@ proxies:
     assert!(config.proxies.contains_key("vless-xhttp-full"));
 }
 #[tokio::test]
-async fn parse_vless_xhttp_unsupported_mode_skipped() {
+async fn parse_vless_xhttp_unsupported_mode_rejected() {
     let yaml = r#"
 proxies:
   - name: vless-xhttp-bad-mode
@@ -1489,17 +1471,15 @@ proxies:
     xhttp-opts:
       mode: auto
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(yaml, "vless-xhttp-bad-mode").await;
     assert!(
-        !config.proxies.contains_key("vless-xhttp-bad-mode"),
-        "proxy with unsupported xhttp mode must be skipped"
+        err.contains("unsupported xhttp mode 'auto'"),
+        "the refusal must name the unsupported mode: {err}"
     );
 }
 
 #[tokio::test]
-async fn parse_vless_xhttp_invalid_padding_range_skipped() {
+async fn parse_vless_xhttp_invalid_padding_range_rejected() {
     let yaml = r#"
 proxies:
   - name: vless-xhttp-bad-pad
@@ -1512,17 +1492,15 @@ proxies:
     xhttp-opts:
       x-padding-bytes: 900-100
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(yaml, "vless-xhttp-bad-pad").await;
     assert!(
-        !config.proxies.contains_key("vless-xhttp-bad-pad"),
-        "proxy with inverted padding range must be skipped"
+        err.contains("min (900) exceeds max (100)"),
+        "the refusal must report the inverted range: {err}"
     );
 }
 
 #[tokio::test]
-async fn parse_vless_xhttp_invalid_padding_shape_skipped() {
+async fn parse_vless_xhttp_invalid_padding_shape_rejected() {
     let yaml = r#"
 proxies:
   - name: vless-xhttp-bad-pad-shape
@@ -1535,11 +1513,9 @@ proxies:
     xhttp-opts:
       x-padding-bytes: 100
 "#;
-    let config = load_config_from_str(yaml)
-        .await
-        .expect("config load must succeed (warn-and-skip)");
+    let err = assert_proxy_rejected(yaml, "vless-xhttp-bad-pad-shape").await;
     assert!(
-        !config.proxies.contains_key("vless-xhttp-bad-pad-shape"),
-        "proxy with invalid padding shape must be skipped"
+        err.contains("'min-max' string or 2-element integer array"),
+        "the refusal must describe the accepted shapes: {err}"
     );
 }

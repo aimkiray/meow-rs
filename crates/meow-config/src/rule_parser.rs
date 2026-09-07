@@ -3,12 +3,14 @@ use std::sync::Arc;
 
 use meow_common::Rule;
 use meow_rules::{ParserContext, RuleSet, RuleSetRule};
-use tracing::warn;
 
 use crate::sub_rules_parser::{build_sub_rule_rule, parse_sub_rule_reference, SubRuleBlocks};
 
 /// Parse rules with no rule-providers or sub-rule blocks available.
-pub fn parse_rules(raw_rules: &[String], ctx: &ParserContext) -> Vec<Box<dyn Rule>> {
+pub fn parse_rules(
+    raw_rules: &[String],
+    ctx: &ParserContext,
+) -> Result<Vec<Box<dyn Rule>>, String> {
     parse_rules_with_providers(raw_rules, &HashMap::new(), ctx)
 }
 
@@ -19,18 +21,23 @@ pub fn parse_rules_with_providers(
     raw_rules: &[String],
     providers: &HashMap<String, Arc<dyn RuleSet>>,
     ctx: &ParserContext,
-) -> Vec<Box<dyn Rule>> {
+) -> Result<Vec<Box<dyn Rule>>, String> {
     parse_rules_full(raw_rules, providers, ctx, &HashMap::new())
 }
 
 /// Parse the `rules:` block with full resolver context — providers, ctx,
 /// and pre-resolved sub-rule blocks for `SUB-RULE,<name>` entries.
+///
+/// A single unparseable line fails the whole block: upstream mihomo drops it
+/// with a warning and keeps routing the rest, which turns a typo into a
+/// silent hole in the policy — traffic the operator wrote a rule for now
+/// falls through to whatever comes next, usually `MATCH,DIRECT` (issue #513).
 pub fn parse_rules_full(
     raw_rules: &[String],
     providers: &HashMap<String, Arc<dyn RuleSet>>,
     ctx: &ParserContext,
     sub_rules: &SubRuleBlocks,
-) -> Vec<Box<dyn Rule>> {
+) -> Result<Vec<Box<dyn Rule>>, String> {
     let mut rules: Vec<Box<dyn Rule>> = Vec::new();
     for line in raw_rules {
         let line = line.trim();
@@ -39,10 +46,10 @@ pub fn parse_rules_full(
         }
         match parse_one_rule_or_subrule(line, providers, ctx, sub_rules) {
             Ok(rule) => rules.push(rule),
-            Err(e) => warn!("Failed to parse rule '{}': {}", line, e),
+            Err(e) => return Err(format!("rules: cannot parse '{line}': {e}")),
         }
     }
-    rules
+    Ok(rules)
 }
 
 /// Parse a single rule line. Handles `RULE-SET,<name>,...`,

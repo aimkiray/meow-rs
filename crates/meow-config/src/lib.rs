@@ -788,6 +788,24 @@ fn rebuild_from_raw_impl(
     shared_ctx: Option<&meow_rules::ParserContext>,
     prefetched_payloads: Option<&rule_provider::PrefetchedPayloads>,
 ) -> Result<RebuildResult, anyhow::Error> {
+    // Fail hard on any rule- or proxy-provider path that would escape the
+    // provider cache directory — before any fetch or on-disk write happens,
+    // so a hostile `PUT /configs` is rejected without touching the
+    // filesystem (issue #429). Proxy-providers get the same loud failure as
+    // rule-providers (PR #444 review follow-up) instead of being warn-skipped
+    // with every group referencing them silently degrading.
+    //
+    // This runs first because an unbuildable group now fails the load too
+    // (issue #513): a group whose members all come from a provider slot it
+    // cannot resolve would otherwise report its own emptiness and bury the
+    // containment violation that caused it.
+    if let Some(map) = raw.rule_providers.as_ref() {
+        rule_provider::validate_paths(map, cache_dir)?;
+    }
+    if let Some(map) = raw.proxy_providers.as_ref() {
+        proxy_provider::validate_paths(map, cache_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
     let ipv6 = effective_ipv6(raw.ipv6);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
     // `dialer-proxy` front hops are resolved by name against this registry on
@@ -836,7 +854,17 @@ fn rebuild_from_raw_impl(
                     .into();
                 proxies.insert(key, proxy);
             }
-            Err(e) => warn!("Failed to parse proxy: {}", e),
+            // Upstream mihomo warns and keeps loading, which leaves every
+            // group and rule naming that proxy resolving to nothing — the
+            // traffic then degrades to DIRECT rather than failing. Name the
+            // offending proxy so the load failure is actionable (issue #513).
+            Err(e) => {
+                let name = raw_proxy
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unnamed>");
+                return Err(anyhow::anyhow!("proxies: '{name}': {e}"));
+            }
         }
     }
 
@@ -894,7 +922,13 @@ fn rebuild_from_raw_impl(
                         let name = SmolStr::from(group.name());
                         proxies.insert(name, group);
                     }
-                    Err(e) => warn!("Failed to parse proxy group '{}': {}", raw_group.name, e),
+                    // The lenient pass already absorbs missing members; an
+                    // `Err` here means the group itself is unusable. Upstream
+                    // mihomo warns and continues, leaving every rule that
+                    // names it without a target (issue #513).
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("proxy-groups: '{}': {e}", raw_group.name))
+                    }
                 }
             }
             break;
@@ -940,7 +974,11 @@ fn rebuild_from_raw_impl(
                     "Auto-created GLOBAL selector with all proxies"
                 );
             }
-            Err(e) => warn!("Failed to create GLOBAL selector: {}", e),
+            // GLOBAL is synthesized from the registry itself, so a failure
+            // here is not a bad member list but an unusable group — and
+            // rules or frontends naming it would silently lose their target
+            // (issue #513).
+            Err(e) => return Err(anyhow::anyhow!("proxy-groups: 'GLOBAL': {e}")),
         }
     }
 
@@ -948,19 +986,6 @@ fn rebuild_from_raw_impl(
     // Per-provider `proxy:` overrides resolve against the full registry —
     // groups and provider-sourced proxies included (issue #377).
     let registry_lookup = |name: &str| proxies.get(name).cloned();
-
-    // Fail hard on any rule- or proxy-provider path that would escape the
-    // provider cache directory — before any fetch or on-disk write happens,
-    // so a hostile `PUT /configs` is rejected without touching the
-    // filesystem (issue #429). Proxy-providers get the same loud failure as
-    // rule-providers (PR #444 review follow-up) instead of being warn-skipped
-    // with every group referencing them silently degrading.
-    if let Some(map) = raw.rule_providers.as_ref() {
-        rule_provider::validate_paths(map, cache_dir)?;
-    }
-    if let Some(map) = raw.proxy_providers.as_ref() {
-        proxy_provider::validate_paths(map, cache_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
 
     // Fetch/read rule-provider payload bytes once — the parser-context build
     // scans them for geo keys (issue #277) and the provider load below parses
@@ -1016,22 +1041,8 @@ fn rebuild_from_raw_impl(
         &ruleset_map,
         ctx,
         &sub_rules,
-    );
-
-    // Validate: any `SUB-RULE,<name>` in top-level rules must reference a
-    // defined block. `parse_rules_full` warns on unknown blocks; promote
-    // undefined-block to a hard error here (Class A per ADR-0002).
-    if let Some(raw_rules) = raw.rules.as_deref() {
-        for line in raw_rules {
-            if let Some(name) = sub_rules_parser::parse_sub_rule_reference(line) {
-                if !sub_rules.contains_key(&name) {
-                    return Err(anyhow::anyhow!(
-                        "rules: SUB-RULE,{name} references undefined sub-rule block"
-                    ));
-                }
-            }
-        }
-    }
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Publish the finished registry: the `dialer-proxy` chains bound above
     // resolve their front hop by name against it, and only now does it hold the

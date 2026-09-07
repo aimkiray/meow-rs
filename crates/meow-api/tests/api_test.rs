@@ -1086,7 +1086,12 @@ async fn get_subscriptions_reports_counts() {
     // Subscription replaces proxies/groups/rules with remote data
     let mut proxy1 = std::collections::HashMap::new();
     proxy1.insert("name".to_string(), serde_yaml::Value::String("S1".into()));
-    proxy1.insert("type".to_string(), serde_yaml::Value::String("ss".into()));
+    // `direct` is the smallest node that builds from a name alone — an
+    // unparseable proxy now fails the load instead of being warn-skipped.
+    proxy1.insert(
+        "type".to_string(),
+        serde_yaml::Value::String("direct".into()),
+    );
     raw.proxies = Some(vec![proxy1]);
     raw.proxy_groups = Some(vec![RawProxyGroup {
         name: "G".into(),
@@ -1140,7 +1145,12 @@ async fn delete_subscription_clears_data() {
     }]);
     let mut proxy1 = std::collections::HashMap::new();
     proxy1.insert("name".to_string(), serde_yaml::Value::String("S1".into()));
-    proxy1.insert("type".to_string(), serde_yaml::Value::String("ss".into()));
+    // `direct` is the smallest node that builds from a name alone — an
+    // unparseable proxy now fails the load instead of being warn-skipped.
+    proxy1.insert(
+        "type".to_string(),
+        serde_yaml::Value::String("direct".into()),
+    );
     raw.proxies = Some(vec![proxy1]);
     raw.proxy_groups = Some(vec![RawProxyGroup {
         name: "G".into(),

@@ -131,6 +131,18 @@ to upstream mihomo, the following are hard load-time errors instead of warnings:
 - Duplicate listener ports or names.
 - Deprecated VLESS flows (`xtls-rprx-direct` / `-splice`) and VMess `cipher: zero`.
 - Unsupported Hysteria2 options (`certificate`, `private-key`, server-side ECH, …).
+- Any `proxies`, `proxy-groups`, or `rules` entry that cannot be built. Upstream drops the
+  entry with a warning and keeps loading; meow-rs fails the load and names the entry,
+  because a dropped entry leaves every rule pointing at it without a target.
+
+A rule that matches but names a target the registry does not hold is refused at connection
+time rather than sent out directly — upstream falls back to DIRECT, which quietly leaks
+traffic the operator routed through a proxy. A rule naming `DIRECT`, and a connection no
+rule matches, still use the built-in DIRECT adapter.
+
+Nodes fetched by a [proxy-provider](./providers) are held to the opposite rule: a
+provider document is remote input, so one unparseable node is dropped with a warning and
+the rest of the subscription still loads.
 
 Forward-compatibility fields that meow-rs does not implement (e.g. some `geodata`
 sub-keys) are accepted and ignored with a one-time warning so upstream configs still load.
