@@ -9,13 +9,15 @@
 //!
 //! upstream: mihomo `component/proxydialer` + `BasicOption.NewDialer`.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use meow_common::{ConnType, Metadata, Network, Proxy, ProxyConn};
 use meow_transport::Stream;
+use smol_str::SmolStr;
 
 /// A pluggable dialer for the underlying connection to a proxy server.
 ///
@@ -162,6 +164,105 @@ impl TcpDialer for ProxyDialer {
             ..Default::default()
         };
         self.dial_metadata(meta).await
+    }
+
+    fn is_proxy(&self) -> bool {
+        true
+    }
+}
+
+/// An immutable snapshot of a finished config build, shared with every
+/// `dialer-proxy` bound from it.
+pub type ProxySnapshot = Arc<HashMap<SmolStr, Arc<dyn Proxy>>>;
+
+/// The proxies built from one config, published when the build completes and
+/// consulted by name on every chained dial.
+///
+/// mihomo resolves `dialer-proxy` the same way (`component/proxydialer/byname.go`).
+/// Capturing the front proxy as an `Arc` while the config is still being built
+/// freezes a stale entry instead: proxy groups clone their members before the
+/// dialer pass replaces them, and a group-valued dialer does not exist yet when
+/// the outbound chaining through it is built (issue #513).
+#[derive(Clone, Default)]
+pub struct ProxyRegistry {
+    proxies: Arc<RwLock<Option<ProxySnapshot>>>,
+}
+
+impl ProxyRegistry {
+    /// Publish the finished registry. Called once per config build, after every
+    /// leaf proxy and group exists; a rebuild publishes into its own registry,
+    /// so adapters from a previous config keep resolving their own snapshot.
+    pub fn publish(&self, proxies: ProxySnapshot) {
+        *self.proxies.write().unwrap() = Some(proxies);
+    }
+
+    fn resolve(&self, name: &str) -> Option<Arc<dyn Proxy>> {
+        self.proxies.read().unwrap().as_ref()?.get(name).cloned()
+    }
+}
+
+/// The front hop of a `dialer-proxy` chain, addressed by name.
+#[derive(Clone)]
+pub struct DialerTarget {
+    name: SmolStr,
+    registry: ProxyRegistry,
+}
+
+impl DialerTarget {
+    pub fn new(name: impl Into<SmolStr>, registry: ProxyRegistry) -> Self {
+        Self {
+            name: name.into(),
+            registry,
+        }
+    }
+
+    /// Registry key of the front proxy, as written in the config.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// `None` when the registry has not been published yet or no longer holds
+    /// the name. Callers must fail loudly — falling back to a direct dial would
+    /// leak past a chain the user configured for policy reasons.
+    pub fn resolve(&self) -> Option<Arc<dyn Proxy>> {
+        self.registry.resolve(&self.name)
+    }
+
+    /// Error for an unresolvable target, worded for the two error types the
+    /// chained dial paths report through.
+    pub fn missing_error(&self) -> String {
+        format!("dialer-proxy '{}' is not in the proxy registry", self.name)
+    }
+}
+
+/// [`TcpDialer`] for a `dialer-proxy` front hop that is resolved by name at
+/// dial time. Equivalent to mihomo's `proxydialer.NewByNameDialer`.
+pub struct NamedProxyDialer {
+    target: DialerTarget,
+}
+
+impl NamedProxyDialer {
+    pub fn new(target: DialerTarget) -> Self {
+        Self { target }
+    }
+}
+
+#[async_trait]
+impl TcpDialer for NamedProxyDialer {
+    async fn dial(&self, host: &str, port: u16) -> io::Result<Box<dyn Stream>> {
+        let front = self
+            .target
+            .resolve()
+            .ok_or_else(|| io::Error::other(self.target.missing_error()))?;
+        ProxyDialer::new(front).dial(host, port).await
+    }
+
+    async fn dial_addr(&self, addr: SocketAddr) -> io::Result<Box<dyn Stream>> {
+        let front = self
+            .target
+            .resolve()
+            .ok_or_else(|| io::Error::other(self.target.missing_error()))?;
+        ProxyDialer::new(front).dial_addr(addr).await
     }
 
     fn is_proxy(&self) -> bool {
