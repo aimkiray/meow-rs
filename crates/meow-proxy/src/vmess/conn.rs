@@ -38,15 +38,31 @@ pub fn spawn_vmess_relay(
                 return;
             }
 
-            while let Ok(plaintext) = read_cipher.read_record(&mut rd).await {
-                if proxy_wr.write_all(&plaintext).await.is_err() {
-                    break;
+            loop {
+                match read_cipher.read_record(&mut rd).await {
+                    Ok(plaintext) => {
+                        if proxy_wr.write_all(&plaintext).await.is_err() {
+                            break;
+                        }
+                    }
+                    // A peer closing mid-stream is ordinary. Anything else — a
+                    // failed record authentication, an exhausted AEAD nonce
+                    // budget — is the reason this connection is being retired.
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => {
+                        tracing::warn!(
+                            "vmess: dropping connection after a failed body record: {e}"
+                        );
+                        break;
+                    }
                 }
             }
             let _ = proxy_wr.shutdown().await;
         });
 
-        // Downstream: proxy_rd → encrypt → stream
+        // Downstream: proxy_rd → encrypt → stream. A failed record ends the
+        // relay and the shutdown below closes the physical stream — that is how
+        // an exhausted AEAD nonce budget retires the connection (issue #513).
         let write_task = tokio::spawn(async move {
             let mut buf = vec![0u8; BodyCipher::max_plaintext()];
             loop {
@@ -54,7 +70,8 @@ pub fn spawn_vmess_relay(
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
-                if write_cipher.write_record(&mut wr, &buf[..n]).await.is_err() {
+                if let Err(e) = write_cipher.write_record(&mut wr, &buf[..n]).await {
+                    tracing::warn!("vmess: dropping connection after a failed body record: {e}");
                     break;
                 }
             }

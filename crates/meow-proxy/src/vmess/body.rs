@@ -9,6 +9,16 @@ use super::header::{response_body_keys, Security};
 /// Maximum plaintext per body record (matching upstream 16 KiB - 16 tag).
 const MAX_PLAINTEXT: usize = 16384 - 16;
 
+/// Records one AEAD key/nonce pair may carry.
+///
+/// The body key and IV are derived once per connection and the record counter
+/// occupies the first two nonce bytes, so the budget is exactly that counter's
+/// range — VMess has no rekey to extend it. It is a *physical* connection
+/// budget: mux multiplexes many logical streams over one body cipher, so they
+/// all draw from the same counter and the session dies with it (the mux client
+/// re-dials on a dead session).
+const MAX_RECORDS: u32 = u16::MAX as u32 + 1;
+
 /// Body keys/IVs derived from the per-connection req_key and req_iv. The IVs
 /// are the full 16-byte seeds; each record nonce is `count(2 BE) || iv[2..12]`.
 struct DerivedKeys {
@@ -122,8 +132,31 @@ pub struct BodyCipher {
     write_iv: [u8; 16],
     read: RecordCipher,
     read_iv: [u8; 16],
-    write_counter: u16,
-    read_counter: u16,
+    /// Wider than the wire counter so exhaustion is detected before the value
+    /// that goes into the nonce wraps.
+    write_counter: u32,
+    read_counter: u32,
+}
+
+/// Next record nonce for one direction, or an error once [`MAX_RECORDS`] is
+/// spent.
+///
+/// Sealing two records under one key/nonce pair destroys AEAD confidentiality
+/// outright — the XOR of the ciphertexts is the XOR of the plaintexts, and the
+/// auth key leaks with it — so the counter must stop rather than wrap. The
+/// caller surfaces this as a failed record, which retires the physical
+/// connection (issue #513). The nonce *format* is untouched: this is a budget
+/// check, not a rekey, and the peer still sees `count(2 BE) || iv[2..12]`.
+fn next_nonce(iv: &[u8; 16], counter: &mut u32) -> std::io::Result<[u8; 12]> {
+    if *counter >= MAX_RECORDS {
+        return Err(std::io::Error::other(format!(
+            "vmess: AEAD nonce budget of {MAX_RECORDS} records exhausted"
+        )));
+    }
+    // The bound above makes the narrowing exact.
+    let nonce = record_nonce(iv, *counter as u16);
+    *counter += 1;
+    Ok(nonce)
 }
 
 impl BodyCipher {
@@ -152,16 +185,12 @@ impl BodyCipher {
         self.read_counter = self.write_counter;
     }
 
-    fn write_nonce(&mut self) -> [u8; 12] {
-        let nonce = record_nonce(&self.write_iv, self.write_counter);
-        self.write_counter = self.write_counter.wrapping_add(1);
-        nonce
+    fn write_nonce(&mut self) -> std::io::Result<[u8; 12]> {
+        next_nonce(&self.write_iv, &mut self.write_counter)
     }
 
-    fn read_nonce(&mut self) -> [u8; 12] {
-        let nonce = record_nonce(&self.read_iv, self.read_counter);
-        self.read_counter = self.read_counter.wrapping_add(1);
-        nonce
+    fn read_nonce(&mut self) -> std::io::Result<[u8; 12]> {
+        next_nonce(&self.read_iv, &mut self.read_counter)
     }
 
     /// Encrypt and write one body record: [len(2 BE)][ciphertext + tag(16)].
@@ -181,7 +210,7 @@ impl BodyCipher {
             return writer.flush().await;
         }
 
-        let nonce = self.write_nonce();
+        let nonce = self.write_nonce()?;
         let ct = self.write.seal(&nonce, plaintext)?;
         let len = ct.len() as u16;
         writer.write_all(&len.to_be_bytes()).await?;
@@ -214,7 +243,7 @@ impl BodyCipher {
         }
         let mut ct = vec![0u8; ct_len];
         reader.read_exact(&mut ct).await?;
-        let nonce = self.read_nonce();
+        let nonce = self.read_nonce()?;
         self.read.open(&nonce, &ct)
     }
 
@@ -293,8 +322,66 @@ mod tests {
 
         let (req_key, _) = test_keys();
         let mut cipher = BodyCipher::new(Security::Aes128Gcm, &req_key, &iv, 0x42);
-        assert_eq!(cipher.write_nonce()[..2], [0, 0]);
-        assert_eq!(cipher.write_nonce()[..2], [0, 1]);
+        assert_eq!(cipher.write_nonce().unwrap()[..2], [0, 0]);
+        assert_eq!(cipher.write_nonce().unwrap()[..2], [0, 1]);
+    }
+
+    /// The record counter feeds the nonce directly and VMess has no rekey, so
+    /// it must stop at the end of its range. Wrapping would seal record 65537
+    /// under record 1's key/nonce pair, which leaks the XOR of the two
+    /// plaintexts and the auth key. Both AEAD suites share this path.
+    fn nonce_budget_is_enforced_before_the_counter_wraps() {
+        for security in [Security::Aes128Gcm, Security::ChaCha20Poly1305] {
+            let (req_key, req_iv) = test_keys();
+            let mut cipher = BodyCipher::new(security, &req_key, &req_iv, 0x42);
+
+            for expected in 0..MAX_RECORDS {
+                let nonce = cipher.write_nonce().expect("still within budget");
+                assert_eq!(
+                    nonce[..2],
+                    u16::try_from(expected).unwrap().to_be_bytes(),
+                    "the wire counter must advance in order and stay 2 bytes"
+                );
+            }
+            let err = cipher
+                .write_nonce()
+                .expect_err("the budget must be enforced before the counter wraps");
+            assert!(
+                err.to_string().contains("nonce budget"),
+                "unexpected: {err}"
+            );
+
+            // The read direction is enforced independently: a peer that keeps
+            // sending past its own budget must not be decrypted under a reused
+            // nonce either.
+            for _ in 0..MAX_RECORDS {
+                cipher.read_nonce().expect("still within budget");
+            }
+            assert!(
+                cipher.read_nonce().is_err(),
+                "read direction must enforce the same budget"
+            );
+        }
+    }
+
+    /// Exhaustion has to stop the record before anything reaches the wire — a
+    /// sealed-and-sent record cannot be un-sent, and the failed write is what
+    /// retires the physical connection.
+    async fn write_record_puts_nothing_on_the_wire_once_the_budget_is_spent() {
+        let (req_key, req_iv) = test_keys();
+        let mut cipher = BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, 0x42);
+        cipher.write_counter = MAX_RECORDS;
+
+        let mut wire = Vec::new();
+        let err = cipher
+            .write_record(&mut wire, b"one record too many")
+            .await
+            .expect_err("the record must not be sealed under a reused nonce");
+        assert!(wire.is_empty(), "no bytes may reach the wire, got {wire:?}");
+        assert!(
+            err.to_string().contains("nonce budget"),
+            "unexpected: {err}"
+        );
     }
 
     /// End-to-end read-direction interop: a hand-rolled "server" encrypts a
@@ -334,5 +421,11 @@ mod tests {
         body_key_derivation_matches_protocol();
         record_nonce_overwrites_iv_prefix_and_increments();
         read_record_decrypts_independently_encoded_response().await;
+    }
+
+    #[tokio::test]
+    async fn nonce_budget_stops_the_counter_instead_of_wrapping() {
+        nonce_budget_is_enforced_before_the_counter_wraps();
+        write_record_puts_nothing_on_the_wire_once_the_budget_is_spent().await;
     }
 }
