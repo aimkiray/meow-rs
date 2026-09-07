@@ -155,6 +155,12 @@ fn parse_proxy_scoped(
     origin: ProxyOrigin,
     ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
+    // `origin` gates the `ss` arm's external-plugin check. Without that
+    // feature there is no config-driven path to a local executable left to
+    // gate, so the parameter is deliberately unread.
+    #[cfg(not(feature = "ss"))]
+    let _ = origin;
+
     let name = config
         .get("name")
         .and_then(|v| v.as_str())
