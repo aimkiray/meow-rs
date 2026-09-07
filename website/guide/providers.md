@@ -38,6 +38,23 @@ proxy-groups:
 | `exclude-type` | string \| list | `[]` | Drop proxy types, e.g. `[ss]` |
 | `health-check` | block | — | Periodic probing (below) |
 | `header` | map | `{}` | Extra HTTP request headers (`http` only) |
+| `allow-external-plugin` | bool | `false` | Let this provider's nodes select an external SIP003 plugin (below) |
+
+#### External SIP003 plugins
+
+A Shadowsocks node whose `plugin:` is not one of the built-in in-process plugins
+(`obfs`, `simple-obfs`, `v2ray-plugin`, `ech-tls-tunnel`) runs that plugin as a
+local subprocess. The process is launched as soon as the node is parsed — on
+first load and again on every refresh — not when traffic later dials the node.
+
+A provider document is remote input even when its vehicle is a local file, so by
+default its nodes may not name an executable: such a node is dropped with a
+warning and the rest of the provider still loads. Set
+`allow-external-plugin: true` on a provider you trust to lift that restriction
+for its nodes only.
+
+Nodes written directly in your own `proxies:` block are unaffected — naming a
+plugin there is already a local decision.
 
 ### `type: http`
 

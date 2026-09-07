@@ -94,13 +94,47 @@ impl Proxy for WrappedProxy {
     }
 }
 
+/// Where a proxy definition came from, which decides how much of it may name
+/// local resources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProxyOrigin {
+    /// The operator's own config document — naming a local executable there is
+    /// already a local decision.
+    Local,
+    /// A proxy-provider's fetched document. Remote input even when the vehicle
+    /// is a local file, so it needs the operator's explicit per-provider
+    /// opt-in before it may select a local executable (issue #513).
+    Provider { allow_external_plugin: bool },
+}
+
 pub fn parse_proxy(
     config: &HashMap<String, serde_yaml::Value>,
     ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let dialer: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
         std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
-    parse_proxy_with_dialer(config, &dialer, ipv6)
+    parse_proxy_scoped(config, &dialer, ProxyOrigin::Local, ipv6)
+}
+
+/// Parse a proxy node whose definition came from a proxy-provider.
+///
+/// Provider documents are remote input, so they are held to a stricter policy
+/// than the operator's own config: see [`ProxyOrigin::Provider`].
+pub fn parse_provider_proxy(
+    config: &HashMap<String, serde_yaml::Value>,
+    allow_external_plugin: bool,
+    ipv6: bool,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
+    let dialer: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
+    parse_proxy_scoped(
+        config,
+        &dialer,
+        ProxyOrigin::Provider {
+            allow_external_plugin,
+        },
+        ipv6,
+    )
 }
 
 /// Like [parse_proxy] but injects a custom [meow_proxy::dialer::TcpDialer]
@@ -110,6 +144,15 @@ pub fn parse_proxy(
 pub fn parse_proxy_with_dialer(
     config: &HashMap<String, serde_yaml::Value>,
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
+    ipv6: bool,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
+    parse_proxy_scoped(config, dialer, ProxyOrigin::Local, ipv6)
+}
+
+fn parse_proxy_scoped(
+    config: &HashMap<String, serde_yaml::Value>,
+    dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
+    origin: ProxyOrigin,
     ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let name = config
@@ -143,6 +186,32 @@ pub fn parse_proxy_with_dialer(
                 .unwrap_or(false);
             let plugin = config.get("plugin").and_then(|v| v.as_str());
             let plugin_opts_str = config.get("plugin-opts").and_then(serialize_plugin_opts);
+
+            // An external SIP003 plugin becomes the executable handed to
+            // `Command::new` inside `ShadowsocksAdapter::new`, so it is a local
+            // process launch driven by whatever named the plugin — and for a
+            // provider-sourced node that is the remote document. The launch
+            // happens at construction, i.e. during the initial load and on every
+            // provider refresh, not only when traffic later dials the node, so
+            // reject it here rather than after the process boundary has been
+            // reached. Built-in plugins run in-process and are unaffected, as is
+            // the operator's own config (issue #513, Class A ADR-0002).
+            if matches!(
+                origin,
+                ProxyOrigin::Provider {
+                    allow_external_plugin: false
+                }
+            ) && is_external_sip003_plugin(plugin)
+            {
+                return Err(format!(
+                    "ss[{name}]: refusing the external SIP003 plugin '{}' from \
+                     provider content — upstream launches it as a local subprocess \
+                     while parsing, which would let a remote document choose the \
+                     executable. Add `allow-external-plugin: true` to the \
+                     proxy-provider to opt in",
+                    plugin.unwrap_or_default()
+                ));
+            }
 
             // A SIP003 *external* plugin is a local subprocess spawned by
             // `ShadowsocksAdapter::new`, and the adapter deliberately dials it
@@ -3282,6 +3351,7 @@ tls: true
             exclude_type: None,
             health_check: None,
             header: None,
+            allow_external_plugin: None,
         };
         let cache_dir = path.parent().expect("temp file has a parent dir");
         let provider =
@@ -3523,5 +3593,74 @@ tls: true
             "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nobfs-opts:\n  mode: http\n",
         );
         assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    // ─── provider trust boundary for external SIP003 plugins (issue #513) ────
+
+    #[cfg(feature = "ss")]
+    fn ss_node(extra: &str) -> HashMap<String, serde_yaml::Value> {
+        proxy_config(&format!(
+            "name: provider-node\ntype: ss\nserver: 127.0.0.1\nport: 443\npassword: p\n\
+             cipher: aes-128-gcm\n{extra}"
+        ))
+    }
+
+    /// A name no built-in plugin claims is handed to the external launcher.
+    #[cfg(feature = "ss")]
+    const EXTERNAL_PLUGIN: &str = "plugin: definitely-not-a-real-plugin\n";
+
+    #[cfg(feature = "ss")]
+    #[test]
+    fn provider_node_may_not_name_an_external_plugin_by_default() {
+        let cfg = ss_node(EXTERNAL_PLUGIN);
+        let Err(err) = super::parse_provider_proxy(&cfg, false, true) else {
+            panic!("provider content must not reach the plugin launcher by default");
+        };
+        assert!(
+            err.contains("allow-external-plugin"),
+            "must name the opt-in: {err}"
+        );
+    }
+
+    #[cfg(feature = "ss")]
+    #[test]
+    fn provider_opt_in_opens_the_gate_and_only_then_reaches_the_launcher() {
+        // Same node, operator opted in: what remains is the launch failure, so
+        // the decision is the flag and not the plugin name.
+        let cfg = ss_node(EXTERNAL_PLUGIN);
+        let Err(err) = super::parse_provider_proxy(&cfg, true, true) else {
+            panic!("a nonexistent plugin still cannot start");
+        };
+        assert!(
+            !err.contains("allow-external-plugin"),
+            "gate must be open: {err}"
+        );
+        assert!(err.contains("failed to start ss plugin"), "msg: {err}");
+    }
+
+    #[cfg(feature = "ss")]
+    #[test]
+    fn provider_gate_leaves_builtin_plugins_alone() {
+        // Built-in plugins run in-process, so they never cross the boundary the
+        // gate guards and must keep working for provider nodes.
+        let cfg = ss_node("plugin: obfs\nplugin-opts:\n  mode: http\n");
+        super::parse_provider_proxy(&cfg, false, true)
+            .expect("an in-process plugin is not an external executable");
+    }
+
+    #[cfg(feature = "ss")]
+    #[test]
+    fn local_config_keeps_naming_external_plugins() {
+        // The very node the provider path rejects: in the operator's own config
+        // it is a local decision, so it must still reach the launcher.
+        let cfg = ss_node(EXTERNAL_PLUGIN);
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("a nonexistent plugin still cannot start");
+        };
+        assert!(
+            !err.contains("allow-external-plugin"),
+            "local config is not provider-scoped: {err}"
+        );
+        assert!(err.contains("failed to start ss plugin"), "msg: {err}");
     }
 }

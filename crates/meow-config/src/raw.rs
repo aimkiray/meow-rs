@@ -418,6 +418,12 @@ pub struct RawProxyProvider {
     pub health_check: Option<RawHealthCheck>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<std::collections::HashMap<String, String>>,
+    /// Let nodes from this provider select an external SIP003 plugin — a local
+    /// executable named by provider content and spawned while the node is
+    /// parsed. Denied by default: the provider document is remote input even
+    /// when the vehicle is a local file (issue #513).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_external_plugin: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

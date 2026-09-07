@@ -30,6 +30,10 @@ pub struct ProxyProvider {
     updated_at: AtomicU,
     header: HashMap<String, String>,
     ipv6: bool,
+    /// The operator's explicit opt-in letting this provider's nodes select an
+    /// external SIP003 plugin, i.e. a local executable named by the fetched
+    /// document (issue #513). Off unless the config says otherwise.
+    allow_external_plugin: bool,
     /// Group-level filtered views of `slot` (issue #358), re-populated on
     /// every refresh. Weak: each view is kept alive by the group built from
     /// it, so views belonging to dropped or rebuilt groups get pruned here.
@@ -199,6 +203,7 @@ impl ProxyProvider {
             updated_at: AtomicU::new(0),
             header,
             ipv6,
+            allow_external_plugin: raw.allow_external_plugin.unwrap_or(false),
             derived: RwLock::new(Vec::new()),
         })
     }
@@ -326,7 +331,8 @@ impl ProxyProvider {
                 continue;
             }
 
-            match proxy_parser::parse_proxy(raw_map, self.ipv6) {
+            match proxy_parser::parse_provider_proxy(raw_map, self.allow_external_plugin, self.ipv6)
+            {
                 Ok(proxy) => result.push(proxy),
                 Err(e) => {
                     warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
@@ -496,6 +502,7 @@ mod tests {
             exclude_type: None,
             health_check: None,
             header: None,
+            allow_external_plugin: None,
         }
     }
 
@@ -543,6 +550,7 @@ mod tests {
             exclude_type: None,
             health_check: None,
             header: None,
+            allow_external_plugin: None,
         };
         let Err(err) = ProxyProvider::new("test", &raw, Some(dir.path()), true) else {
             panic!("escaping http cache path must be rejected");
@@ -583,6 +591,7 @@ mod tests {
                 exclude_type: None,
                 health_check: None,
                 header: None,
+                allow_external_plugin: None,
             },
         );
         validate_paths(&map, Some(dir.path())).expect("contained paths must validate");
@@ -604,6 +613,7 @@ mod tests {
             exclude_type: None,
             health_check: None,
             header: Some(headers),
+            allow_external_plugin: None,
         };
         let p = ProxyProvider::new("airport", &raw, None, true).unwrap();
         assert_eq!(p.vehicle_type, "HTTP");
@@ -636,6 +646,48 @@ header:
         assert!(raw.header.is_none());
         let p = ProxyProvider::new("p", &raw, Some(dir.path()), true).unwrap();
         assert!(p.header.is_empty());
+    }
+
+    // ─── external SIP003 plugin opt-in (issue #513) ──────────────────────────
+
+    /// A provider document with one clean node and one naming an executable no
+    /// built-in plugin claims.
+    #[cfg(feature = "ss")]
+    const PROVIDER_WITH_EXTERNAL_PLUGIN: &str = r#"proxies:
+  - {name: "clean", type: ss, server: 127.0.0.1, port: 443, cipher: aes-128-gcm, password: p}
+  - {name: "plugged", type: ss, server: 127.0.0.1, port: 443, cipher: aes-128-gcm, password: p, plugin: definitely-not-a-real-plugin}
+"#;
+
+    #[test]
+    fn raw_proxy_provider_deserializes_allow_external_plugin() {
+        // The kebab-case spelling is the operator-facing contract: a rename here
+        // would silently leave the opt-in unsettable.
+        let yaml = "type: file\npath: proxies.yaml\nallow-external-plugin: true\n";
+        let raw: RawProxyProvider = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(raw.allow_external_plugin, Some(true));
+    }
+
+    #[test]
+    fn external_plugin_opt_in_is_denied_unless_the_config_says_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut raw = raw_file_provider("proxies.yaml");
+        let p = ProxyProvider::new("p", &raw, Some(dir.path()), true).unwrap();
+        assert!(!p.allow_external_plugin);
+
+        raw.allow_external_plugin = Some(true);
+        let p = ProxyProvider::new("p", &raw, Some(dir.path()), true).unwrap();
+        assert!(p.allow_external_plugin);
+    }
+
+    #[cfg(feature = "ss")]
+    #[tokio::test]
+    async fn provider_content_cannot_select_an_external_plugin() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), PROVIDER_WITH_EXTERNAL_PLUGIN).unwrap();
+        let provider = file_provider(tmp.path()).await;
+        // The clean node still loads; the plugin node is rejected before
+        // `ShadowsocksAdapter::new` can hand the name to the launcher.
+        assert_eq!(slot_names(&provider.slot), ["clean"]);
     }
 
     fn group_filter(
