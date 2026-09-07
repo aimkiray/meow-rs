@@ -15,6 +15,8 @@
 //! body cipher, so they all draw from this same counter and the session dies
 //! with it.
 
+#![cfg(feature = "vmess")]
+
 use std::sync::Arc;
 use std::time::Duration;
 
