@@ -218,11 +218,19 @@ fn parse_upstream_domain_set(data: &[u8]) -> Result<Vec<String>, MrsError> {
 }
 
 fn read_u64_vec(r: &mut ByteReader<'_>, what: &'static str) -> Result<Vec<u64>, MrsError> {
-    let len = r.read_i64_be(what)?;
-    if len < 1 {
-        return Err(MrsError::InvalidLength(what, len));
+    let declared = r.read_i64_be(what)?;
+    if declared < 1 {
+        return Err(MrsError::InvalidLength(what, declared));
     }
-    let mut out = Vec::with_capacity(len as usize);
+    // The word count comes from a remote rule-provider, so prove the bytes are
+    // actually present before reserving: `with_capacity` on a bogus count trips
+    // the capacity-overflow check and aborts the process (issue #513).
+    let len = usize::try_from(declared).map_err(|_| MrsError::InvalidLength(what, declared))?;
+    let bytes = len
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(MrsError::InvalidLength(what, declared))?;
+    r.need(what, bytes)?;
+    let mut out = Vec::with_capacity(len);
     for _ in 0..len {
         out.push(r.read_u64_be(what)?);
     }
@@ -423,15 +431,20 @@ pub fn parse_geosite_payload(
     allowed: Option<&std::collections::HashSet<String>>,
 ) -> Result<GeositePayload, MrsError> {
     let mut r = ByteReader::new(decompressed);
-    let cat_count = r.read_u32_be("category_count")?;
-    let mut categories = Vec::with_capacity(cat_count as usize);
+    let cat_count = r.read_u32_be("category_count")? as usize;
+    // Both counts come from a remote geodata file. Reserving them verbatim asks
+    // for hundreds of gigabytes on a bogus count, which aborts under the
+    // workspace's `panic = "abort"`; cap at what the input can actually hold —
+    // an empty category still costs a u16 name length plus a u32 domain count,
+    // and an empty domain still costs a u16 length.
+    let mut categories = Vec::with_capacity(bounded_capacity(cat_count, r.remaining(), 6));
     for _ in 0..cat_count {
         let name_len = r.read_u16_be("category_name_len")? as usize;
         let name_bytes = r.read_slice("category_name", name_len)?;
         let name = String::from_utf8(name_bytes.to_vec())
             .map_err(|e| MrsError::Utf8("category_name", e))?
             .to_ascii_lowercase();
-        let dom_count = r.read_u32_be("domain_count")?;
+        let dom_count = r.read_u32_be("domain_count")? as usize;
 
         // If an allow-set is active and this category is not in it, skip its
         // domains at the byte level — read lengths and advance the cursor
@@ -446,7 +459,7 @@ pub fn parse_geosite_payload(
             }
         }
 
-        let mut domains = Vec::with_capacity(dom_count as usize);
+        let mut domains = Vec::with_capacity(bounded_capacity(dom_count, r.remaining(), 2));
         for _ in 0..dom_count {
             let dom_len = r.read_u16_be("domain_len")? as usize;
             let dom_bytes = r.read_slice("domain", dom_len)?;
@@ -458,6 +471,14 @@ pub fn parse_geosite_payload(
         categories.push((name, domains));
     }
     Ok(GeositePayload { categories })
+}
+
+/// Cap a reservation derived from a declared element count at what the
+/// remaining input can actually hold, given the smallest encoded size of one
+/// element. The declared counts are remote-controlled; without the cap a bogus
+/// count becomes an allocation failure rather than a `Truncated` error.
+fn bounded_capacity(declared: usize, remaining: usize, min_element_bytes: usize) -> usize {
+    declared.min(remaining / min_element_bytes)
 }
 
 /// Encode a `GeositePayload` into the uncompressed inner payload bytes.
@@ -526,13 +547,22 @@ impl<'a> ByteReader<'a> {
         &self.data[self.pos..]
     }
 
+    /// Unread byte count. Saturating because a hostile declared length can push
+    /// `pos` arithmetic that would otherwise wrap.
+    fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
+    }
+
     fn need(&self, what: &'static str, n: usize) -> Result<(), MrsError> {
-        if self.pos + n > self.data.len() {
+        // Compare against the remaining length rather than `pos + n`: a declared
+        // length near `usize::MAX` would wrap the sum and pass the check.
+        let have = self.remaining();
+        if n > have {
             return Err(MrsError::Truncated {
                 what,
                 offset: self.pos,
                 need: n,
-                have: self.data.len() - self.pos,
+                have,
             });
         }
         Ok(())
@@ -797,5 +827,48 @@ mod tests {
         let parsed = parse_upstream_ruleset_mrs(&bytes).unwrap();
         assert_eq!(parsed.behavior, TYPE_IPCIDR);
         assert_eq!(parsed.entries, vec!["192.168.0.0/24"]);
+    }
+
+    /// A remote rule-provider can declare an enormous word count in a payload
+    /// only a few dozen bytes long. Both `read_u64_vec` call sites must reject
+    /// it with an error: reserving from the declared count trips the
+    /// capacity-overflow check, which terminates the process under the
+    /// workspace's `panic = "abort"` release profile (issue #513).
+    #[test]
+    fn upstream_ruleset_mrs_oversized_word_counts_are_rejected() {
+        // `i64::MAX` overflows the byte-count multiplication; `i64::MAX / 8 + 1`
+        // does not and must instead be caught by the remaining-input check.
+        for declared in [i64::MAX, i64::MAX / 8 + 1, 100] {
+            let mut leaves = vec![1u8];
+            write_i64(&mut leaves, declared);
+            assert!(
+                parse_upstream_ruleset_mrs(&encode_upstream_mrs(TYPE_DOMAIN, 1, &leaves)).is_err(),
+                "leaves_len={declared} must not reserve from the declared count"
+            );
+
+            let mut bitmap = vec![1u8];
+            write_i64(&mut bitmap, 1);
+            write_u64(&mut bitmap, 0);
+            write_i64(&mut bitmap, declared);
+            assert!(
+                parse_upstream_ruleset_mrs(&encode_upstream_mrs(TYPE_DOMAIN, 1, &bitmap)).is_err(),
+                "label_bitmap_len={declared} must not reserve from the declared count"
+            );
+        }
+    }
+
+    /// Same class on the geodata path: `category_count` and `domain_count` are
+    /// u32 values from a remote geodata file, so the reservation has to be
+    /// capped by the input rather than asking for hundreds of gigabytes.
+    #[test]
+    fn geosite_payload_declared_counts_are_bounded_by_input() {
+        assert!(parse_geosite_payload(&u32::MAX.to_be_bytes(), None).is_err());
+
+        let mut category_without_domains = Vec::new();
+        category_without_domains.extend_from_slice(&1u32.to_be_bytes());
+        category_without_domains.extend_from_slice(&2u16.to_be_bytes());
+        category_without_domains.extend_from_slice(b"cn");
+        category_without_domains.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_geosite_payload(&category_without_domains, None).is_err());
     }
 }
