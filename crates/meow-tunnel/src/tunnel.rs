@@ -10,7 +10,7 @@ use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Bundled rules + domain index + proxies map, swapped as one `Arc` on
 /// config reload. Reads on the connection-setup hot path take a single
@@ -274,23 +274,40 @@ impl TunnelInner {
     ) -> (Arc<dyn ProxyAdapter>, SmolStr, SmolStr) {
         match result {
             Some(m) => {
-                let action = if m.adapter_name == "DIRECT" {
+                let target = m.adapter_name;
+                let mut action = if target == "DIRECT" {
                     "DIRECT"
-                } else if m.adapter_name.starts_with("REJECT") {
+                } else if target.starts_with("REJECT") {
                     "REJECT"
                 } else {
                     "PROXY"
                 };
+                let proxy: Arc<dyn ProxyAdapter> = match route.proxies.get(target).cloned() {
+                    Some(p) => p as Arc<dyn ProxyAdapter>,
+                    // DIRECT needs no registry entry: the tunnel owns a direct
+                    // adapter for exactly this.
+                    None if target == "DIRECT" => Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
+                    None => {
+                        // Upstream mihomo falls back to DIRECT here, and so do
+                        // we: a subscription that dropped one node has to keep
+                        // routing the rest. What it must not do is hide that —
+                        // the fallback was a `debug!` and `action` was derived
+                        // from the name alone, so at the default log level
+                        // nothing said the connection had left the machine
+                        // directly, and the statistics counted a proxy hop that
+                        // never happened (issue #513).
+                        warn!(
+                            target,
+                            rule = %m.rule_type.as_str(),
+                            "matched rule names a target that is not in the registry; dialling DIRECT as upstream does"
+                        );
+                        action = "DIRECT";
+                        Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>
+                    }
+                };
                 self.stats
                     .rule_match
                     .increment(m.rule_type.as_str(), action);
-                let proxy = route.proxies.get(m.adapter_name).cloned().map_or_else(
-                    || {
-                        debug!("proxy '{}' not found, using DIRECT", m.adapter_name);
-                        Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>
-                    },
-                    |p| p as Arc<dyn ProxyAdapter>,
-                );
                 // `rule_type.as_str()` is a `&'static str` — wrap it
                 // inline without heap.
                 (
