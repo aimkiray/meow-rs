@@ -11,6 +11,7 @@
 //! MaxReceiveBuffer=4 MiB.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -19,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::{CancellationToken, PollSender};
 
 const CMD_SYN: u8 = 0;
@@ -31,23 +32,15 @@ const FRAME_HEADER_LEN: usize = 8;
 
 /// Largest frame payload — sagernet smux MaxFrameSize default (u16 length).
 const MAX_FRAME_SIZE: usize = 32768;
-/// Per-stream channel depth.  The 4 MiB `receive_budget` semaphore bounds
-/// memory; the channel depth only controls how many frames buffer before a
-/// stalled consumer pauses the reader.  A depth of 2 (two max-sized frames)
-/// head-of-line blocks the entire session too easily — one slow tab stalls
-/// every other stream sharing the physical connection.  32 gives real
-/// headroom; the semaphore still caps total buffered memory.
-///
-/// The target architecture is muxcool's `deliver_now` / `Parked` pattern
-/// (PR 6 of this stack): a full queue parks the delivery and pauses the
-/// connection read (session-wide flow control) without blocking writers.
-/// Porting that to smux is a follow-up; this depth raise is the safe
-/// interim fix.
+/// Per-stream channel depth. A full inbox aborts only that stream rather
+/// than awaiting it in the session reader and blocking unrelated streams.
 const STREAM_QUEUE: usize = 32;
 /// Sagernet's default session-wide receive budget.
 const MAX_RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
 /// Bounded outbound queue; stream writes wait when the physical writer lags.
 const OUTBOUND_QUEUE: usize = 64;
+/// Bounded overflow queue for FIN frames when the writer is backpressured.
+const DEFERRED_FIN_QUEUE: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Frame {
@@ -82,6 +75,29 @@ impl Frame {
     }
 }
 
+async fn drain_frame<R>(
+    reader: &mut R,
+    cancel: &CancellationToken,
+    scratch: &mut [u8],
+    mut remaining: usize,
+) -> bool
+where
+    R: AsyncRead + Unpin,
+{
+    while remaining > 0 {
+        let n = remaining.min(scratch.len());
+        let result = tokio::select! {
+            _ = cancel.cancelled() => return false,
+            result = reader.read_exact(&mut scratch[..n]) => result,
+        };
+        if result.is_err() {
+            return false;
+        }
+        remaining -= n;
+    }
+    true
+}
+
 fn encode_frame(cmd: u8, stream_id: u32, data: &[u8]) -> Bytes {
     // The u16 length field caps single frames; poll_write limits writes to
     // MAX_FRAME_SIZE, so this only guards future call sites.
@@ -100,9 +116,27 @@ fn encode_frame(cmd: u8, stream_id: u32, data: &[u8]) -> Bytes {
 
 struct InboundChunk {
     data: Bytes,
-    /// Releases session receive capacity when the stream consumes or drops
-    /// this chunk.
-    _permit: Option<OwnedSemaphorePermit>,
+    /// Releases session receive capacity as the stream consumes or drops data.
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl InboundChunk {
+    fn advance(&mut self, n: usize) {
+        self.data.advance(n);
+        if let Some(permit) = &mut self.permit {
+            drop(
+                permit
+                    .split(n)
+                    .expect("inbound permit must cover unread payload"),
+            );
+        }
+    }
+}
+
+#[derive(Clone)]
+struct StreamEntry {
+    tx: mpsc::Sender<InboundChunk>,
+    aborted: Arc<AtomicBool>,
 }
 
 /// One outbound writer request.  Flush requests travel the SAME bounded
@@ -119,7 +153,7 @@ enum OutMsg {
 
 struct SessionState {
     /// Streams keyed by stream ID; dropping the sender EOFs the stream.
-    streams: Mutex<HashMap<u32, mpsc::Sender<InboundChunk>>>,
+    streams: Mutex<HashMap<u32, StreamEntry>>,
     dead: AtomicBool,
 }
 
@@ -127,6 +161,7 @@ struct SessionState {
 pub struct Session {
     state: Arc<SessionState>,
     writer_tx: mpsc::Sender<OutMsg>,
+    deferred_fin_tx: mpsc::Sender<Bytes>,
     cancel: CancellationToken,
     next_stream_id: AtomicU32,
 }
@@ -146,12 +181,32 @@ impl Session {
     {
         let (mut reader, mut writer) = tokio::io::split(io);
         let (writer_tx, mut writer_rx) = mpsc::channel::<OutMsg>(OUTBOUND_QUEUE);
+        let (deferred_fin_tx, mut deferred_fin_rx) = mpsc::channel(DEFERRED_FIN_QUEUE);
         let state = Arc::new(SessionState {
             streams: Mutex::new(HashMap::new()),
             dead: AtomicBool::new(false),
         });
         let receive_budget = Arc::new(Semaphore::new(MAX_RECEIVE_BUFFER));
         let cancel = CancellationToken::new();
+
+        // A single forwarder waits for writer capacity, preserving the
+        // original FIFO without spawning one task per dropped stream.
+        let deferred_writer_tx = writer_tx.clone();
+        let deferred_cancel = cancel.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = tokio::select! {
+                _ = deferred_cancel.cancelled() => None,
+                frame = deferred_fin_rx.recv() => frame,
+            } {
+                if tokio::select! {
+                    _ = deferred_cancel.cancelled() => false,
+                    sent = deferred_writer_tx.send(OutMsg::Frame(frame)) => sent.is_ok(),
+                } {
+                    continue;
+                }
+                break;
+            }
+        });
 
         // Writer task: outbound frames are already encoded, so the hot path
         // performs no second allocation or payload copy.
@@ -198,16 +253,20 @@ impl Session {
                     }
                 }
             }
-            writer_state.mark_dead().await;
+            writer_state.mark_dead();
             writer_cancel.cancel();
         });
 
-        // Reader task: parse frames, route PSH/FIN to streams.
+        // Reader task: a full stream inbox aborts that stream; it never
+        // awaits the inbox while holding up frame dispatch for its peers.
         let reader_state = Arc::clone(&state);
         let reader_cancel = cancel.clone();
+        let reader_writer_tx = writer_tx.clone();
+        let reader_deferred_fin_tx = deferred_fin_tx.clone();
         tokio::spawn(async move {
             let mut header = [0u8; FRAME_HEADER_LEN];
-            loop {
+            let mut discard = [0u8; 8 * 1024];
+            'reader: loop {
                 let header_result = tokio::select! {
                     _ = reader_cancel.cancelled() => break,
                     result = reader.read_exact(&mut header) => result,
@@ -218,51 +277,90 @@ impl Session {
                 let Ok((cmd, length, stream_id)) = Frame::decode_header(&header) else {
                     break;
                 };
-                let permit = if cmd == CMD_PSH && length > 0 {
-                    let permits = length as u32;
-                    match tokio::select! {
-                        _ = reader_cancel.cancelled() => break,
-                        result = Arc::clone(&receive_budget).acquire_many_owned(permits) => result,
-                    } {
-                        Ok(permit) => Some(permit),
-                        Err(_) => break,
-                    }
-                } else {
-                    None
-                };
-                let mut payload = vec![0u8; length];
-                if !payload.is_empty() {
-                    let payload_result = tokio::select! {
-                        _ = reader_cancel.cancelled() => break,
-                        result = reader.read_exact(&mut payload) => result,
-                    };
-                    if payload_result.is_err() {
-                        break;
-                    }
-                }
-                if reader_state
-                    .handle_frame(
-                        cmd,
-                        stream_id,
-                        InboundChunk {
+                match cmd {
+                    CMD_PSH if length == 0 => continue,
+                    CMD_PSH => {
+                        let Some(entry) = reader_state.stream(stream_id) else {
+                            if !drain_frame(&mut reader, &reader_cancel, &mut discard, length).await
+                            {
+                                break 'reader;
+                            }
+                            continue;
+                        };
+                        if entry.tx.is_closed() {
+                            if !drain_frame(&mut reader, &reader_cancel, &mut discard, length).await
+                            {
+                                break 'reader;
+                            }
+                            continue;
+                        }
+                        // A zero capacity is a stable overflow signal because
+                        // this task is the inbox's sole producer. Retire the
+                        // stream before it borrows session receive capacity.
+                        if entry.tx.capacity() == 0 {
+                            entry.aborted.store(true, Ordering::Release);
+                            reader_state.remove_stream(stream_id);
+                            queue_fin(
+                                &reader_writer_tx,
+                                &reader_deferred_fin_tx,
+                                &reader_state,
+                                &reader_cancel,
+                                stream_id,
+                            );
+                            if !drain_frame(&mut reader, &reader_cancel, &mut discard, length).await
+                            {
+                                break 'reader;
+                            }
+                            continue;
+                        }
+                        let permit = tokio::select! {
+                            _ = reader_cancel.cancelled() => break,
+                            result = Arc::clone(&receive_budget).acquire_many_owned(length as u32) => match result {
+                                Ok(permit) => permit,
+                                Err(_) => break,
+                            },
+                        };
+                        let mut payload = vec![0u8; length];
+                        let payload_result = tokio::select! {
+                            _ = reader_cancel.cancelled() => break,
+                            result = reader.read_exact(&mut payload) => result,
+                        };
+                        if payload_result.is_err() {
+                            break;
+                        }
+                        match entry.tx.try_send(InboundChunk {
                             data: Bytes::from(payload),
-                            _permit: permit,
-                        },
-                        &reader_cancel,
-                    )
-                    .await
-                    .is_err()
-                {
-                    break;
+                            permit: Some(permit),
+                        }) {
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                entry.aborted.store(true, Ordering::Release);
+                                reader_state.remove_stream(stream_id);
+                                queue_fin(
+                                    &reader_writer_tx,
+                                    &reader_deferred_fin_tx,
+                                    &reader_state,
+                                    &reader_cancel,
+                                    stream_id,
+                                );
+                            }
+                            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                        }
+                    }
+                    CMD_FIN if length == 0 => reader_state.remove_stream(stream_id),
+                    CMD_NOP if length == 0 => {}
+                    // SYN, unknown commands, and control frames with payload
+                    // are protocol errors; reject before allocating payload.
+                    _ => break,
                 }
             }
-            reader_state.mark_dead().await;
+            reader_state.mark_dead();
             reader_cancel.cancel();
         });
 
         Ok(Self {
             state,
             writer_tx,
+            deferred_fin_tx,
             cancel,
             next_stream_id: AtomicU32::new(1),
         })
@@ -270,15 +368,16 @@ impl Session {
 
     /// Open a new stream.  Client IDs count up by 2 from 1.
     pub async fn open_stream(self: &Arc<Self>) -> io::Result<SmuxStream> {
-        if self.is_dead() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "smux session is closed",
-            ));
-        }
         let id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(STREAM_QUEUE);
-        self.state.streams.lock().await.insert(id, tx);
+        let aborted = Arc::new(AtomicBool::new(false));
+        self.state.register_stream(
+            id,
+            StreamEntry {
+                tx,
+                aborted: Arc::clone(&aborted),
+            },
+        )?;
         // The guard removes the map entry if this future is cancelled
         // while waiting for outbound capacity — otherwise the id stays
         // consumed and the entry lingers until a server FIN.
@@ -299,6 +398,12 @@ impl Session {
                 "smux writer gone",
             ));
         }
+        if self.is_dead() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "smux session is closed",
+            ));
+        }
         guard.disarm();
         Ok(SmuxStream {
             id,
@@ -311,6 +416,7 @@ impl Session {
             shutdown_frame: None,
             flush_rx: None,
             write_since_flush: false,
+            aborted,
         })
     }
 }
@@ -332,81 +438,59 @@ impl MapEntryGuard {
 impl Drop for MapEntryGuard {
     fn drop(&mut self) {
         if self.armed {
-            let state = Arc::clone(&self.state);
-            let id = self.id;
-            // Detached: drop cannot await the map lock.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    state.streams.lock().await.remove(&id);
-                });
-            }
+            self.state.remove_stream(self.id);
         }
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.state.dead.store(true, Ordering::SeqCst);
+        self.state.mark_dead();
         self.cancel.cancel();
     }
 }
 
+fn queue_fin(
+    writer_tx: &mpsc::Sender<OutMsg>,
+    deferred_fin_tx: &mpsc::Sender<Bytes>,
+    state: &SessionState,
+    cancel: &CancellationToken,
+    stream_id: u32,
+) {
+    let frame = encode_frame(CMD_FIN, stream_id, &[]);
+    if writer_tx.try_send(OutMsg::Frame(frame.clone())).is_ok() {
+        return;
+    }
+    if deferred_fin_tx.try_send(frame).is_err() {
+        state.mark_dead();
+        cancel.cancel();
+    }
+}
+
 impl SessionState {
-    async fn mark_dead(&self) {
-        if !self.dead.swap(true, Ordering::SeqCst) {
-            // Close every stream.  The read side distinguishes this physical
-            // failure from a peer FIN by consulting `Session::is_dead`.
-            self.streams.lock().await.clear();
+    fn register_stream(&self, id: u32, entry: StreamEntry) -> io::Result<()> {
+        let mut streams = self.streams.lock();
+        if self.dead.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "smux session is closed",
+            ));
         }
+        streams.insert(id, entry);
+        Ok(())
     }
 
-    async fn handle_frame(
-        &self,
-        cmd: u8,
-        stream_id: u32,
-        chunk: InboundChunk,
-        cancel: &CancellationToken,
-    ) -> io::Result<()> {
-        match cmd {
-            CMD_PSH => {
-                // Data for an unknown stream is dropped rather than killing
-                // the session — an intentional divergence from xtaci (which
-                // closes the connection on protocol violation): the server
-                // may legitimately race a FIN (peer closed, stream removed)
-                // against in-flight PSH frames.
-                let tx = self.streams.lock().await.get(&stream_id).cloned();
-                if let Some(tx) = tx {
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::Interrupted,
-                                "smux session closed",
-                            ));
-                        }
-                        result = tx.send(chunk) => {
-                            let _ = result;
-                        }
-                    }
-                }
-                Ok(())
-            }
-            CMD_FIN => {
-                // Peer half-closed: EOF the read side by dropping the sender.
-                self.streams.lock().await.remove(&stream_id);
-                Ok(())
-            }
-            CMD_NOP => Ok(()),
-            // v1 has no UPD; a server-initiated SYN is unexpected in
-            // client-only usage and unsupported commands are protocol errors.
-            CMD_SYN => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "smux: unexpected SYN from server (client-only usage)",
-            )),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("smux: unknown command {other}"),
-            )),
-        }
+    fn stream(&self, stream_id: u32) -> Option<StreamEntry> {
+        self.streams.lock().get(&stream_id).cloned()
+    }
+
+    fn remove_stream(&self, stream_id: u32) {
+        self.streams.lock().remove(&stream_id);
+    }
+
+    fn mark_dead(&self) {
+        self.dead.store(true, Ordering::SeqCst);
+        self.streams.lock().clear();
     }
 }
 
@@ -427,55 +511,30 @@ pub struct SmuxStream {
     /// sent: the flush ack then no longer covers every write, so
     /// `poll_flush` must send another request once the pending one lands.
     write_since_flush: bool,
+    aborted: Arc<AtomicBool>,
 }
 
 impl SmuxStream {
     fn best_effort_fin(&mut self) {
-        if self.fin_sent {
+        if self.fin_sent || self.aborted.load(Ordering::Acquire) {
+            self.fin_sent = true;
             return;
         }
-        let frame = encode_frame(CMD_FIN, self.id, &[]);
-        match self
-            .session
-            .writer_tx
-            .try_send(OutMsg::Frame(frame.clone()))
-        {
-            Ok(()) => self.fin_sent = true,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                // The outbound channel is full: queue the FIN
-                // asynchronously instead of dropping it.  Mark fin_sent
-                // now so a later poll_shutdown/drop does not double-send.
-                self.fin_sent = true;
-                let sender = self.session.writer_tx.clone();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        let _ = sender.send(OutMsg::Frame(frame)).await;
-                    });
-                }
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                // Session is gone; the connection is closing anyway.
-                self.fin_sent = true;
-            }
-        }
+        self.fin_sent = true;
+        queue_fin(
+            &self.session.writer_tx,
+            &self.session.deferred_fin_tx,
+            &self.session.state,
+            &self.session.cancel,
+            self.id,
+        );
     }
 }
 
 impl Drop for SmuxStream {
     fn drop(&mut self) {
         self.best_effort_fin();
-        // Remove the stream-map entry explicitly.  smux servers (notably
-        // sing-box) may not echo a FIN for a stream the client abandoned,
-        // so waiting for CMD_FIN would leak the entry for the session's
-        // lifetime.  The detached spawn mirrors MapEntryGuard's pattern:
-        // cleanup must not wait on outbound channel capacity.
-        let state = Arc::clone(&self.session.state);
-        let id = self.id;
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                state.streams.lock().await.remove(&id);
-            });
-        }
+        self.session.state.remove_stream(self.id);
     }
 }
 
@@ -498,7 +557,7 @@ impl AsyncRead for SmuxStream {
         if let Some(mut chunk) = this.pending.take() {
             let n = chunk.data.len().min(buf.remaining());
             buf.put_slice(&chunk.data[..n]);
-            chunk.data.advance(n);
+            chunk.advance(n);
             if !chunk.data.is_empty() {
                 this.pending = Some(chunk);
             }
@@ -517,7 +576,7 @@ impl AsyncRead for SmuxStream {
                         }
                         let n = chunk.data.len().min(buf.remaining());
                         buf.put_slice(&chunk.data[..n]);
-                        chunk.data.advance(n);
+                        chunk.advance(n);
                         if !chunk.data.is_empty() {
                             this.pending = Some(chunk);
                         }
@@ -525,6 +584,12 @@ impl AsyncRead for SmuxStream {
                     }
                     Poll::Ready(None) => {
                         this.eof = true;
+                        if this.aborted.load(Ordering::Acquire) {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::ConnectionAborted,
+                                "smux stream receive buffer exceeded",
+                            )));
+                        }
                         if this.session.is_dead() {
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::BrokenPipe,
@@ -550,6 +615,12 @@ impl AsyncWrite for SmuxStream {
             return Poll::Ready(Ok(0));
         }
         let this = self.get_mut();
+        if this.aborted.load(Ordering::Acquire) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "smux stream receive buffer exceeded",
+            )));
+        }
         if this.session.is_dead() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -628,6 +699,12 @@ impl AsyncWrite for SmuxStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if this.aborted.load(Ordering::Acquire) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "smux stream receive buffer exceeded",
+            )));
+        }
         if this.fin_sent {
             return Poll::Ready(Ok(()));
         }
@@ -764,6 +841,34 @@ mod tests {
         assert_eq!(&buf, b"AAA");
         b.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"BBB");
+    }
+
+    #[tokio::test]
+    async fn full_inbox_aborts_only_the_stalled_stream() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let session = Arc::new(Session::client(client_io).unwrap());
+        let mut a = session.open_stream().await.unwrap();
+        let mut b = session.open_stream().await.unwrap();
+
+        let mut wire = Vec::new();
+        for _ in 0..=STREAM_QUEUE {
+            wire.extend_from_slice(&encode_frame(CMD_PSH, a.id, b"x"));
+        }
+        wire.extend_from_slice(&encode_frame(CMD_PSH, b.id, b"ready"));
+        server_io.write_all(&wire).await.unwrap();
+
+        let mut ready = [0u8; 5];
+        tokio::time::timeout(std::time::Duration::from_secs(1), b.read_exact(&mut ready))
+            .await
+            .expect("a full A inbox must not block B")
+            .unwrap();
+        assert_eq!(&ready, b"ready");
+
+        let mut drained = vec![0u8; STREAM_QUEUE];
+        a.read_exact(&mut drained).await.unwrap();
+        let error = a.read(&mut [0u8; 1]).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(!session.is_dead());
     }
 
     #[tokio::test]
@@ -1133,7 +1238,7 @@ mod tests {
         // The cancellation guard removes the entry asynchronously.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
-            session.state.streams.lock().await.is_empty(),
+            session.state.streams.lock().is_empty(),
             "the cancelled open must not leave its stream-map entry"
         );
         // Release the parked write and drain so the session can shut
