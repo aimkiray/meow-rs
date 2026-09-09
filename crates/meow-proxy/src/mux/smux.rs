@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio_util::sync::{CancellationToken, PollSender};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 const CMD_SYN: u8 = 0;
 const CMD_FIN: u8 = 1;
@@ -49,11 +49,20 @@ const MAX_RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
 /// disconnected. sing-mux's own `MaxStreamBuffer` is 64 KiB, but that is a
 /// *blocking* threshold — reusing it as a retire threshold would kill
 /// streams for sub-millisecond stalls.
-const MAX_STREAM_BUFFER: usize = MAX_RECEIVE_BUFFER / 4;
+///
+/// The divisor has to leave headroom for many concurrent streams, not just
+/// a few: `MuxClient::offer` stops consulting `max-streams` once
+/// `max-connections` sessions exist, so one session carries an unbounded
+/// number of streams. At `/4`, four stalled streams exhausted the whole
+/// budget and wedged the reader for every other stream on the session; at
+/// `/32` that takes thirty-two.
+const MAX_STREAM_BUFFER: usize = MAX_RECEIVE_BUFFER / 32;
 /// How long the reader waits for session receive budget before giving up on
 /// the session. Nothing below the mux layer reclaims budget held by a
-/// stalled consumer, so a wedged session cannot recover on its own; see
-/// `BUDGET_STALL_TIMEOUT` use in the reader.
+/// stalled consumer, so a wedged session cannot recover on its own. The
+/// deadline is session-wide, not per frame: it is armed the first time an
+/// acquire blocks and cleared only by a successful one, so a trickle of
+/// permits cannot keep postponing it forever.
 const BUDGET_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounded outbound queue; stream writes wait when the physical writer lags.
 const OUTBOUND_QUEUE: usize = 64;
@@ -305,6 +314,9 @@ impl Session {
         tokio::spawn(async move {
             let mut header = [0u8; FRAME_HEADER_LEN];
             let mut discard = [0u8; 8 * 1024];
+            // Expiry of the session-wide budget-stall deadline; `None` while
+            // the reader is making progress. See `BUDGET_STALL_TIMEOUT`.
+            let mut budget_deadline: Option<tokio::time::Instant> = None;
             'reader: loop {
                 let header_result = tokio::select! {
                     _ = reader_cancel.cancelled() => break,
@@ -357,32 +369,55 @@ impl Session {
                         let permit = match Arc::clone(&receive_budget)
                             .try_acquire_many_owned(length as u32)
                         {
-                            Ok(permit) => permit,
+                            Ok(permit) => {
+                                // Uncontended, so the session has real
+                                // headroom: this is the only progress signal
+                                // that clears the stall deadline.
+                                budget_deadline = None;
+                                permit
+                            }
                             Err(TryAcquireError::Closed) => break 'reader,
-                            Err(TryAcquireError::NoPermits) => tokio::select! {
-                                _ = reader_cancel.cancelled() => break 'reader,
-                                result = Arc::clone(&receive_budget)
-                                    .acquire_many_owned(length as u32) => match result {
-                                    Ok(permit) => permit,
-                                    Err(_) => break 'reader,
-                                },
-                                // Every budget holder has stalled. The budget
-                                // lives in chunks queued inside inboxes whose
-                                // consumers are not polling, and the relay
-                                // stops polling a read half whose write half
-                                // is blocked — so no layer below can reclaim
-                                // it and this session will never dispatch
-                                // again. Abandon it: the physical connection
-                                // closes, the server releases its side, and
-                                // the pool opens a fresh session.
-                                _ = tokio::time::sleep(BUDGET_STALL_TIMEOUT) => {
-                                    debug!(
-                                        "smux: session receive budget ({MAX_RECEIVE_BUFFER} bytes) \
-                                         held for {BUDGET_STALL_TIMEOUT:?}; abandoning session"
-                                    );
-                                    break 'reader;
+                            Err(TryAcquireError::NoPermits) => {
+                                // One deadline shared by every consecutive
+                                // blocked frame. A blocking acquire that
+                                // eventually succeeds deliberately leaves it
+                                // armed: scraping by means the budget is still
+                                // saturated, and clearing on that would let a
+                                // trickle of permits postpone abandonment
+                                // forever, parking the session in a near-wedged
+                                // state the pool still considers healthy.
+                                let deadline = *budget_deadline.get_or_insert_with(|| {
+                                    tokio::time::Instant::now() + BUDGET_STALL_TIMEOUT
+                                });
+                                let remaining =
+                                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                                tokio::select! {
+                                    _ = reader_cancel.cancelled() => break 'reader,
+                                    result = Arc::clone(&receive_budget)
+                                        .acquire_many_owned(length as u32) => match result {
+                                        Ok(permit) => permit,
+                                        Err(_) => break 'reader,
+                                    },
+                                    // Every budget holder has stalled. The
+                                    // budget lives in chunks queued inside
+                                    // inboxes whose consumers are not polling,
+                                    // and the relay stops polling a read half
+                                    // whose write half is blocked — so no layer
+                                    // below can reclaim it and this session will
+                                    // never dispatch again. Abandon it: the
+                                    // physical connection closes, the server
+                                    // releases its side, and the pool opens a
+                                    // fresh session.
+                                    _ = tokio::time::sleep(remaining) => {
+                                        warn!(
+                                            "smux: session receive budget \
+                                             ({MAX_RECEIVE_BUFFER} bytes) saturated for \
+                                             {BUDGET_STALL_TIMEOUT:?}; abandoning session"
+                                        );
+                                        break 'reader;
+                                    }
                                 }
-                            },
+                            }
                         };
                         let mut payload = vec![0u8; length];
                         let payload_result = tokio::select! {
@@ -432,11 +467,11 @@ impl Session {
                     // client-only usage and anything else is a protocol error.
                     // Reject before allocating payload.
                     CMD_SYN => {
-                        debug!("smux: protocol error: unexpected SYN from server");
+                        warn!("smux: protocol error: unexpected SYN from server; dropping session");
                         break 'reader;
                     }
                     other => {
-                        debug!("smux: protocol error: unknown command {other}");
+                        warn!("smux: protocol error: unknown command {other}; dropping session");
                         break 'reader;
                     }
                 }
@@ -569,7 +604,7 @@ fn retire_stream(
     reason: &str,
 ) {
     entry.aborted.store(true, Ordering::Release);
-    debug!(
+    info!(
         "smux: retiring stream {stream_id}: {reason} ({} bytes undelivered)",
         entry.unread.load(Ordering::Relaxed)
     );
@@ -1060,6 +1095,17 @@ mod tests {
     async fn wedged_receive_budget_abandons_the_session() {
         let frames_per_stream = MAX_STREAM_BUFFER / MAX_FRAME_SIZE;
         let hogs = MAX_RECEIVE_BUFFER / MAX_STREAM_BUFFER;
+        // `hogs` is the session's concurrency headroom: this many streams
+        // have to pin themselves at the cap before the reader can wedge.
+        // `MuxClient::offer` places no bound on streams per session once
+        // max-connections is reached, so a small divisor would make the
+        // wedge reachable in ordinary traffic.
+        const {
+            assert!(
+                MAX_RECEIVE_BUFFER / MAX_STREAM_BUFFER >= 32,
+                "the receive budget must leave headroom for many streams per session"
+            );
+        };
         let (client_io, mut server_io) = tokio::io::duplex(MAX_RECEIVE_BUFFER + 64 * 1024);
         let session = Arc::new(Session::client(client_io).unwrap());
         let mut streams = Vec::new();
@@ -1096,13 +1142,231 @@ mod tests {
             session.is_dead(),
             "a session that cannot make progress must be abandoned"
         );
-        // A hog was served in full, so the reader really did consume the
-        // whole budget and only then stop — pinning the teardown to the
+        // The last hog was served in full, so the reader really did consume
+        // the whole budget and only then stop — pinning the teardown to the
         // acquire rather than to some other session-death path.
         let mut buffered = vec![0u8; MAX_STREAM_BUFFER];
-        streams[0].read_exact(&mut buffered).await.unwrap();
+        streams[hogs - 1].read_exact(&mut buffered).await.unwrap();
         assert!(buffered.iter().all(|b| *b == 0x5a));
         writer.await.unwrap();
+    }
+
+    /// The inbox depth is a real retire trigger, not just a comment: it fires
+    /// when frames are small enough that [`STREAM_QUEUE`] of them cost less
+    /// payload than [`MAX_STREAM_BUFFER`]. Retiring must stay scoped to the
+    /// stalled stream, and everything already queued must still be delivered.
+    #[tokio::test]
+    async fn inbox_depth_retires_only_the_stalled_stream() {
+        // Guards the premise: the depth bound has to be reached first, or
+        // this test silently exercises the byte cap instead.
+        const {
+            assert!(
+                STREAM_QUEUE + 1 < MAX_STREAM_BUFFER,
+                "inbox depth must bind before the byte cap, or this test proves nothing"
+            );
+        };
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let session = Arc::new(Session::client(client_io).unwrap());
+        let mut slow = session.open_stream().await.unwrap();
+        let mut peer = session.open_stream().await.unwrap();
+
+        let mut wire = Vec::new();
+        for _ in 0..=STREAM_QUEUE {
+            wire.extend_from_slice(&encode_frame(CMD_PSH, slow.id, b"x"));
+        }
+        wire.extend_from_slice(&encode_frame(CMD_PSH, peer.id, b"ready"));
+        server_io.write_all(&wire).await.unwrap();
+
+        let mut ready = [0u8; 5];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.read_exact(&mut ready),
+        )
+        .await
+        .expect("a depth-capped stream must not block its peers")
+        .unwrap();
+        assert_eq!(&ready, b"ready");
+
+        let mut drained = vec![0u8; STREAM_QUEUE];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            slow.read_exact(&mut drained),
+        )
+        .await
+        .expect("data queued before the retire must still be delivered")
+        .unwrap();
+        assert!(drained.iter().all(|b| *b == b'x'));
+
+        let error =
+            tokio::time::timeout(std::time::Duration::from_secs(1), slow.read(&mut [0u8; 1]))
+                .await
+                .expect("the retire must surface, not hang")
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(!session.is_dead());
+    }
+
+    /// Consuming data must return those bytes to the per-stream counter. A
+    /// counter that only ever grows would retire every long-lived stream once
+    /// it had transferred one cap's worth in total — the exact defect class
+    /// the byte cap replaced the frame count to avoid.
+    #[tokio::test]
+    async fn draining_a_stream_frees_its_receive_cap() {
+        let frames_per_batch = MAX_STREAM_BUFFER / MAX_FRAME_SIZE;
+        let (client_io, mut server_io) = tokio::io::duplex(2 * MAX_STREAM_BUFFER);
+        let session = Arc::new(Session::client(client_io).unwrap());
+        let mut stream = session.open_stream().await.unwrap();
+
+        let big = vec![0x5au8; MAX_FRAME_SIZE];
+        // Two consecutive full-cap batches. The second is only deliverable if
+        // draining the first gave the bytes back.
+        for batch in 0..2 {
+            let mut wire = Vec::new();
+            for _ in 0..frames_per_batch {
+                wire.extend_from_slice(&encode_frame(CMD_PSH, stream.id, &big));
+            }
+            server_io.write_all(&wire).await.unwrap();
+
+            let mut buf = vec![0u8; MAX_STREAM_BUFFER];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.read_exact(&mut buf),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("batch {batch} must be delivered in full"))
+            .unwrap();
+            assert!(buf.iter().all(|b| *b == 0x5a), "batch {batch} corrupted");
+        }
+
+        // Still open: the next read parks instead of erroring.
+        let next = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stream.read(&mut [0u8; 1]),
+        )
+        .await;
+        assert!(
+            next.is_err(),
+            "a fully drained stream must not have been retired"
+        );
+        assert!(!session.is_dead());
+    }
+
+    /// smux v1 control frames carry no payload, but a malformed one must cost
+    /// only its own bytes. Treating it as fatal takes down every stream on the
+    /// session, which is a peer-visible failure for traffic this client should
+    /// simply skip.
+    #[tokio::test]
+    async fn malformed_control_frame_does_not_kill_the_session() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let session = Arc::new(Session::client(client_io).unwrap());
+        let mut stream = session.open_stream().await.unwrap();
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&encode_frame(CMD_NOP, 0, b"junk"));
+        // An unknown id, so the FIN's stream removal is a no-op and only the
+        // payload tolerance is under test.
+        wire.extend_from_slice(&encode_frame(CMD_FIN, 0xFFFF_FFFF, b"junk"));
+        wire.extend_from_slice(&encode_frame(CMD_PSH, stream.id, b"alive"));
+        server_io.write_all(&wire).await.unwrap();
+
+        let mut buf = [0u8; 5];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream.read_exact(&mut buf),
+        )
+        .await
+        .expect("the session must keep dispatching after a malformed control frame")
+        .unwrap();
+        assert_eq!(&buf, b"alive");
+        assert!(!session.is_dead());
+    }
+
+    /// Regression: when both outbound queues are full, `queue_fin` drops one
+    /// FIN. It used to call `mark_dead` + `cancel`, and because this path is
+    /// reachable from `Drop`, merely closing a stream during backpressure
+    /// killed every healthy stream on the session.
+    #[tokio::test]
+    async fn dropped_fin_does_not_kill_the_session() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let open = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(std::sync::Mutex::new(None));
+        let polled = Arc::new(AtomicBool::new(false));
+        let session = Arc::new(
+            Session::client(GatedIo {
+                inner: client_io,
+                open: Arc::clone(&open),
+                waker: Arc::clone(&waker),
+                polled: Arc::clone(&polled),
+            })
+            .unwrap(),
+        );
+        // Open both streams before wedging the writer: opening queues a SYN.
+        let victim = session.open_stream().await.unwrap();
+        let mut peer = session.open_stream().await.unwrap();
+        let victim_id = victim.id;
+
+        // Park the writer on the gate, then fill BOTH outbound queues so
+        // `queue_fin` has nowhere left to put the frame.
+        let filler = OutMsg::Frame(encode_frame(CMD_PSH, 0xFFFF, &[1]));
+        loop {
+            while session.writer_tx.capacity() > 0 {
+                session.writer_tx.try_send(filler.clone()).unwrap();
+            }
+            if polled.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let deferred_filler = encode_frame(CMD_PSH, 0xFFFF, &[1]);
+        while session.deferred_fin_tx.capacity() > 0 {
+            session
+                .deferred_fin_tx
+                .try_send(deferred_filler.clone())
+                .unwrap();
+        }
+
+        drop(victim);
+        assert!(
+            !session.is_dead(),
+            "an unqueueable FIN must cost one stream, not the session"
+        );
+
+        open.store(true, Ordering::SeqCst);
+        if let Some(w) = waker.lock().unwrap().take() {
+            w.wake();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), peer.write_all(b"ping"))
+            .await
+            .expect("the session must still accept writes")
+            .unwrap();
+        assert!(!session.is_dead());
+
+        // The FIN really was dropped rather than slipping into a queue.
+        let mut io = server_io;
+        let mut hdr = [0u8; FRAME_HEADER_LEN];
+        let mut payload = [0u8; 64];
+        let mut saw_victim_fin = false;
+        let drain = async {
+            loop {
+                if io.read_exact(&mut hdr).await.is_err() {
+                    break;
+                }
+                let Ok((cmd, length, sid)) = Frame::decode_header(&hdr) else {
+                    break;
+                };
+                if length > 0 && io.read_exact(&mut payload[..length]).await.is_err() {
+                    break;
+                }
+                if cmd == CMD_FIN && sid == victim_id {
+                    saw_victim_fin = true;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), drain).await;
+        assert!(
+            !saw_victim_fin,
+            "both queues were full, so the FIN must have been dropped"
+        );
     }
 
     #[tokio::test]
