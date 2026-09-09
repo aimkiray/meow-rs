@@ -580,15 +580,20 @@ fn queue_fin(
     stream_id: u32,
 ) {
     let frame = encode_frame(CMD_FIN, stream_id, &[]);
-    if writer_tx.try_send(OutMsg::Frame(frame.clone())).is_ok() {
-        return;
+    match writer_tx.try_send(OutMsg::Frame(frame.clone())) {
+        // Closed means the writer already broke out and marked the session dead.
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
+        Err(mpsc::error::TrySendError::Full(_)) => {}
     }
-    if deferred_fin_tx.try_send(frame).is_err() {
-        // Both bounded queues are full, so the physical writer is wedged.
-        // Dropping this FIN leaks one server-side stream until the session
-        // ends; tearing the session down here would kill every healthy
-        // stream on it, and this path is reachable from `Drop`.
-        debug!("smux: dropping FIN for stream {stream_id}: outbound queues full");
+    match deferred_fin_tx.try_send(frame) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            // Both bounded queues are full, so the physical writer is wedged.
+            // Dropping this FIN leaks one server-side stream until the session
+            // ends; tearing the session down here would kill every healthy
+            // stream on it, and this path is reachable from `Drop`.
+            debug!("smux: dropping FIN for stream {stream_id}: outbound queues full");
+        }
     }
 }
 
@@ -1366,6 +1371,73 @@ mod tests {
         assert!(
             !saw_victim_fin,
             "both queues were full, so the FIN must have been dropped"
+        );
+    }
+
+    #[derive(Clone)]
+    struct CaptureSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureSink {
+        type Writer = CaptureSink;
+        fn make_writer(&'a self) -> CaptureSink {
+            self.clone()
+        }
+    }
+
+    /// Thread-local on purpose: a global subscriber races across parallel test binaries.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        let sink = CaptureSink(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let captured = sink.0.lock().unwrap();
+        String::from_utf8_lossy(&captured).into_owned()
+    }
+
+    /// Blaming a wedge for a dead session points whoever reads the log at a live socket.
+    #[test]
+    fn dropped_fin_distinguishes_a_dead_session_from_a_wedge() {
+        const WEDGE: &str = "outbound queues full";
+
+        let (writer_tx, writer_rx) = mpsc::channel::<OutMsg>(OUTBOUND_QUEUE);
+        let (deferred_tx, deferred_rx) = mpsc::channel::<Bytes>(DEFERRED_FIN_QUEUE);
+        drop(writer_rx);
+        drop(deferred_rx);
+        let dead = capture_logs(|| queue_fin(&writer_tx, &deferred_tx, 7));
+        assert!(
+            !dead.contains(WEDGE),
+            "a dead session must not be reported as backpressure: {dead:?}"
+        );
+
+        let (writer_tx, _writer_rx) = mpsc::channel::<OutMsg>(OUTBOUND_QUEUE);
+        let (deferred_tx, _deferred_rx) = mpsc::channel::<Bytes>(DEFERRED_FIN_QUEUE);
+        for _ in 0..OUTBOUND_QUEUE {
+            writer_tx
+                .try_send(OutMsg::Frame(Bytes::from_static(b"x")))
+                .expect("the writer queue has room for this filler");
+        }
+        for _ in 0..DEFERRED_FIN_QUEUE {
+            deferred_tx
+                .try_send(Bytes::from_static(b"x"))
+                .expect("the deferred queue has room for this filler");
+        }
+        let wedged = capture_logs(|| queue_fin(&writer_tx, &deferred_tx, 7));
+        assert!(
+            wedged.contains(WEDGE),
+            "a genuinely wedged writer must still be reported: {wedged:?}"
         );
     }
 
