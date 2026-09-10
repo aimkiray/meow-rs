@@ -43,6 +43,20 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends simple-obfs
 
+      # The real-server smux E2E (smux_singbox_integration) REFUSES to
+      # silently skip without this binary. Keep the version in sync with
+      # SINGBOX_VERSION in crates/meow-app/tests/smux_singbox_integration.rs
+      # and with the test.yml install step.
+      - name: Install sing-box (real-server smux E2E)
+        run: |
+          set -euo pipefail
+          SINGBOX_VERSION=1.14.0
+          curl -fsSL -o /tmp/sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          sudo install -m 755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          command -v sing-box
+
       - name: Collect coverage
         env:
           MIHOMO_REQUIRE_INTEGRATION_BINS: "1"

@@ -348,9 +348,12 @@ async fn slow_reader_is_isolated_and_fast_readers_survive() {
     // A fast reader works while the slow one is stalled over its share.
     fast_roundtrip(mixed, echo_addr).await;
 
-    // Let the stall watchdog (500 ms grace) retire the slow stream.
+    // Let the stall watchdog (500 ms grace) retire the slow stream. The
+    // writer task's blocked write errors out once the relay tears the
+    // local connection down; the timeout is insurance so a pathological
+    // teardown can never hang the whole test binary.
     tokio::time::sleep(ISOLATION_WAIT).await;
-    let _ = slow_writer.await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), slow_writer).await;
 
     // The retire stayed scoped: the session survived, and a fresh stream
     // multiplexed onto the same physical session works end-to-end.
