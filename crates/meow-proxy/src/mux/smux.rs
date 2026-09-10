@@ -12,7 +12,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio_util::sync::{CancellationToken, PollSender};
 use tracing::{debug, info, warn};
 
@@ -34,21 +34,27 @@ const FRAME_HEADER_LEN: usize = 8;
 
 /// Largest frame payload — sagernet smux MaxFrameSize default (u16 length).
 const MAX_FRAME_SIZE: usize = 32768;
-/// Inbox depth. This is a bound on queue *overhead*, not a flow-control
-/// threshold: a frame count says nothing about how much data a consumer is
-/// behind by, so retiring on it disconnects streams that merely paused.
-/// [`MAX_STREAM_BUFFER`] is the real trigger; this depth is only reached
-/// first when the peer sends frames small enough that 2048 of them cost
-/// less payload than their queue slots.
+/// Inbox depth: a bound on the *frame-count overhead* of the per-stream
+/// fast-path queue. It is deliberately NOT a retire trigger on its own —
+/// a frame count says nothing about whether the consumer is stalled, and
+/// retiring on it cut off healthy streams mid-burst (see
+/// [`MAX_STREAM_BUFFER`] and [`STREAM_STALL_GRACE`] for the real policy).
 const STREAM_QUEUE: usize = 2048;
+/// Per-stream spill capacity beyond the inbox, in frames. A consumer that
+/// has not drained a single one of `STREAM_QUEUE + SPILL_QUEUE` frames is
+/// by construction an adversarial tiny-frame flood, never an ordinary
+/// burst — ordinary frames (>= 32 B payload on average) cross the
+/// grace-gated byte cap first. See the last-resort retire in the reader.
+const SPILL_QUEUE: usize = 2048;
 /// Sagernet's default session-wide receive budget.
 const MAX_RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
 /// One stream's share of [`MAX_RECEIVE_BUFFER`]. A stream is retired only
-/// once this much of its payload sits undelivered, so a slow consumer is
-/// buffered (and the session keeps dispatching its peers) rather than
-/// disconnected. sing-mux's own `MaxStreamBuffer` is 64 KiB, but that is a
-/// *blocking* threshold — reusing it as a retire threshold would kill
-/// streams for sub-millisecond stalls.
+/// once this much of its payload sits undelivered for a whole
+/// [`STREAM_STALL_GRACE`] window — see [`stall_watchdog`] for why the
+/// decision must not be taken at frame-arrival time. sing-mux's own
+/// `MaxStreamBuffer` is 64 KiB, but that is a *blocking* threshold —
+/// reusing it as a retire threshold would kill streams for sub-millisecond
+/// stalls.
 ///
 /// The divisor has to leave headroom for many concurrent streams, not just
 /// a few: `MuxClient::offer` stops consulting `max-streams` once
@@ -57,6 +63,17 @@ const MAX_RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
 /// budget and wedged the reader for every other stream on the session; at
 /// `/32` that takes thirty-two.
 const MAX_STREAM_BUFFER: usize = MAX_RECEIVE_BUFFER / 32;
+/// How long a stream may hold more than its receive share ([`MAX_STREAM_BUFFER`]
+/// bytes unread, or a non-empty spill) before it is retired. Retirement is
+/// deliberately NOT decided at frame-arrival time: in a buffered burst the
+/// reader task drains frames back-to-back without ever yielding to the
+/// consumer, so `unread` crosses any byte cap while a perfectly healthy,
+/// actively reading consumer is merely waiting to be scheduled. The
+/// watchdog re-checks the live watermark when it fires, so a consumer that
+/// gets back under its share inside the window — which every ordinary burst
+/// does — survives; only a stream still holding more than its share after
+/// the full window is cut off to release the budget for its peers.
+const STREAM_STALL_GRACE: Duration = Duration::from_millis(500);
 /// How long the reader waits for session receive budget before giving up on
 /// the session. Nothing below the mux layer reclaims budget held by a
 /// stalled consumer, so a wedged session cannot recover on its own. The
@@ -174,15 +191,52 @@ impl Drop for InboundChunk {
     }
 }
 
+/// Per-stream receive-side accounting and overflow parking, shared between
+/// the reader (producer) and the stream's consumer.
+///
+/// The `unread` counter lives in its own `Arc` (not inside this struct)
+/// because [`InboundChunk`] shares it: parking a chunk that held an
+/// `Arc<StreamStats>` would form a cycle (`StreamStats::spill` → chunk →
+/// `Arc<StreamStats>`) and leak the chunk's session-budget permits forever.
+struct StreamStats {
+    /// Payload bytes enqueued for this stream and not yet handed to its
+    /// consumer. Retiring is gated on this passing [`MAX_STREAM_BUFFER`]
+    /// for a whole [`STREAM_STALL_GRACE`] window, which keeps one stream
+    /// from monopolising the session budget while transient consumer
+    /// pauses — bursts, scheduler hiccups — ride through untouched.
+    unread: Arc<AtomicUsize>,
+    /// Overflow parking for chunks that arrive while the inbox is full.
+    /// FIFO is preserved by the reader (once the spill is non-empty every
+    /// later chunk parks there too) and by the consumer (which drains the
+    /// inbox to exhaustion before touching the spill).
+    spill: Mutex<VecDeque<InboundChunk>>,
+    /// Single-watchdog gate: the reader arms exactly one watchdog per
+    /// stream with a CAS on this flag; whichever watchdog owns the `true`
+    /// value is responsible for clearing it on exit.
+    armed: AtomicBool,
+    /// Wakes the consumer when a chunk is parked in the spill. The inbox
+    /// channel has its own wake-up path; this covers only the spill.
+    notify: Notify,
+}
+
+impl StreamStats {
+    fn pop_spill(&self) -> Option<InboundChunk> {
+        self.spill.lock().pop_front()
+    }
+
+    /// The retire condition: the stream holds more than its share of the
+    /// receive budget, or is carrying parked overflow, right now. Arming
+    /// uses the same predicate, so the watchdog's re-check is exact.
+    fn over_share(&self) -> bool {
+        self.unread.load(Ordering::Acquire) > MAX_STREAM_BUFFER || !self.spill.lock().is_empty()
+    }
+}
+
 #[derive(Clone)]
 struct StreamEntry {
     tx: mpsc::Sender<InboundChunk>,
     aborted: Arc<AtomicBool>,
-    /// Payload bytes enqueued for this stream and not yet handed to its
-    /// consumer. The reader stops accepting for the stream once this passes
-    /// [`MAX_STREAM_BUFFER`], which keeps one stream from monopolising the
-    /// session budget while leaving transient consumer pauses unaffected.
-    unread: Arc<AtomicUsize>,
+    stats: Arc<StreamStats>,
 }
 
 /// One outbound writer request.  Flush requests travel the SAME bounded
@@ -345,24 +399,12 @@ impl Session {
                             }
                             continue;
                         }
-                        // Retire on undelivered BYTES. Checked before taking
-                        // budget so a hog cannot borrow capacity for a frame
-                        // that is about to be discarded.
-                        if entry.unread.load(Ordering::Acquire) + length > MAX_STREAM_BUFFER {
-                            retire_stream(
-                                &entry,
-                                &reader_state,
-                                &reader_writer_tx,
-                                &reader_deferred_fin_tx,
-                                stream_id,
-                                "per-stream receive buffer exhausted",
-                            );
-                            if !drain_frame(&mut reader, &reader_cancel, &mut discard, length).await
-                            {
-                                break 'reader;
-                            }
-                            continue;
-                        }
+                        // The session receive budget is the hard bound on
+                        // bytes in flight; the per-stream share is enforced
+                        // by the stall watchdog AFTER this frame is
+                        // delivered, never here — at arrival time a healthy
+                        // consumer that simply has not been scheduled yet is
+                        // indistinguishable from a stalled one.
                         // Try without blocking first: arming a timer on every
                         // frame would tax the hot path, and the budget is
                         // uncontended in the common case.
@@ -427,25 +469,79 @@ impl Session {
                         if payload_result.is_err() {
                             break;
                         }
-                        entry.unread.fetch_add(length, Ordering::Release);
-                        match entry.tx.try_send(InboundChunk {
+                        entry.stats.unread.fetch_add(length, Ordering::Release);
+                        // Fast path: the inbox, whose bounded depth caps
+                        // queue *overhead*. A full inbox parks the chunk in
+                        // the spill instead of retiring the stream — FIFO is
+                        // preserved because later chunks park too while the
+                        // spill is non-empty, and the consumer drains the
+                        // inbox first.
+                        let chunk = InboundChunk {
                             data: Bytes::from(payload),
                             permit: Some(permit),
-                            unread: Arc::clone(&entry.unread),
-                        }) {
-                            // Depth bound, reached only when frames are small
-                            // enough that 2048 of them fit under the byte cap.
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                retire_stream(
-                                    &entry,
-                                    &reader_state,
-                                    &reader_writer_tx,
-                                    &reader_deferred_fin_tx,
-                                    stream_id,
-                                    "stream inbox depth exhausted",
-                                );
+                            unread: Arc::clone(&entry.stats.unread),
+                        };
+                        let mut spill = entry.stats.spill.lock();
+                        let parked = if spill.is_empty() {
+                            match entry.tx.try_send(chunk) {
+                                // `Ok`: parked in the inbox. `Closed`: the
+                                // consumer is gone and `InboundChunk::drop`
+                                // releases the budget permits and unread
+                                // accounting — either way, no spill parking.
+                                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => false,
+                                Err(mpsc::error::TrySendError::Full(chunk)) => {
+                                    spill.push_back(chunk);
+                                    true
+                                }
                             }
-                            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                        } else {
+                            spill.push_back(chunk);
+                            true
+                        };
+                        let spill_len = spill.len();
+                        drop(spill);
+                        if parked {
+                            entry.stats.notify.notify_one();
+                        }
+                        // Last-resort retire, the ONLY synchronous one: more
+                        // than inbox+spill frames parked against a consumer
+                        // that has not drained one of them is an adversarial
+                        // tiny-frame flood (see [`SPILL_QUEUE`]). Ordinary
+                        // traffic crosses the grace-gated byte cap long
+                        // before this fires.
+                        if spill_len > SPILL_QUEUE {
+                            retire_stream(
+                                &entry.aborted,
+                                &entry.stats,
+                                &reader_state,
+                                &reader_writer_tx,
+                                &reader_deferred_fin_tx,
+                                stream_id,
+                                "receive queue exhausted by frame flood",
+                            );
+                            continue;
+                        }
+                        // Arm the per-stream stall watchdog when this stream
+                        // crosses its receive share. The CAS keeps one
+                        // watchdog per stream; the running one owns the
+                        // re-arm until it exits.
+                        let over_share = entry.stats.unread.load(Ordering::Acquire)
+                            > MAX_STREAM_BUFFER
+                            || parked;
+                        if over_share && !entry.stats.armed.swap(true, Ordering::AcqRel) {
+                            let aborted = Arc::clone(&entry.aborted);
+                            let stats = Arc::clone(&entry.stats);
+                            let state = Arc::clone(&reader_state);
+                            let writer_tx = reader_writer_tx.clone();
+                            let deferred_fin_tx = reader_deferred_fin_tx.clone();
+                            tokio::spawn(stall_watchdog(
+                                aborted,
+                                stats,
+                                state,
+                                writer_tx,
+                                deferred_fin_tx,
+                                stream_id,
+                            ));
                         }
                     }
                     CMD_FIN | CMD_NOP => {
@@ -494,12 +590,18 @@ impl Session {
         let id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(STREAM_QUEUE);
         let aborted = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(StreamStats {
+            unread: Arc::new(AtomicUsize::new(0)),
+            spill: Mutex::new(VecDeque::new()),
+            armed: AtomicBool::new(false),
+            notify: Notify::new(),
+        });
         self.state.register_stream(
             id,
             StreamEntry {
                 tx,
                 aborted: Arc::clone(&aborted),
-                unread: Arc::new(AtomicUsize::new(0)),
+                stats: Arc::clone(&stats),
             },
         )?;
         // The guard removes the map entry if this future is cancelled
@@ -541,6 +643,7 @@ impl Session {
             flush_rx: None,
             write_since_flush: false,
             aborted,
+            stats,
         })
     }
 }
@@ -599,22 +702,89 @@ fn queue_fin(
 
 /// Retire one stream: mark it aborted so its consumer surfaces an error
 /// instead of a clean EOF, drop its map entry, and tell the peer. The
-/// session and every other stream are untouched.
+/// session and every other stream are untouched. Data already buffered in
+/// the stream's inbox and spill is still delivered before the error shows.
 fn retire_stream(
-    entry: &StreamEntry,
+    aborted: &AtomicBool,
+    stats: &StreamStats,
     state: &SessionState,
     writer_tx: &mpsc::Sender<OutMsg>,
     deferred_fin_tx: &mpsc::Sender<Bytes>,
     stream_id: u32,
     reason: &str,
 ) {
-    entry.aborted.store(true, Ordering::Release);
+    aborted.store(true, Ordering::Release);
     info!(
         "smux: retiring stream {stream_id}: {reason} ({} bytes undelivered)",
-        entry.unread.load(Ordering::Relaxed)
+        stats.unread.load(Ordering::Relaxed)
     );
     state.remove_stream(stream_id);
     queue_fin(writer_tx, deferred_fin_tx, stream_id);
+}
+
+/// Per-stream stall watchdog, armed by the reader (CAS on
+/// [`StreamStats::armed`]) when a stream crosses its receive share.
+///
+/// Retirement must not be decided at frame-arrival time: in one buffered
+/// burst the reader task processes frames back-to-back without yielding to
+/// the consumer, so `unread` crosses any byte cap while a healthy,
+/// actively reading consumer is merely unscheduled — cutting the stream
+/// there is the exact regression this watchdog exists to prevent. Instead
+/// it re-checks the live watermark ([`StreamStats::over_share`]) after a
+/// full [`STREAM_STALL_GRACE`] window:
+///
+/// * drained back under the share inside the window — every ordinary
+///   burst — the watchdog disarms (with a re-check that closes the race
+///   against a concurrent re-arm by the reader) and the stream survives;
+/// * still holding more than the share after the full window — the
+///   consumer is stalled or structurally slower than the peer, with no
+///   v1 flow control to hold it back — the stream is retired so its
+///   budget reaches its peers instead of wedging the session until
+///   [`BUDGET_STALL_TIMEOUT`] kills it wholesale.
+async fn stall_watchdog(
+    aborted: Arc<AtomicBool>,
+    stats: Arc<StreamStats>,
+    state: Arc<SessionState>,
+    writer_tx: mpsc::Sender<OutMsg>,
+    deferred_fin_tx: mpsc::Sender<Bytes>,
+    stream_id: u32,
+) {
+    loop {
+        tokio::time::sleep(STREAM_STALL_GRACE).await;
+        // The stream may have been closed, FIN'd, or retired (by an earlier
+        // watchdog or the frame-flood last resort) while we slept: nothing
+        // left to guard. Deliberately checked BEFORE the share check so a
+        // post-FIN consumer draining slowly is never aborted — its budget
+        // release is bounded by BUDGET_STALL_TIMEOUT instead.
+        if state.dead.load(Ordering::SeqCst) || state.stream(stream_id).is_none() {
+            stats.armed.store(false, Ordering::Release);
+            return;
+        }
+        if !stats.over_share() {
+            // Drained inside the window: a burst, not a stall. Clear, then
+            // re-check: if the reader armed a fresh watchdog in between,
+            // that one owns the watch and we exit; if the share was crossed
+            // again first, we re-own it and watch another full window.
+            stats.armed.store(false, Ordering::Release);
+            if stats.over_share() && !stats.armed.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            return;
+        }
+        retire_stream(
+            &aborted,
+            &stats,
+            &state,
+            &writer_tx,
+            &deferred_fin_tx,
+            stream_id,
+            "consumer stalled: undelivered payload held over its receive share",
+        );
+        // Leave `armed` set: the map entry is gone so the reader can never
+        // arm again, and a stale `true` keeps any racing path from
+        // spawning a second watchdog for this dead stream.
+        return;
+    }
 }
 
 impl SessionState {
@@ -662,6 +832,9 @@ pub struct SmuxStream {
     /// `poll_flush` must send another request once the pending one lands.
     write_since_flush: bool,
     aborted: Arc<AtomicBool>,
+    /// Receive-side accounting + overflow parking shared with the reader;
+    /// see [`StreamStats`].
+    stats: Arc<StreamStats>,
 }
 
 impl SmuxStream {
@@ -686,6 +859,19 @@ impl Drop for SmuxStream {
     }
 }
 
+/// Hand one chunk to the caller's ReadBuf, keeping any unread remainder
+/// parked as `pending`. Must return `Ready` — returning `Pending` after
+/// writing into the caller's `ReadBuf` would lose those bytes (the buffer
+/// is recreated on the next poll).
+fn serve_chunk(this: &mut SmuxStream, mut chunk: InboundChunk, buf: &mut ReadBuf<'_>) {
+    let n = chunk.data.len().min(buf.remaining());
+    buf.put_slice(&chunk.data[..n]);
+    chunk.advance(n);
+    if !chunk.data.is_empty() {
+        this.pending = Some(chunk);
+    }
+}
+
 impl AsyncRead for SmuxStream {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -702,51 +888,83 @@ impl AsyncRead for SmuxStream {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        if let Some(mut chunk) = this.pending.take() {
-            let n = chunk.data.len().min(buf.remaining());
-            buf.put_slice(&chunk.data[..n]);
-            chunk.advance(n);
-            if !chunk.data.is_empty() {
-                this.pending = Some(chunk);
-            }
+        if let Some(chunk) = this.pending.take() {
+            serve_chunk(this, chunk, buf);
             Poll::Ready(Ok(()))
         } else if this.eof {
             Poll::Ready(Ok(()))
         } else {
             loop {
                 match this.rx.poll_recv(cx) {
-                    Poll::Ready(Some(mut chunk)) => {
+                    Poll::Ready(Some(chunk)) => {
                         if chunk.data.is_empty() {
                             // Zero-length PSH frames carry no payload (flush /
                             // ack signals from the peer); returning Ready with
                             // an empty ReadBuf would read as EOF to consumers.
                             continue;
                         }
-                        let n = chunk.data.len().min(buf.remaining());
-                        buf.put_slice(&chunk.data[..n]);
-                        chunk.advance(n);
-                        if !chunk.data.is_empty() {
-                            this.pending = Some(chunk);
-                        }
+                        serve_chunk(this, chunk, buf);
                         return Poll::Ready(Ok(()));
                     }
                     Poll::Ready(None) => {
-                        this.eof = true;
-                        if this.aborted.load(Ordering::Acquire) {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::ConnectionAborted,
-                                "smux stream receive buffer exceeded",
-                            )));
+                        // The inbox channel is closed (server FIN, retire,
+                        // session teardown) — everything parked in the spill
+                        // is still deliverable, so EOF only after the spill
+                        // drains too.
+                        match this.stats.pop_spill() {
+                            Some(chunk) => {
+                                if chunk.data.is_empty() {
+                                    continue;
+                                }
+                                serve_chunk(this, chunk, buf);
+                                return Poll::Ready(Ok(()));
+                            }
+                            None => {
+                                this.eof = true;
+                                if this.aborted.load(Ordering::Acquire) {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::ConnectionAborted,
+                                        "smux stream retired: consumer stalled past its receive share",
+                                    )));
+                                }
+                                if this.session.is_dead() {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::BrokenPipe,
+                                        "smux session closed",
+                                    )));
+                                }
+                                return Poll::Ready(Ok(()));
+                            }
                         }
-                        if this.session.is_dead() {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                "smux session closed",
-                            )));
-                        }
-                        return Poll::Ready(Ok(()));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        // The inbox is exhausted: serve the spill next (its
+                        // chunks are older than anything that can arrive
+                        // from now on — the reader only refills the inbox
+                        // once the spill is empty). When the spill is empty
+                        // too, park on its wake-up so a chunk parked between
+                        // the empty check and here cannot be missed:
+                        // `notify_one` stores a permit when no one is
+                        // waiting, which this poll consumes.
+                        match this.stats.pop_spill() {
+                            Some(chunk) => {
+                                if chunk.data.is_empty() {
+                                    continue;
+                                }
+                                serve_chunk(this, chunk, buf);
+                                return Poll::Ready(Ok(()));
+                            }
+                            None => {
+                                let mut notified = std::pin::pin!(this.stats.notify.notified());
+                                if notified.as_mut().poll(cx).is_ready() {
+                                    // A stored permit or a fresh wake:
+                                    // re-check the inbox and spill.
+                                    continue;
+                                }
+                                return Poll::Pending;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -766,7 +984,7 @@ impl AsyncWrite for SmuxStream {
         if this.aborted.load(Ordering::Acquire) {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
-                "smux stream receive buffer exceeded",
+                "smux stream retired: consumer stalled past its receive share",
             )));
         }
         if this.session.is_dead() {
@@ -850,7 +1068,7 @@ impl AsyncWrite for SmuxStream {
         if this.aborted.load(Ordering::Acquire) {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
-                "smux stream receive buffer exceeded",
+                "smux stream retired: consumer stalled past its receive share",
             )));
         }
         if this.fin_sent {
@@ -1039,14 +1257,17 @@ mod tests {
         assert!(!session.is_dead());
     }
 
-    /// Retiring is reserved for a stream that has taken more than its share
-    /// of the session receive budget. What it already buffered is still
-    /// delivered, the consumer then sees `ConnectionAborted`, and neither the
-    /// session nor its peers are affected.
-    #[tokio::test]
-    async fn per_stream_byte_cap_retires_only_the_hog() {
-        // One frame past the cap: the cap check is `unread + length > cap`.
+    /// A stream that holds more than its receive share is retired — but
+    /// only after a full [`STREAM_STALL_GRACE`] window, never at frame
+    /// arrival. What it already buffered is still delivered, the consumer
+    /// then sees `ConnectionAborted`, and neither the session nor its
+    /// peers are affected.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_hog_retires_after_grace_and_only_the_hog() {
+        // Four 32 KiB frames land exactly at the share; the fifth crosses
+        // it and arms the watchdog.
         let frames_over_cap = MAX_STREAM_BUFFER / MAX_FRAME_SIZE + 1;
+        let hog_bytes = frames_over_cap * MAX_FRAME_SIZE;
         let (client_io, mut server_io) = tokio::io::duplex(2 * MAX_STREAM_BUFFER);
         let session = Arc::new(Session::client(client_io).unwrap());
         let mut hog = session.open_stream().await.unwrap();
@@ -1058,14 +1279,11 @@ mod tests {
             wire.extend_from_slice(&encode_frame(CMD_PSH, hog.id, &big));
         }
         wire.extend_from_slice(&encode_frame(CMD_PSH, peer.id, b"ready"));
-        tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            server_io.write_all(&wire),
-        )
-        .await
-        .expect("wire write must not block")
-        .unwrap();
+        server_io.write_all(&wire).await.unwrap();
 
+        // While the hog sits over its share — before any grace has elapsed
+        // — the peer still receives: the over-share condition alone must
+        // not disturb anyone.
         let mut ready = [0u8; 5];
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -1076,18 +1294,29 @@ mod tests {
         .unwrap();
         assert_eq!(&ready, b"ready");
 
-        let mut buffered = vec![0u8; MAX_STREAM_BUFFER];
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            hog.read_exact(&mut buffered),
-        )
-        .await
-        .expect("data queued before the retire must still be delivered")
-        .unwrap();
-        assert!(buffered.iter().all(|b| *b == 0x5a));
+        // The consumer never drains a byte, so once the full grace window
+        // has elapsed the watchdog retires the stream. Paused time
+        // auto-advances to the watchdog timer once every task parks.
+        tokio::time::sleep(STREAM_STALL_GRACE * 2).await;
 
+        // Data queued before the retire must still be delivered, then the
+        // abort surfaces.
+        let mut buffered = vec![0u8; hog_bytes];
+        hog.read_exact(&mut buffered)
+            .await
+            .expect("data queued before the retire must still be delivered");
+        assert!(buffered.iter().all(|b| *b == 0x5a));
         let error = hog.read(&mut [0u8; 1]).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+
+        // The retire stayed scoped: the peer keeps its stream and the
+        // session survives.
+        let next = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            peer.read(&mut [0u8; 1]),
+        )
+        .await;
+        assert!(next.is_err(), "the peer stream must still be open");
         assert!(!session.is_dead());
     }
 
@@ -1156,12 +1385,15 @@ mod tests {
         writer.await.unwrap();
     }
 
-    /// The inbox depth is a real retire trigger, not just a comment: it fires
-    /// when frames are small enough that [`STREAM_QUEUE`] of them cost less
-    /// payload than [`MAX_STREAM_BUFFER`]. Retiring must stay scoped to the
-    /// stalled stream, and everything already queued must still be delivered.
-    #[tokio::test]
-    async fn inbox_depth_retires_only_the_stalled_stream() {
+    /// The inbox depth still matters, but through the spill and the
+    /// grace-gated watchdog rather than a synchronous cut: frames small
+    /// enough that [`STREAM_QUEUE`] of them cost less payload than their
+    /// queue slots fill the inbox, overflow into the spill, and retire the
+    /// stream only when the consumer has drained nothing for a whole
+    /// [`STREAM_STALL_GRACE`]. Retiring stays scoped, and everything
+    /// already queued — inbox and spill alike — is still delivered.
+    #[tokio::test(start_paused = true)]
+    async fn inbox_depth_overflow_retires_only_a_never_draining_consumer() {
         // Guards the premise: the depth bound has to be reached first, or
         // this test silently exercises the byte cap instead.
         const {
@@ -1170,43 +1402,167 @@ mod tests {
                 "inbox depth must bind before the byte cap, or this test proves nothing"
             );
         };
+        let frames = STREAM_QUEUE + 1;
         let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
         let session = Arc::new(Session::client(client_io).unwrap());
         let mut slow = session.open_stream().await.unwrap();
         let mut peer = session.open_stream().await.unwrap();
 
         let mut wire = Vec::new();
-        for _ in 0..=STREAM_QUEUE {
+        for _ in 0..frames {
             wire.extend_from_slice(&encode_frame(CMD_PSH, slow.id, b"x"));
         }
         wire.extend_from_slice(&encode_frame(CMD_PSH, peer.id, b"ready"));
         server_io.write_all(&wire).await.unwrap();
 
+        // The overflow is already parked while the peers keep flowing.
         let mut ready = [0u8; 5];
         tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
             peer.read_exact(&mut ready),
         )
         .await
-        .expect("a depth-capped stream must not block its peers")
+        .expect("an overflowing stream must not block its peers")
         .unwrap();
         assert_eq!(&ready, b"ready");
 
-        let mut drained = vec![0u8; STREAM_QUEUE];
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            slow.read_exact(&mut drained),
-        )
-        .await
-        .expect("data queued before the retire must still be delivered")
-        .unwrap();
+        // The consumer never drains, so the full grace window retires it.
+        tokio::time::sleep(STREAM_STALL_GRACE * 2).await;
+
+        // Everything queued before the retire — inbox AND spill — is still
+        // delivered, then the abort surfaces.
+        let mut drained = vec![0u8; frames];
+        slow.read_exact(&mut drained)
+            .await
+            .expect("data queued before the retire must still be delivered");
         assert!(drained.iter().all(|b| *b == b'x'));
 
-        let error =
-            tokio::time::timeout(std::time::Duration::from_secs(1), slow.read(&mut [0u8; 1]))
-                .await
-                .expect("the retire must surface, not hang")
-                .unwrap_err();
+        let error = slow.read(&mut [0u8; 1]).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(!session.is_dead());
+    }
+
+    /// Regression (PR #491 review): the receive cap must not abort a
+    /// healthy, actively reading stream. In one buffered burst the reader
+    /// task processes frames back-to-back without ever yielding to the
+    /// consumer, so on a current-thread runtime sixteen 32 KiB frames push
+    /// `unread` past the cap while a consumer that is continuously
+    /// reading has simply not been scheduled. The arrival-time retire
+    /// returned `ConnectionAborted` after exactly 131072 bytes; the same
+    /// probe must now deliver the whole burst with a clean EOF.
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_burst_does_not_abort_a_reading_consumer() {
+        const FRAMES: usize = 16;
+        let total = FRAMES * MAX_FRAME_SIZE;
+        let (client_io, mut server_io) = tokio::io::duplex(1024 * 1024);
+        let session = Arc::new(Session::client(client_io).unwrap());
+        let mut stream = session.open_stream().await.unwrap();
+
+        // One buffered burst, fully written before the consumer task ever
+        // gets to poll: 16 PSH frames + FIN. The 1 MiB duplex absorbs it
+        // without yielding, which is exactly the harshest scheduling gap.
+        let big = vec![0xa5u8; MAX_FRAME_SIZE];
+        let mut wire = Vec::with_capacity((MAX_FRAME_SIZE + FRAME_HEADER_LEN) * FRAMES);
+        for _ in 0..FRAMES {
+            wire.extend_from_slice(&encode_frame(CMD_PSH, stream.id, &big));
+        }
+        wire.extend_from_slice(&encode_frame(CMD_FIN, stream.id, &[]));
+        server_io.write_all(&wire).await.unwrap();
+
+        // The consumer reads continuously; only the reader parking lets it
+        // run, which is the exact interleaving that used to be misread as
+        // a stall.
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received.len(), total);
+        assert!(received.iter().all(|b| *b == 0xa5));
+        assert!(!session.is_dead());
+    }
+
+    /// A consumer that crosses its share but drains back under it inside
+    /// the grace window is a burst, not a stall: the watchdog must disarm
+    /// and leave the stream fully usable.
+    #[tokio::test(start_paused = true)]
+    async fn over_share_recovered_within_the_grace_window_survives() {
+        let frames_over_cap = MAX_STREAM_BUFFER / MAX_FRAME_SIZE + 1;
+        let hog_bytes = frames_over_cap * MAX_FRAME_SIZE;
+        let (client_io, mut server_io) = tokio::io::duplex(2 * MAX_STREAM_BUFFER);
+        let session = Arc::new(Session::client(client_io).unwrap());
+        let mut stream = session.open_stream().await.unwrap();
+
+        let big = vec![0x5au8; MAX_FRAME_SIZE];
+        let mut wire = Vec::new();
+        for _ in 0..frames_over_cap {
+            wire.extend_from_slice(&encode_frame(CMD_PSH, stream.id, &big));
+        }
+        server_io.write_all(&wire).await.unwrap();
+
+        // Halfway through the grace window the consumer drains everything.
+        tokio::time::sleep(STREAM_STALL_GRACE / 2).await;
+        let mut buffered = vec![0u8; hog_bytes];
+        stream.read_exact(&mut buffered).await.unwrap();
+        assert!(buffered.iter().all(|b| *b == 0x5a));
+
+        // Past the original fire time the watchdog finds the stream back
+        // under its share and disarms instead of retiring.
+        tokio::time::sleep(STREAM_STALL_GRACE).await;
+
+        // The stream must still be usable end-to-end.
+        server_io
+            .write_all(&encode_frame(CMD_PSH, stream.id, b"still alive"))
+            .await
+            .unwrap();
+        let mut alive = [0u8; 11];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut alive),
+        )
+        .await
+        .expect("a recovered stream must stay readable")
+        .unwrap();
+        assert_eq!(&alive, b"still alive");
+        assert!(!session.is_dead());
+    }
+
+    /// The frame-count last resort: a flood of tiny frames that the byte
+    /// cap can never catch (payload too small to cross the share) parks
+    /// more than inbox+spill frames against a consumer that has drained
+    /// nothing, and the stream is retired synchronously so queue-overhead
+    /// memory stays bounded. Ordinary traffic crosses the grace-gated byte
+    /// cap long before this fires.
+    #[tokio::test(start_paused = true)]
+    async fn tiny_frame_flood_beyond_inbox_and_spill_retires_immediately() {
+        // The 4097th frame makes the spill exceed SPILL_QUEUE.
+        let frames = STREAM_QUEUE + SPILL_QUEUE + 1;
+        let (client_io, mut server_io) = tokio::io::duplex(128 * 1024);
+        let session = Arc::new(Session::client(client_io).unwrap());
+        let mut flood = session.open_stream().await.unwrap();
+        let mut peer = session.open_stream().await.unwrap();
+
+        let mut wire = Vec::new();
+        for _ in 0..frames {
+            wire.extend_from_slice(&encode_frame(CMD_PSH, flood.id, b"f"));
+        }
+        wire.extend_from_slice(&encode_frame(CMD_PSH, peer.id, b"ready"));
+        server_io.write_all(&wire).await.unwrap();
+
+        // The flood never blocks its peers.
+        let mut ready = [0u8; 5];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            peer.read_exact(&mut ready),
+        )
+        .await
+        .expect("a flood stream must not block its peers")
+        .unwrap();
+        assert_eq!(&ready, b"ready");
+
+        // Every parked frame is delivered, then the abort surfaces — the
+        // last resort fired during the flood, no grace wait involved.
+        let mut drained = vec![0u8; frames];
+        flood.read_exact(&mut drained).await.unwrap();
+        assert!(drained.iter().all(|b| *b == b'f'));
+        let error = flood.read(&mut [0u8; 1]).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
         assert!(!session.is_dead());
     }
