@@ -85,6 +85,21 @@ jobs:
           command -v obfs-local
           command -v obfs-server
 
+      # Real-server smux E2E (smux_singbox_integration) runs against this
+      # pinned sing-box and REFUSES to silently skip when it is missing,
+      # so a green run always means real-server smux was exercised. Keep
+      # the version in sync with SINGBOX_VERSION in
+      # crates/meow-app/tests/smux_singbox_integration.rs.
+      - name: Install sing-box (real-server smux E2E)
+        run: |
+          set -euo pipefail
+          SINGBOX_VERSION=1.14.0
+          curl -fsSL -o /tmp/sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          sudo install -m 755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          command -v sing-box
+
       - name: Build
         run: cargo build --tests
 
@@ -117,6 +132,7 @@ jobs:
             --test ws_test \
             --test crate_invariants_test \
             --test crate_publish_metadata_test \
+            --test smux_singbox_integration \
             -- --nocapture
 
       - name: UDP routing regression (SOCKS5, Shadowsocks, TUN)

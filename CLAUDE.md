@@ -148,8 +148,16 @@ cargo test --lib --bin meow \
   --test trojan_integration --test vless_config_test --test vless_integration \
   --test v2ray_plugin_integration --test pre_resolve_test \
   --test tls_test --test ws_test --test crate_invariants_test \
-  --test crate_publish_metadata_test
+  --test crate_publish_metadata_test \
+  --test smux_singbox_integration
 ```
+
+`smux_singbox_integration` runs the full stack (config → mixed listener →
+tunnel → VLESS adapter + smux) against a real sing-box server and **fails**
+(never silently skips) when the binary is missing: install the pinned
+version from https://github.com/SagerNet/sing-box/releases or point
+`SINGBOX_BIN` at it. `MEOW_SMUX_E2E_ALLOW_SKIP=1` prints a loud explicit
+skip for local runs only — CI must never set it.
 
 Keep the target list in sync with `.github/workflows/test.yml`; a new `tests/`
 file that CI runs but this list omits is invisible to the local bar.
