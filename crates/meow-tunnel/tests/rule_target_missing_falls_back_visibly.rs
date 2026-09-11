@@ -1,16 +1,18 @@
 //! A matched rule whose target the registry does not hold falls back to
-//! DIRECT, exactly as upstream mihomo does — but no longer silently
-//! (issue #513).
+//! DIRECT — no longer silently (issue #513).
 //!
-//! The fallback itself is the compatible behaviour and stays: a subscription
-//! that dropped one node has to keep routing the rest, and refusing the
-//! connection instead would break traffic mihomo sends directly. What the rust
-//! port got wrong is that nothing said so. The log line was a `debug!`,
-//! invisible at the default level, and the match statistics derived their
-//! action label from the target *name* before the lookup ran, so a rule naming
-//! `ghost-group` was counted as a PROXY hop that never happened while the bytes
-//! left the machine over the direct adapter. These tests pin the observable
-//! half — same DIRECT dial, honest counter.
+//! Note the deliberate deviation from upstream mihomo: its match loop *skips*
+//! a rule whose target is absent and keeps scanning later rules, reaching
+//! DIRECT only via the no-match tail (and reporting no rule). meow-rs stops at
+//! the first match and dials DIRECT — a subscription that dropped one node
+//! keeps routing the rest, but a later rule upstream would have matched is
+//! never consulted. The semantic parity question is a separate follow-up;
+//! what this port got wrong regardless is that nothing said so. The log line
+//! was a `debug!`, invisible at the default level, and the match statistics
+//! derived their action label from the target *name* before the lookup ran,
+//! so a rule naming `ghost-group` was counted as a PROXY hop that never
+//! happened while the bytes left the machine over the direct adapter. These
+//! tests pin the observable half — same DIRECT dial, honest counter.
 
 use meow_common::{AdapterType, DnsMode, Metadata, Network, Rule, TunnelMode};
 use meow_dns::Resolver;
@@ -72,7 +74,7 @@ fn a_matched_rule_with_a_missing_target_still_dials_direct() {
     assert_eq!(
         proxy.adapter_type(),
         AdapterType::Direct,
-        "upstream mihomo falls back to DIRECT here, and so must this"
+        "meow-rs dials DIRECT here; upstream instead skips the rule and keeps matching"
     );
 }
 

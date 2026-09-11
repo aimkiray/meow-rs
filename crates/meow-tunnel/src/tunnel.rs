@@ -288,18 +288,28 @@ impl TunnelInner {
                     // adapter for exactly this.
                     None if target == "DIRECT" => Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
                     None => {
-                        // Upstream mihomo falls back to DIRECT here, and so do
-                        // we: a subscription that dropped one node has to keep
-                        // routing the rest. What it must not do is hide that —
-                        // the fallback was a `debug!` and `action` was derived
-                        // from the name alone, so at the default log level
-                        // nothing said the connection had left the machine
-                        // directly, and the statistics counted a proxy hop that
-                        // never happened (issue #513).
+                        // Deliberate deviation from upstream mihomo: its match
+                        // loop *skips* a rule whose target is absent and keeps
+                        // scanning (`continue`), reaching DIRECT only via the
+                        // no-match tail. meow-rs stops at the first match and
+                        // dials DIRECT — a subscription that dropped one node
+                        // keeps routing the rest, but a later rule upstream
+                        // would have matched is never consulted (issue #513;
+                        // skip-and-continue is tracked as a parity follow-up).
+                        //
+                        // What it must not do is hide the fallback — it was a
+                        // `debug!` and `action` was derived from the name
+                        // alone, so at the default log level nothing said the
+                        // connection left the machine directly, and the
+                        // statistics counted a proxy hop that never happened.
+                        //
+                        // Interpolate into the message itself: the /logs
+                        // broadcast keeps only the `message` field, so
+                        // structured fields would never reach it.
                         warn!(
-                            target,
-                            rule = %m.rule_type.as_str(),
-                            "matched rule names a target that is not in the registry; dialling DIRECT as upstream does"
+                            "rule {} matched target '{target}' which is not in \
+                             the registry; dialling DIRECT",
+                            m.rule_type.as_str()
                         );
                         action = "DIRECT";
                         Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>

@@ -168,3 +168,135 @@ async fn dialer_may_name_a_group_built_later() {
         "C must not contact its own server directly"
     );
 }
+
+/// A dialer that can route back to the chained proxy through group membership
+/// is a hard config error: the loop never reaches I/O, so the first dial
+/// recurses synchronously until the native stack overflows. This includes the
+/// auto-created `GLOBAL`, which selects over every registry entry.
+#[test]
+fn group_dialer_routing_back_is_a_config_error() {
+    for (dialer, groups) in [
+        // G selects A itself.
+        ("G", "  - name: G\n    type: select\n    proxies: [A, B]"),
+        // Nested: G holds G2, G2 selects A.
+        ("G", "  - name: G\n    type: select\n    proxies: [G2]\n  - name: G2\n    type: select\n    proxies: [A]"),
+        // include-all-proxies pulls every registry name in.
+        ("G", "  - name: G\n    type: select\n    include-all-proxies: true"),
+        // The auto-created GLOBAL contains everything.
+        ("GLOBAL", ""),
+    ] {
+        let raw: RawConfig = serde_yaml::from_str(&format!(
+            r#"
+mixed-port: 17890
+proxies:
+  - name: A
+    type: trojan
+    server: 127.0.0.1
+    port: 1
+    password: issue-513
+    dialer-proxy: {dialer}
+  - name: B
+    type: trojan
+    server: 127.0.0.1
+    port: 2
+    password: issue-513
+proxy-groups:
+{groups}
+rules:
+  - MATCH,DIRECT
+"#
+        ))
+        .unwrap();
+        let err = meow_config::rebuild_from_raw(&raw)
+            .err()
+            .expect("a dialer that routes back to its source must be rejected");
+        assert!(
+            err.to_string().contains("through group membership"),
+            "dialer {dialer}: unexpected error: {err}"
+        );
+    }
+}
+
+/// A dialer may name a group only if it actually builds: a *declared* group
+/// whose members all fail to resolve never enters the registry, and the load
+/// must fail at build time rather than on the first dial.
+#[test]
+fn dialer_to_unbuilt_group_is_a_config_error() {
+    let raw: RawConfig = serde_yaml::from_str(
+        r#"
+mixed-port: 17890
+proxies:
+  - name: A
+    type: trojan
+    server: 127.0.0.1
+    port: 1
+    password: issue-513
+    dialer-proxy: G
+proxy-groups:
+  - name: G
+    type: select
+    proxies: [ghost-node]
+rules:
+  - MATCH,DIRECT
+"#,
+    )
+    .unwrap();
+    let err = meow_config::rebuild_from_raw(&raw)
+        .err()
+        .expect("a dialer naming a group that never built must be rejected");
+    assert!(
+        err.to_string()
+            .contains("did not build into a registry entry"),
+        "unexpected: {err}"
+    );
+}
+
+/// A remote rule-provider fetch dials through `download_proxy` — the first
+/// named proxy — *inside* the config build. When that proxy is itself
+/// chained, its front hop must already resolve: publishing the by-name
+/// registry has to happen before provider fetches, not after. The observable
+/// is whether B's server was contacted.
+#[tokio::test]
+async fn provider_fetch_through_chained_download_proxy_resolves() {
+    let (server_b, b_accepts) = counting_listener().await;
+    let (server_a, _a_accepts) = counting_listener().await;
+
+    let raw: RawConfig = serde_yaml::from_str(&format!(
+        r#"
+mixed-port: 17890
+proxies:
+  - name: A
+    type: trojan
+    server: 127.0.0.1
+    port: {port_a}
+    password: issue-513
+    dialer-proxy: B
+  - name: B
+    type: trojan
+    server: 127.0.0.1
+    port: {port_b}
+    password: issue-513
+rule-providers:
+  rp:
+    type: http
+    behavior: domain
+    url: http://127.0.0.1:9/payload.mrs
+rules:
+  - MATCH,DIRECT
+"#,
+        port_a = server_a.port(),
+        port_b = server_b.port(),
+    ))
+    .unwrap();
+
+    // The fetch itself fails — the mock listener drops every connection — so
+    // the provider is warn-skipped, but the dial must have reached B.
+    // `rebuild_from_raw` blocks until the fetch resolves, so it runs on the
+    // blocking pool to keep the accept loop's executor free.
+    let _ = tokio::task::spawn_blocking(move || meow_config::rebuild_from_raw(&raw)).await;
+    assert!(
+        b_accepts.load(Ordering::SeqCst) >= 1,
+        "the provider fetch must chain through B; 0 accepts means the front \
+         hop could not resolve during the build"
+    );
+}
