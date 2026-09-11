@@ -577,13 +577,14 @@ pub fn rebuild_from_raw_with_cache_dir(
 /// a direct dial would let traffic egress from the real source path past a
 /// chain the user configured for policy/security reasons (Class A, ADR-0002).
 /// A cycle has to be caught here in particular: late binding would turn it into
-/// unbounded recursion on the first dial. The check covers cycles through group
-/// membership too — a group-valued dialer can select the chained proxy itself —
-/// not just proxy→proxy edges, which is all upstream mihomo validates.
+/// unbounded recursion on the first dial. Cycles *through group membership* are
+/// checked separately by [`reject_group_membership_cycles`], which runs after
+/// the group build where the real membership is known.
 ///
 /// Returns the applied `(proxy, dialer)` edges so the caller can re-validate
 /// dialer targets once groups have been built (a *declared* group that failed
-/// to build satisfies `dialable` but never enters the registry).
+/// to build satisfies `dialable` but never enters the registry) and run
+/// [`reject_group_membership_cycles`] against the finished registry.
 fn apply_dialer_proxies(
     proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
     raw_proxies: &[HashMap<String, serde_yaml::Value>],
@@ -664,77 +665,6 @@ fn apply_dialer_proxies(
         anyhow::bail!("dialer-proxy cycle detected: {}", cycle.join(", "));
     }
 
-    // A dialer may name a *group*, whose front-hop dial then selects any member
-    // — including, transitively, the proxy that declared the chain. That loop
-    // never reaches I/O: it is synchronous nested polls and exhausts the
-    // native stack on the first dial (mihomo's `validateDialerProxies` has the
-    // same blind spot — it only sees proxy→proxy edges). Reject any edge whose
-    // dialer can reach back to its source over the combined graph of dialer
-    // edges and group-membership edges.
-    //
-    // Group membership is expanded from the *declared* config: `proxies:` may
-    // name leaves or other groups (nested), `include-all-proxies` and an
-    // auto-created `GLOBAL` contain every registry name. Provider-slot members
-    // (`use:` / `include-all`) can never carry a `dialer-proxy` themselves, so
-    // they are dead ends for reachability and are ignored.
-    let all_names: std::collections::HashSet<&str> = proxies
-        .keys()
-        .map(SmolStr::as_str)
-        .chain(raw_groups.iter().map(|group| group.name.as_str()))
-        .collect();
-    let mut members_of: HashMap<&str, Vec<&str>> = HashMap::new();
-    for group in raw_groups {
-        let mut members: Vec<&str> = group
-            .proxies
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(String::as_str)
-            .collect();
-        if group.include_all_proxies.unwrap_or(false) {
-            members.extend(all_names.iter().copied());
-        }
-        members_of.insert(group.name.as_str(), members);
-    }
-    if !raw_groups.iter().any(|group| group.name == "GLOBAL") {
-        // Auto-created GLOBAL selects over the entire registry.
-        members_of.insert("GLOBAL", all_names.iter().copied().collect());
-    }
-    let edge_map: HashMap<&str, &str> = edges
-        .iter()
-        .map(|(name, dialer)| (name.as_str(), dialer.as_str()))
-        .collect();
-    // DFS from each dialer over dialer edges and membership edges; reaching the
-    // edge's source means the first dial recurses without bound.
-    for (name, dialer) in &edges {
-        // A source that never parsed has no entry to wrap, so no chain is
-        // applied and it cannot re-enter itself — skip it rather than rejecting
-        // a config that is otherwise only missing one node.
-        if !proxies.contains_key(name) {
-            continue;
-        }
-        let mut stack: Vec<&str> = vec![dialer.as_str()];
-        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        while let Some(node) = stack.pop() {
-            if node == name.as_str() {
-                anyhow::bail!(
-                    "proxy '{name}': dialer-proxy '{dialer}' can route back to \
-                     '{name}' through group membership, which would recurse \
-                     forever on the first dial"
-                );
-            }
-            if !visited.insert(node) {
-                continue;
-            }
-            if let Some(next) = edge_map.get(node) {
-                stack.push(next);
-            }
-            if let Some(members) = members_of.get(node) {
-                stack.extend(members.iter().copied());
-            }
-        }
-    }
-
     // Apply the edges. Order no longer matters — the front hop is resolved at
     // dial time — so nested chains need no deepest-first deferral pass.
     for (name, dialer) in &edges {
@@ -795,6 +725,101 @@ fn apply_dialer_proxies(
         }
     }
     Ok(edges)
+}
+
+/// Reject any `dialer-proxy` edge whose target can route the front-hop dial
+/// back to the chained proxy through group membership — a loop that never
+/// reaches I/O: it is synchronous nested polls and exhausts the native stack
+/// on the first dial (mihomo's `validateDialerProxies` only sees proxy→proxy
+/// edges and has the same blind spot).
+///
+/// Runs after the group build so the model matches the *built* registry:
+/// groups that failed to build contribute no membership edges, and a declared
+/// `GLOBAL` that failed to build is backstopped by the auto-created one
+/// holding every registry entry — modelling declared membership before the
+/// build would miss both.
+///
+/// Conservative over-approximations, all fail-closed: `include-all-proxies`
+/// expands to the final registry (the build itself saw a mid-pass subset);
+/// duplicate group declarations are unioned (the registry keeps the last
+/// *successful* build, not the last declaration); relay members are all
+/// treated as reachable heads (only the first member's dialer can actually
+/// fire); provider-slot members (`use:` / `include-all`) are dead ends —
+/// provider nodes never carry a `dialer-proxy`.
+fn reject_group_membership_cycles(
+    edges: &[(SmolStr, SmolStr)],
+    raw_groups: &[raw::RawProxyGroup],
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    global_auto_created: bool,
+) -> Result<(), anyhow::Error> {
+    if edges.is_empty() {
+        return Ok(());
+    }
+    let mut members_of: HashMap<&str, Vec<&str>> = HashMap::new();
+    for group in raw_groups {
+        if !proxies.contains_key(group.name.as_str()) {
+            // Never built — its entry is absent, so it contributes no
+            // membership edges at runtime.
+            continue;
+        }
+        let mut members: Vec<&str> = group
+            .proxies
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(String::as_str)
+            .filter(|m| proxies.contains_key(*m))
+            .collect();
+        if group.include_all_proxies.unwrap_or(false) {
+            members.extend(proxies.keys().map(SmolStr::as_str));
+        }
+        members_of
+            .entry(group.name.as_str())
+            .or_default()
+            .extend(members);
+    }
+    if global_auto_created {
+        members_of
+            .entry("GLOBAL")
+            .or_default()
+            .extend(proxies.keys().map(SmolStr::as_str));
+    }
+    // Only edges whose source actually entered the registry produce a wrapped
+    // adapter; an unparseable source can never fire its chain, so following
+    // its edge would be a phantom.
+    let edge_map: HashMap<&str, &str> = edges
+        .iter()
+        .filter(|(name, _)| proxies.contains_key(name))
+        .map(|(name, dialer)| (name.as_str(), dialer.as_str()))
+        .collect();
+    // DFS from each dialer over dialer edges and membership edges; reaching the
+    // edge's source means the first dial recurses without bound.
+    for (name, dialer) in edges {
+        if !proxies.contains_key(name) {
+            continue;
+        }
+        let mut stack: Vec<&str> = vec![dialer.as_str()];
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        while let Some(node) = stack.pop() {
+            if node == name.as_str() {
+                anyhow::bail!(
+                    "proxy '{name}': dialer-proxy '{dialer}' can route back to \
+                     '{name}' through group membership, which would recurse \
+                     forever on the first dial"
+                );
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            if let Some(next) = edge_map.get(node) {
+                stack.push(next);
+            }
+            if let Some(members) = members_of.get(node) {
+                stack.extend(members.iter().copied());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Policy names resolved internally rather than declared as usable outbounds.
@@ -988,7 +1013,8 @@ fn rebuild_from_raw_impl(
     // outbound first: SelectorGroup uses its first member when no choice has
     // been stored, and sorting every registry key previously made global mode
     // default to DIRECT or an alphabetically-first quota/expiry pseudo-node.
-    if !proxies.contains_key("GLOBAL") {
+    let had_global = proxies.contains_key("GLOBAL");
+    if !had_global {
         let mut all_proxy_names: Vec<String> = proxies
             .keys()
             .map(std::string::ToString::to_string)
@@ -1023,6 +1049,9 @@ fn rebuild_from_raw_impl(
             Err(e) => warn!("Failed to create GLOBAL selector: {}", e),
         }
     }
+    // Whether `GLOBAL` is the auto-created all-registry selector or a declared
+    // group changes what a `dialer-proxy: GLOBAL` edge can reach.
+    let global_auto_created = !had_global && proxies.contains_key("GLOBAL");
 
     // `dialable` admitted *declared* group names before the group build ran;
     // a group that failed to build never entered the registry, so re-check
@@ -1036,6 +1065,11 @@ fn rebuild_from_raw_impl(
             );
         }
     }
+
+    // Cycles that run through group membership — including a declared-but-
+    // failed GLOBAL that the auto-create just backstopped — are only decidable
+    // now that the registry is finished.
+    reject_group_membership_cycles(&dialer_edges, raw_groups, &proxies, global_auto_created)?;
 
     // Publish the finished registry: the `dialer-proxy` chains bound above
     // resolve their front hop by name against it, and only now does it hold the
@@ -2340,14 +2374,24 @@ mod dialer_proxy_tests {
     }
 
     /// Same as [`apply_chains`] but with declared `proxy-groups`, so tests can
-    /// exercise group-valued dialers and the membership cycle check.
+    /// exercise group-valued dialers and the membership cycle check. Stands in
+    /// for the group build by giving every declared group a registry entry —
+    /// the cycle check models declared membership, so what the entry *is*
+    /// does not matter, only that it exists.
     fn apply_chains_with_groups(
         proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
         raw_proxies: &[HashMap<String, serde_yaml::Value>],
         raw_groups: &[raw::RawProxyGroup],
     ) -> Result<(), anyhow::Error> {
         let registry = meow_proxy::dialer::ProxyRegistry::default();
-        apply_dialer_proxies(proxies, raw_proxies, raw_groups, &registry, true)?;
+        let edges = apply_dialer_proxies(proxies, raw_proxies, raw_groups, &registry, true)?;
+        for group in raw_groups {
+            proxies
+                .entry(SmolStr::from(group.name.as_str()))
+                .or_insert_with(|| simple_proxy(&group.name));
+        }
+        let global_auto_created = !proxies.contains_key("GLOBAL");
+        reject_group_membership_cycles(&edges, raw_groups, proxies, global_auto_created)?;
         registry.publish(Arc::new(proxies.clone()));
         Ok(())
     }

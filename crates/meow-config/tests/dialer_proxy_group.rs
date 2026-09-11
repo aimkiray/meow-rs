@@ -184,6 +184,12 @@ fn group_dialer_routing_back_is_a_config_error() {
         ("G", "  - name: G\n    type: select\n    include-all-proxies: true"),
         // The auto-created GLOBAL contains everything.
         ("GLOBAL", ""),
+        // A declared GLOBAL that fails to build is backstopped by the
+        // auto-created all-members one.
+        ("GLOBAL", "  - name: GLOBAL\n    type: select\n    proxies: [ghost-node]"),
+        // Duplicate group names: the registry keeps the last *successful*
+        // declaration — {A} — not the last-declared {ghost-node} block.
+        ("G", "  - name: G\n    type: select\n    proxies: [A]\n  - name: G\n    type: select\n    proxies: [ghost-node]"),
     ] {
         let raw: RawConfig = serde_yaml::from_str(&format!(
             r#"

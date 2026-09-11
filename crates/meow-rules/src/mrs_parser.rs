@@ -221,6 +221,22 @@ fn parse_upstream_domain_set(data: &[u8]) -> Result<Vec<String>, MrsError> {
         .map_err(|_| MrsError::InvalidLength("domain_set_labels_len", labels_len))?;
     let labels = r.read_slice("domain_set_labels", labels_len)?;
 
+    // A well-formed trie has exactly one terminator bit per node and every
+    // non-root node owns one incoming label edge, so #ones <= labels + 1.
+    // Enforce the correlation *before* DomainSetIndex materializes one `usize`
+    // per set bit — a mostly-ones bitmap would otherwise amplify the input
+    // ~64x into memory (issue #513).
+    let node_count: usize = label_bitmap
+        .iter()
+        .map(|word| word.count_ones() as usize)
+        .sum();
+    if node_count > labels.len() + 1 {
+        return Err(MrsError::InvalidLength(
+            "domain_set_terminators",
+            node_count as i64,
+        ));
+    }
+
     let traversal = DomainSetTraversal {
         leaves: &leaves,
         label_bitmap: &label_bitmap,
@@ -271,20 +287,47 @@ struct DomainSetTraversal<'a> {
 /// check (issue #513).
 const MAX_DOMAIN_SET_ENTRIES: usize = 4 * 1024 * 1024;
 const MAX_DOMAIN_SET_BYTES: usize = 256 * 1024 * 1024;
+/// A domain never exceeds 253 octets of labels, so a legitimate trie walk is
+/// ~127 frames deep at most; 4 Ki frames is generous headroom. Without the
+/// cap the explicit stack and `current` still grow proportionally to remote
+/// input — a deep-chain gadget turns a bounded payload into GiBs of frames.
+const MAX_DOMAIN_SET_DEPTH: usize = 4 * 1024;
 
 impl DomainSetTraversal<'_> {
-    /// Depth-first walk of the label graph, iterative because the input is
-    /// remote-controlled: recursion depth is proportional to input size and
-    /// would overflow the (small) stack of the spawned provider-fetch thread.
-    ///
-    /// Frame discipline: `current` holds one label byte per frame above the
-    /// root, so `current.len() == stack.len() - 1` is an invariant.
     fn traverse(
         &self,
         root_node: usize,
         root_bm: usize,
         current: &mut Vec<u8>,
         out: &mut Vec<Vec<u8>>,
+    ) -> Result<(), MrsError> {
+        self.traverse_bounded(
+            root_node,
+            root_bm,
+            current,
+            out,
+            MAX_DOMAIN_SET_ENTRIES,
+            MAX_DOMAIN_SET_BYTES,
+            MAX_DOMAIN_SET_DEPTH,
+        )
+    }
+
+    /// Depth-first walk of the label graph, iterative because the input is
+    /// remote-controlled: recursion depth is proportional to input size and
+    /// would overflow the (small) stack of the spawned provider-fetch thread.
+    ///
+    /// Frame discipline: `current` holds one label byte per frame above the
+    /// root, so `current.len() == stack.len() - 1` is an invariant.
+    #[allow(clippy::too_many_arguments, reason = "bounds grouped for tests")]
+    fn traverse_bounded(
+        &self,
+        root_node: usize,
+        root_bm: usize,
+        current: &mut Vec<u8>,
+        out: &mut Vec<Vec<u8>>,
+        max_entries: usize,
+        max_bytes: usize,
+        max_depth: usize,
     ) -> Result<(), MrsError> {
         let mut out_bytes = 0usize;
         let mut stack: Vec<(usize, usize)> = vec![(root_node, root_bm)];
@@ -316,9 +359,7 @@ impl DomainSetTraversal<'_> {
             top.1 = idx + 1;
             current.push(label);
             if get_bit(self.leaves, next_node_id) {
-                if out.len() >= MAX_DOMAIN_SET_ENTRIES
-                    || out_bytes + current.len() > MAX_DOMAIN_SET_BYTES
-                {
+                if out.len() >= max_entries || out_bytes + current.len() > max_bytes {
                     return Err(MrsError::InvalidLength(
                         "domain_set_output",
                         out.len() as i64,
@@ -326,6 +367,12 @@ impl DomainSetTraversal<'_> {
                 }
                 out_bytes += current.len();
                 out.push(current.clone());
+            }
+            if stack.len() >= max_depth {
+                return Err(MrsError::InvalidLength(
+                    "domain_set_depth",
+                    stack.len() as i64,
+                ));
             }
             stack.push((next_node_id, next_bm_idx));
         }
@@ -402,6 +449,14 @@ fn parse_upstream_ipcidr_set(data: &[u8]) -> Result<Vec<String>, MrsError> {
         let from = IpAddr::from(Ipv6Addr::from(from));
         let to = IpAddr::from(Ipv6Addr::from(to));
         push_range_prefixes(from, to, &mut out);
+        // One 32-byte record can expand to over a hundred CIDR strings; bound
+        // the total or a max-size payload amplifies ~100x (issue #513).
+        if out.len() > MAX_DOMAIN_SET_ENTRIES {
+            return Err(MrsError::InvalidLength(
+                "ipcidr_set_output",
+                out.len() as i64,
+            ));
+        }
     }
     Ok(out)
 }
@@ -957,9 +1012,9 @@ mod tests {
     }
 
     /// A crafted label graph can chain one traversal frame per few input
-    /// bytes. The walk must be iterative (no native recursion) and its output
-    /// bounded — the gadget below produces a leaf per level and would
-    /// previously have recursed ~input-size deep.
+    /// bytes. The walk must be iterative (no native recursion), bounded in
+    /// depth, and bounded in output — the gadget below produces a leaf per
+    /// level and would previously have recursed ~input-size deep.
     #[test]
     fn domain_set_traversal_is_iterative_and_bounded() {
         // labels[i] = 'a'; a linear chain of N levels: leaf bit set only at the
@@ -967,40 +1022,50 @@ mod tests {
         // its terminator. Depth = level count, not bounded by anything in the
         // input except size — recursion would overflow a 2 MiB fetch-thread
         // stack around ~10^5 levels.
-        let levels = 300_000usize;
-        let mut leaves = vec![0u64; levels / 64 + 1];
-        leaves[levels / 64] = 1 << (levels % 64);
-        // Bitmap: level k occupies bit position 2k (label edge), 2k+1 is the
-        // terminator bit marking the end of the node's children. The final
-        // node has no children: just its terminator.
-        let mut bitmap = vec![0u64; (2 * levels + 1) / 64 + 1];
-        for level in 0..=levels {
-            let pos = 2 * level + 1;
-            bitmap[pos / 64] |= 1 << (pos % 64);
-        }
-        let labels = vec![b'a'; levels];
-        let body = encode_domain_set_raw(&leaves, &bitmap, &labels);
-        let parsed = parse_upstream_ruleset_mrs(&encode_upstream_mrs(TYPE_DOMAIN, 1, &body))
-            .unwrap_or_else(|e| panic!("iterative traversal must not overflow: {e}"));
-        // One leaf, the deepest: a string of `levels` 'a' labels.
+        let deep_chain = |levels: usize| {
+            let mut leaves = vec![0u64; levels / 64 + 1];
+            leaves[levels / 64] = 1 << (levels % 64);
+            // Level k occupies bit position 2k (label edge), 2k+1 is the
+            // terminator marking the end of the node's children.
+            let mut bitmap = vec![0u64; (2 * levels + 1) / 64 + 1];
+            for level in 0..=levels {
+                let pos = 2 * level + 1;
+                bitmap[pos / 64] |= 1 << (pos % 64);
+            }
+            let labels = vec![b'a'; levels];
+            encode_domain_set_raw(&leaves, &bitmap, &labels)
+        };
+        // Just under the depth cap: one leaf, the deepest.
+        let parsed = parse_upstream_ruleset_mrs(&encode_upstream_mrs(
+            TYPE_DOMAIN,
+            1,
+            &deep_chain(MAX_DOMAIN_SET_DEPTH - 100),
+        ))
+        .unwrap_or_else(|e| panic!("iterative traversal must not overflow: {e}"));
         assert_eq!(parsed.entries.len(), 1);
+        // Past the cap the walk is an error, not a stack overflow or a
+        // multi-GiB frame allocation.
+        match parse_upstream_ruleset_mrs(&encode_upstream_mrs(
+            TYPE_DOMAIN,
+            1,
+            &deep_chain(MAX_DOMAIN_SET_DEPTH + 100),
+        ))
+        .map(|_| ())
+        {
+            Err(MrsError::InvalidLength("domain_set_depth", _)) => {}
+            other => panic!("expected InvalidLength(domain_set_depth), got {other:?}"),
+        }
     }
 
     /// The same traversal must stop rather than amplify input bytes into
     /// unbounded output: a bitmap of all-zero edges makes every level a leaf.
     #[test]
     fn domain_set_output_is_bounded() {
-        // A single node whose label fan-out walks `labels` and whose leaf bit
-        // is set — plus enough sibling edges to emit many copies. Keep it
-        // simple: one node, leaf set, N zero-edge children each needing a
-        // `select_one` — the gadget is fiddly to hand-construct, so instead
-        // bound-check via a wide shallow fan: node 0 has N children, each
-        // child is a leaf.
+        // Node 0 has N children, each a leaf: node 0's bitmap run is N zero
+        // bits then a terminator; child i is node i+1 (count_zeros gives the
+        // running zero count) with its own bitmap segment holding an edge
+        // attempt that dies on an out-of-range label, then a terminator.
         let n = 1_000_000usize;
-        // Node 0: N zero-bits then terminator at bit N. Each child i is node
-        // i+1 (count_zeros gives the running zero count) with its own bitmap
-        // segment [N+1+2(i), N+2+2i]: zero edge (no label left → frame ends)
-        // then terminator.
         let total_bits = n + 1 + 3 * n + 1;
         let mut bitmap = vec![0u64; total_bits / 64 + 1];
         let set = |b: &mut Vec<u64>, pos: usize| b[pos / 64] |= 1 << (pos % 64);
@@ -1018,5 +1083,61 @@ mod tests {
         let parsed = parse_upstream_ruleset_mrs(&encode_upstream_mrs(TYPE_DOMAIN, n, &body))
             .unwrap_or_else(|e| panic!("shallow fan within bounds must parse: {e}"));
         assert_eq!(parsed.entries.len(), n);
+    }
+
+    /// A mostly-ones bitmap makes `DomainSetIndex` allocate one `usize` per
+    /// set bit — ~64x input amplification. A well-formed trie has one
+    /// terminator per node and one incoming label edge per non-root node, so
+    /// #ones <= labels + 1 is rejected before the index is built.
+    #[test]
+    fn domain_set_terminators_are_bounded_by_labels() {
+        let body = encode_domain_set_raw(&[0u64], &[u64::MAX; 8], b"x");
+        match parse_upstream_domain_set(&body) {
+            Err(MrsError::InvalidLength("domain_set_terminators", _)) => {}
+            other => panic!("expected InvalidLength(domain_set_terminators), got {other:?}"),
+        }
+    }
+
+    /// The output and depth caps must actually fire: encode a small real trie
+    /// and drive `traverse_bounded` with tiny limits.
+    #[test]
+    fn domain_set_bounds_error_instead_of_amplifying() {
+        let body = encode_domain_set(&["a.example.com", "b.example.com", "c.example.com"]);
+        let mut r = ByteReader::new(&body);
+        assert_eq!(r.read_u8("v").unwrap(), 1);
+        let leaves = read_u64_vec(&mut r, "leaves").unwrap();
+        let label_bitmap = read_u64_vec(&mut r, "bitmap").unwrap();
+        let labels_len = r.read_i64_be("labels_len").unwrap() as usize;
+        let labels = r.read_slice("labels", labels_len).unwrap();
+        let traversal = DomainSetTraversal {
+            leaves: &leaves,
+            label_bitmap: &label_bitmap,
+            label_index: DomainSetIndex::new(&label_bitmap),
+            labels,
+        };
+        let (mut out, mut current) = (Vec::new(), Vec::new());
+        // Three domains in the set; cap at two.
+        assert!(
+            traversal
+                .traverse_bounded(0, 0, &mut current, &mut out, 2, usize::MAX, 4096)
+                .is_err(),
+            "entry cap must error"
+        );
+        let (mut out, mut current) = (Vec::new(), Vec::new());
+        // Depth 1 refuses every descent.
+        assert!(
+            traversal
+                .traverse_bounded(0, 0, &mut current, &mut out, usize::MAX, usize::MAX, 1)
+                .is_err(),
+            "depth cap must error"
+        );
+        let (mut out, mut current) = (Vec::new(), Vec::new());
+        // Byte cap: each emitted domain is longer than 1 byte.
+        assert!(
+            traversal
+                .traverse_bounded(0, 0, &mut current, &mut out, usize::MAX, 1, 4096)
+                .is_err(),
+            "byte cap must error"
+        );
     }
 }
