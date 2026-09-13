@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tracing::{debug, info, warn};
 
 /// Bundled rules + domain index + proxies map, swapped as one `Arc` on
@@ -65,10 +65,15 @@ pub struct TunnelInner {
     /// wholesale on config reload. Readers clone the `Arc` and drop the
     /// guard immediately; never hold the guard across an `.await`.
     pub route: RwLock<Arc<RouteTable>>,
-    pub resolver: Arc<Resolver>,
+    /// Hot-swappable resolver slot (issue #514): `PUT /configs` rebuilds
+    /// the DNS resolver and publishes it via `Tunnel::set_resolver`. The
+    /// slot is shared with `direct` and handed to runtime route rebuilds,
+    /// so the map's `DIRECT` adapter tracks the same generation.
+    resolver: meow_dns::ResolverSlot,
     /// Fallback DIRECT adapter used when no user-defined rule matches or
     /// when Direct/Global mode bypasses the proxies map. Pre-built with the
-    /// internal resolver so hostname dials avoid the OS resolver.
+    /// internal resolver so hostname dials avoid the OS resolver; its
+    /// resolver slot is swapped alongside `resolver` on reload.
     pub direct: Arc<DirectAdapter>,
     pub nat_table: NatTable,
     pub stats: Arc<Statistics>,
@@ -96,6 +101,12 @@ impl TunnelInner {
         Arc::clone(&self.route.read())
     }
 
+    /// Snapshot the current resolver generation: one short read lock +
+    /// `Arc` clone. Always reflects the latest `Tunnel::set_resolver`.
+    pub fn resolver(&self) -> Arc<Resolver> {
+        Arc::clone(&self.resolver.read())
+    }
+
     /// Rewrite a fake-IP destination back to its real hostname before rule
     /// matching. Mirrors upstream `preHandleMetadata` in
     /// `tunnel/tunnel.go`. Always called from `handle_tcp` / `handle_udp`
@@ -110,18 +121,19 @@ impl TunnelInner {
         let Some(ip) = metadata.dst_ip else {
             return;
         };
-        if !self.resolver.is_fake_ip(ip) {
+        let resolver = self.resolver();
+        if !resolver.is_fake_ip(ip) {
             // Outside fake-IP mode — also fold in a snooping-cache hostname
             // if metadata.host is currently empty. Preserves the upstream
             // `DNSMapping` mode contract used by the tproxy listener.
             if metadata.host.is_empty() {
-                if let Some(host) = self.resolver.reverse_lookup(ip) {
+                if let Some(host) = resolver.reverse_lookup(ip) {
                     metadata.host = host;
                 }
             }
             return;
         }
-        if let Some(host) = self.resolver.reverse_lookup(ip) {
+        if let Some(host) = resolver.reverse_lookup(ip) {
             debug!("pre_handle_metadata: fake-ip {} → {}", ip, host);
             metadata.host = host;
             metadata.dst_ip = None;
@@ -147,7 +159,7 @@ impl TunnelInner {
         if metadata.host.is_empty() || metadata.dst_ip.is_some() {
             return;
         }
-        if let Some(real_ip) = self.resolver.resolve_ip_real(&metadata.host).await {
+        if let Some(real_ip) = self.resolver().resolve_ip_real(&metadata.host).await {
             debug!("pre_resolve: {} -> {}", metadata.host, real_ip);
             metadata.dst_ip = Some(real_ip);
         }
@@ -251,7 +263,7 @@ impl TunnelInner {
                 if needs_ip {
                     // `needs_ip` already encodes the `pre_resolve` guards:
                     // host present, dst_ip absent.
-                    if let Some(real_ip) = self.resolver.resolve_ip_real(&metadata.host).await {
+                    if let Some(real_ip) = self.resolver().resolve_ip_real(&metadata.host).await {
                         debug!("lazy resolve: {} -> {}", metadata.host, real_ip);
                         metadata.dst_ip = Some(real_ip);
                     }
@@ -363,8 +375,19 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
+    /// New tunnel with a private resolver slot — `set_resolver` swaps are
+    /// visible to `inner.direct`, but adapters rebuilt with a different
+    /// slot are not. Production uses [`Self::new_with_slot`] so the slot
+    /// is also shared into every runtime route rebuild (issue #514).
     pub fn new(resolver: Arc<Resolver>) -> Self {
-        let direct = Arc::new(DirectAdapter::new().with_resolver(Arc::clone(&resolver)));
+        Self::new_with_slot(meow_dns::new_resolver_slot(resolver))
+    }
+
+    /// New tunnel sharing `resolver_slot` — the same slot must be passed
+    /// to `rebuild_from_raw_*` so the map's `DIRECT` adapter and
+    /// `inner.direct` observe `set_resolver` swaps identically.
+    pub fn new_with_slot(resolver: meow_dns::ResolverSlot) -> Self {
+        let direct = Arc::new(DirectAdapter::new().with_resolver_slot(Arc::clone(&resolver)));
         Self {
             inner: Arc::new(TunnelInner {
                 mode: RwLock::new(TunnelMode::Rule),
@@ -383,6 +406,20 @@ impl Tunnel {
 
     pub fn inner(&self) -> &Arc<TunnelInner> {
         &self.inner
+    }
+
+    /// Weak handle to the inner state — long-lived background loops
+    /// (subscription refresh, geodata auto-update) capture this and
+    /// upgrade per tick so dropping every `Tunnel` handle actually stops
+    /// them (same contract the health-check loops and NAT sweeper use,
+    /// issue #514).
+    pub fn weak_inner(&self) -> Weak<TunnelInner> {
+        Arc::downgrade(&self.inner)
+    }
+
+    /// Rebuild a `Tunnel` handle from an upgraded [`Self::weak_inner`].
+    pub fn from_inner(inner: Arc<TunnelInner>) -> Self {
+        Self { inner }
     }
 
     pub fn set_mode(&self, mode: TunnelMode) {
@@ -504,8 +541,32 @@ impl Tunnel {
         &self.inner.stats
     }
 
-    pub fn resolver(&self) -> &Arc<Resolver> {
-        &self.inner.resolver
+    /// Snapshot the current resolver generation (one short read lock +
+    /// `Arc` clone). Reflects the latest [`Self::set_resolver`] — callers
+    /// holding the returned `Arc` keep that generation; the next call picks
+    /// up any swap.
+    pub fn resolver(&self) -> Arc<Resolver> {
+        self.inner.resolver()
+    }
+
+    /// The shared resolver slot. Pass clones to `rebuild_from_raw_*` and
+    /// the TUN loopback DNS so every consumer — including each rebuilt
+    /// `DIRECT` adapter — tracks `set_resolver` swaps (issue #514).
+    pub fn resolver_slot(&self) -> meow_dns::ResolverSlot {
+        Arc::clone(&self.inner.resolver)
+    }
+
+    /// Publish a rebuilt DNS resolver (issue #514): routing lookups
+    /// (fake-IP checks, pre-resolve, lazy resolve), the built-in DIRECT
+    /// adapter's hostname resolution, and any component taking
+    /// `resolver()` snapshots all pick up the new generation. Previously
+    /// the resolver was fixed at `Tunnel::new`, so `PUT /configs`
+    /// persisted a new `dns:` section while the process kept resolving
+    /// through the old one.
+    pub fn set_resolver(&self, resolver: Arc<Resolver>) {
+        // One write updates the routing snapshot, `inner.direct`, and every
+        // rebuilt `DIRECT` — they all share this slot.
+        *self.inner.resolver.write() = resolver;
     }
 
     /// Snapshot of the current route table (rules + domain index + proxies).

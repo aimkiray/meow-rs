@@ -26,18 +26,37 @@ const OPT_RECORD: &[u8] = &[
     0x00, 0x00, // RDLENGTH: 0
 ];
 
+/// Shared resolver slot behind `RwLock<Arc<..>>` so a config reload can
+/// swap the generation every live server reads per query — no socket
+/// rebind, no in-flight query disruption (issue #514).
+pub type ResolverSlot = Arc<parking_lot::RwLock<Arc<Resolver>>>;
+
+/// Build a fresh slot holding `resolver`. Every component that should
+/// observe resolver hot-swaps (DNS servers, the built-in DIRECT adapter,
+/// the TUN loopback DNS) must share the *same* slot — pass clones of the
+/// returned `Arc`, not freshly wrapped copies of the resolver.
+pub fn new_resolver_slot(resolver: Arc<Resolver>) -> ResolverSlot {
+    Arc::new(parking_lot::RwLock::new(resolver))
+}
+
 /// Simple DNS server that handles queries by forwarding to our resolver.
 pub struct DnsServer {
-    resolver: Arc<Resolver>,
+    resolver: ResolverSlot,
     listen_addr: SocketAddr,
 }
 
 impl DnsServer {
     pub fn new(resolver: Arc<Resolver>, listen_addr: SocketAddr) -> Self {
         Self {
-            resolver,
+            resolver: Arc::new(parking_lot::RwLock::new(resolver)),
             listen_addr,
         }
+    }
+
+    /// The slot the bound server reads per query. Store the returned `Arc`
+    /// and write the rebuilt resolver into it on config reload (issue #514).
+    pub fn resolver_slot(&self) -> ResolverSlot {
+        Arc::clone(&self.resolver)
     }
 
     /// Bind the listen socket eagerly and return a [`BoundDnsServer`] ready to
@@ -494,7 +513,7 @@ impl DnsServer {
 /// A [`DnsServer`] whose listen socket is already bound. Produced by
 /// [`DnsServer::bind`]; consumed by [`Self::run`].
 pub struct BoundDnsServer {
-    resolver: Arc<Resolver>,
+    resolver: ResolverSlot,
     socket: Arc<UdpSocket>,
 }
 
@@ -504,11 +523,29 @@ impl BoundDnsServer {
     /// instead of hand-rolling their own — e.g. the TUN loopback DNS servers
     /// on Windows, which must bind `127.0.0.1:53`/`[::1]:53` *before* the OS
     /// resolver is repointed at them.
+    /// The resolver is captured as a fixed `Arc` — it does NOT track a later
+    /// `Tunnel::set_resolver` generation swap. Callers that must follow
+    /// runtime DNS reloads should use [`BoundDnsServer::from_slot`] instead
+    /// (issue #514).
     pub fn from_socket(socket: UdpSocket, resolver: Arc<Resolver>) -> Self {
+        Self {
+            resolver: Arc::new(parking_lot::RwLock::new(resolver)),
+            socket: Arc::new(socket),
+        }
+    }
+
+    /// Variant taking a shared slot directly, for callers that hot-swap the
+    /// resolver across generations (issue #514).
+    pub fn from_slot(socket: UdpSocket, resolver: ResolverSlot) -> Self {
         Self {
             resolver,
             socket: Arc::new(socket),
         }
+    }
+
+    /// The slot the serve loop reads per query.
+    pub fn resolver_slot(&self) -> ResolverSlot {
+        Arc::clone(&self.resolver)
     }
 
     /// Local address of the bound listen socket (useful with a port-0 bind).
@@ -538,10 +575,14 @@ impl BoundDnsServer {
             Vec::with_capacity(N_WORKERS);
         for worker_id in 0..N_WORKERS {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_DEPTH);
-            let resolver = Arc::clone(&resolver);
+            let resolver_slot = Arc::clone(&resolver);
             let sock: Weak<UdpSocket> = Arc::downgrade(&socket);
             tokio::spawn(async move {
                 while let Some((data, src)) = rx.recv().await {
+                    // Snapshot the current resolver generation per query —
+                    // a `PUT /configs` DNS reload swaps the slot (issue #514).
+                    // The read guard must drop before `.await`: it is !Send.
+                    let resolver = Arc::clone(&resolver_slot.read());
                     // Panic guard: a panic inside query handling must not kill
                     // the worker — a dead worker silently blackholes its
                     // round-robin share of ALL queries for the server's

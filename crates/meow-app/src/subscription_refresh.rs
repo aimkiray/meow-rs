@@ -70,7 +70,7 @@ pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config
                         raw.clone()
                     };
 
-                    let resolver = Arc::clone(tunnel.resolver());
+                    let resolver = tunnel.resolver_slot();
                     let rebuild = tokio::task::spawn_blocking({
                         let snapshot = snapshot.clone();
                         let cache_dir = cache_dir.clone();

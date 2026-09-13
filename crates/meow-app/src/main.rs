@@ -761,9 +761,6 @@ async fn run(
     // Rule providers in shared state for runtime refresh and API exposure.
     let rule_providers = Arc::new(RwLock::new(config.rule_providers));
 
-    // Keep a resolver clone for the auto-update task before it moves into the tunnel.
-    let resolver = Arc::clone(&config.dns.resolver);
-
     // Install the configured resolver as the global host-resolver hook used
     // by `meow_common::connect_tcp_host` / `resolve_host`, so a proxy node's
     // own server hostname is resolved by the DNS in the config — matching
@@ -806,7 +803,9 @@ async fn run(
     }
 
     // Create the tunnel (core routing engine)
-    let tunnel = Tunnel::new(Arc::clone(&config.dns.resolver));
+    // Share the DNS config's resolver slot so runtime `set_resolver` swaps
+    // reach the map's DIRECT adapters built from this slot (issue #514).
+    let tunnel = Tunnel::new_with_slot(Arc::clone(&config.dns.resolver_slot));
     tunnel.set_mode(config.general.mode);
     tunnel.update_routing(config.proxies, config.rules);
     tunnel.spawn_background_tasks();
@@ -875,13 +874,9 @@ async fn run(
         let geodata = config.geodata.clone();
         let tunnel = tunnel.clone();
         let raw_config = Arc::clone(&raw_config);
-        let resolver = Arc::clone(&resolver);
         let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
         tokio::spawn(async move {
-            meow_app::geodata_fetch::run_on_startup(
-                geodata, tunnel, raw_config, resolver, cache_dir,
-            )
-            .await;
+            meow_app::geodata_fetch::run_on_startup(geodata, tunnel, raw_config, cache_dir).await;
         });
     }
 
@@ -890,13 +885,9 @@ async fn run(
         let geodata = config.geodata.clone();
         let tunnel = tunnel.clone();
         let raw_config = Arc::clone(&raw_config);
-        let resolver = Arc::clone(&resolver);
         let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
         tokio::spawn(async move {
-            meow_app::geodata_fetch::auto_update_loop(
-                geodata, tunnel, raw_config, resolver, cache_dir,
-            )
-            .await;
+            meow_app::geodata_fetch::auto_update_loop(geodata, tunnel, raw_config, cache_dir).await;
         });
     }
 

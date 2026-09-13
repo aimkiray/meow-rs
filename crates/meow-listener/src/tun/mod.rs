@@ -592,7 +592,7 @@ impl TunListener {
         // pipeline as the TUN dns-hijack path, returning fake IPs.
         #[cfg(target_os = "windows")]
         if let Some(sockets) = local_dns_sockets {
-            let resolver = Arc::clone(self.tunnel.resolver());
+            let resolver = self.tunnel.resolver_slot();
             tasks.spawn(async move {
                 local_dns::run(sockets, resolver).await;
             });

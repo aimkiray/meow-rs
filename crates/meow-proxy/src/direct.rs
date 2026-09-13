@@ -14,7 +14,11 @@ pub struct DirectAdapter {
     /// hostnames via this resolver instead of the OS resolver — this is
     /// important when meow-rs *is* the system DNS, because routing a direct
     /// DNS query back through the OS would loop the query back into meow-rs.
-    resolver: Option<Arc<Resolver>>,
+    /// Behind a slot so `Tunnel::set_resolver` can hot-swap the generation
+    /// on `PUT /configs` without rebuilding the adapter (issue #514). When
+    /// built via `with_resolver_slot` the slot is shared with the tunnel,
+    /// so map `DIRECT` and `TunnelInner.direct` track one generation.
+    resolver: Option<meow_dns::ResolverSlot>,
     /// Wall-clock bound on `TcpStream::connect`. iOS / macOS scoped-routing
     /// and reachability-cache transients can leave a `connect()` hanging
     /// indefinitely against a destination whose route is in flux (Wi-Fi
@@ -42,8 +46,19 @@ impl DirectAdapter {
         self
     }
 
+    /// Wrap `resolver` in a fresh private slot — this adapter will not
+    /// follow later `Tunnel::set_resolver` swaps. Prefer
+    /// [`Self::with_resolver_slot`] when a shared generation is intended.
     pub fn with_resolver(mut self, resolver: Arc<Resolver>) -> Self {
-        self.resolver = Some(resolver);
+        self.resolver = Some(meow_dns::new_resolver_slot(resolver));
+        self
+    }
+
+    /// Share an existing resolver slot — writes to the slot (e.g.
+    /// `Tunnel::set_resolver`) are observed by this adapter on every dial
+    /// (issue #514).
+    pub fn with_resolver_slot(mut self, slot: meow_dns::ResolverSlot) -> Self {
+        self.resolver = Some(slot);
         self
     }
 
@@ -84,6 +99,7 @@ impl DirectAdapter {
         //    standalone usage).
         if !metadata.host.is_empty() {
             if let Some(resolver) = &self.resolver {
+                let resolver = Arc::clone(&resolver.read());
                 return match resolver.resolve_ips(&metadata.host).await {
                     Some(ips) if !ips.is_empty() => Ok(ips
                         .into_iter()

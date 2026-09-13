@@ -1042,7 +1042,7 @@ async fn apply_raw_to_tunnel(
     let cache_dir = meow_config::resource_cache_dir_for_config_path(&state.config_path);
     let (proxies, rules) = rebuild_from_raw_with_resolver_async(
         raw,
-        Arc::clone(state.tunnel.resolver()),
+        state.tunnel.resolver_slot(),
         providers,
         cache_dir,
     )
@@ -1072,7 +1072,7 @@ async fn commit_raw_candidate(
 
 async fn rebuild_from_raw_with_resolver_async(
     raw: RawConfig,
-    resolver: Arc<meow_dns::Resolver>,
+    resolver: meow_dns::ResolverSlot,
     providers: HashMap<String, Arc<ProxyProvider>>,
     cache_dir: std::path::PathBuf,
 ) -> Result<meow_config::RebuildResult, String> {
@@ -1900,7 +1900,7 @@ async fn put_configs(
     let _mutation = CONFIG_MUTATION.lock().await;
 
     // Semantic rebuild (proxy/rule parsing)
-    let resolver = Arc::clone(state.tunnel.resolver());
+    let resolver = state.tunnel.resolver_slot();
     let providers = state
         .proxy_providers
         .iter()
