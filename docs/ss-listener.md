@@ -148,9 +148,9 @@ the TUN stack). The flow table is capped at the listener's
 caps): each flow holds a 64 KiB reply buffer, a task, and an outbound
 socket, so without a cap any password holder could exhaust memory/FDs
 between idle sweeps. Datagrams for existing flows always pass; only *new*
-flows are dropped (with a warn) while the table is saturated. As with
-SOCKS5-UDP, port-53 traffic bypasses rule matching to DIRECT (avoiding
-looping client DNS back through a proxy / the in-process resolver).
+flows are dropped (with a warn) while the table is saturated. Client UDP —
+including port 53 — follows the configured routing policy (a `REJECT` rule
+still applies; there is no port-53 DIRECT bypass).
 
 ## Feature gating
 

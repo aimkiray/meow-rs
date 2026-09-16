@@ -169,8 +169,12 @@ impl ShadowsocksListener {
                 let name = self.name.clone();
                 let in_port = bound.port();
                 let max_flows = self.max_connections;
+                // SIP022 §3.2.2 requires the *server* to mint its own random
+                // session ID per relay session, so the relay draws from the
+                // cipher context's CSPRNG instead of a plain counter.
+                let session_ids = ServerSessionIds::new(Arc::clone(&self.ctx), self.method);
                 tokio::spawn(async move {
-                    run_udp_relay(tunnel, udp_sock, name, in_port, max_flows).await;
+                    run_udp_relay(tunnel, udp_sock, session_ids, name, in_port, max_flows).await;
                 });
             }
         }
@@ -337,13 +341,15 @@ fn build_metadata(peer: SocketAddr, target: &Address, in_name: &str, in_port: u1
 // mirroring the SOCKS5-UDP per-destination NAT, but keyed by both endpoints
 // since the socket is shared.
 //
-// Idle eviction reuses `meow_tunnel::udp::DEFAULT_UDP_IDLE`; a flow whose
+// Idle eviction reuses `meow_tunnel::udp::DEFAULT_UDP_IDLE`; a flow on which
 // neither direction has touched `last_activity_ms` within the idle window is
 // dropped, aborting its reply task and freeing the outbound conn.
 
 use meow_common::atomic::{AtomicU, Uint};
-use meow_common::{with_dial_timeout, ProxyPacketConn};
+use meow_common::{with_dial_timeout, ProxyPacketConn, ReplayWindow};
 use meow_tunnel::udp::DEFAULT_UDP_IDLE;
+use shadowsocks::context::SharedContext;
+use shadowsocks::relay::udprelay::options::UdpSocketControlData;
 use shadowsocks::relay::udprelay::{DatagramReceive, DatagramSend};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -352,6 +358,96 @@ use tokio::task::AbortHandle;
 use crate::monotonic_ms;
 
 const UDP_NAT_SWEEP: Duration = Duration::from_secs(30);
+
+/// Mints server-side UDP session IDs for the AEAD-2022 relay.
+///
+/// SIP022 §3.2.2: the server session ID "MUST be randomly generated" and must
+/// differ from the client's. The ID travels in cleartext in every reply, so it
+/// is a session discriminator rather than a secret — but strict clients key
+/// their reply-decryption state off it, and `0` is exactly the sentinel
+/// sing-box uses for "no reply session seen yet" (it then dereferences a nil
+/// cipher and panics). So: draw from the cipher context's CSPRNG (already a
+/// dependency), whose fill is already guaranteed non-zero.
+struct ServerSessionIds {
+    ctx: SharedContext,
+    method: CipherKind,
+}
+
+impl ServerSessionIds {
+    fn new(ctx: SharedContext, method: CipherKind) -> Self {
+        Self { ctx, method }
+    }
+
+    /// Random, non-zero server session ID for one relay session.
+    fn next(&self) -> u64 {
+        let mut buf = [0u8; 8];
+        // `unique: false` — this is not a cipher nonce, so it needs no replay
+        // bookkeeping, only unpredictability and non-zero-ness. The fill is
+        // `random_iv_or_salt`, which loops until the buffer is non-zero.
+        self.ctx.generate_nonce(self.method, &mut buf, false);
+        u64::from_be_bytes(buf)
+    }
+}
+
+/// The server side of one AEAD-2022 relay session (SIP022 §3.2.2/§3.2.4).
+///
+/// Sessions are scoped to a client session ID — *not* to a `(peer, target)`
+/// flow — so a client multiplexing several targets over one session sees a
+/// single server session ID and a single, session-wide reply packet-ID
+/// counter. `Arc`-shared between the relay loop (which owns it in
+/// [`UdpRelayState::sessions`]) and every reply task sending under it.
+struct ServerSession {
+    /// Our randomly generated session ID, echoed in every reply header.
+    server_session_id: u64,
+    /// Reply packet-ID allocator for the whole session. Strict clients keep
+    /// a replay window per server session, so IDs must stay unique across
+    /// all of the session's flows — hence shared state rather than a
+    /// per-task counter.
+    next_packet_id: AtomicU,
+}
+
+/// The relay loop's view of a client session: the shared [`ServerSession`]
+/// plus the sliding-window filter over this session's client→server packet
+/// IDs (§3.2.4 mandates replay rejection per session).
+struct ClientSession {
+    server: Arc<ServerSession>,
+    window: ReplayWindow,
+}
+
+/// Mutable state owned by [`run_udp_relay`]'s loop: the `(peer, target)`
+/// flow table plus the AEAD-2022 client-session table.
+#[derive(Default)]
+struct UdpRelayState {
+    flows: HashMap<(SocketAddr, SocketAddr), UdpFlow>,
+    /// Relay sessions keyed by client session ID — the spec's session
+    /// discriminator (§3.2.4: "Servers MUST route packets based on client
+    /// session ID, not packet source address"). Non-2022 ciphers carry no
+    /// session ID and never touch this map.
+    sessions: HashMap<u64, ClientSession>,
+}
+
+/// Build the server→client control template for a new flow (SIP022 §3.2.3):
+/// echo the client's session ID — `cloned()` also carries the EIH `user`
+/// key through, which `send_to_with_ctrl` uses to select the reply
+/// encryption key — and stamp our server session ID. The reply task
+/// allocates packet IDs per send from the session's shared counter.
+///
+/// Ciphers outside the AEAD-2022 category carry no client control (`server`
+/// is then `None`) and ignore the control when encrypting, so the all-zero
+/// default is harmless for them.
+fn build_reply_control(
+    client: Option<&UdpSocketControlData>,
+    server: Option<&ServerSession>,
+) -> UdpSocketControlData {
+    // A client control without a session would stamp server_session_id = 0
+    // — exactly the value that panics sing-box's clientPacketConn. The
+    // caller guarantees the session entry exists for any AEAD-2022 datagram.
+    debug_assert!(client.is_none() || server.is_some());
+    let mut control = client.cloned().unwrap_or_default();
+    control.server_session_id = server.map_or(0, |s| s.server_session_id);
+    control.packet_id = 0;
+    control
+}
 
 /// One `(peer, target)` outbound flow.
 struct UdpFlow {
@@ -362,6 +458,11 @@ struct UdpFlow {
     /// the next datagram redials instead of writing into a conn that can
     /// never answer (issue #514, same class as the SOCKS5-UDP fix).
     dead: Arc<std::sync::atomic::AtomicBool>,
+    /// The client session ID this flow echoes in replies (`0` for ciphers
+    /// outside AEAD-2022). A datagram carrying a *different* ID on the same
+    /// `(peer, target)` key is a new relay session per SIP022 §3.2.4 — the
+    /// flow must be torn down and re-dialed, not reused with a stale echo.
+    client_session_id: u64,
     /// Reply task (server→client); aborted when the flow is evicted.
     reply_task: AbortHandle,
 }
@@ -386,9 +487,28 @@ impl Drop for UdpFlow {
 /// Generic over the inner socket type `S` so the concrete type returned by
 /// `ProxySocket::bind` (`ShadowUdpSocket`) flows in by inference — the relay
 /// logic is identical for any `DatagramSend + DatagramReceive` socket.
+///
+/// Replies go out through `send_to_with_ctrl` with a control built from the
+/// per-client-session [`ServerSession`]: `recv_from_with_ctrl` hands us the
+/// client's session ID, which selects (or creates) the session supplying the
+/// server session ID and reply packet-ID counter. The crate's 4-tuple
+/// `recv_from` / 3-arg `send_to` convenience forms silently substitute an
+/// all-zero control, which violates SIP022 §3.2.3 in two ways (the server
+/// session ID must be random, and the reply header must echo the client
+/// session ID) and makes strict clients — sing-box's `clientPacketConn` —
+/// drop or panic on every reply. Ciphers outside the 2022 category ignore
+/// the control field entirely, so they are unaffected either way.
+///
+/// `handle_ss_udp_datagram` is awaited inline, not spawned: every datagram
+/// runs the flow-table check-then-insert under one task, so a retransmitted
+/// first datagram can never create a duplicate flow. The cost is that one
+/// client's slow `dial_udp` stalls decrypt→dispatch for the whole shared
+/// socket — bounded by `with_dial_timeout` and the same trade-off the
+/// SOCKS5-UDP loop makes.
 async fn run_udp_relay<S>(
     tunnel: Tunnel,
     sock: shadowsocks::ProxySocket<S>,
+    session_ids: ServerSessionIds,
     in_name: String,
     in_port: u16,
     max_flows: usize,
@@ -396,18 +516,22 @@ async fn run_udp_relay<S>(
     S: DatagramSend + DatagramReceive + Send + Sync + 'static,
 {
     let sock = Arc::new(sock);
-    let mut flows: HashMap<(SocketAddr, SocketAddr), UdpFlow> = HashMap::new();
-    let mut buf = vec![0u8; 65535];
+    let mut state = UdpRelayState::default();
+    // The crate asks for ≥65536 bytes of intermediate storage — the full
+    // decrypted datagram plus the AEAD-2022 header it is parsed from.
+    let mut buf = vec![0u8; 65536];
     let mut sweeper = tokio::time::interval(UDP_NAT_SWEEP);
     sweeper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let idle_ms = DEFAULT_UDP_IDLE.as_millis() as u64;
     let mut warned_saturated = false;
 
     loop {
+        // No `biased`: the recv arm is permanently ready under sustained
+        // inbound traffic, and a biased poll would starve the sweeper — the
+        // flow table would pin at `max_flows` with no idle eviction.
         tokio::select! {
-            biased;
-            r = sock.recv_from(&mut buf) => {
-                let (n, peer, target, _recv_total) = match r {
+            r = sock.recv_from_with_ctrl(&mut buf) => {
+                let (n, peer, target, _recv_total, control) = match r {
                     Ok(v) => v,
                     Err(e) => {
                         debug!("ss udp '{}' recv error: {e}", in_name);
@@ -415,7 +539,21 @@ async fn run_udp_relay<S>(
                     }
                 };
                 let payload = &buf[..n];
-                match handle_ss_udp_datagram(&tunnel, &sock, &mut flows, payload, peer, &target, &in_name, in_port, max_flows).await {
+                match handle_ss_udp_datagram(
+                    &tunnel,
+                    &sock,
+                    &mut state,
+                    payload,
+                    peer,
+                    &target,
+                    control.as_ref(),
+                    &session_ids,
+                    &in_name,
+                    in_port,
+                    max_flows,
+                )
+                .await
+                {
                     Ok(true) => {}
                     Ok(false) => {
                         if !warned_saturated {
@@ -431,7 +569,7 @@ async fn run_udp_relay<S>(
             }
             _ = sweeper.tick() => {
                 let now = monotonic_ms() as Uint;
-                flows.retain(|_, f| {
+                state.flows.retain(|_, f| {
                     // Dead reply task → the conn can never answer; evict so
                     // the next datagram redials (issue #514).
                     if f.dead.load(std::sync::atomic::Ordering::Relaxed) {
@@ -445,7 +583,14 @@ async fn run_udp_relay<S>(
                     let elapsed = u64::from(now.wrapping_sub(last));
                     elapsed < idle_ms
                 });
-                if warned_saturated && (max_flows == 0 || flows.len() < max_flows) {
+                // Drop sessions no flow references any more (`strong_count`
+                // falls back to 1 once the last reply task's Arc is gone). A
+                // client resuming on a GC'd session ID simply gets a fresh
+                // server session — §3.2.4 requires clients to tolerate that.
+                state
+                    .sessions
+                    .retain(|_, s| Arc::strong_count(&s.server) > 1);
+                if warned_saturated && state.flows.len() < max_flows {
                     debug!("ss udp '{}' flow table has free capacity again", in_name);
                     warned_saturated = false;
                 }
@@ -457,21 +602,30 @@ async fn run_udp_relay<S>(
 /// Decrypt is already done by `ProxySocket`; here we resolve the target,
 /// route, and forward through the (possibly new) per-flow outbound conn.
 ///
+/// `control` is the client's per-datagram control as decrypted by
+/// `recv_from_with_ctrl` (`None` for ciphers outside the AEAD-2022 category,
+/// which carry no session IDs). For AEAD-2022 the client session ID owns an
+/// entry in `state.sessions` — created on first sight — that supplies the
+/// server session ID + reply packet counter for every flow of the session
+/// and the replay window the datagram's packet ID is checked against.
+///
 /// Returns `Ok(true)` when the datagram was handled (existing or new flow),
 /// `Ok(false)` when it was dropped because the flow table is at `max_flows`
 /// (new-flow cap only — datagrams for existing flows always pass), and
 /// `Err` with a reason for per-datagram failures.
 #[allow(
     clippy::too_many_arguments,
-    reason = "mirrors socks5_udp::handle_client_datagram's parameter set plus the shared socket and flow cap"
+    reason = "mirrors socks5_udp::handle_client_datagram's parameter set plus the shared socket, the flow cap, and the AEAD-2022 reply-control inputs"
 )]
 async fn handle_ss_udp_datagram<S>(
     tunnel: &Tunnel,
     sock: &Arc<shadowsocks::ProxySocket<S>>,
-    flows: &mut HashMap<(SocketAddr, SocketAddr), UdpFlow>,
+    state: &mut UdpRelayState,
     payload: &[u8],
     peer: SocketAddr,
     target: &Address,
+    control: Option<&UdpSocketControlData>,
+    session_ids: &ServerSessionIds,
     in_name: &str,
     in_port: u16,
     max_flows: usize,
@@ -479,6 +633,31 @@ async fn handle_ss_udp_datagram<S>(
 where
     S: DatagramSend + DatagramReceive + Send + Sync + 'static,
 {
+    // SIP022 §3.2.4: the client session ID — not the source address — is the
+    // session discriminator, and every received packet's ID must pass the
+    // session's replay window *before* anything is forwarded upstream. The
+    // window consumes the ID even when the datagram is dropped later (rules,
+    // saturation, dial failure): a received-and-validated ID is spent.
+    let client_session_id = control.map_or(0, |c| c.client_session_id);
+    if let Some(c) = control {
+        let session = state
+            .sessions
+            .entry(c.client_session_id)
+            .or_insert_with(|| ClientSession {
+                server: Arc::new(ServerSession {
+                    server_session_id: session_ids.next(),
+                    next_packet_id: AtomicU::new(0),
+                }),
+                window: ReplayWindow::new(),
+            });
+        if !session.window.check_and_set(c.packet_id) {
+            return Err(format!(
+                "replayed/out-of-window packet_id {} for session {:#x}",
+                c.packet_id, c.client_session_id
+            ));
+        }
+    }
+
     let inner = tunnel.inner();
     let (host, dst_ip, dst_port) = match target {
         Address::DomainNameAddress(d, port) => (d.to_lowercase(), None, *port),
@@ -512,11 +691,17 @@ where
     let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
     let key = (peer, dst_addr);
 
-    // Fast path: existing flow. A dead reply task means the conn can never
-    // answer — evict and fall through to a fresh dial (issue #514).
-    if let Some(flow) = flows.get(&key) {
-        if flow.dead.load(std::sync::atomic::Ordering::Relaxed) {
-            flows.remove(&key);
+    // Fast path: existing flow. Two reasons to evict and fall through to a
+    // fresh dial instead of reusing it:
+    //   * a dead reply task means the conn can never answer (issue #514);
+    //   * a changed client session ID on the same `(peer, target)` is a new
+    //     relay session per SIP022 §3.2.4 — replies must echo the new ID,
+    //     which only a freshly built flow can do.
+    if let Some(flow) = state.flows.get(&key) {
+        if flow.dead.load(std::sync::atomic::Ordering::Relaxed)
+            || flow.client_session_id != client_session_id
+        {
+            state.flows.remove(&key);
         } else {
             match flow.conn.write_packet(payload, &dst_addr).await {
                 Ok(_n) => {
@@ -530,7 +715,7 @@ where
                     // later datagram on this key would keep erroring. Evict
                     // now so the next packet redials (mirrors the SOCKS5
                     // path, issue #514 review).
-                    flows.remove(&key);
+                    state.flows.remove(&key);
                     return Err(format!("udp write {dst_addr}: {e}"));
                 }
             }
@@ -540,7 +725,7 @@ where
     // Flow-table cap: a new flow costs a 64 KiB reply buffer, a task, and an
     // outbound socket; without a cap any password holder could exhaust
     // memory/FDs between idle sweeps. `0` disables the cap.
-    if max_flows > 0 && flows.len() >= max_flows {
+    if max_flows > 0 && state.flows.len() >= max_flows {
         return Ok(false);
     }
 
@@ -563,18 +748,51 @@ where
 
     let last_activity_ms = Arc::new(AtomicU::new(monotonic_ms() as Uint));
     let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The session created (or found) above supplies the server session ID and
+    // the reply packet-ID allocator; `build_reply_control` echoes this
+    // datagram's client session ID and carries its EIH user key through.
+    let server_session = control.and_then(|c| {
+        state
+            .sessions
+            .get(&c.client_session_id)
+            .map(|s| Arc::clone(&s.server))
+    });
+    let reply_control = build_reply_control(control, server_session.as_deref());
     let reply_task = {
         let sock = Arc::clone(sock);
         let conn = Arc::clone(&conn);
         let last_activity_ms = Arc::clone(&last_activity_ms);
         let dead = Arc::clone(&dead);
-        // Echo back the original target Address (domain or IP) so the SS
-        // client can correlate replies by the same address type it sent.
-        let reply_addr = target.clone();
+        let mut control = reply_control;
         tokio::spawn(async move {
-            let mut rbuf = vec![0u8; 65535];
-            while let Ok((m, _src)) = conn.read_packet(&mut rbuf).await {
-                if sock.send_to(peer, &reply_addr, &rbuf[..m]).await.is_err() {
+            let mut rbuf = vec![0u8; 65536];
+            while let Ok((m, src)) = conn.read_packet(&mut rbuf).await {
+                if let Some(s) = &server_session {
+                    // The reply packet-ID space belongs to the *session*, not
+                    // this flow — a client multiplexing targets still sees a
+                    // strictly increasing stream (SIP022 §3.2.3).
+                    #[allow(
+                        clippy::useless_conversion,
+                        reason = "identity on 64-bit; u32→u64 widening on mips32"
+                    )]
+                    let packet_id = u64::from(
+                        s.next_packet_id
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    );
+                    control.packet_id = packet_id;
+                }
+                // The reply's inner address is the responder's real socket
+                // address (matching ssserver), not the request's target:
+                // two domains resolving to one IP share this flow — the
+                // flow's flow key is the resolved `(peer, dst_ip)` — and
+                // stamping the request's domain form would mislabel every
+                // datagram that didn't create the flow.
+                let reply_addr = Address::SocketAddress(src);
+                if sock
+                    .send_to_with_ctrl(peer, &reply_addr, &control, &rbuf[..m])
+                    .await
+                    .is_err()
+                {
                     break;
                 }
                 last_activity_ms
@@ -585,12 +803,13 @@ where
         .abort_handle()
     };
 
-    flows.insert(
+    state.flows.insert(
         key,
         UdpFlow {
             conn,
             last_activity_ms,
             dead,
+            client_session_id,
             reply_task,
         },
     );
@@ -598,36 +817,91 @@ where
 }
 
 #[cfg(test)]
-mod routing_tests {
+mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn udp_port_53_obeys_reject_rule() {
-        let tunnel = crate::test_rule_tunnel();
+    /// Like [`crate::test_rule_tunnel`] but routing everything to DIRECT:
+    /// the outbound conn is a real UDP socket whose `read_packet` simply
+    /// blocks (nothing replies to the synthetic targets), so the flow's
+    /// `dead` flag stays false and session-rotation tests exercise the
+    /// session-ID branch rather than the dead-conn one.
+    fn direct_rule_tunnel() -> Tunnel {
+        let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let tunnel = Tunnel::new(resolver);
+        tunnel.update_proxies(
+            meow_config::rebuild_from_raw(&Default::default())
+                .unwrap()
+                .0,
+        );
+        tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+            "DIRECT",
+        ))]);
+        tunnel
+    }
+
+    /// Shared harness: a bound server-side `ProxySocket` + its session-ID
+    /// minter for the given cipher.
+    async fn server_sock_and_ids(
+        method: &str,
+    ) -> (
+        Arc<shadowsocks::ProxySocket<shadowsocks::net::UdpSocket>>,
+        ServerSessionIds,
+    ) {
+        // AEAD-2022 keys must be base64 iPSKs; older ciphers take any
+        // password string.
+        let key = if method.starts_with("2022-") {
+            "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+        } else {
+            "synthetic-test-password"
+        };
         let config = shadowsocks::config::ServerConfig::new(
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-            "synthetic-test-password",
-            "aes-256-gcm".parse().unwrap(),
+            key,
+            method.parse().unwrap(),
         )
         .unwrap();
         let context =
             shadowsocks::context::Context::new_shared(shadowsocks::config::ServerType::Server);
+        let session_ids = ServerSessionIds::new(Arc::clone(&context), config.method());
         let sock = Arc::new(
             shadowsocks::ProxySocket::bind(context, &config)
                 .await
                 .unwrap(),
         );
-        let mut flows = HashMap::new();
+        (sock, session_ids)
+    }
+
+    fn client_control(client_session_id: u64, packet_id: u64) -> UdpSocketControlData {
+        let mut c = UdpSocketControlData::default();
+        c.client_session_id = client_session_id;
+        c.packet_id = packet_id;
+        c
+    }
+
+    #[tokio::test]
+    async fn udp_port_53_obeys_reject_rule() {
+        let tunnel = crate::test_rule_tunnel();
+        let (sock, session_ids) = server_sock_and_ids("aes-256-gcm").await;
+        let mut state = UdpRelayState::default();
         let peer = "127.0.0.1:12345".parse().unwrap();
         for port in [53, 5353] {
             let dst = SocketAddr::from(([127, 0, 0, 1], port));
             assert!(handle_ss_udp_datagram(
                 &tunnel,
                 &sock,
-                &mut flows,
+                &mut state,
                 b"not a DNS query",
                 peer,
                 &Address::SocketAddress(dst),
+                None,
+                &session_ids,
                 "ss",
                 8388,
                 8,
@@ -635,9 +909,382 @@ mod routing_tests {
             .await
             .unwrap());
             assert!(
-                flows[&(peer, dst)].conn.local_addr().is_err(),
+                state.flows[&(peer, dst)].conn.local_addr().is_err(),
                 "must use REJECT, not DIRECT"
             );
         }
+    }
+
+    /// Regression (SIP022 §3.2.2/§3.2.3): the control attached to a new flow's
+    /// replies must echo the client's session ID and carry the server session
+    /// ID minted for that client session. The crate's 3-arg `send_to`
+    /// substitutes an all-zero control, which makes sing-box's
+    /// `clientPacketConn` treat the reply as belonging to the "no session
+    /// seen yet" state it initialised with, select a nil cipher, and panic
+    /// on every reply.
+    #[test]
+    fn ss_udp_reply_control_echoes_client_and_mints_server_session_id() {
+        let client_session_id = 0x0123_4567_89ab_cdef_u64;
+        let inbound = client_control(client_session_id, 7);
+
+        let server = ServerSession {
+            server_session_id: 0xdead_beef,
+            next_packet_id: AtomicU::new(0),
+        };
+        let reply = build_reply_control(Some(&inbound), Some(&server));
+        assert_eq!(
+            reply.client_session_id, client_session_id,
+            "the reply header must echo the client session ID"
+        );
+        assert_eq!(
+            reply.server_session_id, 0xdead_beef,
+            "the reply carries the session's server session ID"
+        );
+        assert_ne!(
+            reply.server_session_id, client_session_id,
+            "the server session ID must not reuse the client's"
+        );
+        assert_eq!(
+            reply.packet_id, 0,
+            "reply packet IDs are allocated per send, not at flow creation"
+        );
+
+        // Ciphers outside the 2022 category carry no client control: the
+        // template stays all-zero (those ciphers ignore it when encrypting).
+        let no_control = build_reply_control(None, None);
+        assert_eq!(no_control.client_session_id, 0);
+        assert_eq!(no_control.server_session_id, 0);
+    }
+
+    /// The server session ID is per client session, must be random, and must
+    /// never be `0`.
+    #[test]
+    fn server_session_ids_are_random_and_non_zero() {
+        let context =
+            shadowsocks::context::Context::new_shared(shadowsocks::config::ServerType::Server);
+        let session_ids =
+            ServerSessionIds::new(context, "2022-blake3-aes-256-gcm".parse().unwrap());
+        let first = session_ids.next();
+        let second = session_ids.next();
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert_ne!(first, second, "each client session needs its own ID");
+    }
+
+    /// SIP022 §3.2.4: one client session spanning several `(peer, target)`
+    /// flows shares a single server session (one ID, one reply packet
+    /// counter) — the spec's session discriminator is the client session ID,
+    /// not the NAT tuple.
+    #[tokio::test]
+    async fn flows_of_one_client_session_share_the_server_session() {
+        let tunnel = direct_rule_tunnel();
+        let (sock, session_ids) = server_sock_and_ids("2022-blake3-aes-256-gcm").await;
+        let mut state = UdpRelayState::default();
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let csid = 0x0bad_f00d_u64;
+
+        for (i, port) in [443u16, 853].into_iter().enumerate() {
+            let dst = SocketAddr::from(([127, 0, 0, 1], port));
+            let control = client_control(csid, i as u64);
+            assert!(handle_ss_udp_datagram(
+                &tunnel,
+                &sock,
+                &mut state,
+                b"payload",
+                peer,
+                &Address::SocketAddress(dst),
+                Some(&control),
+                &session_ids,
+                "ss",
+                8388,
+                8,
+            )
+            .await
+            .unwrap());
+        }
+
+        assert_eq!(state.flows.len(), 2, "each target keeps its own flow");
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "one client session ID = one server session"
+        );
+        let session = &state.sessions[&csid];
+        assert_eq!(
+            Arc::strong_count(&session.server),
+            3,
+            "sessions map + one reply task per flow hold the session"
+        );
+    }
+
+    /// SIP022 §3.2.4: a changed client session ID on an existing `(peer,
+    /// target)` key is a new relay session — the old flow must be replaced,
+    /// not reused to echo the stale ID.
+    #[tokio::test]
+    async fn rotated_client_session_id_forces_a_new_flow() {
+        let tunnel = direct_rule_tunnel();
+        let (sock, session_ids) = server_sock_and_ids("2022-blake3-aes-256-gcm").await;
+        let mut state = UdpRelayState::default();
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let dst = SocketAddr::from(([127, 0, 0, 1], 443));
+        let target = Address::SocketAddress(dst);
+        let key = (peer, dst);
+
+        let old_csid = 0xaaaa_0001_u64;
+        let control = client_control(old_csid, 0);
+        assert!(handle_ss_udp_datagram(
+            &tunnel,
+            &sock,
+            &mut state,
+            b"first",
+            peer,
+            &target,
+            Some(&control),
+            &session_ids,
+            "ss",
+            8388,
+            8,
+        )
+        .await
+        .unwrap());
+        let old_conn = Arc::clone(&state.flows[&key].conn);
+        let old_server = Arc::clone(&state.sessions[&old_csid].server);
+
+        // Same (peer, target), new client session ID: the flow must be
+        // re-dialed so its replies echo the new ID.
+        let new_csid = 0xbbbb_0002_u64;
+        let control = client_control(new_csid, 0);
+        assert!(handle_ss_udp_datagram(
+            &tunnel,
+            &sock,
+            &mut state,
+            b"second",
+            peer,
+            &target,
+            Some(&control),
+            &session_ids,
+            "ss",
+            8388,
+            8,
+        )
+        .await
+        .unwrap());
+
+        let flow = &state.flows[&key];
+        assert_eq!(
+            flow.client_session_id, new_csid,
+            "the live flow must echo the new session ID"
+        );
+        assert!(
+            !Arc::ptr_eq(&flow.conn, &old_conn),
+            "rotation must re-dial, not reuse the stale flow's conn"
+        );
+        assert_eq!(
+            state.sessions.len(),
+            2,
+            "both client sessions keep their own server session"
+        );
+        assert_ne!(
+            state.sessions[&old_csid].server.server_session_id,
+            state.sessions[&new_csid].server.server_session_id,
+            "each client session owns a distinct server session ID"
+        );
+
+        // Rotating back to A while A's session is still mapped: A's retained
+        // replay window is reused — its already-seen packet ID 0 stays
+        // dropped — and the flow re-dials back under session A.
+        let control = client_control(old_csid, 0);
+        let err = handle_ss_udp_datagram(
+            &tunnel,
+            &sock,
+            &mut state,
+            b"replay of A",
+            peer,
+            &target,
+            Some(&control),
+            &session_ids,
+            "ss",
+            8388,
+            8,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("replay"), "A's window must persist: {err}");
+
+        let control = client_control(old_csid, 1);
+        assert!(handle_ss_udp_datagram(
+            &tunnel,
+            &sock,
+            &mut state,
+            b"back to A",
+            peer,
+            &target,
+            Some(&control),
+            &session_ids,
+            "ss",
+            8388,
+            8,
+        )
+        .await
+        .unwrap());
+        assert_eq!(state.flows[&key].client_session_id, old_csid);
+        assert!(
+            Arc::ptr_eq(&state.sessions[&old_csid].server, &old_server),
+            "returning to a live session must reuse its server session"
+        );
+    }
+
+    /// SIP022 §3.2.4: a re-sent datagram with an already-seen packet ID is
+    /// replay — dropped before any forwarding work.
+    #[tokio::test]
+    async fn replayed_client_packet_id_is_dropped() {
+        let tunnel = direct_rule_tunnel();
+        let (sock, session_ids) = server_sock_and_ids("2022-blake3-aes-256-gcm").await;
+        let mut state = UdpRelayState::default();
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let target = Address::SocketAddress(SocketAddr::from(([127, 0, 0, 1], 443)));
+        let control = client_control(0xcccc_0003, 42);
+
+        assert!(handle_ss_udp_datagram(
+            &tunnel,
+            &sock,
+            &mut state,
+            b"first",
+            peer,
+            &target,
+            Some(&control),
+            &session_ids,
+            "ss",
+            8388,
+            8,
+        )
+        .await
+        .unwrap());
+
+        // Same session + same packet ID → replay.
+        let err = handle_ss_udp_datagram(
+            &tunnel,
+            &sock,
+            &mut state,
+            b"retransmitted",
+            peer,
+            &target,
+            Some(&control),
+            &session_ids,
+            "ss",
+            8388,
+            8,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("replay"), "unexpected drop reason: {err}");
+
+        // Same session + an *older* but still in-window packet ID →
+        // accepted (real UDP reorders; the window is not strict-FIFO).
+        let control = client_control(0xcccc_0003, 41);
+        assert!(handle_ss_udp_datagram(
+            &tunnel,
+            &sock,
+            &mut state,
+            b"reordered",
+            peer,
+            &target,
+            Some(&control),
+            &session_ids,
+            "ss",
+            8388,
+            8,
+        )
+        .await
+        .unwrap());
+
+        // Same session + a fresh packet ID on the same flow → accepted.
+        let control = client_control(0xcccc_0003, 43);
+        assert!(handle_ss_udp_datagram(
+            &tunnel,
+            &sock,
+            &mut state,
+            b"next",
+            peer,
+            &target,
+            Some(&control),
+            &session_ids,
+            "ss",
+            8388,
+            8,
+        )
+        .await
+        .unwrap());
+        assert_eq!(state.flows.len(), 1, "the replay never touched the table");
+    }
+
+    /// Issue #514 regression: when a flow's reply task dies (upstream conn
+    /// gone), the flow is dead weight — the next datagram on the same
+    /// `(peer, target)` must evict and re-dial, not write into a conn that
+    /// can never answer.
+    #[tokio::test]
+    async fn dead_reply_task_evicts_flow_for_redial() {
+        // REJECT conns' `read_packet` errors immediately, so the spawned
+        // reply task sets `dead` as soon as it is polled.
+        let tunnel = crate::test_rule_tunnel();
+        let (sock, session_ids) = server_sock_and_ids("aes-256-gcm").await;
+        let mut state = UdpRelayState::default();
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let target = Address::SocketAddress(SocketAddr::from(([127, 0, 0, 1], 443)));
+        let key = (peer, SocketAddr::from(([127, 0, 0, 1], 443)));
+
+        assert!(handle_ss_udp_datagram(
+            &tunnel,
+            &sock,
+            &mut state,
+            b"first",
+            peer,
+            &target,
+            None,
+            &session_ids,
+            "ss",
+            8388,
+            8,
+        )
+        .await
+        .unwrap());
+        let dead_flow_conn = Arc::clone(&state.flows[&key].conn);
+
+        // Let the reply task run to its read error and mark the flow dead.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if state.flows[&key]
+                .dead
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                break;
+            }
+        }
+        assert!(
+            state.flows[&key]
+                .dead
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the reply task must mark the flow dead on upstream read error"
+        );
+
+        assert!(handle_ss_udp_datagram(
+            &tunnel,
+            &sock,
+            &mut state,
+            b"second",
+            peer,
+            &target,
+            None,
+            &session_ids,
+            "ss",
+            8388,
+            8,
+        )
+        .await
+        .unwrap());
+        assert!(
+            !Arc::ptr_eq(&state.flows[&key].conn, &dead_flow_conn),
+            "a dead flow must be evicted and re-dialed, not reused"
+        );
     }
 }

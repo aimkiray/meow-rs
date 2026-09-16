@@ -134,6 +134,10 @@ cargo clippy --all-targets --no-default-features -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo test -p meow-listener --all-features --lib udp_port_53
+# `listener-shadowsocks` is opt-in: the default-features suite never compiles
+# the SS listener tests, so they need their own feature-gated runs.
+cargo test -p meow-listener --features listener-shadowsocks --lib shadowsocks
+cargo test -p meow-listener --features listener-shadowsocks --test ss_listener_integration
 
 # Mirrors the "Unit + integration tests (default features)" CI step. `--lib`
 # alone is not enough: it skips every `--test` target, so a broken integration

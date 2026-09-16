@@ -102,6 +102,23 @@ the canonical, in-repo source a release is cut from.
 
 - Proxy groups declared before their nested groups now retain those forward
   references even when either group also names a missing proxy.
+
+- **Shadowsocks AEAD-2022 UDP now interoperates in both directions**
+  (#566). Both the inbound listener and the outbound adapter previously ran
+  with an all-zero `UdpSocketControlData`: inbound replies echoed
+  `client_session_id = 0` with a zero server session ID (strict clients like
+  sing-box reject them), and every outbound datagram repeated
+  `client_session_id = 0`/`packet_id = 0`, so a conforming ssserver's replay
+  filter dropped everything after the first packet. Inbound relay sessions
+  are now keyed by `client_session_id` (SIP022 §3.2.4, matching ssserver's
+  `NatKey::SessionId`) with a random non-zero server session ID, a
+  session-wide reply packet counter shared across flows, and a per-session
+  client packet-ID replay window; outbound associations mint a random client
+  session ID, count packet IDs up, and filter replies through
+  per-server-session windows. Reply headers now carry the responder's real
+  socket address, and malformed reply datagrams are dropped per-packet
+  instead of killing the association.
+
 - Hysteria2 authentication no longer advertises HTTP/3 datagrams, preventing
   the server's HTTP/3 receiver from consuming raw QUIC UDP relay packets.
   The TProxy test image now includes the mandatory BoringSSL build toolchain.

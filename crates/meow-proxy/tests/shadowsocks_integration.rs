@@ -111,16 +111,31 @@ async fn start_udp_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 
 /// Start ssserver with the given port and target echo servers configured.
 async fn start_ssserver(ss_port: u16) -> Child {
-    start_ssserver_inner(ss_port, None, None).await
+    start_ssserver_inner(ss_port, SS_CIPHER, SS_PASSWORD, None, None).await
+}
+
+/// Start ssserver with an explicit cipher + key (AEAD-2022 needs a base64
+/// iPSK rather than the suite's shared password).
+async fn start_ssserver_with_cipher(ss_port: u16, cipher: &str, key: &str) -> Child {
+    start_ssserver_inner(ss_port, cipher, key, None, None).await
 }
 
 /// Start ssserver with an optional SIP003 plugin.
 async fn start_ssserver_with_plugin(ss_port: u16, plugin: &str, plugin_opts: &str) -> Child {
-    start_ssserver_inner(ss_port, Some(plugin), Some(plugin_opts)).await
+    start_ssserver_inner(
+        ss_port,
+        SS_CIPHER,
+        SS_PASSWORD,
+        Some(plugin),
+        Some(plugin_opts),
+    )
+    .await
 }
 
 async fn start_ssserver_inner(
     ss_port: u16,
+    cipher: &str,
+    password: &str,
     plugin: Option<&str>,
     plugin_opts: Option<&str>,
 ) -> Child {
@@ -128,9 +143,9 @@ async fn start_ssserver_inner(
         "-s".to_string(),
         format!("127.0.0.1:{}", ss_port),
         "-k".to_string(),
-        SS_PASSWORD.to_string(),
+        password.to_string(),
         "-m".to_string(),
-        SS_CIPHER.to_string(),
+        cipher.to_string(),
         "-U".to_string(), // enable UDP relay
     ];
     if let Some(p) = plugin {
@@ -339,6 +354,68 @@ async fn test_ss_udp_relay() {
         .expect("UDP read2 timed out")
         .expect("UDP read_packet2 failed");
     assert_eq!(&buf[..n2], payload2, "UDP echo mismatch round 2");
+}
+
+/// AEAD-2022 UDP outbound against a real `ssserver` (SIP022 §3.2.2/§3.2.4).
+///
+/// The client must mint a session ID and count packet IDs up per session.
+/// With the old all-zero control every datagram repeated
+/// `(client_session_id=0, packet_id=0)` and the server's mandatory replay
+/// filter dropped everything after the first packet — several echo rounds in
+/// a row is exactly what that bug breaks.
+#[tokio::test]
+async fn test_ss_udp_relay_2022() {
+    if !ssserver_available() {
+        skip_or_fail("ssserver not found in PATH");
+        return;
+    }
+
+    // AEAD-2022 keys are base64 iPSKs, not arbitrary passwords — 16 bytes
+    // for the aes-128-gcm variant ("1234567890123456").
+    const CIPHER_2022: &str = "2022-blake3-aes-128-gcm";
+    const PSK_2022: &str = "MTIzNDU2Nzg5MDEyMzQ1Ng==";
+
+    let (echo_addr, _echo_handle) = start_udp_echo_server().await;
+    let ss_port = free_port().await;
+    let _ssserver = start_ssserver_with_cipher(ss_port, CIPHER_2022, PSK_2022).await;
+
+    let adapter = ShadowsocksAdapter::new(
+        "test-ss-2022",
+        "127.0.0.1",
+        ss_port,
+        PSK_2022,
+        CIPHER_2022,
+        true,
+        None,
+        None,
+        Arc::new(DirectDialer),
+    )
+    .unwrap();
+
+    let metadata = Metadata {
+        network: Network::Udp,
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        dst_port: echo_addr.port(),
+        ..Default::default()
+    };
+    let conn = timeout(TIMEOUT, adapter.dial_udp(&metadata))
+        .await
+        .expect("UDP dial timed out")
+        .expect("UDP dial failed");
+
+    let mut buf = vec![0u8; 65536];
+    for round in 0..5u8 {
+        let payload = format!("ss-2022 udp round {round}");
+        conn.write_packet(payload.as_bytes(), &echo_addr)
+            .await
+            .expect("UDP write_packet failed");
+        let (n, from_addr) = timeout(TIMEOUT, conn.read_packet(&mut buf))
+            .await
+            .expect("UDP read timed out — server replay filter may be dropping packets")
+            .expect("UDP read_packet failed");
+        assert_eq!(&buf[..n], payload.as_bytes(), "UDP echo mismatch");
+        assert_eq!(from_addr, echo_addr, "UDP source address mismatch");
+    }
 }
 
 #[tokio::test]
