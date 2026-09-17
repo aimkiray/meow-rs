@@ -14,6 +14,7 @@ use meow_rules::{
     src_geoip::SrcGeoIpRule,
 };
 use regex::Regex;
+use smallvec::SmallVec;
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -255,6 +256,11 @@ pub enum LazyMatchOutcome<'a> {
     /// The scan reached a slot whose predicate needs metadata not yet
     /// materialized. Enrich the reported fields, then re-run the strict
     /// [`CompiledRuleSet::match_rules`]. At least one flag is `true`.
+    ///
+    /// Dead-target warnings gathered before this point were buffered, not
+    /// emitted — returning this variant without the strict re-run loses
+    /// them permanently. The re-scan re-derives each skipped match and
+    /// warns exactly once.
     NeedsEnrichment { needs_ip: bool, needs_process: bool },
     /// No rule matched (and no slot was blocked on missing metadata).
     NoMatch,
@@ -284,7 +290,8 @@ fn process_missing(metadata: &Metadata) -> bool {
 /// registry or unusable for this traffic (issue #513; mihomo's match loop
 /// also `continue`s a target without UDP support on UDP flows).
 /// Interpolated into the message itself because the /logs broadcast
-/// forwards only the `message` field.
+/// forwards only the `message` field. Keep the wording in sync with the
+/// legacy engine's copy in `match_engine::warn_missing_target`.
 fn warn_missing_target(m: &CompiledMatchResult<'_>) {
     warn!(
         "rule {} matched target '{}' which is unavailable for this \
@@ -296,6 +303,7 @@ fn warn_missing_target(m: &CompiledMatchResult<'_>) {
 }
 
 /// One borrowed result from a compiled rule-set match.
+#[derive(Clone, Copy)]
 pub struct CompiledMatchResult<'a> {
     pub adapter_name: &'a str,
     pub adapter_index: Option<usize>,
@@ -543,6 +551,7 @@ impl CompiledRuleSet {
 
         let helper = RuleMatchHelper;
         let input = MatchInput::new(metadata);
+        let mut on_missing = |m: CompiledMatchResult<'_>| warn_missing_target(&m);
         if self.execution_plan == ExecutionPlan::LinearScan {
             // EVAL_TRIE is inert under LinearScan (no trie, hence no owned
             // slots) — `true` keeps the scan correct if one ever appears.
@@ -552,6 +561,7 @@ impl CompiledRuleSet {
                 rules,
                 &helper,
                 target_exists,
+                &mut on_missing,
             );
         }
 
@@ -583,9 +593,14 @@ impl CompiledRuleSet {
 
         // Prefix scan: EVAL_TRIE=false — the trie proved no owned slot
         // before `scan_end` matches this host.
-        if let Some(matched) =
-            self.scan_range::<false>(0..scan_end, &input, rules, &helper, target_exists)
-        {
+        if let Some(matched) = self.scan_range::<false>(
+            0..scan_end,
+            &input,
+            rules,
+            &helper,
+            target_exists,
+            &mut on_missing,
+        ) {
             return Some(matched);
         }
 
@@ -599,7 +614,7 @@ impl CompiledRuleSet {
             if target_exists(m.adapter_name) {
                 return Some(m);
             }
-            warn_missing_target(&m);
+            on_missing(m);
             tail_start += 1;
         }
 
@@ -609,6 +624,7 @@ impl CompiledRuleSet {
             rules,
             &helper,
             target_exists,
+            &mut on_missing,
         )
     }
 
@@ -623,7 +639,9 @@ impl CompiledRuleSet {
     /// [`LazyMatchOutcome::NeedsEnrichment`], materialize the reported
     /// fields and re-run [`Self::match_rules`] with the enriched metadata.
     /// Same `target_exists` contract as [`Self::match_rules`]: matched slots
-    /// whose target is absent are skipped and the scan continues.
+    /// whose target is absent are skipped and the scan continues — with the
+    /// warn deferred so the strict re-scan after `NeedsEnrichment` is the
+    /// single place it fires (skipping that re-run loses the warnings).
     pub fn match_rules_lazy<'a>(
         &'a self,
         metadata: &Metadata,
@@ -636,69 +654,101 @@ impl CompiledRuleSet {
             "CompiledRuleSet must be evaluated with the rule slice it was built from",
         );
 
-        let helper = RuleMatchHelper;
-        let input = MatchInput::new(metadata);
-        if self.execution_plan == ExecutionPlan::LinearScan {
-            return match self.scan_range_ctl::<true, true>(
-                0..self.slots.len(),
-                &input,
-                rules,
-                &helper,
-                target_exists,
-            ) {
-                ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
-                ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
-                ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
-            };
-        }
+        // Dead-target matches are buffered, not warned: a `NeedsEnrichment`
+        // outcome means the caller re-runs `match_rules`, which re-fires the
+        // same skips deterministically — emitting here too would warn twice
+        // per connection. The SmallVec keeps up to two skips inline, so even
+        // the dead-target path stays allocation-free.
+        let mut skipped: SmallVec<[CompiledMatchResult<'a>; 2]> = SmallVec::new();
+        let outcome = {
+            let mut on_missing = |m: CompiledMatchResult<'a>| skipped.push(m);
 
-        let trie_hit = if input.host.is_empty() {
-            None
-        } else {
-            self.domain_index.search(input.host)
-        };
-        let (scan_end, hit_slot) = match trie_hit {
-            Some(rule_idx) => {
-                let pos = self.slots.partition_point(|s| s.rule_index() < rule_idx);
-                let slot = self
-                    .slots
-                    .get(pos)
-                    .filter(|slot| slot.rule_index() == rule_idx);
-                (pos, slot)
+            let helper = RuleMatchHelper;
+            let input = MatchInput::new(metadata);
+            'scan: {
+                if self.execution_plan == ExecutionPlan::LinearScan {
+                    break 'scan match self.scan_range_ctl::<true, true>(
+                        0..self.slots.len(),
+                        &input,
+                        rules,
+                        &helper,
+                        target_exists,
+                        &mut on_missing,
+                    ) {
+                        ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
+                        ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
+                        ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
+                    };
+                }
+
+                let trie_hit = if input.host.is_empty() {
+                    None
+                } else {
+                    self.domain_index.search(input.host)
+                };
+                let (scan_end, hit_slot) = match trie_hit {
+                    Some(rule_idx) => {
+                        let pos = self.slots.partition_point(|s| s.rule_index() < rule_idx);
+                        let slot = self
+                            .slots
+                            .get(pos)
+                            .filter(|slot| slot.rule_index() == rule_idx);
+                        (pos, slot)
+                    }
+                    None => (self.slots.len(), None),
+                };
+
+                match self.scan_range_ctl::<true, false>(
+                    0..scan_end,
+                    &input,
+                    rules,
+                    &helper,
+                    target_exists,
+                    &mut on_missing,
+                ) {
+                    ScanOutcome::Matched(matched) => {
+                        break 'scan LazyMatchOutcome::Matched(matched);
+                    }
+                    // A blocked slot before the trie hit may match and beat
+                    // it, so enrichment is needed even though a domain rule
+                    // stands ready.
+                    ScanOutcome::Blocked { pos } => {
+                        break 'scan self.enrichment_needs(pos, &input);
+                    }
+                    ScanOutcome::Exhausted => {}
+                }
+
+                let mut tail_start = scan_end;
+                if let Some(slot) = hit_slot {
+                    let m = self.static_match(slot, rules);
+                    if target_exists(m.adapter_name) {
+                        break 'scan LazyMatchOutcome::Matched(m);
+                    }
+                    on_missing(m);
+                    tail_start += 1;
+                }
+
+                match self.scan_range_ctl::<true, true>(
+                    tail_start..self.slots.len(),
+                    &input,
+                    rules,
+                    &helper,
+                    target_exists,
+                    &mut on_missing,
+                ) {
+                    ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
+                    ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
+                    ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
+                }
             }
-            None => (self.slots.len(), None),
         };
 
-        match self.scan_range_ctl::<true, false>(0..scan_end, &input, rules, &helper, target_exists)
-        {
-            ScanOutcome::Matched(matched) => return LazyMatchOutcome::Matched(matched),
-            // A blocked slot before the trie hit may match and beat it, so
-            // enrichment is needed even though a domain rule stands ready.
-            ScanOutcome::Blocked { pos } => return self.enrichment_needs(pos, &input),
-            ScanOutcome::Exhausted => {}
-        }
-
-        let mut tail_start = scan_end;
-        if let Some(slot) = hit_slot {
-            let m = self.static_match(slot, rules);
-            if target_exists(m.adapter_name) {
-                return LazyMatchOutcome::Matched(m);
+        if !matches!(outcome, LazyMatchOutcome::NeedsEnrichment { .. }) {
+            for m in &skipped {
+                warn_missing_target(m);
             }
-            warn_missing_target(&m);
-            tail_start += 1;
         }
-
-        match self.scan_range_ctl::<true, true>(
-            tail_start..self.slots.len(),
-            &input,
-            rules,
-            &helper,
-            target_exists,
-        ) {
-            ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
-            ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
-            ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
-        }
+        outcome
     }
 
     /// Union the demands of every slot at or after `from_pos`, filtered to
@@ -766,8 +816,16 @@ impl CompiledRuleSet {
         rules: &'a [Box<dyn Rule>],
         helper: &RuleMatchHelper,
         target_exists: &dyn Fn(&str) -> bool,
+        on_missing: &mut dyn FnMut(CompiledMatchResult<'a>),
     ) -> Option<CompiledMatchResult<'a>> {
-        match self.scan_range_ctl::<false, EVAL_TRIE>(range, input, rules, helper, target_exists) {
+        match self.scan_range_ctl::<false, EVAL_TRIE>(
+            range,
+            input,
+            rules,
+            helper,
+            target_exists,
+            on_missing,
+        ) {
             ScanOutcome::Matched(matched) => Some(matched),
             ScanOutcome::Blocked { .. } | ScanOutcome::Exhausted => None,
         }
@@ -781,10 +839,12 @@ impl CompiledRuleSet {
     /// those owned slots cannot match); `true` everywhere else, including
     /// post-skip tail scans where a second matching domain rule may live.
     ///
-    /// A matched slot whose target is absent from the registry is warned and
-    /// skipped (`continue`), matching mihomo's `match()` loop — one hash
-    /// lookup per *matching* slot only, so the miss-scan hot path is
-    /// unchanged (issue #513).
+    /// A matched slot whose target is absent from the registry is reported
+    /// through `on_missing` and skipped (`continue`), matching mihomo's
+    /// `match()` loop — one hash lookup per *matching* slot only, so the
+    /// miss-scan hot path is unchanged (issue #513). The sink is a callback
+    /// so the lazy path can defer warnings when a strict re-scan will
+    /// re-emit them.
     fn scan_range_ctl<'a, const STOP_ON_DEMAND: bool, const EVAL_TRIE: bool>(
         &'a self,
         range: Range<usize>,
@@ -792,6 +852,7 @@ impl CompiledRuleSet {
         rules: &'a [Box<dyn Rule>],
         helper: &RuleMatchHelper,
         target_exists: &dyn Fn(&str) -> bool,
+        on_missing: &mut dyn FnMut(CompiledMatchResult<'a>),
     ) -> ScanOutcome<'a> {
         let start = range.start;
         for (offset, slot) in self.slots[range].iter().enumerate() {
@@ -839,7 +900,7 @@ impl CompiledRuleSet {
                 if target_exists(m.adapter_name) {
                     return ScanOutcome::Matched(m);
                 }
-                warn_missing_target(&m);
+                on_missing(m);
             }
         }
         ScanOutcome::Exhausted
@@ -2771,6 +2832,210 @@ mod tests {
             }
             _ => panic!("scan must stop at the IP-CIDR slot"),
         }
+    }
+
+    /// Scoped WARN capture — `with_default` is thread-local, so parallel tests
+    /// in this binary don't see each other's lines.
+    fn capture_warns<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let sink = Sink(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let captured = sink.0.lock().unwrap();
+        (out, String::from_utf8_lossy(&captured).into_owned())
+    }
+
+    // Issue #533 item 4: the lazy two-phase resolve used to warn about a
+    // dead-target match twice per connection — once in `match_rules_lazy`
+    // and again when `match_rules` re-scanned after enrichment.
+    #[test]
+    fn lazy_dead_target_warns_once_across_enrichment() {
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(DomainSuffixRule::new("example.com", "DEAD")),
+            Box::new(IpCidrRule::new("1.2.3.0/24", "CidrProxy", false, false).unwrap()),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        let usable = |name: &str| name != "DEAD";
+
+        let mut meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        // Phase 1: the dead-target domain rule matches and the IP-CIDR slot
+        // blocks → NeedsEnrichment. The warn must be deferred to phase 2.
+        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        assert!(
+            matches!(
+                outcome,
+                LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
+            ),
+            "scan must stop at the IP-CIDR slot"
+        );
+        assert!(
+            !logs.contains("DEAD"),
+            "phase 1 must defer the dead-target warn, got: {logs}"
+        );
+
+        // Phase 2: the strict re-match warns exactly once.
+        meta.dst_ip = Some("1.2.3.4".parse().unwrap());
+        let (result, logs) = capture_warns(|| set.match_rules(&meta, &rules, &usable));
+        assert_eq!(
+            result.map(|m| m.adapter_name),
+            Some("CidrProxy"),
+            "the dead-target rule is skipped and the CIDR rule wins"
+        );
+        let warns = logs.matches("unavailable").count();
+        assert_eq!(
+            warns, 1,
+            "expected exactly one dead-target warn, got: {logs}"
+        );
+    }
+
+    // The warn is still emitted when the lazy scan finishes without
+    // enrichment — deferral must not swallow it.
+    #[test]
+    fn lazy_dead_target_warns_on_final_outcome() {
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(DomainSuffixRule::new("example.com", "DEAD")),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        let usable = |name: &str| name != "DEAD";
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        assert!(matches!(outcome, LazyMatchOutcome::Matched(_)));
+        let warns = logs.matches("unavailable").count();
+        assert_eq!(
+            warns, 1,
+            "final outcome must emit the warn once, got: {logs}"
+        );
+    }
+
+    // Same invariant under the DomainIndexed plan: the trie-hit slot's
+    // `on_missing` and the tail scan's buffered skips must be deferred past
+    // a `NeedsEnrichment` exactly like the linear path's.
+    #[test]
+    fn lazy_dead_target_warns_once_across_enrichment_indexed() {
+        let mut rules = filler_suffix_rules(70);
+        rules.push(Box::new(DomainSuffixRule::new("example.com", "DEAD-HIT")));
+        rules.push(Box::new(DomainSuffixRule::new("example.com", "DEAD-TAIL")));
+        rules.push(Box::new(
+            IpCidrRule::new("1.2.3.0/24", "CidrProxy", false, false).unwrap(),
+        ));
+        rules.push(Box::new(FinalRule::new("DIRECT")));
+        let set = CompiledRuleSet::build(&rules);
+        assert!(!set.uses_linear_scan_plan(), "must run the indexed plan");
+        let usable = |name: &str| !name.starts_with("DEAD");
+
+        let mut meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        assert!(matches!(
+            outcome,
+            LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
+        ));
+        assert!(
+            !logs.contains("DEAD"),
+            "phase 1 must defer both dead-target warns, got: {logs}"
+        );
+
+        meta.dst_ip = Some("1.2.3.4".parse().unwrap());
+        let (result, logs) = capture_warns(|| set.match_rules(&meta, &rules, &usable));
+        assert_eq!(result.map(|m| m.adapter_name), Some("CidrProxy"));
+        // The trie hit and the second matching domain rule in the tail each
+        // warn exactly once — buffer order equals scan order.
+        assert_eq!(logs.matches("DEAD-HIT").count(), 1, "got: {logs}");
+        assert_eq!(logs.matches("DEAD-TAIL").count(), 1, "got: {logs}");
+    }
+
+    // `NoMatch` is also a final outcome: buffered warns must still drain.
+    #[test]
+    fn lazy_dead_target_warns_on_no_match() {
+        let rules: Vec<Box<dyn Rule>> =
+            vec![Box::new(DomainSuffixRule::new("example.com", "DEAD"))];
+        let set = CompiledRuleSet::build(&rules);
+        let usable = |name: &str| name != "DEAD";
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        assert!(matches!(outcome, LazyMatchOutcome::NoMatch));
+        let warns = logs.matches("unavailable").count();
+        assert_eq!(
+            warns, 1,
+            "NoMatch must drain the buffered warn, got: {logs}"
+        );
+    }
+
+    // A dead-target match *after* the blocked slot is never buffered in
+    // phase 1 — the scan stops before reaching it. The strict re-scan still
+    // finds and warns it exactly once.
+    #[test]
+    fn lazy_dead_target_after_blocked_slot_warns_once_in_rescan() {
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(IpCidrRule::new("10.0.0.0/8", "CidrProxy", false, false).unwrap()),
+            Box::new(DomainSuffixRule::new("example.com", "DEAD")),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        let usable = |name: &str| name != "DEAD";
+
+        let mut meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        assert!(matches!(
+            outcome,
+            LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
+        ));
+        assert!(!logs.contains("DEAD"), "phase 1 warns nothing, got: {logs}");
+
+        // The enriched IP misses the CIDR, so the strict re-scan walks past
+        // the previously blocked slot and reaches the dead domain rule.
+        meta.dst_ip = Some("1.2.3.4".parse().unwrap());
+        let (result, logs) = capture_warns(|| set.match_rules(&meta, &rules, &usable));
+        assert_eq!(result.map(|m| m.adapter_name), Some("DIRECT"));
+        assert_eq!(
+            logs.matches("DEAD").count(),
+            1,
+            "post-block dead target warns exactly once in the re-scan, got: {logs}"
+        );
     }
 
     #[test]

@@ -207,6 +207,8 @@ pub fn match_rules<'rules>(
 /// Log a skipped match: the rule matched but its target is absent from the
 /// registry or unusable for this traffic (issue #513; mihomo's match loop
 /// also `continue`s a target without UDP support on UDP flows).
+/// Keep the wording in sync with the IR engine's copy in
+/// `rule_ir::warn_missing_target`.
 fn warn_missing_target(adapter_name: &str, rule: &dyn Rule) {
     tracing::warn!(
         "rule {} matched target '{adapter_name}' which is unavailable for \

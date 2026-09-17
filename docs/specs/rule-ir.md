@@ -43,7 +43,7 @@ The IR is not:
 | --- | --- |
 | source rule | One parsed `Box<dyn Rule>` from the ordered config rule list. |
 | compiled rule set | `CompiledRuleSet`, the immutable IR built from the full source rule list. |
-| slot | `CompiledRuleSlot`, one IR entry corresponding one-to-one with a source rule. Slot order is source order. |
+| slot | `CompiledRuleSlot`, one IR entry for a source rule that survived pruning (constant-false, duplicate, and shadowed rules emit no slot). Slot order is source order. |
 | opcode | `RuleOp`, a native predicate compiled from a source rule's public type and payload. |
 | fallback slot | A slot whose source rule cannot be fully represented as an opcode and must call the public `Rule` trait. |
 | target plan | Whether a successful slot returns the source rule's static adapter or a dynamic adapter from nested rule evaluation. |
@@ -91,10 +91,12 @@ Each slot stores:
 - `rule_index`: index into the original `rules` slice.
 - `rule_type`: copied `RuleType`.
 - `adapter_index`: interned top-level adapter.
-- `payload`: copied diagnostic payload.
 - `target_plan`: whether the rule returns a static adapter or can return a
   nested dynamic adapter.
 - `op`: lowered native predicate or `Fallback`.
+
+The rule payload is deliberately *not* stored in the slot (footprint); the
+scan re-reads it from `rules[rule_index]` only when a match is produced.
 
 ## IR Coding Spec
 
@@ -186,6 +188,16 @@ Execution-plan selection is a compiler optimization over the same slots.
 - The IR must not resolve DNS, perform process lookup, or inspect proxies.
 - `needs_ip_resolution()` and `needs_process_lookup()` are aggregate hints
   copied from source rules. The tunnel owns the actual enrichment work.
+- `match_rules_lazy(metadata, rules, target_exists)` is the two-phase
+  variant used on the TCP hot path: the scan stops at the first slot whose
+  predicate needs a field the caller has not materialized yet
+  (`dst_ip`/`process`) and returns `NeedsEnrichment` instead of a silent
+  non-match. Missing-target warnings are deferred inside the lazy scan and
+  emitted only on a final outcome (`Matched`/`NoMatch`); on
+  `NeedsEnrichment` the strict `match_rules` re-scan the caller performs
+  re-derives the same skips deterministically, so each missing target
+  warns exactly once per connection. A caller that treats
+  `NeedsEnrichment` as terminal loses those warnings.
 
 ## Example IR Sequences
 
@@ -581,25 +593,30 @@ compiled rule set or source rule. It does not allocate for successful matches.
 
 ## Tunnel Hot Path
 
-In `TunnelInner::match_adapter()`:
+TCP connections resolve through `Tunnel::resolve_proxy_lazy()`:
 
 1. `Direct` mode bypasses the rule engine.
 2. `Global` mode resolves the `GLOBAL` proxy or falls back to DIRECT.
-3. `Rule` mode loads the current `RouteTable` snapshot.
-4. If any active rule needs process lookup, the metadata is enriched before
-   matching.
-5. The tunnel calls
-   `route.compiled_rules.match_rules(metadata, route.rules, target_exists)`
+3. `Rule` mode loads an owned `Arc<RouteTable>` snapshot (held across any
+   `.await`) and calls
+   `route.compiled_rules.match_rules_lazy(metadata, route.rules, target_exists)`
    where `target_exists` checks the same route snapshot's proxy registry
    (with `DIRECT` hard-coded as always present).
+4. On `Matched`/`NoMatch` the buffered dead-target warnings drain (see the
+   lazy contract above) and the result materializes immediately.
+5. On `NeedsEnrichment` the tunnel materializes only the demanded fields —
+   process lookup and/or real-IP resolution on the cloned metadata — then
+   re-runs the strict `match_rules`, which re-derives the same dead-target
+   skips and warns each once.
 6. On match, statistics are incremented from the returned `RuleType`, and the
    proxy is resolved by the returned adapter name — already proven present by
    the predicate, so a missing proxy is only a defensive fallback to DIRECT.
 7. On no match, the tunnel uses DIRECT.
 
-DNS/IP pre-resolution remains outside the IR. The IR consumes the `Metadata`
-prepared by the tunnel and rule helpers; it does not perform DNS or process
-lookups itself.
+The eager `resolve_proxy()` (process-enrich-then-scan) remains for non-TCP
+paths and non-Rule modes. DNS/IP pre-resolution stays outside the IR: the IR
+consumes the `Metadata` prepared by the tunnel and rule helpers; it does not
+perform DNS or process lookups itself.
 
 ## Correctness Invariants
 

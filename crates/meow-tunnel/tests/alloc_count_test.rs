@@ -1,6 +1,7 @@
 use meow_common::{ConnType, DnsMode, Metadata, Network, Rule, RuleType};
 use meow_config::load_config_from_str;
 use meow_tunnel::match_engine::{match_rules, DomainIndex};
+use meow_tunnel::rule_ir::{CompiledRuleSet, LazyMatchOutcome};
 use meow_tunnel::Statistics;
 use smallvec::smallvec;
 use smol_str::SmolStr;
@@ -398,5 +399,43 @@ fn metadata_remote_address_zero_alloc() {
     assert!(
         allocs_bare <= 5,
         "remote_address() should produce near-zero heap allocations, got {allocs_bare}"
+    );
+}
+
+#[test]
+fn lazy_match_zero_alloc_on_clean_scan() {
+    // The lazy matcher buffers dead-target skips in a SmallVec and drains
+    // them only on final outcomes — a scan that never hits a dead target or
+    // a demanding slot must stay allocation-free (ADR-0008).
+    let _guard = serial();
+
+    let rules: Vec<Box<dyn Rule>> = vec![
+        Box::new(SimpleDomainRule::new("example.com", "DIRECT")),
+        Box::new(FinalRule::new("DIRECT")),
+    ];
+    let compiled = CompiledRuleSet::build(&rules);
+    let meta = test_metadata();
+
+    // Warm up.
+    let _ = compiled.match_rules_lazy(&meta, &rules, &|_| true);
+
+    reset_counts();
+    let n = 1000;
+    for _ in 0..n {
+        let outcome = compiled.match_rules_lazy(&meta, &rules, &|_| true);
+        assert!(matches!(outcome, LazyMatchOutcome::Matched(_)));
+        let _ = std::hint::black_box(outcome);
+    }
+    let (allocs, _) = snapshot();
+
+    let per_match = allocs as f64 / n as f64;
+    println!("lazy_rule_match: {allocs} allocs for {n} iterations = {per_match:.3} per match");
+    if under_coverage_instrumentation() {
+        println!("skipping alloc assertion under coverage instrumentation");
+        return;
+    }
+    assert!(
+        allocs == 0,
+        "expected zero heap allocations per lazy rule match, got {allocs} total ({per_match:.3}/match)"
     );
 }

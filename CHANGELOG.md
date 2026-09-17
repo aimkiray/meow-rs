@@ -193,6 +193,18 @@ the canonical, in-repo source a release is cut from.
   complementing the periodic sweep, which probes provider members too via
   `member_proxies()`. (#533)
 
+- **Lazy rule matching no longer warns twice for the same missing
+  target.** The two-phase lazy matcher warned inline when a matched rule
+  named a missing/dead adapter; when a later rule then demanded IP or
+  process enrichment (`NeedsEnrichment`), the strict re-scan warned the
+  same match again — two identical warnings per connection. Phase one now
+  buffers missing-target matches and emits them only when it reaches a
+  final outcome (`Matched`/`NoMatch`); on `NeedsEnrichment` the buffer is
+  dropped because the deterministic strict re-scan re-fires each skip
+  exactly once. Strict `match_rules` behaviour is unchanged; the buffer
+  keeps up to two skips inline, so even a dead-target match stays
+  allocation-free. (#533)
+
 - **TLS handshakes no longer fail on multiplexed transports whose
   `poll_flush` pends.** Every TLS-over-mux handshake — AnyTLS, smux, and any
   stream whose `poll_flush` waits on a writer-task acknowledgement — died at
