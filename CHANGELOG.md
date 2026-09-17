@@ -167,6 +167,18 @@ the canonical, in-repo source a release is cut from.
   only way to keep its chained upstreams bound to a live generation.
   (#533)
 
+- **Startup prefetch no longer bypasses `dialer-proxy` chains.** The
+  pre-registry rule-provider payload prefetch and `ensure_geodata`'s
+  download proxy were built by re-parsing raw `proxies:` entries — a
+  provider fetch through a chained node egressed without its front hop.
+  Both now share one pre-registry proxy layer built by the same code path
+  as the runtime map — `dialer-proxy` chains, groups, and GLOBAL included —
+  published into a private registry cell for the fetch's duration, so a
+  chained or group front hop resolves exactly as it will at runtime. When
+  the layer itself is rejected the real build hard-fails on the same
+  error moments later; explicit `proxy:` prefetches are then skipped
+  rather than egressing unchained. (#533)
+
 - **TLS handshakes no longer fail on multiplexed transports whose
   `poll_flush` pends.** Every TLS-over-mux handshake — AnyTLS, smux, and any
   stream whose `poll_flush` waits on a writer-task acknowledgement — died at

@@ -241,9 +241,10 @@ fn effective_download_proxy(
 /// parsing them. Failures are logged and skipped; `load_providers_prefetched`
 /// retries any provider missing from the map and reports the error there.
 ///
-/// A `proxy:` name `lookup` cannot resolve (prefetch runs before groups and
-/// provider-sourced proxies exist) skips the prefetch quietly — the load
-/// pass retries against the full registry.
+/// A `proxy:` name `lookup` cannot resolve (provider-sourced proxies are
+/// never indexed by the lookup, and the prefetch layer can be absent when
+/// its build was rejected) skips the prefetch quietly — the load pass
+/// retries against the full registry.
 pub fn prefetch_payloads(
     raw_providers: &HashMap<String, RawRuleProvider>,
     cache_dir: Option<&Path>,

@@ -1060,31 +1060,59 @@ fn has_unresolved_group_dependency(
     })
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the rebuild passes every stage of one config build through; \
-              bundling them would only rename the same list"
-)]
-fn rebuild_from_raw_impl(
+/// Parse every `proxies:` leaf entry into `proxies`, keyed by its YAML `name:`
+/// (`proxy.name()` only as fallback — `DirectAdapter::name()` is hardcoded to
+/// "DIRECT" and would overwrite the built-in, hiding a user-named direct proxy
+/// from groups). `static_proxy_names` collects the same keys so the caller can
+/// distinguish static leaves from group/provider members when modelling
+/// `include-all-proxies` and membership cycles. Factored out of
+/// `build_proxy_layer` so the key derivation lives in exactly one place.
+fn insert_parsed_leaves(
+    proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
+    static_proxy_names: &mut std::collections::HashSet<SmolStr>,
+    raw_proxies: &[HashMap<String, serde_yaml::Value>],
+    ipv6: bool,
+) {
+    for raw_proxy in raw_proxies {
+        match proxy_parser::parse_proxy(raw_proxy, ipv6) {
+            Ok(proxy) => {
+                // Prefer the YAML `name:` as the registry key. `proxy.name()`
+                // is fine for SS/Trojan/VLESS (their parsers thread the name
+                // into the adapter) but `DirectAdapter::name()` is hardcoded
+                // to "DIRECT" and would overwrite the built-in, hiding any
+                // user-named direct proxy (e.g. `name: "直连"`) from groups.
+                let key: SmolStr = raw_proxy
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| proxy.name())
+                    .into();
+                static_proxy_names.insert(key.clone());
+                proxies.insert(key, proxy);
+            }
+            Err(e) => warn!("Failed to parse proxy: {}", e),
+        }
+    }
+}
+
+/// Build the complete proxy layer for one config: built-ins, `proxies:` leaf
+/// adapters, `dialer-proxy` chains, proxy groups and the auto-created GLOBAL
+/// selector, with every chain/cycle invariant validated. Shared between the
+/// real build and the pre-registry prefetch map so a prefetch resolves
+/// `dialer-proxy`/`proxy:` names against exactly the layer the runtime will
+/// publish (issue #533).
+///
+/// `resolver` is injected into `DIRECT` (pass 2 of the startup build); the
+/// prefetch map and pass 1 pass `None`, matching their no-resolver stage.
+/// `registry` is the cell the `dialer-proxy` targets bind to weakly — the
+/// caller publishes the returned map into it and must keep the cell alive
+/// for as long as the adapters are used.
+fn build_proxy_layer(
     raw: &raw::RawConfig,
-    cache_dir: Option<&Path>,
     resolver: Option<meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
-    shared_ctx: Option<&meow_rules::ParserContext>,
-    prefetched_payloads: Option<&rule_provider::PrefetchedPayloads>,
-    // `dialer-proxy` front hops are resolved by name against this registry on
-    // every dial; it is published once the build below has finished. The
-    // caller supplies the cell so a multi-pass build (startup) can share one
-    // registry generation across passes; it is returned in [`RebuildResult`]
-    // so the generation owner can retain it (issue #533).
     registry: &meow_proxy::dialer::ProxyRegistry,
-    // An already-loaded provider set to bind into this build (startup's
-    // two-pass build shares the set it loaded for DNS so rules, DNS
-    // `rule-set:` matchers, and `Config.rule_providers` all reference one
-    // object per provider). `None` = parse `raw.rule_providers` fresh.
-    shared_providers: Option<HashMap<String, Arc<rule_provider::RuleProvider>>>,
-) -> Result<RebuildResult, anyhow::Error> {
+) -> Result<HashMap<SmolStr, Arc<dyn Proxy>>, anyhow::Error> {
     let ipv6 = effective_ipv6(raw.ipv6);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
     let mut static_proxy_names = std::collections::HashSet::new();
@@ -1116,25 +1144,12 @@ fn rebuild_from_raw_impl(
         ))),
     );
 
-    for raw_proxy in raw.proxies.as_deref().unwrap_or(&[]) {
-        match proxy_parser::parse_proxy(raw_proxy, ipv6) {
-            Ok(proxy) => {
-                // Prefer the YAML `name:` as the registry key. `proxy.name()`
-                // is fine for SS/Trojan/VLESS (their parsers thread the name
-                // into the adapter) but `DirectAdapter::name()` is hardcoded
-                // to "DIRECT" and would overwrite the built-in, hiding any
-                // user-named direct proxy (e.g. `name: "直连"`) from groups.
-                let key: SmolStr = raw_proxy
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_else(|| proxy.name())
-                    .into();
-                static_proxy_names.insert(key.clone());
-                proxies.insert(key, proxy);
-            }
-            Err(e) => warn!("Failed to parse proxy: {}", e),
-        }
-    }
+    insert_parsed_leaves(
+        &mut proxies,
+        &mut static_proxy_names,
+        raw.proxies.as_deref().unwrap_or(&[]),
+        ipv6,
+    );
 
     let raw_groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
 
@@ -1344,21 +1359,109 @@ fn rebuild_from_raw_impl(
         global_auto_created,
     )?;
 
-    // Publish the finished registry: the `dialer-proxy` chains bound above
-    // resolve their front hop by name against it, and only now does it hold the
-    // groups they may name (issue #513). Nothing mutates `proxies` after this
-    // point, and publishing *before* the provider fetches below matters: they
-    // dial through `download_proxy`, which may itself be a chained node whose
-    // front hop must already resolve. A later rebuild publishes into its own
-    // registry, so adapters already handed to the tunnel keep resolving the
-    // snapshot they were built from — while the owning generation is still
-    // retained (the cell is only held weakly by the adapters, issue #533).
+    Ok(proxies)
+}
+
+/// A full proxy layer for the pre-registry payload prefetch — built by the
+/// same [`build_proxy_layer`] the real build uses, then published into a
+/// private registry cell so chained adapters resolve their front hops during
+/// the fetch (issue #533). `_registry` must stay alive for the map's whole
+/// use: the adapters hold it weakly.
+struct PrefetchProxies {
+    map: HashMap<SmolStr, Arc<dyn Proxy>>,
+    _registry: meow_proxy::dialer::ProxyRegistry,
+}
+
+fn prefetch_proxy_map(
+    raw: &raw::RawConfig,
+    providers: &HashMap<String, Arc<ProxyProvider>>,
+    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+) -> Result<Option<PrefetchProxies>, anyhow::Error> {
+    // No `proxies:` entries means nothing to tunnel through — named `proxy:`
+    // lookups and the default proxy all come back empty either way. Such a
+    // config's provider `proxy:` names (a group, or GLOBAL) simply defer to
+    // the load pass, which resolves them against the pass-1 registry.
+    if raw.proxies.as_deref().unwrap_or(&[]).is_empty() {
+        return Ok(None);
+    }
+    let registry = meow_proxy::dialer::ProxyRegistry::default();
+    // A rejected layer (bad chain, group-membership cycle) hard-fails the
+    // real build with the same error; surface it now instead of letting
+    // default-proxy provider/geodata fetches egress direct on a config that
+    // intends chained egress.
+    let map = build_proxy_layer(raw, None, providers, selector_store, &registry)?;
+    registry.publish(Arc::new(map.clone()));
+    Ok(Some(PrefetchProxies {
+        map,
+        _registry: registry,
+    }))
+}
+
+/// Build the prefetch proxy layer on a blocking thread — adapter and group
+/// construction can spawn plugin subprocesses and read TLS material, so it
+/// must not run inline on the async executor. `selector_store` is threaded
+/// in so a `select` group's persisted choice resolves to the same member
+/// the runtime build would pick. A rejected layer or a failed build task
+/// surfaces as `Err` — the same failure pass 1 of the real build reports.
+async fn prefetch_proxy_layer_async(
+    raw: &raw::RawConfig,
+    providers: &HashMap<String, Arc<ProxyProvider>>,
+    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+) -> Result<Option<Arc<PrefetchProxies>>, anyhow::Error> {
+    let raw = raw.clone();
+    let providers = providers.clone();
+    let selector_store = selector_store.cloned();
+    spawn_blocking_with_current_dispatcher(move || {
+        prefetch_proxy_map(&raw, &providers, selector_store.as_ref())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("prefetch proxy-layer build task failed: {e}"))?
+    .map(|o| o.map(Arc::new))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the rebuild passes every stage of one config build through; \
+              bundling them would only rename the same list"
+)]
+fn rebuild_from_raw_impl(
+    raw: &raw::RawConfig,
+    cache_dir: Option<&Path>,
+    resolver: Option<meow_dns::ResolverSlot>,
+    providers: &HashMap<String, Arc<ProxyProvider>>,
+    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    shared_ctx: Option<&meow_rules::ParserContext>,
+    prefetched_payloads: Option<&rule_provider::PrefetchedPayloads>,
+    // `dialer-proxy` front hops are resolved by name against this registry on
+    // every dial; it is published once the build below has finished. The
+    // caller supplies the cell so a multi-pass build (startup) can share one
+    // registry generation across passes; it is returned in [`RebuildResult`]
+    // so the generation owner can retain it (issue #533).
+    registry: &meow_proxy::dialer::ProxyRegistry,
+    // An already-loaded provider set to bind into this build (startup's
+    // two-pass build shares the set it loaded for DNS so rules, DNS
+    // `rule-set:` matchers, and `Config.rule_providers` all reference one
+    // object per provider). `None` = parse `raw.rule_providers` fresh.
+    shared_providers: Option<HashMap<String, Arc<rule_provider::RuleProvider>>>,
+) -> Result<RebuildResult, anyhow::Error> {
+    let proxies = build_proxy_layer(raw, resolver, providers, selector_store, registry)?;
+
+    // Publish the finished registry: the `dialer-proxy` chains bound during
+    // the layer build resolve their front hop by name against it, and only
+    // now does it hold the groups they may name (issue #513). Nothing mutates
+    // `proxies` after this point, and publishing *before* the provider fetches
+    // below matters: they dial through `download_proxy`, which may itself be
+    // a chained node whose front hop must already resolve. A later rebuild
+    // publishes into its own registry, so adapters already handed to the
+    // tunnel keep resolving the snapshot they were built from — while the
+    // owning generation is still retained (the cell is only held weakly by
+    // the adapters, issue #533).
     registry.publish(Arc::new(proxies.clone()));
 
     let download_proxy = internal_http::first_named_proxy(raw.proxies.as_deref(), &proxies);
     // Per-provider `proxy:` overrides resolve against the full registry —
     // groups and provider-sourced proxies included (issue #377).
-    let registry_lookup = |name: &str| proxies.get(name).cloned();
+    let proxy_lookup = |name: &str| proxies.get(name).cloned();
 
     // Fail hard on any rule- or proxy-provider path that would escape the
     // provider cache directory — before any fetch or on-disk write happens,
@@ -1385,7 +1488,7 @@ fn rebuild_from_raw_impl(
                     map,
                     cache_dir,
                     download_proxy.as_ref(),
-                    &registry_lookup,
+                    &proxy_lookup,
                 ),
                 _ => HashMap::new(),
             };
@@ -1402,7 +1505,7 @@ fn rebuild_from_raw_impl(
         }
     };
 
-    let providers = match shared_providers {
+    let rule_providers = match shared_providers {
         Some(shared) => shared,
         None => match raw.rule_providers.as_ref() {
             Some(map) if !map.is_empty() => rule_provider::load_providers_prefetched(
@@ -1410,14 +1513,14 @@ fn rebuild_from_raw_impl(
                 cache_dir,
                 ctx,
                 download_proxy.as_ref(),
-                &registry_lookup,
+                &proxy_lookup,
                 payloads,
                 Some(registry),
             ),
             _ => HashMap::new(),
         },
     };
-    let ruleset_map = rule_provider::live_ruleset_map(&providers);
+    let ruleset_map = rule_provider::live_ruleset_map(&rule_providers);
 
     // Parse sub-rules before top-level rules so that SUB-RULE entries in
     // `rules:` can resolve against already-built blocks.
@@ -1456,7 +1559,7 @@ fn rebuild_from_raw_impl(
         proxies,
         rules,
         dialer_registry: registry.clone(),
-        rule_providers: providers,
+        rule_providers,
     })
 }
 
@@ -1481,33 +1584,28 @@ async fn build_parser_context_with_geo_async(
 }
 
 /// Prefetch every file/http rule-provider payload on a blocking thread.
-/// Uses the first parseable proxy from the raw config for tunneled fetches
-/// (same policy as [`ensure_geodata`]) since the proxy registry is not built
-/// yet at this point of startup.
+/// `prefetch` is the shared pre-registry proxy layer built by
+/// [`prefetch_proxy_layer_async`]; `proxy:` download names and the default
+/// (first `proxies:` entry, same as [`internal_http::first_named_proxy`])
+/// resolve against it with `dialer-proxy` chains applied — previously each
+/// name was re-parsed straight from raw YAML, so a chained node fetched its
+/// provider payload WITHOUT the configured front hop (issue #533).
 async fn prefetch_rule_provider_payloads_async(
     raw: &raw::RawConfig,
     cache_dir: Option<PathBuf>,
+    prefetch: Option<Arc<PrefetchProxies>>,
 ) -> rule_provider::PrefetchedPayloads {
     let Some(raw_providers) = raw.rule_providers.as_ref().filter(|m| !m.is_empty()) else {
         return HashMap::new();
     };
     let raw_providers = raw_providers.clone();
-    let ipv6 = effective_ipv6(raw.ipv6);
     let raw_proxies: Vec<HashMap<String, serde_yaml::Value>> =
         raw.proxies.clone().unwrap_or_default();
     spawn_blocking_with_current_dispatcher(move || {
-        let default_proxy: Option<Arc<dyn Proxy>> = raw_proxies
-            .iter()
-            .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy, ipv6).ok());
-        // Pre-registry `proxy:` resolution parses the named leaf out of the
-        // raw `proxies:` block; group names don't resolve here, so their
-        // providers skip prefetch and fetch during the registry-backed load.
-        let lookup = |wanted: &str| {
-            raw_proxies
-                .iter()
-                .filter(|p| p.get("name").and_then(serde_yaml::Value::as_str) == Some(wanted))
-                .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy, ipv6).ok())
-        };
+        let default_proxy = prefetch
+            .as_ref()
+            .and_then(|m| internal_http::first_named_proxy(Some(&raw_proxies), &m.map));
+        let lookup = |wanted: &str| prefetch.as_ref().and_then(|m| m.map.get(wanted).cloned());
         rule_provider::prefetch_payloads(
             &raw_providers,
             cache_dir.as_deref(),
@@ -1566,7 +1664,7 @@ async fn load_rule_providers_async(
     cache_dir: Option<PathBuf>,
     ctx: meow_rules::ParserContext,
     download_proxy: Option<Arc<dyn Proxy>>,
-    registry: HashMap<SmolStr, Arc<dyn Proxy>>,
+    proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
     provider_payloads: Arc<rule_provider::PrefetchedPayloads>,
     // Retained inside each provider's fetch context so a chained download
     // adapter keeps resolving its `dialer-proxy` front hop on refreshes that
@@ -1574,7 +1672,7 @@ async fn load_rule_providers_async(
     dialer_registry: Option<meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<HashMap<String, Arc<rule_provider::RuleProvider>>, anyhow::Error> {
     spawn_blocking_with_current_dispatcher(move || {
-        let lookup = |name: &str| registry.get(name).cloned();
+        let lookup = |name: &str| proxies.get(name).cloned();
         rule_provider::load_providers_prefetched(
             &raw_providers,
             cache_dir.as_deref(),
@@ -1687,32 +1785,22 @@ fn parse_sniffer_config(raw: &raw::RawConfig) -> Result<SnifferConfig, anyhow::E
     }
 }
 
-/// Scan `raw.rules` for any GeoIP-backed entry (`GEOIP`, `SRC-GEOIP`) or any
-/// ASN-backed entry (`IP-ASN`, `SRC-IP-ASN`); if present, lazy-load the
-/// corresponding MMDB from the default path and build a `ParserContext`
-/// carrying the readers. Fail-fast (returning an error that names the
-/// offending rule and the path we tried) when the scan matches but the
-/// load fails.
-///
-/// For `GEOSITE` entries the DB is discovered separately and loaded only if
-/// at least one GEOSITE rule is present (same lazy pattern as GeoIP/ASN).
-/// Unlike GeoIP/ASN, the GEOSITE DB is tolerated as absent — per spec the
-/// rule no-matches at query time rather than failing at parse.
-/// Download missing geodata files that the config's rules require.
-///
-/// Parses the first proxy from the raw config for tunneled downloads (needed
-/// in regions where the CDN is blocked); falls back to a direct fetch when
-/// no proxy is configured. Download failures are logged as warnings — the
-/// subsequent parser-context build will hard-error if the file is still
-/// absent, giving a clear diagnostic.
-async fn ensure_geodata(raw: &raw::RawConfig, geo: &GeoDataConfig, scan_lines: &[String]) {
+/// The geodata files this config's rules reference that are absent on disk —
+/// `(url, destination)` pairs in scan order. Shared between the prefetch-map
+/// gate in `build_config` and [`ensure_geodata`] so both agree on what a
+/// startup actually has to download.
+fn missing_geodata_downloads<'a>(
+    raw: &raw::RawConfig,
+    geo: &'a GeoDataConfig,
+    scan_lines: &[String],
+) -> Vec<(&'a String, PathBuf)> {
     let needs_geoip = scan_lines.iter().any(|l| line_references_geoip(l));
     let needs_asn = scan_lines.iter().any(|l| line_references_asn(l));
     let needs_geosite =
         scan_lines.iter().any(|l| line_references_geosite(l)) || dns_policy_uses_geosite(raw);
 
     if !needs_geoip && !needs_asn && !needs_geosite {
-        return;
+        return Vec::new();
     }
 
     let geoip_path = geo.mmdb_path.clone().unwrap_or_else(default_geoip_path);
@@ -1734,18 +1822,6 @@ async fn ensure_geodata(raw: &raw::RawConfig, geo: &GeoDataConfig, scan_lines: &
             |p| !p.exists(),
         );
 
-    if !geoip_missing && !asn_missing && !geosite_missing {
-        return;
-    }
-
-    // Build a download proxy from the first configured proxy, if any.
-    let proxy: Option<Arc<dyn Proxy>> = raw
-        .proxies
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy, effective_ipv6(raw.ipv6)).ok());
-
     let mut downloads = Vec::new();
     if geoip_missing {
         downloads.push((&geo.mmdb_url, geoip_path));
@@ -1756,6 +1832,64 @@ async fn ensure_geodata(raw: &raw::RawConfig, geo: &GeoDataConfig, scan_lines: &
     if geosite_missing {
         downloads.push((&geo.geosite_url, geosite_path));
     }
+    downloads
+}
+
+/// Whether the shared prefetch proxy layer is worth building. `http`
+/// providers need it for the payload prefetch itself; `file` providers read
+/// locally but their payloads can carry geo references whose download rides
+/// the same layer. `inline` payloads sit inside `raw`, so they are covered
+/// by the raw scan below. The payload-less scan is exact here: the only geo
+/// references it could miss live inside fetched provider payloads, and when
+/// every provider is inline there are no fetched payloads (the first clause
+/// already returned true otherwise). `proxy-providers` are out of scope:
+/// their fetches run before any proxy layer exists and `RawProxyProvider`
+/// has no `proxy:` key — their subscriptions always egress direct.
+fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> bool {
+    // No `proxies:` entries → the layer can never exist; skip the
+    // spawn_blocking hop to a deterministic `Ok(None)`.
+    if raw.proxies.as_deref().unwrap_or(&[]).is_empty() {
+        return false;
+    }
+    let has_fetchable_provider = raw
+        .rule_providers
+        .as_ref()
+        .is_some_and(|m| m.values().any(|c| c.provider_type != "inline"));
+    if has_fetchable_provider {
+        return true;
+    }
+    let scan = collect_geo_scan_lines(raw, &HashMap::new());
+    !missing_geodata_downloads(raw, geo, &scan).is_empty()
+}
+
+/// Download missing geodata files that the config's rules require.
+///
+/// For `GEOSITE` entries the DB is discovered separately and loaded only if
+/// at least one GEOSITE rule is present (same lazy pattern as GeoIP/ASN).
+/// Unlike GeoIP/ASN, the GEOSITE DB is tolerated as absent — per spec the
+/// rule no-matches at query time rather than failing at parse.
+///
+/// Downloads ride the first configured proxy through `prefetch` — the shared
+/// pre-registry proxy layer with `dialer-proxy` chains applied (needed in
+/// regions where the CDN is blocked; issue #533). Fetches go direct only
+/// when no layer exists — a config without `proxies:` — since a rejected
+/// layer aborts the build before this runs. Download failures are logged as
+/// warnings — the subsequent parser-context build hard-errors on a missing
+/// GeoIP/ASN file (geosite is tolerated absent, per spec), giving a clear
+/// diagnostic.
+async fn ensure_geodata(
+    raw: &raw::RawConfig,
+    geo: &GeoDataConfig,
+    scan_lines: &[String],
+    prefetch: Option<&PrefetchProxies>,
+) {
+    let downloads = missing_geodata_downloads(raw, geo, scan_lines);
+    if downloads.is_empty() {
+        return;
+    }
+
+    let proxy: Option<Arc<dyn Proxy>> =
+        prefetch.and_then(|m| internal_http::first_named_proxy(raw.proxies.as_deref(), &m.map));
 
     for (url, dest) in downloads {
         info!("geodata: downloading {} to {}", url, dest.display());
@@ -1795,6 +1929,14 @@ fn build_parser_context_with_geo(
 
 /// Same as [`build_parser_context`] but lets the caller override the mmdb
 /// paths — used by tests and by the M2 `geodata:` config path overrides.
+///
+/// Scans `raw.rules` (plus sub-rules and provider payloads, via
+/// [`collect_geo_scan_lines`]) for any GeoIP-backed entry (`GEOIP`,
+/// `SRC-GEOIP`) or ASN-backed entry (`IP-ASN`, `SRC-IP-ASN`); if present,
+/// lazy-loads the corresponding MMDB from the configured or default path and
+/// builds a `ParserContext` carrying the readers. Fail-fast — the error names
+/// the offending rule and the path tried — when the scan matches but the load
+/// fails.
 fn build_parser_context_at(
     raw: &raw::RawConfig,
     geoip_path: &Path,
@@ -2469,20 +2611,37 @@ async fn build_config(
         None => None,
     };
 
+    // One shared pre-registry proxy layer for the two startup fetches that
+    // can ride a proxy (rule-provider prefetch + geodata download). Built
+    // only when at least one of them could need it — a full layer costs an
+    // adapter construction per `proxies:` entry (issue #533).
+    let prefetch_proxies = if prefetch_proxy_layer_needed(&raw, &geodata) {
+        prefetch_proxy_layer_async(&raw, &proxy_providers, selector_store.as_ref()).await?
+    } else {
+        None
+    };
+
     // Fetch/read rule-provider payloads once; the geodata check, the parser
     // context build, and every provider load pass below reuse these bytes so
     // geo keys referenced only inside provider payloads are seen (issue #277)
     // and nothing is fetched twice.
-    let provider_payloads =
-        Arc::new(prefetch_rule_provider_payloads_async(&raw, cache_dir_buf.clone()).await);
+    let provider_payloads = Arc::new(
+        prefetch_rule_provider_payloads_async(
+            &raw,
+            cache_dir_buf.clone(),
+            prefetch_proxies.clone(),
+        )
+        .await,
+    );
 
     // Ensure geodata files exist — download any that are missing and needed
     // by the config's rules (including sub-rules and provider payloads). This
     // must happen before building the parser context, which hard-errors on
     // missing GeoIP/ASN files.
     let geo_scan_lines = collect_geo_scan_lines(&raw, &provider_payloads);
-    ensure_geodata(&raw, &geodata, &geo_scan_lines).await;
+    ensure_geodata(&raw, &geodata, &geo_scan_lines, prefetch_proxies.as_deref()).await;
     drop(geo_scan_lines);
+    drop(prefetch_proxies);
 
     // Build the parser context once and share across all passes.
     let ctx = build_parser_context_with_geo_async(
@@ -2785,6 +2944,174 @@ mod dialer_proxy_tests {
             target.name() == "B" && reg.downgrade().upgrade().is_some(),
             "the handle stays live while retained"
         );
+    }
+
+    /// Issue #533 item 2: the pre-registry payload prefetch resolves `proxy:`
+    /// download names against the full proxy layer — `dialer-proxy` chains
+    /// and groups included — built by the same `build_proxy_layer` the
+    /// runtime publishes. Before this, the named node was re-parsed bare and
+    /// the fetch bypassed the configured front hop entirely (silent egress).
+    /// The observable is which listener the dial physically contacts.
+    #[tokio::test]
+    async fn prefetch_map_dials_through_the_chain() {
+        async fn counting_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = Arc::clone(&count);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+            (port, count)
+        }
+        let (port_a, a_hits) = counting_listener().await;
+        let (port_b, b_hits) = counting_listener().await;
+        let (port_c, c_hits) = counting_listener().await;
+
+        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+            "proxies:\n\
+             \x20 - name: A\n    type: trojan\n    server: 127.0.0.1\n    port: {port_a}\n    \
+             password: x\n    dialer-proxy: B\n\
+             \x20 - name: B\n    type: trojan\n    server: 127.0.0.1\n    port: {port_b}\n    \
+             password: x\n\
+             \x20 - name: C\n    type: trojan\n    server: 127.0.0.1\n    port: {port_c}\n    \
+             password: x\n    dialer-proxy: G\n\
+             proxy-groups:\n\
+             \x20 - name: G\n    type: select\n    proxies: [B]\n"
+        ))
+        .unwrap();
+
+        let providers = HashMap::new();
+        let mini = prefetch_proxy_map(&raw, &providers, None)
+            .expect("layer builds")
+            .expect("proxies configured");
+        let metadata = meow_common::Metadata {
+            network: meow_common::Network::Tcp,
+            host: "example.invalid".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        // A dials through B: B's listener is contacted, A's own is not.
+        let _ = mini.map["A"].dial_tcp(&metadata).await;
+        assert!(b_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // C's front hop is group G (selecting B) — the prefetch layer
+        // resolves it exactly as the runtime registry would, so the dial
+        // still lands on B rather than failing closed or touching C.
+        let before = b_hits.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = mini.map["C"].dial_tcp(&metadata).await;
+        assert!(b_hits.load(std::sync::atomic::Ordering::SeqCst) > before);
+        assert_eq!(c_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// The prefetch layer is only built when a startup fetch could ride it:
+    /// any non-inline provider (http fetch, or a file payload hiding geo
+    /// references) forces it on; otherwise it hinges on geodata the rules
+    /// actually need being absent.
+    #[test]
+    fn prefetch_layer_gate_tracks_real_need() {
+        let geo = GeoDataConfig::default();
+        let one_proxy = "proxies:\n  - {name: p, type: direct}\n";
+        let no_providers: raw::RawConfig = serde_yaml::from_str(one_proxy).unwrap();
+
+        // Fetchable provider → build it even with no geo references.
+        let with_http: raw::RawConfig = serde_yaml::from_str(&format!(
+            "{one_proxy}rule-providers:\n  rs:\n    type: http\n    behavior: domain\n    url: http://x/y\n    path: ./rs.yaml"
+        ))
+        .unwrap();
+        assert!(prefetch_proxy_layer_needed(&with_http, &geo));
+
+        // A `file` provider counts too — its payload can carry geo keys the
+        // raw scan cannot see yet.
+        let with_file: raw::RawConfig = serde_yaml::from_str(&format!(
+            "{one_proxy}rule-providers:\n  rs:\n    type: file\n    behavior: domain\n    path: ./rs.yaml"
+        ))
+        .unwrap();
+        assert!(prefetch_proxy_layer_needed(&with_file, &geo));
+
+        // Inline-only, rules free of geo references → nothing to fetch.
+        let inline_only: raw::RawConfig = serde_yaml::from_str(&format!(
+            "{one_proxy}rule-providers:\n  rs:\n    type: inline\n    behavior: domain\n    payload: ['.example.com']"
+        ))
+        .unwrap();
+        assert!(!prefetch_proxy_layer_needed(&inline_only, &geo));
+        assert!(!prefetch_proxy_layer_needed(&no_providers, &geo));
+
+        // No `proxies:` at all → the layer can never exist.
+        let empty_proxies: raw::RawConfig = serde_yaml::from_str(
+            "rule-providers:\n  rs:\n    type: http\n    behavior: domain\n    url: http://x/y\n    path: ./rs.yaml",
+        )
+        .unwrap();
+        assert!(!prefetch_proxy_layer_needed(&empty_proxies, &geo));
+
+        // Inline-only but a GEOIP rule with a missing DB → the geodata
+        // download needs the layer.
+        let dir = tempfile::tempdir().unwrap();
+        let missing_mmdb = GeoDataConfig {
+            mmdb_path: Some(dir.path().join("absent.mmdb")),
+            ..geo.clone()
+        };
+        let geoip_rules: raw::RawConfig = serde_yaml::from_str(&format!(
+            "{one_proxy}rule-providers:\n  rs:\n    type: inline\n    behavior: domain\n    payload: ['.example.com']\n\
+             rules:\n  - GEOIP,CN,DIRECT"
+        ))
+        .unwrap();
+        assert!(prefetch_proxy_layer_needed(&geoip_rules, &missing_mmdb));
+
+        // Same rules with the DB present → nothing downloads → no layer.
+        let present = dir.path().join("geoip.mmdb");
+        std::fs::write(&present, b"x").unwrap();
+        let present_mmdb = GeoDataConfig {
+            mmdb_path: Some(present),
+            ..geo
+        };
+        assert!(!prefetch_proxy_layer_needed(&geoip_rules, &present_mmdb));
+    }
+
+    /// End-to-end wiring: a provider's `proxy:` key resolves through the
+    /// shared prefetch layer, so its HTTP fetch dials the chained front
+    /// hop rather than the leaf's own (or a direct) egress.
+    #[tokio::test]
+    async fn prefetch_payloads_fetch_rides_the_chain() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_port = listener.local_addr().unwrap().port();
+        let b_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&b_hits);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+            "proxies:\n\
+             \x20 - name: A\n    type: trojan\n    server: 127.0.0.1\n    port: 9\n    \
+             password: x\n    dialer-proxy: B\n\
+             \x20 - name: B\n    type: trojan\n    server: 127.0.0.1\n    port: {b_port}\n    \
+             password: x\n\
+             rule-providers:\n\
+             \x20 rs:\n    type: http\n    behavior: domain\n    \
+             url: http://127.0.0.1:9/rs.yaml\n    path: ./rs.yaml\n    proxy: A\n"
+        ))
+        .unwrap();
+
+        let providers = HashMap::new();
+        let layer = Arc::new(
+            prefetch_proxy_map(&raw, &providers, None)
+                .expect("layer builds")
+                .expect("proxies configured"),
+        );
+        // The fetch itself fails — the counting listener accepts then drops
+        // — but the TCP connect to B proves `proxy: A` dialled its front hop.
+        let payloads = prefetch_rule_provider_payloads_async(&raw, None, Some(layer)).await;
+        assert!(payloads.is_empty());
+        assert!(b_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     }
 
     #[test]
