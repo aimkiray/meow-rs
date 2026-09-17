@@ -345,7 +345,7 @@ fn build_metadata(peer: SocketAddr, target: &Address, in_name: &str, in_port: u1
 // neither direction has touched `last_activity_ms` within the idle window is
 // dropped, aborting its reply task and freeing the outbound conn.
 
-use meow_common::atomic::{AtomicU, Uint};
+use meow_common::atomic::{checked_increment, AtomicU, Uint};
 use meow_common::{with_dial_timeout, ProxyPacketConn, ReplayWindow};
 use meow_tunnel::udp::DEFAULT_UDP_IDLE;
 use shadowsocks::context::SharedContext;
@@ -499,8 +499,8 @@ impl Drop for UdpFlow {
 }
 
 /// The sweeper's session predicate: retain while a flow can still answer
-/// under the session (`strong_count` > 1 — the relay loop plus each live
-/// reply task's `Arc`) OR while the session is inside the
+/// under the session (`strong_count` > 1 — the map holds one `Arc`, each
+/// live reply task another) OR while the session is inside the
 /// [`SESSION_MIN_RETAIN`] floor measured from `last_seen_ms`. Extracted for
 /// unit testing — the arithmetic is the same wrap-safe `Uint` subtraction
 /// the flow idle check uses.
@@ -666,7 +666,7 @@ async fn run_udp_relay<S>(
 /// per-datagram failures.
 #[allow(
     clippy::too_many_arguments,
-    reason = "mirrors socks5_udp::handle_client_datagram's parameter set plus the shared socket, the flow cap, and the AEAD-2022 reply-control inputs"
+    reason = "mirrors socks5_udp::handle_client_datagram's parameter set plus the shared socket, the flow/session caps, and the AEAD-2022 reply-control inputs"
 )]
 async fn handle_ss_udp_datagram<S>(
     tunnel: &Tunnel,
@@ -703,9 +703,13 @@ where
             return Ok(false);
         }
         let now = monotonic_ms() as Uint;
+        // ssserver refreshes the session's TTL on every datagram carrying
+        // the ID — including ones the window will reject — so retention
+        // tracks traffic, not flow references.
         let session = state
             .sessions
             .entry(c.client_session_id)
+            .and_modify(|s| s.last_seen_ms = now)
             .or_insert_with(|| ClientSession {
                 server: Arc::new(ServerSession {
                     server_session_id: session_ids.next(),
@@ -714,10 +718,6 @@ where
                 window: ReplayWindow::new(),
                 last_seen_ms: now,
             });
-        // ssserver refreshes the session's TTL on every datagram carrying
-        // the ID — including ones the window will reject — so retention
-        // tracks traffic, not flow references.
-        session.last_seen_ms = now;
         if !session.window.check_and_set(c.packet_id) {
             return Err(format!(
                 "replayed/out-of-window packet_id {} for session {:#x}",
@@ -834,40 +834,29 @@ where
         let mut control = reply_control;
         tokio::spawn(async move {
             let mut rbuf = vec![0u8; 65536];
+            // Warn-once: an exhausted counter (32-bit targets, after 2^32
+            // replies) makes every later reply hit this branch.
+            let mut exhaustion_warned = false;
             while let Ok((m, src)) = conn.read_packet(&mut rbuf).await {
                 if let Some(s) = &server_session {
                     // The reply packet-ID space belongs to the *session*, not
                     // this flow — a client multiplexing targets still sees a
                     // strictly increasing stream (SIP022 §3.2.3). The counter
                     // is pre-incremented, matching ssserver: IDs start at 1.
-                    // `checked_add` refuses the 2^32 wrap on 32-bit targets
-                    // (where `AtomicU` is u32): reusing IDs would only get
-                    // the reply dropped by the client's replay window anyway,
-                    // so the reply is skipped and the stalled session lets
-                    // the client re-key — the recovery ssserver relies on.
-                    let next = s
-                        .next_packet_id
-                        .fetch_update(
-                            std::sync::atomic::Ordering::Relaxed,
-                            std::sync::atomic::Ordering::Relaxed,
-                            |x| x.checked_add(1),
-                        )
-                        .map(|prev| prev + 1);
-                    match next {
-                        Ok(id) => {
-                            #[allow(
-                                clippy::useless_conversion,
-                                reason = "identity on 64-bit; u32→u64 widening on mips32"
-                            )]
-                            {
-                                control.packet_id = u64::from(id);
+                    // On exhaustion the reply is skipped — reusing IDs would
+                    // only get them dropped by the client's replay window —
+                    // and the stalled session lets the client re-key, the
+                    // recovery ssserver relies on.
+                    match checked_increment(&s.next_packet_id) {
+                        Some(id) => control.packet_id = id,
+                        None => {
+                            if !exhaustion_warned {
+                                warn!(
+                                    "ss udp reply packet-ID space exhausted for session {:#x}; dropping replies",
+                                    s.server_session_id
+                                );
+                                exhaustion_warned = true;
                             }
-                        }
-                        Err(_) => {
-                            warn!(
-                                "ss udp reply packet-ID space exhausted for session {:#x}; dropping reply",
-                                s.server_session_id
-                            );
                             continue;
                         }
                     }

@@ -115,9 +115,14 @@ the canonical, in-repo source a release is cut from.
   session-wide reply packet counter shared across flows, and a per-session
   client packet-ID replay window; outbound associations mint a random client
   session ID, count packet IDs up, and filter replies through
-  per-server-session windows. Reply headers now carry the responder's real
-  socket address, and malformed reply datagrams are dropped per-packet
-  instead of killing the association.
+  per-server-session windows. The inbound session table shares the
+  listener's `max-connections` bound and retains each session for the spec's
+  60-second minimum measured from its last datagram, independent of flow
+  liveness; both packet-ID counters are checked (32-bit targets terminate
+  the association rather than wrapping), and the outbound reply tracker
+  evicts single least-recently-used windows instead of clearing the table.
+  Reply headers now carry the responder's real socket address, and malformed
+  reply datagrams are dropped per-packet instead of killing the association.
 
 - Hysteria2 authentication no longer advertises HTTP/3 datagrams, preventing
   the server's HTTP/3 receiver from consuming raw QUIC UDP relay packets.

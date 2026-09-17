@@ -2,7 +2,7 @@
 use crate::ech_tls_tunnel::{self, EchTlsTunnelConfig};
 use crate::v2ray_plugin::{self, V2rayPluginConfig};
 use async_trait::async_trait;
-use meow_common::atomic::AtomicU;
+use meow_common::atomic::{checked_increment, AtomicU};
 use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
@@ -526,32 +526,20 @@ impl SsUdpSession {
     fn send_control(&self) -> Option<UdpSocketControlData> {
         let mut control = UdpSocketControlData::default();
         control.client_session_id = self.client_session_id;
-        let prev = self
-            .next_packet_id
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |x| x.checked_add(1),
-            )
-            .ok()?;
-        // `prev < Uint::MAX` is guaranteed by the successful checked_add.
-        #[allow(
-            clippy::useless_conversion,
-            reason = "identity on 64-bit; u32→u64 widening on mips32"
-        )]
-        {
-            control.packet_id = u64::from(prev + 1);
-        }
+        control.packet_id = checked_increment(&self.next_packet_id)?;
         Some(control)
     }
 
     /// Validate a server→client control (§3.2.3/§3.2.4): the echoed client
-    /// session ID must be ours; each server session ID keeps its own replay
-    /// window (server restarts legitimately re-key sessions, and interleaved
-    /// sessions must not reset each other's window); the packet ID must not
-    /// be a replay or older than its session's window.
+    /// session ID must be ours and the server session ID non-zero (`0` is
+    /// the "no session" sentinel every implementation reserves — ssserver
+    /// generates IDs in a non-zero loop, sing-box uses it as the empty
+    /// marker); each server session ID keeps its own replay window (server
+    /// restarts legitimately re-key sessions, and interleaved sessions must
+    /// not reset each other's window); the packet ID must not be a replay
+    /// or older than its session's window.
     fn accept_reply(&self, control: &UdpSocketControlData) -> bool {
-        if control.client_session_id != self.client_session_id {
+        if control.client_session_id != self.client_session_id || control.server_session_id == 0 {
             return false;
         }
         let mut tracker = self
@@ -572,14 +560,15 @@ impl SsUdpSession {
                 windows.remove(&oldest);
             }
         }
-        let tracked = windows
+        windows
             .entry(control.server_session_id)
+            .and_modify(|t| t.last_used = tick)
             .or_insert_with(|| TrackedWindow {
                 window: meow_common::ReplayWindow::new(),
-                last_used: 0,
-            });
-        tracked.last_used = tick;
-        tracked.window.check_and_set(control.packet_id)
+                last_used: tick,
+            })
+            .window
+            .check_and_set(control.packet_id)
     }
 }
 
@@ -908,6 +897,7 @@ impl DatagramSend for TokioUdpDatagram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meow_common::atomic::Uint;
 
     #[test]
     fn sip003u_mode_extraction() {
@@ -1060,6 +1050,40 @@ mod tests {
         );
         reply.packet_id = 10;
         assert!(session.accept_reply(&reply));
+
+        // `server_session_id == 0` is the reserved "no session" sentinel:
+        // it never opens a window.
+        reply.server_session_id = 0;
+        reply.packet_id = 42;
+        assert!(
+            !session.accept_reply(&reply),
+            "the 0 sentinel is rejected outright"
+        );
+    }
+
+    /// The client packet-ID space is terminal rather than wrapping:
+    /// `send_control` returns `None` once exhausted (32-bit targets run out
+    /// at 2^32 datagrams) so the caller can error the association and the
+    /// next datagram re-dials under a fresh session — and the space never
+    /// emits `Uint::MAX`, the window's always-reject sentinel.
+    #[test]
+    fn send_control_none_on_exhaustion() {
+        let ctx = Context::new_shared(ServerType::Local);
+        let session = SsUdpSession::new(&ctx, "2022-blake3-aes-256-gcm".parse().unwrap());
+        session
+            .next_packet_id
+            .store(Uint::MAX - 1, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            session.send_control().is_none(),
+            "an exhausted packet-ID space errors the association"
+        );
+        assert_eq!(
+            session
+                .next_packet_id
+                .load(std::sync::atomic::Ordering::Relaxed),
+            Uint::MAX - 1,
+            "the counter stays terminal rather than wrapping to 0"
+        );
     }
 
     /// §3.2.4: reaching [`MAX_TRACKED_SERVER_SESSIONS`] evicts the least
