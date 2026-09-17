@@ -152,6 +152,15 @@ flows are dropped (with a warn) while the table is saturated. Client UDP —
 including port 53 — follows the configured routing policy (a `REJECT` rule
 still applies; there is no port-53 DIRECT bypass).
 
+For AEAD-2022 ciphers a second table maps `client_session_id` → relay
+session (random server session ID, session-wide reply packet counter, and
+the §3.2.4 client packet-ID replay window). It shares the same
+`max-connections` bound — unseen session IDs are dropped at capacity while
+known ones always pass — and each session is retained for at least 60 s
+after its last datagram (the spec's "remembered for at least 60 seconds"
+floor, measured independently of flow liveness so an early-dead flow cannot
+take the replay window down inside the 30 s header-timestamp tolerance).
+
 ## Feature gating
 
 `listener-shadowsocks` is fully opt-in: off by default (server scenario;

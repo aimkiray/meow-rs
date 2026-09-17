@@ -359,6 +359,15 @@ use crate::monotonic_ms;
 
 const UDP_NAT_SWEEP: Duration = Duration::from_secs(30);
 
+/// SIP022 §3.2.4: "Each relay session MUST be remembered for at least 60
+/// seconds." The floor is measured from the last datagram that carried the
+/// session's client ID — not from flow liveness — so a flow dying early
+/// (dead upstream conn) cannot take the replay window down inside the
+/// crate's 30-second header-timestamp tolerance: a captured-but-still-valid
+/// replay must keep hitting the old window instead of minting a fresh
+/// session that would re-forward it upstream.
+const SESSION_MIN_RETAIN: Duration = Duration::from_secs(60);
+
 /// Mints server-side UDP session IDs for the AEAD-2022 relay.
 ///
 /// SIP022 §3.2.2: the server session ID "MUST be randomly generated" and must
@@ -412,6 +421,11 @@ struct ServerSession {
 struct ClientSession {
     server: Arc<ServerSession>,
     window: ReplayWindow,
+    /// Stamp of the last datagram that carried this client session ID, in
+    /// the same `Uint`-domain `monotonic_ms` units the flow activity stamps
+    /// use. Drives the [`SESSION_MIN_RETAIN`] floor independently of flow
+    /// references.
+    last_seen_ms: Uint,
 }
 
 /// Mutable state owned by [`run_udp_relay`]'s loop: the `(peer, target)`
@@ -423,6 +437,17 @@ struct UdpRelayState {
     /// discriminator (§3.2.4: "Servers MUST route packets based on client
     /// session ID, not packet source address"). Non-2022 ciphers carry no
     /// session ID and never touch this map.
+    ///
+    /// The bare-ID key matches ssserver's `NatKey::SessionId`: this listener
+    /// terminates a single PSK (no EIH multi-user), so two datagrams sharing
+    /// a client session ID are indistinguishable from one client re-using
+    /// the ID — there is no second identity a malicious "other user" could
+    /// collide against.
+    ///
+    /// Bounded by the same `max_flows` value as the flow table: an uncapped
+    /// session map is the only unbounded state this relay adds — any key
+    /// holder could otherwise pin ~400 B per forged client session ID
+    /// between sweeps.
     sessions: HashMap<u64, ClientSession>,
 }
 
@@ -473,6 +498,24 @@ impl Drop for UdpFlow {
     }
 }
 
+/// The sweeper's session predicate: retain while a flow can still answer
+/// under the session (`strong_count` > 1 — the relay loop plus each live
+/// reply task's `Arc`) OR while the session is inside the
+/// [`SESSION_MIN_RETAIN`] floor measured from `last_seen_ms`. Extracted for
+/// unit testing — the arithmetic is the same wrap-safe `Uint` subtraction
+/// the flow idle check uses.
+fn session_is_live(session: &ClientSession, now: Uint) -> bool {
+    if Arc::strong_count(&session.server) > 1 {
+        return true;
+    }
+    #[allow(
+        clippy::useless_conversion,
+        reason = "identity on 64-bit; u32→u64 widening on mips32"
+    )]
+    let elapsed = u64::from(now.wrapping_sub(session.last_seen_ms));
+    elapsed < SESSION_MIN_RETAIN.as_millis() as u64
+}
+
 /// Run the SS UDP relay: decrypt inbound datagrams, route each through the
 /// tunnel (rule match → `dial_udp`), and relay replies back encrypted to the
 /// originating peer. Runs until the socket errors out (process lifetime).
@@ -481,8 +524,12 @@ impl Drop for UdpFlow {
 /// uncapped), mirroring the TCP accept loop's `max_connections` — each flow
 /// holds a 64 KiB reply buffer, a task, and an outbound socket, so an
 /// unbounded table is a memory/FD exhaustion vector on an internet-exposed
-/// listener. Saturated new flows are dropped with a warn-once log (recovery
-/// logs at debug), exactly like the TCP saturation path.
+/// listener. The same value bounds the AEAD-2022 session table: each entry
+/// is only ~400 B, but the map is otherwise the relay's only unbounded
+/// state — a key holder could grow it by one entry per forged client
+/// session ID between sweeps. Saturated new flows *and* unseen session IDs
+/// are dropped with a warn-once log (recovery logs at debug), exactly like
+/// the TCP saturation path; existing flows and sessions are never capped.
 ///
 /// Generic over the inner socket type `S` so the concrete type returned by
 /// `ProxySocket::bind` (`ShadowUdpSocket`) flows in by inference — the relay
@@ -558,7 +605,7 @@ async fn run_udp_relay<S>(
                     Ok(false) => {
                         if !warned_saturated {
                             warn!(
-                                "ss udp '{}' flow table saturated at {} flows; new flows are dropped until idle eviction",
+                                "ss udp '{}' capacity reached ({} max flows/sessions); new flows and unseen client session IDs are dropped until eviction",
                                 in_name, max_flows
                             );
                             warned_saturated = true;
@@ -583,15 +630,18 @@ async fn run_udp_relay<S>(
                     let elapsed = u64::from(now.wrapping_sub(last));
                     elapsed < idle_ms
                 });
-                // Drop sessions no flow references any more (`strong_count`
-                // falls back to 1 once the last reply task's Arc is gone). A
-                // client resuming on a GC'd session ID simply gets a fresh
-                // server session — §3.2.4 requires clients to tolerate that.
-                state
-                    .sessions
-                    .retain(|_, s| Arc::strong_count(&s.server) > 1);
-                if warned_saturated && state.flows.len() < max_flows {
-                    debug!("ss udp '{}' flow table has free capacity again", in_name);
+                // A session survives while a flow can still answer under it
+                // (`strong_count` > 1 — the last reply task's Arc) OR while
+                // it is inside the §3.2.4 60-second retention floor measured
+                // from `last_seen_ms`. A client resuming on a GC'd session
+                // ID simply gets a fresh server session — §3.2.4 requires
+                // clients to tolerate that.
+                state.sessions.retain(|_, s| session_is_live(s, now));
+                if warned_saturated
+                    && state.flows.len() < max_flows
+                    && state.sessions.len() < max_flows
+                {
+                    debug!("ss udp '{}' tables have free capacity again", in_name);
                     warned_saturated = false;
                 }
             }
@@ -610,9 +660,10 @@ async fn run_udp_relay<S>(
 /// and the replay window the datagram's packet ID is checked against.
 ///
 /// Returns `Ok(true)` when the datagram was handled (existing or new flow),
-/// `Ok(false)` when it was dropped because the flow table is at `max_flows`
-/// (new-flow cap only — datagrams for existing flows always pass), and
-/// `Err` with a reason for per-datagram failures.
+/// `Ok(false)` when it was dropped because the flow or session table is at
+/// `max_flows` (cap on *new* entries only — datagrams for existing flows
+/// and known session IDs always pass), and `Err` with a reason for
+/// per-datagram failures.
 #[allow(
     clippy::too_many_arguments,
     reason = "mirrors socks5_udp::handle_client_datagram's parameter set plus the shared socket, the flow cap, and the AEAD-2022 reply-control inputs"
@@ -640,6 +691,18 @@ where
     // saturation, dial failure): a received-and-validated ID is spent.
     let client_session_id = control.map_or(0, |c| c.client_session_id);
     if let Some(c) = control {
+        // The session table shares the listener's `max_flows` budget: left
+        // uncapped, any key holder could grow it by one ~400 B entry per
+        // forged client session ID between sweeps. At capacity, unseen
+        // session IDs are dropped; sessions already in the table (the only
+        // ones that can still pass a window check) are never capped out.
+        if max_flows > 0
+            && state.sessions.len() >= max_flows
+            && !state.sessions.contains_key(&c.client_session_id)
+        {
+            return Ok(false);
+        }
+        let now = monotonic_ms() as Uint;
         let session = state
             .sessions
             .entry(c.client_session_id)
@@ -649,7 +712,12 @@ where
                     next_packet_id: AtomicU::new(0),
                 }),
                 window: ReplayWindow::new(),
+                last_seen_ms: now,
             });
+        // ssserver refreshes the session's TTL on every datagram carrying
+        // the ID — including ones the window will reject — so retention
+        // tracks traffic, not flow references.
+        session.last_seen_ms = now;
         if !session.window.check_and_set(c.packet_id) {
             return Err(format!(
                 "replayed/out-of-window packet_id {} for session {:#x}",
@@ -770,16 +838,39 @@ where
                 if let Some(s) = &server_session {
                     // The reply packet-ID space belongs to the *session*, not
                     // this flow — a client multiplexing targets still sees a
-                    // strictly increasing stream (SIP022 §3.2.3).
-                    #[allow(
-                        clippy::useless_conversion,
-                        reason = "identity on 64-bit; u32→u64 widening on mips32"
-                    )]
-                    let packet_id = u64::from(
-                        s.next_packet_id
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                    );
-                    control.packet_id = packet_id;
+                    // strictly increasing stream (SIP022 §3.2.3). The counter
+                    // is pre-incremented, matching ssserver: IDs start at 1.
+                    // `checked_add` refuses the 2^32 wrap on 32-bit targets
+                    // (where `AtomicU` is u32): reusing IDs would only get
+                    // the reply dropped by the client's replay window anyway,
+                    // so the reply is skipped and the stalled session lets
+                    // the client re-key — the recovery ssserver relies on.
+                    let next = s
+                        .next_packet_id
+                        .fetch_update(
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                            |x| x.checked_add(1),
+                        )
+                        .map(|prev| prev + 1);
+                    match next {
+                        Ok(id) => {
+                            #[allow(
+                                clippy::useless_conversion,
+                                reason = "identity on 64-bit; u32→u64 widening on mips32"
+                            )]
+                            {
+                                control.packet_id = u64::from(id);
+                            }
+                        }
+                        Err(_) => {
+                            warn!(
+                                "ss udp reply packet-ID space exhausted for session {:#x}; dropping reply",
+                                s.server_session_id
+                            );
+                            continue;
+                        }
+                    }
                 }
                 // The reply's inner address is the responder's real socket
                 // address (matching ssserver), not the request's target:
@@ -1015,6 +1106,117 @@ mod tests {
             3,
             "sessions map + one reply task per flow hold the session"
         );
+    }
+
+    /// The session table shares the `max_flows` bound: at capacity a
+    /// datagram carrying an *unseen* client session ID is dropped, while a
+    /// known session ID still passes.
+    #[tokio::test]
+    async fn session_table_cap_drops_unseen_ids_only() {
+        let tunnel = direct_rule_tunnel();
+        let (sock, session_ids) = server_sock_and_ids("2022-blake3-aes-256-gcm").await;
+        let mut state = UdpRelayState::default();
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let target = Address::SocketAddress(SocketAddr::from(([127, 0, 0, 1], 443)));
+
+        // Fill the session table to the cap of 1 *without* a flow — sessions
+        // outlive flows by design, so the cap must hold with an empty flow
+        // table (isolating the session bound from the flow bound).
+        state.sessions.insert(
+            0xaaaa_1111,
+            ClientSession {
+                server: Arc::new(ServerSession {
+                    server_session_id: session_ids.next(),
+                    next_packet_id: AtomicU::new(0),
+                }),
+                window: ReplayWindow::new(),
+                last_seen_ms: monotonic_ms() as Uint,
+            },
+        );
+
+        // An unseen session ID is rejected at the cap — `Ok(false)`, the
+        // same saturation signal the flow cap returns.
+        let control = client_control(0xbbbb_2222, 0);
+        let verdict = handle_ss_udp_datagram(
+            &tunnel,
+            &sock,
+            &mut state,
+            b"forged session",
+            peer,
+            &target,
+            Some(&control),
+            &session_ids,
+            "ss",
+            8388,
+            1,
+        )
+        .await;
+        assert!(
+            matches!(verdict, Ok(false)),
+            "unseen session ID must be dropped at the sessions cap: {verdict:?}"
+        );
+        assert_eq!(state.sessions.len(), 1, "no new entry was created");
+        assert!(state.flows.is_empty(), "the drop preceded flow creation");
+
+        // The known session ID is not subject to the cap: it passes the
+        // (fresh) window and gets its flow.
+        let control = client_control(0xaaaa_1111, 0);
+        assert!(handle_ss_udp_datagram(
+            &tunnel,
+            &sock,
+            &mut state,
+            b"known session",
+            peer,
+            &target,
+            Some(&control),
+            &session_ids,
+            "ss",
+            8388,
+            1,
+        )
+        .await
+        .unwrap());
+        assert_eq!(state.flows.len(), 1);
+    }
+
+    /// §3.2.4's 60-second retention floor, decoupled from flow references:
+    /// a session stays while a reply task can still answer under it OR
+    /// while inside the floor measured from `last_seen_ms` — a flow dying
+    /// early can no longer take the replay window down inside the header
+    /// timestamp tolerance.
+    #[test]
+    fn session_retention_floor_outlives_flow_references() {
+        let retain_ms = SESSION_MIN_RETAIN.as_millis() as Uint;
+        let mk = |last_seen_ms: Uint| ClientSession {
+            server: Arc::new(ServerSession {
+                server_session_id: 1,
+                next_packet_id: AtomicU::new(0),
+            }),
+            window: ReplayWindow::new(),
+            last_seen_ms,
+        };
+        let now: Uint = retain_ms * 10;
+
+        // Unreferenced (the map holds the only Arc) but inside the floor:
+        // retained — this is the case an early-dead flow used to lose.
+        let fresh = mk(now - retain_ms + 1);
+        assert!(session_is_live(&fresh, now));
+
+        // Unreferenced and exactly at the floor boundary: evicted.
+        let stale = mk(now - retain_ms);
+        assert!(!session_is_live(&stale, now));
+
+        // Far past the floor but still referenced by a live reply task:
+        // retained — replies may legitimately still go out under it.
+        let ancient = mk(0);
+        let _reply_task_handle = Arc::clone(&ancient.server);
+        assert!(session_is_live(&ancient, now));
+
+        // The Uint-domain subtraction is wrap-safe across the 32-bit
+        // ~49.7-day monotonic boundary.
+        let across_wrap = mk(Uint::MAX - 10);
+        let now_after_wrap: Uint = 10;
+        assert!(session_is_live(&across_wrap, now_after_wrap));
     }
 
     /// SIP022 §3.2.4: a changed client session ID on an existing `(peer,

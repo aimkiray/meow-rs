@@ -539,8 +539,8 @@ async fn ss_udp_2022_reply_echoes_client_session_id() {
         "the server session ID must not reuse the client's"
     );
     assert_eq!(
-        reply.packet_id, 0,
-        "the session's reply counter starts at 0"
+        reply.packet_id, 1,
+        "the session's reply counter pre-increments, starting at 1 (ssserver parity)"
     );
     let server_session_id = reply.server_session_id;
 
@@ -564,7 +564,7 @@ async fn ss_udp_2022_reply_echoes_client_session_id() {
         "the server session ID is stable for the session's lifetime"
     );
     assert_eq!(
-        reply.packet_id, 1,
+        reply.packet_id, 2,
         "reply packet IDs count up within the session"
     );
 }
@@ -617,7 +617,7 @@ async fn ss_udp_2022_one_client_session_spans_targets() {
     );
     assert_eq!(
         (reply1.packet_id, reply2.packet_id),
-        (0, 1),
+        (1, 2),
         "the reply packet counter is session-wide across flows"
     );
 }
@@ -668,7 +668,7 @@ async fn ss_udp_2022_rotated_client_session_rekeys_replies() {
         "a new client session mints a new server session ID"
     );
     assert_eq!(
-        reply_b.packet_id, 0,
+        reply_b.packet_id, 1,
         "the new session restarts the reply packet counter"
     );
 }
