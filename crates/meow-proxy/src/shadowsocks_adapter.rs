@@ -483,10 +483,21 @@ struct SsUdpSession {
 #[derive(Default)]
 struct ServerReplyTracker {
     /// server_session_id → its reply packet-ID window. Bounded by
-    /// [`MAX_TRACKED_SERVER_SESSIONS`]: past it the map is cleared and
-    /// rebuilt (legitimate rotation produces a handful of IDs over an
-    /// association's lifetime; beyond that the IDs are adversarial churn).
-    windows: std::collections::HashMap<u64, meow_common::ReplayWindow>,
+    /// [`MAX_TRACKED_SERVER_SESSIONS`]: past it the *least recently used*
+    /// window is evicted — never the whole table. A full `clear()` would let
+    /// an on-path attacker replay N distinct recently-captured server
+    /// session IDs to wipe every window at once, re-opening all of them to
+    /// replays; per-entry eviction bounds that blast radius to a single
+    /// session per injected datagram.
+    windows: std::collections::HashMap<u64, TrackedWindow>,
+    /// Monotonic access stamp feeding LRU eviction.
+    tick: u64,
+}
+
+/// A replay window plus the last time it filtered a reply.
+struct TrackedWindow {
+    window: meow_common::ReplayWindow,
+    last_used: u64,
 }
 
 const MAX_TRACKED_SERVER_SESSIONS: usize = 4;
@@ -504,21 +515,34 @@ impl SsUdpSession {
         }
     }
 
-    /// The control for the next client→server datagram.
-    fn send_control(&self) -> UdpSocketControlData {
+    /// The control for the next client→server datagram, or `None` once the
+    /// packet-ID space is exhausted. IDs are pre-incremented (sslocal
+    /// parity: the first datagram carries 1). On 32-bit targets `AtomicU`
+    /// is u32 and the space runs out after 2^32 datagrams; `checked_add`
+    /// refuses the wrap rather than reusing IDs the server's replay window
+    /// would drop. The caller errors the association so the next datagram
+    /// re-dials under a freshly minted session — the same recovery shape
+    /// as sslocal's socket reset + session renewal.
+    fn send_control(&self) -> Option<UdpSocketControlData> {
         let mut control = UdpSocketControlData::default();
         control.client_session_id = self.client_session_id;
+        let prev = self
+            .next_packet_id
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |x| x.checked_add(1),
+            )
+            .ok()?;
+        // `prev < Uint::MAX` is guaranteed by the successful checked_add.
         #[allow(
             clippy::useless_conversion,
             reason = "identity on 64-bit; u32→u64 widening on mips32"
         )]
         {
-            control.packet_id = u64::from(
-                self.next_packet_id
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            );
+            control.packet_id = u64::from(prev + 1);
         }
-        control
+        Some(control)
     }
 
     /// Validate a server→client control (§3.2.3/§3.2.4): the echoed client
@@ -534,16 +558,28 @@ impl SsUdpSession {
             .server
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tracker.tick += 1;
+        let tick = tracker.tick;
         let windows = &mut tracker.windows;
         if !windows.contains_key(&control.server_session_id)
             && windows.len() >= MAX_TRACKED_SERVER_SESSIONS
         {
-            windows.clear();
+            if let Some(&oldest) = windows
+                .iter()
+                .min_by_key(|(_, w)| w.last_used)
+                .map(|(id, _)| id)
+            {
+                windows.remove(&oldest);
+            }
         }
-        windows
+        let tracked = windows
             .entry(control.server_session_id)
-            .or_default()
-            .check_and_set(control.packet_id)
+            .or_insert_with(|| TrackedWindow {
+                window: meow_common::ReplayWindow::new(),
+                last_used: 0,
+            });
+        tracked.last_used = tick;
+        tracked.window.check_and_set(control.packet_id)
     }
 }
 
@@ -599,7 +635,15 @@ impl<S: DatagramSend + DatagramReceive + DatagramSocket + Send + Sync + 'static>
 
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
         let target = Address::SocketAddress(*addr);
-        let control = self.session.send_control();
+        // An exhausted packet-ID space kills the association: the tunnel
+        // drops the session on this error and the next datagram re-dials
+        // under a fresh `SsUdpSession` — sslocal's recovery on counter
+        // overflow (socket reset + session renewal).
+        let Some(control) = self.session.send_control() else {
+            return Err(MeowError::Proxy(
+                "ss udp: client packet-ID space exhausted".into(),
+            ));
+        };
         // ProxySocket::send_with_ctrl returns the encrypted packet size (with
         // protocol overhead), but callers expect the payload size.
         self.socket
@@ -970,11 +1014,14 @@ mod tests {
         let session = SsUdpSession::new(&ctx, "2022-blake3-aes-256-gcm".parse().unwrap());
         assert_ne!(session.client_session_id, 0);
 
-        let c0 = session.send_control();
-        let c1 = session.send_control();
+        let c0 = session.send_control().unwrap();
+        let c1 = session.send_control().unwrap();
         assert_eq!(c0.client_session_id, session.client_session_id);
-        assert_eq!(c0.packet_id, 0);
-        assert_eq!(c1.packet_id, 1, "client packet IDs count up per session");
+        assert_eq!(
+            c0.packet_id, 1,
+            "packet IDs are pre-incremented, sslocal-style"
+        );
+        assert_eq!(c1.packet_id, 2, "client packet IDs count up per session");
 
         let mut reply = UdpSocketControlData::default();
         reply.client_session_id = session.client_session_id;
@@ -1013,6 +1060,46 @@ mod tests {
         );
         reply.packet_id = 10;
         assert!(session.accept_reply(&reply));
+    }
+
+    /// §3.2.4: reaching [`MAX_TRACKED_SERVER_SESSIONS`] evicts the least
+    /// recently used window only — never clears the table. A `clear()`
+    /// would let an on-path attacker replay N distinct captured
+    /// server-session IDs to re-open every window at once; per-entry
+    /// eviction bounds the damage to the single evicted session.
+    #[test]
+    fn server_reply_tracker_evicts_lru_not_all() {
+        let ctx = Context::new_shared(ServerType::Local);
+        let session = SsUdpSession::new(&ctx, "2022-blake3-aes-256-gcm".parse().unwrap());
+        let reply = |ssid: u64, pid: u64| {
+            let mut c = UdpSocketControlData::default();
+            c.client_session_id = session.client_session_id;
+            c.server_session_id = ssid;
+            c.packet_id = pid;
+            c
+        };
+
+        // Fill the table: server sessions 1..=4 each record packet ID 5.
+        for s in 1..=MAX_TRACKED_SERVER_SESSIONS as u64 {
+            assert!(session.accept_reply(&reply(s, 5)));
+        }
+
+        // A fifth distinct session ID evicts exactly the LRU entry
+        // (session 1) — every other window must keep its state.
+        assert!(session.accept_reply(&reply(5, 5)));
+        for s in 2..=4u64 {
+            assert!(
+                !session.accept_reply(&reply(s, 5)),
+                "session {s}'s window must survive the LRU eviction"
+            );
+        }
+
+        // The evicted session is the only one whose recorded IDs are
+        // re-accepted — the bounded blast radius of per-entry eviction.
+        assert!(
+            session.accept_reply(&reply(1, 5)),
+            "only the evicted LRU window forgets its IDs"
+        );
     }
 
     /// The same adapter with the default direct dialer keeps advertising UDP —
