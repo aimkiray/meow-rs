@@ -1066,3 +1066,94 @@ async fn c16_ech_self_heal_uses_retry_configs_on_next_connect() {
         r2.err().map(|e| e.to_string())
     );
 }
+
+// ─── D1: TLS handshake over a flush-pending stream ────────────────────────────
+//
+// Regression test for the boring 4.22.0 `BIO_CTRL_FLUSH` retry-flag bug
+// (meow-rs#569).  Multiplexed transports (anytls, smux, …) implement
+// `poll_flush` as a barrier on a writer-task acknowledgement, so the first
+// poll almost always returns `Poll::Pending`.  tokio-boring's BIO bridge maps
+// that Pending to `ErrorKind::WouldBlock`; boring's `bio.rs` ctrl handler
+// stored the error but never called `BIO_set_retry_write`, so `SSL_get_error`
+// mapped a routine flush retry to fatal `SSL_ERROR_SYSCALL` and surfaced the
+// misleading "TLS handshake failed operation would block".  Upstream fixed it
+// in cloudflare/boring@ed76885, but no 4.x release carries the fix and quiche
+// pins this workspace to `boring ^4.3`.
+//
+// `DeferredFlushStream` pends `pending_budget` `poll_flush` calls before
+// delegating — the same observable behaviour as a mux writer barrier.
+
+struct DeferredFlushStream {
+    inner: TcpStream,
+    pending_budget: usize,
+}
+
+impl AsyncRead for DeferredFlushStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for DeferredFlushStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.pending_budget > 0 {
+            this.pending_budget -= 1;
+            // The mux writer resolves the barrier asynchronously; emulate that
+            // by waking ourselves so a correctly-retrying caller is re-polled.
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn d1_tls_handshake_over_pending_flush_stream() {
+    install_crypto_provider();
+    // One pending flush is enough to trip the bug; eight covers handshakes
+    // that flush once per flight.  The loopback server is single-accept, so
+    // each iteration needs its own.
+    for pends in [1usize, 8] {
+        let (cert_der, key_der, _, _) = gen_cert(&["localhost"]);
+        let (addr, _conn_rx) = spawn_tls_server(ServerOptions {
+            cert_der,
+            key_der,
+            server_alpn: vec![],
+            require_client_cert_ca: None,
+        })
+        .await;
+        let tcp = TcpStream::connect(addr).await.expect("TCP connect");
+        let stream = DeferredFlushStream {
+            inner: tcp,
+            pending_budget: pends,
+        };
+        let config = TlsConfig {
+            skip_cert_verify: true,
+            ..TlsConfig::new("localhost")
+        };
+        let layer = TlsLayer::new(&config).expect("TlsLayer::new");
+        let result = layer.connect(Box::new(stream)).await;
+        assert!(
+            result.is_ok(),
+            "handshake over flush-pending stream (pends={pends}) must succeed: {:?}",
+            result.err()
+        );
+    }
+}

@@ -59,6 +59,23 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **TLS handshakes no longer fail on multiplexed transports whose
+  `poll_flush` pends.** Every TLS-over-mux handshake — AnyTLS, smux, and any
+  stream whose `poll_flush` waits on a writer-task acknowledgement — died at
+  the first `BIO_flush` with the misleading "TLS handshake failed operation
+  would block". tokio-boring's BIO bridge turns `Poll::Pending` into
+  `ErrorKind::WouldBlock`, and boring 4.22.0's `BIO_CTRL_FLUSH` handler stored
+  the error but never called `BIO_set_retry_write`, so `SSL_get_error` mapped
+  a routine retry to fatal `SSL_ERROR_SYSCALL`. Upstream fixed this in
+  cloudflare/boring@ed76885 but no 4.x release carries it, and quiche pins
+  this workspace to `boring ^4.3`. `BoringInner::connect` now wraps the inner
+  stream so a pending flush reports complete — safe because `BIO_flush` only
+  pushes an already-queued flight and mux writers drain in order. HTTPS
+  URL-test probes over AnyTLS/smux recover (visible symptom: url-test groups
+  with `https://` URLs reported nearly all mux members dead while the same
+  nodes carried real traffic fine). Regression test:
+  `d1_tls_handshake_over_pending_flush_stream`. (#569)
+
 - **Provider `header:` maps now accept mihomo's list form, and rule-providers
   honor `header:` at all.** mihomo types provider headers as
   `map[string][]string`, but meow-rs typed `proxy-providers` `header` as
