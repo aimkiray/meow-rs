@@ -646,6 +646,11 @@ impl LazyBoringInner {
 /// result is masked — reads, writes and shutdown delegate unchanged, so a
 /// genuinely wedged writer still surfaces as a stalled read rather than a
 /// falsely-successful flush.
+///
+/// TODO(#572): remove once quiche releases >0.29.3 and `boring` upgrades to
+/// 5.x — upstream fix ed76885 then handles retriable flush errors natively,
+/// and this wrapper is a no-op for streams whose flush is Ready anyway, so
+/// removal is zero-risk.
 struct TolerantFlushStream<S> {
     inner: S,
 }
