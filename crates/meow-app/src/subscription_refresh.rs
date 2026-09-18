@@ -98,11 +98,9 @@ pub async fn run_loop(
                         // Same stamping as the rebuild-error arms below —
                         // a statically-defective payload shouldn't
                         // re-download every 60 s either (issue #533 review).
-                        // The stamp deliberately rides outside the lane:
-                        // it's loss-tolerant bookkeeping (a clobbered stamp
-                        // just re-downloads next pass) and taking the lane
-                        // could park it ~300 s behind a TUN reconcile
-                        // (issue #543 review).
+                        // In-lane so a sibling commit's clone→write can't
+                        // silently drop the stamp.
+                        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
                         let mut live = raw_config.write();
                         if let Some(sub) = live
                             .subscriptions
@@ -126,11 +124,24 @@ pub async fn run_loop(
                     let candidate = {
                         let mut c = raw_config.read().clone();
 
-                        if let Some(ref mut subs) = c.subscriptions {
-                            if let Some(sub) = subs.iter_mut().find(|s| s.name == name) {
-                                sub.last_updated = Some(now);
-                            }
-                        }
+                        // A `DELETE /api/subscriptions/{name}` landing while
+                        // the fetch was in flight removes the entry under
+                        // this lane — re-verify inside it so the fetched
+                        // payload cannot resurrect a deleted subscription
+                        // (same guard the manual refresh endpoint runs,
+                        // issue #543 review).
+                        let Some(sub) = c
+                            .subscriptions
+                            .as_mut()
+                            .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
+                        else {
+                            info!(
+                                "subscription '{name}' removed while its refresh was \
+                                 in flight; discarding fetched payload"
+                            );
+                            continue;
+                        };
+                        sub.last_updated = Some(now);
 
                         c.proxies = Some(fetched.proxies);
                         c.proxy_groups = Some(fetched.proxy_groups);
@@ -290,11 +301,13 @@ pub async fn run_loop(
                                 ),
                             );
                             info!("Subscription '{}' refreshed successfully", name);
-                            // The commit is done — release the mutation
-                            // lane before the async disk write so file I/O
-                            // does not serialize concurrent config commits
-                            // (issue #514 review).
-                            drop(_lane);
+                            // Save while still in the lane: every other
+                            // writer serializes its rename under
+                            // `CONFIG_MUTATION`, so the file's last writer
+                            // must follow commit order — otherwise an older
+                            // candidate's rename can land last and
+                            // resurrect stale state on restart (issue #543
+                            // review).
                             let _ =
                                 meow_config::save_raw_config_async(&config_path, &candidate).await;
                         }
@@ -346,9 +359,9 @@ pub async fn run_loop(
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs() as i64;
-                        // Loss-tolerant stamp, deliberately outside the
-                        // lane — see the same carve-out above (issue #543
-                        // review).
+                        // In-lane so a sibling commit's clone→write can't
+                        // silently drop the stamp.
+                        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
                         let mut live = raw_config.write();
                         if let Some(sub) = live
                             .subscriptions

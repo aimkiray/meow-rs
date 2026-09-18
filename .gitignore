@@ -2,8 +2,11 @@
 config.yaml
 config.yaml.bak
 config.yaml.tmp
+config.yaml.*.tmp
 config-*.yaml
 config-*.yaml.bak
+config-*.yaml.tmp
+config-*.yaml.*.tmp
 # default config shipped inside the OpenWrt ipk is tracked source, not a
 # local runtime config
 !openwrt/meow/files/config.yaml

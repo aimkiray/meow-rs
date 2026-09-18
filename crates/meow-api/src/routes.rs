@@ -1055,6 +1055,8 @@ async fn save_config(
 /// plus the resolver generation that was live before the early install —
 /// the caller passes it to [`swap_config_and_reconcile_tun`] so the TUN
 /// fake-IP comparison sees the true old state (issue #533 review).
+///
+/// Callers must hold the `CONFIG_MUTATION` lane (issue #543).
 async fn apply_raw_to_tunnel(
     raw: RawConfig,
     state: &AppState,
@@ -1712,11 +1714,15 @@ async fn refresh_subscription(
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
 
-        if let Some(ref mut subs) = raw.subscriptions {
-            if let Some(sub) = subs.iter_mut().find(|s| s.name == name) {
-                sub.last_updated = Some(now);
-            }
-        }
+        // The subscription may have been deleted while the fetch ran —
+        // re-verify inside the lane so a removed subscription's payload
+        // cannot resurrect (issue #543).
+        let sub = raw
+            .subscriptions
+            .as_mut()
+            .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "subscription not found".into()))?;
+        sub.last_updated = Some(now);
 
         raw.proxies = Some(fetched.proxies);
         raw.proxy_groups = Some(fetched.proxy_groups);

@@ -87,6 +87,13 @@ struct Fixture {
 /// each test finishes arranging global state (e.g. the SelectorStore)
 /// before calling [`spawn_loop`] so the first pass can't race it.
 async fn fixture(sub_body: &'static str) -> Fixture {
+    let sub_addr = spawn_origin(sub_body).await;
+    fixture_at(sub_addr).await
+}
+
+/// Same scaffolding as [`fixture`] but against a caller-provided origin —
+/// lets a test gate the response itself.
+async fn fixture_at(sub_addr: std::net::SocketAddr) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     // The provider cache dir is derived from `config_path`'s parent (no
     // home-dir override in tests), so the provider payload lives beside
@@ -108,8 +115,6 @@ async fn fixture(sub_body: &'static str) -> Fixture {
          \x20   port: 9\n"
     )
     .unwrap();
-
-    let sub_addr = spawn_origin(sub_body).await;
 
     let raw: RawConfig = serde_yaml::from_str(&format!(
         "mode: rule\n\
@@ -265,5 +270,110 @@ async fn refreshed_select_group_keeps_persisted_choice() {
         picked.name(),
         "node-b",
         "refresh must restore the persisted choice, not the first member"
+    );
+}
+
+/// Origin that holds its response until the test releases it: `got_rx`
+/// fires once the request head arrives (the fetch is in flight), `go_tx`
+/// releases the response body. One request only — the test deletes the
+/// subscription so no second pass fetches.
+async fn spawn_gated_origin(
+    body: &'static str,
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (got_tx, got_rx) = tokio::sync::oneshot::channel();
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0u8; 4096];
+        let mut head = Vec::new();
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    head.extend_from_slice(&buf[..n]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = got_tx.send(());
+        let _ = go_rx.await;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = sock.write_all(resp.as_bytes()).await;
+        let _ = sock.shutdown().await;
+    });
+    (addr, got_rx, go_tx)
+}
+
+/// A `DELETE` landing while the refresh fetch is in flight must discard
+/// the fetched payload: the loop re-verifies the subscription inside the
+/// `CONFIG_MUTATION` lane before committing, mirroring the manual
+/// endpoint's 404 recheck (issue #543 review).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_during_in_flight_refresh_discards_payload() {
+    let (sub_addr, got_rx, go_tx) = spawn_gated_origin(
+        "proxies:\n\
+         \x20 - name: resurrected\n\
+         \x20   type: http\n\
+         \x20   server: 127.0.0.1\n\
+         \x20   port: 9\n\
+         rules:\n\
+         \x20 - MATCH,DIRECT\n",
+    )
+    .await;
+    let fx = fixture_at(sub_addr).await;
+    spawn_loop(&fx);
+
+    // The fetch is in flight; park the loop on the mutation lane while
+    // the "DELETE" commits (entry removed + owned sections emptied,
+    // exactly what `delete_subscription` writes).
+    got_rx.await.expect("origin must see the request");
+    let lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    go_tx.send(()).expect("origin must still be listening");
+    // Let the loop consume the response and queue on the lane — it
+    // cannot run its commit section while we hold it, so the delete
+    // below is guaranteed to precede the candidate build.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    {
+        let mut live = fx.raw_config.write();
+        if let Some(subs) = live.subscriptions.as_mut() {
+            subs.retain(|s| s.name != "s");
+        }
+        live.proxies = None;
+        live.proxy_groups = None;
+        live.rules = None;
+    }
+    drop(lane);
+
+    // tokio's Mutex is FIFO-fair: this re-acquisition queues behind the
+    // parked loop and resolves only after its in-lane section (recheck →
+    // discard, or a buggy commit) has run to completion.
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    assert!(
+        fx.tunnel.proxy("resurrected").is_none(),
+        "a deleted subscription's fetched payload must not be committed"
+    );
+    assert!(
+        fx.raw_config
+            .read()
+            .proxies
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .all(|p| p.get("name").and_then(|n| n.as_str()) != Some("resurrected")),
+        "raw_config must not regain the deleted subscription's nodes"
     );
 }

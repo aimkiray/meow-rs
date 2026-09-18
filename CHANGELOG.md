@@ -280,6 +280,23 @@ the canonical, in-repo source a release is cut from.
   independently; changing the API secret refreshes authentication. Add
   dashboard browser and lifecycle regression tests to CI.
 
+- **A deleted subscription's payload could resurrect on a raced
+  refresh.** `POST /api/subscriptions/{name}/refresh` and the scheduled
+  refresh loop both resolve the URL and fetch before taking the mutation
+  lane; if the subscription was deleted meanwhile, the fetched
+  proxies/groups/rules were committed unconditionally. The endpoint now
+  re-verifies the subscription exists inside the lane and returns 404
+  otherwise, and the loop discards the payload on the same recheck. The
+  loop also keeps the lane through its disk save so the file's last
+  writer follows commit order (issue #543).
+- **Concurrent config saves could publish a torn file.** Every writer
+  shared the same `{path}.tmp` scratch name, so one save's
+  create+truncate could land inside another's `write_all` and the
+  victim's `rename` would publish the mixed file. Saves now use a
+  unique scratch name per call, and the scratch is swept when the write
+  or rename fails so repeated failures can't fill the config dir
+  (issue #543).
+
 - **AnyTLS UDP-over-TCP reads poison the conn on an incomplete frame**
   (feature `anytls`). `AnytlsPacketConn::read_packet` consumed the uot
   address + length + payload incrementally under the stream's reader

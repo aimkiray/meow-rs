@@ -501,17 +501,36 @@ fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
     Ok(serde_yaml::from_value(value)?)
 }
 
+/// Unique-per-call scratch path for the atomic save below — a shared
+/// `{path}.tmp` lets one writer's create+truncate land inside another's
+/// `write_all`, and the victim's `rename` then publishes the mixed file
+/// (issue #543).
+fn save_scratch_path(path: &str) -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{path}.{}.{}.tmp", std::process::id(), n)
+}
+
 /// Save a RawConfig back to disk with atomic write (.tmp → rename) and .bak backup.
 pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_yaml::to_string(raw)?;
-    let tmp_path = format!("{path}.tmp");
+    let tmp_path = save_scratch_path(path);
     let bak_path = format!("{path}.bak");
-    std::fs::write(&tmp_path, yaml)?;
+    // Unique scratch names would accumulate on repeated failures — sweep
+    // the scratch on each fallible step so a chronic error (ENOSPC, a
+    // denied rename) can't fill the config dir.
+    if let Err(e) = std::fs::write(&tmp_path, &yaml) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
     if std::path::Path::new(path).exists() {
         // Keep one backup
         let _ = std::fs::rename(path, &bak_path);
     }
-    std::fs::rename(&tmp_path, path)?;
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
     info!("Config saved to {}", path);
     Ok(())
 }
@@ -519,15 +538,118 @@ pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::E
 /// Async counterpart to [`save_raw_config`] for Tokio request/background paths.
 pub async fn save_raw_config_async(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_yaml::to_string(raw)?;
-    let tmp_path = format!("{path}.tmp");
+    let tmp_path = save_scratch_path(path);
     let bak_path = format!("{path}.bak");
-    tokio::fs::write(&tmp_path, yaml).await?;
+    if let Err(e) = tokio::fs::write(&tmp_path, &yaml).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(e.into());
+    }
     if tokio::fs::metadata(path).await.is_ok() {
         let _ = tokio::fs::rename(path, &bak_path).await;
     }
-    tokio::fs::rename(&tmp_path, path).await?;
+    if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(e.into());
+    }
     info!("Config saved to {}", path);
     Ok(())
+}
+
+#[cfg(test)]
+mod save_scratch_tests {
+    //! Issue #543: every save gets a unique scratch file, so an
+    //! interleaved pair of writers can never publish a splice of two
+    //! payloads — and a failed save must not leave scratch behind.
+    use super::*;
+
+    fn leftovers(dir: &std::path::Path) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_saves_publish_a_complete_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let path_str = path.to_string_lossy().into_owned();
+
+        let a: raw::RawConfig =
+            serde_yaml::from_str("mode: rule\nlog-level: info\nrules:\n  - MATCH,DIRECT\n")
+                .unwrap();
+        let b: raw::RawConfig = serde_yaml::from_str(
+            "mode: global\nlog-level: debug\nipv6: true\nrules:\n  - MATCH,REJECT\n",
+        )
+        .unwrap();
+        let ser_a = serde_yaml::to_string(&a).unwrap();
+        let ser_b = serde_yaml::to_string(&b).unwrap();
+
+        std::thread::scope(|s| {
+            for raw in [&a, &b] {
+                let path = path_str.clone();
+                s.spawn(move || {
+                    for _ in 0..64 {
+                        save_raw_config(&path, raw).unwrap();
+                    }
+                });
+            }
+        });
+
+        // Whichever rename landed last, the file is one whole document —
+        // never a splice (byte-exact: save writes the same serialization).
+        let final_doc = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            final_doc == ser_a || final_doc == ser_b,
+            "concurrent saves must publish a complete document"
+        );
+        assert!(
+            leftovers(dir.path()).is_empty(),
+            "no scratch survives a successful save storm"
+        );
+    }
+
+    #[test]
+    fn failed_save_leaves_no_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw: raw::RawConfig = serde_yaml::from_str("mode: rule\n").unwrap();
+
+        // Rename step fails: `as-dir.bak` is a non-empty directory, so the
+        // backup rotate fails silently and `as-dir` stays put — the final
+        // rename then hits EISDIR and must sweep its scratch.
+        let bad = dir.path().join("as-dir");
+        std::fs::create_dir(&bad).unwrap();
+        std::fs::create_dir(dir.path().join("as-dir.bak")).unwrap();
+        std::fs::write(dir.path().join("as-dir.bak").join("x"), "").unwrap();
+        let bad = bad.to_string_lossy().into_owned();
+        assert!(save_raw_config(&bad, &raw).is_err());
+        assert!(
+            leftovers(dir.path()).is_empty(),
+            "rename failure must sweep its scratch: {:?}",
+            leftovers(dir.path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_write_leaves_no_scratch() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let raw: raw::RawConfig = serde_yaml::from_str("mode: rule\n").unwrap();
+
+        let path = ro.join("config.yaml").to_string_lossy().into_owned();
+        assert!(save_raw_config(&path, &raw).is_err());
+        assert!(
+            leftovers(&ro).is_empty(),
+            "write failure must sweep its scratch: {:?}",
+            leftovers(&ro)
+        );
+    }
 }
 
 /// The result of rebuilding proxies and rules from a RawConfig: the proxy

@@ -190,9 +190,17 @@ fn save_creates_tmp_and_bak_in_same_dir_as_config() {
         ".bak must be in the same directory as the config"
     );
 
-    // .tmp should have been renamed away (not left behind)
+    // *.tmp scratch should have been renamed away (not left behind) —
+    // scratch names are unique per call (`config.yaml.<pid>.<n>.tmp`), so
+    // glob the dir rather than asserting one literal name.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.file_name())
+        .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+        .collect();
     assert!(
-        !dir.path().join("config.yaml.tmp").exists(),
-        ".tmp must not be left behind after successful save"
+        leftovers.is_empty(),
+        "no *.tmp scratch must be left behind after successful save, found {leftovers:?}"
     );
 }
