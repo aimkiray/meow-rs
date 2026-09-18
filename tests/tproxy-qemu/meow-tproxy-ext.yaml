@@ -1,0 +1,32 @@
+# External-firewall variant (issue #563): the tproxy listener is declared via
+# `listeners:` with `firewall: false` — meow installs no nftables state; the
+# test harness owns the redirect table (`inet meow_ext_fw`) itself.
+mixed-port: 7890
+routing-mark: 9527
+mode: rule
+log-level: debug
+
+listeners:
+  - name: ext-tproxy
+    type: tproxy
+    listen: 127.0.0.1
+    port: 7894
+    firewall: false
+
+dns:
+  enable: true
+  listen: "127.0.0.1:5353"
+  enhanced-mode: normal
+  nameserver:
+    - "8.8.8.8"
+
+proxies:
+  - name: "test-ss"
+    type: ss
+    server: "10.99.0.1"
+    port: 8388
+    cipher: "aes-128-gcm"
+    password: "test-password"
+
+rules:
+  - "MATCH,DIRECT"

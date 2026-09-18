@@ -60,8 +60,8 @@ routing-mark: 9527     # Linux: SO_MARK for loop avoidance
 ## How tproxy works
 
 - **REDIRECT-based, TCP only.** Traffic is redirected to the TProxy listener, and the
-  original destination is recovered via `SO_ORIGINAL_DST` (Linux) or a `getpeername`
-  rewrite (macOS). UDP is not intercepted.
+  original destination is recovered via `SO_ORIGINAL_DST` (Linux) or a pf
+  state-table lookup (`DIOCNATLOOK`, macOS). UDP is not intercepted.
 - **Loop avoidance.** meow-rs's own outbound (the `DIRECT` adapter) is marked so the
   firewall skips it — on Linux via `SO_MARK` (`routing-mark`), on macOS via a UID bypass.
 - **Proxy-server bypass.** The IPs of your configured upstream proxy servers are
@@ -79,8 +79,44 @@ meow-rs creates an `inet meow_tproxy` table hooking the **output** chain:
 
 ### macOS (pf)
 
-A `com.meow.tproxy` anchor with `rdr` redirect on `lo0`, a UID bypass for meow's own
+A `com.apple/com.meow.tproxy` anchor with `rdr` redirect on `lo0`, a UID bypass for meow's own
 traffic, loopback and proxy-IP bypasses. (macOS pf support is experimental.)
+
+## External firewall management
+
+A named `listeners:` entry can opt out of the managed firewall with
+`firewall: false` (issue #563):
+
+```yaml
+listeners:
+  - name: gateway
+    type: tproxy
+    listen: "0.0.0.0"
+    port: 7893
+    firewall: false
+```
+
+meow then **never** invokes nftables or pfctl for this listener: no rules are
+installed, probed, or removed, and the upstream proxy-IP bypass list is not
+collected. The data plane is unchanged — the listener still accepts TCP
+`REDIRECT` connections and recovers the original destination.
+
+The deployer's responsibilities, all of them:
+
+- install the `REDIRECT` rules that steer traffic into the listener, on whatever
+  backend you prefer (iptables, nftables, pf, an external firewall manager);
+- provide the loop-prevention bypass (a `routing-mark`/UID exemption for meow's
+  own outbound and upstream server IPs), or meow's outbound will be re-captured;
+- own startup/shutdown ordering — rules installed before meow binds are silently
+  blackholed or fail-open depending on your design; meow cleans up nothing;
+- pick a **fixed** port. `port: 0` resolves after external rules would already
+  need to exist, so it only works if you discover the bound port via
+  `GET /listeners` and install rules afterwards.
+
+Out of scope: `firewall: false` does **not** add an iptables backend, does not
+enable UDP or true Linux `TPROXY` (the listener remains TCP `REDIRECT`), and
+takes effect at startup only — a config change needs a restart. The shorthand
+`tproxy-port` always keeps the managed firewall.
 
 ## Host-only vs. LAN gateway
 

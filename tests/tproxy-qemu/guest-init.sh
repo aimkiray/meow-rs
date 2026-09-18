@@ -164,10 +164,108 @@ else
     pass "firewall_teardown"
 fi
 
+# ═══ Phase 2: `firewall: false` — external rule management (issue #563) ═══
+#
+# The deployer installs the redirect table by hand (mirroring the managed
+# shape: mark/loopback/proxy-IP bypasses + catch-all redirect); meow must
+# serve the intercepted traffic without creating `inet meow_tproxy`, and
+# must leave this table alone on exit.
+echo ""
+echo "=== External-firewall phase (firewall: false) ==="
+
+nft -f - <<'NFT'
+table inet meow_ext_fw {
+  chain output {
+    type nat hook output priority -100; policy accept;
+    meta mark 0x2537 accept
+    ip daddr 127.0.0.0/8 accept
+    ip6 daddr ::1 accept
+    ip daddr 10.99.0.1 accept
+    tcp dport 1-65535 redirect to :7894
+  }
+}
+NFT
+
+meow -f /etc/meow-tproxy-ext.yaml > /tmp/meow-ext.log 2>&1 &
+EXT_MEOW_PID=$!
+echo "meow (external fw) started (PID $EXT_MEOW_PID)"
+
+EXT_READY=0
+for i in $(seq 1 20); do
+    if grep -q "TProxy listener 'ext-tproxy' started" /tmp/meow-ext.log 2>/dev/null; then
+        EXT_READY=1
+        echo "External-fw TProxy listener ready after $((i * 500))ms"
+        break
+    fi
+    if ! kill -0 "$EXT_MEOW_PID" 2>/dev/null; then
+        echo "meow (external fw) exited prematurely"
+        break
+    fi
+    sleep 0.5
+done
+
+# Test 11: ext_tproxy_ready — externally-managed listener started
+if [ "$EXT_READY" -eq 1 ]; then
+    pass "ext_tproxy_ready"
+else
+    fail "ext_tproxy_ready"
+fi
+
+# Test 12: ext_no_managed_table — meow created NO nftables state for this
+# listener (the managed table must not exist)
+if nft list table inet meow_tproxy >/dev/null 2>&1; then
+    fail "ext_no_managed_table"
+else
+    pass "ext_no_managed_table"
+fi
+
+# Test 13: ext_fw_log — startup log discloses external management
+if grep -q "external firewall management" /tmp/meow-ext.log 2>/dev/null; then
+    pass "ext_fw_log"
+else
+    fail "ext_fw_log"
+fi
+
+# Test 14: ext_tproxy_relay — traffic redirected by the EXTERNAL rules is
+# served end-to-end (orig-dest recovery + relay through the tunnel)
+EXT_RESPONSE=""
+EXT_RESPONSE=$(echo "HELLO" | timeout 5 nc -w 3 10.88.0.1 9999 2>/dev/null) || true
+sleep 1
+
+if [ "$EXT_RESPONSE" = "ECHO_RESPONSE" ] \
+    && grep -q "10.88.0.1:9999" /tmp/meow-ext.log 2>/dev/null; then
+    pass "ext_tproxy_relay"
+else
+    fail "ext_tproxy_relay"
+fi
+
+# Test 15: ext_fw_persists — stopping meow must NOT remove the deployer's
+# table (meow cleans up only what it owns)
+kill -TERM "$EXT_MEOW_PID" 2>/dev/null
+for i in $(seq 1 10); do
+    kill -0 "$EXT_MEOW_PID" 2>/dev/null || break
+    sleep 0.5
+done
+kill -9 "$EXT_MEOW_PID" 2>/dev/null || true
+sleep 1
+
+if nft list table inet meow_ext_fw >/dev/null 2>&1; then
+    pass "ext_fw_persists"
+else
+    fail "ext_fw_persists"
+fi
+
+# The harness owns the external table — remove it explicitly.
+nft delete table inet meow_ext_fw 2>/dev/null || true
+
 # --- Debug output ---
 echo ""
 echo "=== meow log ==="
 cat /tmp/meow.log 2>/dev/null || echo "(no log)"
+echo "=== end log ==="
+echo ""
+echo "=== meow log (external fw) ==="
+cat /tmp/meow-ext.log 2>/dev/null || echo "(no log)"
 echo "=== end log ==="
 
 echo ""

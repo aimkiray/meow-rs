@@ -51,6 +51,7 @@ listeners:
 | `port` | u16 | | — | Unique across listeners; omit or `0` to let the OS assign an ephemeral port |
 | `listen` | string | | per type | Bind IP literal, or `host:port` (e.g. `127.0.0.1:0`) |
 | `tproxy-sni` | bool | | global | (tproxy) deprecated SNI shorthand — prefer [`sniffer`](./sniffer) |
+| `firewall` | bool | | `true` | (tproxy) `false` = external firewall management — no nft/pfctl calls, no cleanup; see [Transparent Proxy](./transparent-proxy) |
 | `max-connections` | usize | | global | Per-listener concurrency cap; `0` = unlimited |
 
 `listen` defaults to `127.0.0.1` for `tproxy` and to the global `bind-address` otherwise.

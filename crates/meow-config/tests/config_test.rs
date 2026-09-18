@@ -1964,7 +1964,10 @@ tproxy-sni: true
         .expect("tproxy shorthand listener must exist");
     assert_eq!(
         tproxy.spec,
-        ListenerSpec::TProxy { sni: true },
+        ListenerSpec::TProxy {
+            sni: true,
+            firewall: true
+        },
         "shorthand tproxy-port should inherit the global tproxy-sni default"
     );
     // TProxy always hard-binds 127.0.0.1
@@ -1986,7 +1989,10 @@ tproxy-sni: false
         .expect("tproxy shorthand listener must exist");
     assert_eq!(
         tproxy.spec,
-        ListenerSpec::TProxy { sni: false },
+        ListenerSpec::TProxy {
+            sni: false,
+            firewall: true
+        },
         "shorthand tproxy-port with global tproxy-sni: false"
     );
 }
@@ -2010,9 +2016,171 @@ listeners:
         .expect("named tproxy listener must exist");
     assert_eq!(
         tproxy.spec,
-        ListenerSpec::TProxy { sni: true },
+        ListenerSpec::TProxy {
+            sni: true,
+            firewall: true
+        },
         "per-listener tproxy-sni: true must override the global false default"
     );
+}
+
+// ── Issue #563: per-listener `firewall` on tproxy ────────────────
+//
+// `firewall: false` delegates nftables/pf rule management to an external
+// system. The shorthand `tproxy-port` always keeps the managed default;
+// only an explicit `listeners:` entry can opt out.
+
+#[tokio::test]
+async fn test_tproxy_firewall_defaults_true() {
+    let yaml = r#"
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: 0.0.0.0:5332
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let tproxy = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "my-tproxy")
+        .expect("named tproxy listener must exist");
+    assert_eq!(
+        tproxy.spec,
+        ListenerSpec::TProxy {
+            sni: true,
+            firewall: true
+        },
+        "omitted firewall must default to managed"
+    );
+}
+
+#[tokio::test]
+async fn test_tproxy_firewall_explicit_false() {
+    for value in ["false", "true"] {
+        let yaml = format!(
+            r#"
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: 0.0.0.0:5332
+    firewall: {value}
+"#
+        );
+        let config = load_config_from_str(&yaml).await.unwrap();
+        let tproxy = config
+            .listeners
+            .named
+            .iter()
+            .find(|nl| nl.name == "my-tproxy")
+            .expect("named tproxy listener must exist");
+        let expected = value == "true";
+        assert_eq!(
+            tproxy.spec,
+            ListenerSpec::TProxy {
+                sni: true,
+                firewall: expected
+            },
+            "firewall: {value} must round-trip"
+        );
+    }
+}
+
+/// `tproxy-port` shorthand cannot opt out — external management is an
+/// explicit `listeners:`-only feature.
+#[tokio::test]
+async fn test_tproxy_shorthand_keeps_managed_firewall() {
+    let yaml = "tproxy-port: 7893\n";
+    let config = load_config_from_str(yaml).await.unwrap();
+    let tproxy = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| matches!(nl.spec, ListenerSpec::TProxy { .. }))
+        .expect("tproxy shorthand listener must exist");
+    assert_eq!(
+        tproxy.spec,
+        ListenerSpec::TProxy {
+            sni: true,
+            firewall: true
+        },
+        "shorthand tproxy-port must keep the managed-firewall default"
+    );
+}
+
+/// A persisted spec written before the `firewall` field existed must
+/// deserialize with the managed default, not `false`.
+#[test]
+fn test_tproxy_spec_deserialization_defaults_firewall_true() {
+    let spec: ListenerSpec = serde_yaml::from_str("!tproxy\nsni: true\n").unwrap();
+    assert_eq!(
+        spec,
+        ListenerSpec::TProxy {
+            sni: true,
+            firewall: true
+        },
+        "legacy spec without `firewall` must default to managed"
+    );
+}
+
+/// `firewall:` on a non-tproxy listener is inert — parsed with a warning
+/// rather than silently changing that listener's behaviour. The warning is
+/// captured via a scoped subscriber; the config build is driven on a
+/// current-thread runtime inside `with_default` so the thread-local
+/// dispatch is in effect when the warn fires.
+#[test]
+fn test_firewall_on_non_tproxy_listener_warns() {
+    let yaml = r#"
+listeners:
+  - name: my-mixed
+    type: mixed
+    listen: 127.0.0.1:7890
+    firewall: false
+"#;
+    #[derive(Clone)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+    let sink = Sink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let config = tracing::subscriber::with_default(subscriber, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(load_config_from_str(yaml))
+            .unwrap()
+    });
+    let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+    assert!(
+        logs.contains("only meaningful on `type: tproxy`"),
+        "expected a misuse warning, got: {logs}"
+    );
+
+    let mixed = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "my-mixed")
+        .expect("named mixed listener must exist");
+    assert_eq!(mixed.spec, ListenerSpec::Mixed);
 }
 
 #[tokio::test]
@@ -2033,7 +2201,10 @@ listeners:
         .expect("named tproxy listener must exist");
     assert_eq!(
         tproxy.spec,
-        ListenerSpec::TProxy { sni: true },
+        ListenerSpec::TProxy {
+            sni: true,
+            firewall: true
+        },
         "named tproxy without per-listener tproxy-sni should fall back to global true"
     );
 }
@@ -2107,8 +2278,22 @@ async fn test_listener_type_name() {
     assert_eq!(ListenerSpec::Mixed.type_name(), "mixed");
     assert_eq!(ListenerSpec::Http.type_name(), "http");
     assert_eq!(ListenerSpec::Socks5.type_name(), "socks5");
-    assert_eq!(ListenerSpec::TProxy { sni: true }.type_name(), "tproxy");
-    assert_eq!(ListenerSpec::TProxy { sni: false }.type_name(), "tproxy");
+    assert_eq!(
+        ListenerSpec::TProxy {
+            sni: true,
+            firewall: true
+        }
+        .type_name(),
+        "tproxy"
+    );
+    assert_eq!(
+        ListenerSpec::TProxy {
+            sni: false,
+            firewall: true
+        }
+        .type_name(),
+        "tproxy"
+    );
 }
 
 #[tokio::test]

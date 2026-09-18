@@ -64,6 +64,39 @@ listeners:
 (Do not also set the top-level `tproxy-port` — that would create a second,
 loopback-bound listener on a different port.)
 
+### `firewall: false` — fully external rule management
+
+If you want to own **all** the firewall state — including the output chain and
+the loop-prevention bypasses meow normally installs — set `firewall: false` on
+the named listener (issue #563):
+
+```yaml
+listeners:
+  - name: tproxy-gw
+    type: tproxy
+    listen: '::'
+    port: 7893
+    firewall: false   # meow never invokes nft/pfctl for this listener
+```
+
+Under external management meow installs nothing, probes nothing, and removes
+nothing on exit — including the `meta mark` bypass and upstream proxy-IP bypass
+list (they are not even collected). You must reproduce the loop-prevention
+rules yourself or meow's own outbound will be re-captured, and you own the
+boot-ordering/fail-open story: rules pointing at the listener port before meow
+binds will blackhole or pass through depending on your ruleset. Use a fixed
+port — `port: 0` is only viable if you read the bound port back via
+`GET /listeners` and install rules afterwards. Changes need a restart; there
+is no listener hot-reload.
+
+The `tproxy-port:` shorthand always keeps the managed firewall — a top-level
+`firewall:` key does not exist and is silently ignored, so external management
+requires declaring the listener under `listeners:` as above.
+
+This is the mode to reach for when nftables is unavailable, when another
+privileged service (or iptables) owns redirect policy, or when you want custom
+output-chain behaviour the built-in table doesn't express.
+
 ---
 
 ## Prerequisites

@@ -11,6 +11,11 @@ mixed-port: 7890
 # tproxy-sni: true       # Extract SNI from TLS ClientHello (default: true)
 # routing-mark: 9527     # SO_MARK for DIRECT loop avoidance on Linux
 #
+# A named `listeners:` tproxy entry also accepts `firewall: false` to leave
+# all rule management to an external system (no nft/pfctl calls from meow).
+# The tproxy-port shorthand always stays managed — a top-level `firewall:`
+# key does not exist and would be silently ignored. See docs/tproxy-gateway.md.
+#
 # Windows: Wintun TUN inbound (the transparent-proxy path). Requires an
 # elevated process. Official zips ship wintun.dll next to meow.exe; if it
 # is missing the official DLL embedded in the binary is extracted. Also

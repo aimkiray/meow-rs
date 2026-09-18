@@ -167,6 +167,20 @@ the canonical, in-repo source a release is cut from.
   listener cap. The superseded `bench.yml` workflow and the unused
   `bench/results/` dir are removed.
 
+- **External firewall management for TProxy listeners (#563).** A named
+  `listeners:` entry accepts `firewall: false`, which makes meow skip every
+  nftables/pfctl interaction for that listener: no rules installed, probed,
+  or removed, and the upstream proxy-IP bypass list is not collected. The
+  data plane is unchanged — TCP `REDIRECT` connections are still accepted
+  and the original destination recovered — while the deployer owns redirect
+  rules, loop-prevention bypasses, and boot-ordering/fail-open semantics.
+  The default stays `true` (managed), the `tproxy-port` shorthand always
+  keeps managed mode, and a `firewall:` key on a non-tproxy listener parses
+  with a warning. Managed-mode setup failures now hint at the opt-out in the
+  error message. Documented in `docs/tproxy-gateway.md`,
+  `docs/tproxy-macos.md`, and the website listeners/transparent-proxy
+  guides.
+
 ### Changed
 
 - **`AppState::config_mutation_lock` was removed** — the per-state mutex

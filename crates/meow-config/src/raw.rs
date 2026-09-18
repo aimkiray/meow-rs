@@ -323,6 +323,11 @@ pub struct RawListener {
     pub port: Option<u16>,
     pub listen: Option<String>,
     pub tproxy_sni: Option<bool>,
+    /// `tproxy` listeners only: whether meow installs and owns the platform
+    /// firewall rules (default `true`). `false` leaves rule management to
+    /// an external system — no nft/pfctl invocation, no bypass-IP
+    /// collection, no cleanup on exit (issue #563).
+    pub firewall: Option<bool>,
     /// Per-listener override of the global `max-connections` cap. `0`
     /// disables the cap for this listener.
     pub max_connections: Option<usize>,

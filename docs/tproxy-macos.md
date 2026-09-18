@@ -68,6 +68,27 @@ Out of the box this intercepts only traffic that already traverses `lo0`
 `scripts/tproxy-local-macos.sh up|down|status` wraps the above and confirms
 the anchor came up.
 
+## External firewall management (`firewall: false`)
+
+A named `listeners:` entry can skip the managed anchor entirely (issue #563):
+
+```yaml
+listeners:
+  - name: tproxy
+    type: tproxy
+    listen: 127.0.0.1:7893
+    firewall: false   # meow never invokes pfctl for this listener
+```
+
+With `firewall: false` meow installs no anchor and removes none on exit — you
+own the `rdr` rules, the UID loop-prevention bypass, and the anchor's
+lifecycle. The listener still accepts redirected TCP and recovers the original
+destination via the pf state-table lookup (`DIOCNATLOOK` on `/dev/pf`), so
+your rules must use `rdr` — a plain `pass` + connect leaves no NAT state to
+look up. See
+[tproxy-gateway.md](tproxy-gateway.md#firewall-false--fully-external-rule-management)
+for the full contract.
+
 ## Intercepting real outbound traffic (`route-to lo0`)
 
 The host's outbound connections to remote IPs leave via `en0` and never touch

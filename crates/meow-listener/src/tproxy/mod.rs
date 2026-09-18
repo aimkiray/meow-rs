@@ -28,6 +28,11 @@ pub struct TProxyListener {
     routing_mark: Option<u32>,
     name: String,
     max_connections: usize,
+    /// Whether meow installs and owns the platform firewall rules
+    /// (nftables/pf) for this listener. `false` leaves rule management to
+    /// an external system — no `nft`/`pfctl` invocation, no upstream
+    /// bypass-IP collection, no rule cleanup on exit (issue #563).
+    firewall: bool,
 }
 
 impl TProxyListener {
@@ -62,6 +67,7 @@ impl TProxyListener {
             routing_mark,
             name,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            firewall: true,
         }
     }
 
@@ -76,6 +82,15 @@ impl TProxyListener {
     /// [`DEFAULT_MAX_CONNECTIONS`]). `0` disables the cap.
     pub fn with_max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
+        self
+    }
+
+    /// Set `false` to delegate firewall rule management to an external
+    /// system (issue #563): the listener only accepts TCP REDIRECT'd
+    /// connections and recovers the original destination; no nftables/pf
+    /// rules are installed, probed, or cleaned up. Default `true`.
+    pub fn with_firewall(mut self, enabled: bool) -> Self {
+        self.firewall = enabled;
         self
     }
 
@@ -94,13 +109,44 @@ impl TProxyListener {
         self,
         listener: TcpListener,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Collect upstream proxy server IPs for firewall bypass
-        let bypass_ips = collect_proxy_server_ips(&self.tunnel);
-
         let bound_addr = listener.local_addr().unwrap_or(self.listen_addr);
 
-        // Set up firewall redirect rules (tears down on drop)
-        let _firewall = FirewallGuard::setup(bound_addr.port(), self.routing_mark, &bypass_ips)?;
+        // Set up firewall redirect rules (tears down on drop) — skipped
+        // entirely under external firewall management: no bypass-IP
+        // collection, no nft/pfctl invocation, no cleanup ownership
+        // (issue #563). An externally-managed listener without rules in
+        // place accepts nothing; that is the deployer's contract.
+        //
+        // `FirewallGuard::setup` doubles as the unsupported-platform gate —
+        // `firewall: false` must not smuggle a dead listener onto a platform
+        // where orig-dest recovery cannot work, so keep the gate explicit.
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        if !self.firewall {
+            return Err("transparent proxy is not supported on this platform".into());
+        }
+
+        let _firewall = if self.firewall {
+            let bypass_ips = collect_proxy_server_ips(&self.tunnel);
+            Some(
+                FirewallGuard::setup(bound_addr.port(), self.routing_mark, &bypass_ips).map_err(
+                    |e| -> Box<dyn std::error::Error + Send + Sync> {
+                        // `firewall: false` is only a remedy where orig-dest
+                        // recovery can work — on other platforms the external
+                        // gate above refuses too, so don't send users down a
+                        // dead end.
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
+                        let e = format!(
+                            "{e} — to manage firewall rules externally (no nft/pfctl \
+                             required), declare this listener under `listeners:` \
+                             with `firewall: false`"
+                        );
+                        e.into()
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
 
         if self.max_connections == 0 {
             info!(
@@ -114,18 +160,31 @@ impl TProxyListener {
             );
         }
 
+        if !self.firewall {
+            info!(
+                "TProxy listener '{}': external firewall management — no rules \
+                 installed or cleaned up; TCP REDIRECT (and loop-prevention \
+                 bypass) is the deployer's responsibility",
+                self.name
+            );
+        }
+
         // Scope decision for the pf path (#248): the managed ruleset
         // intercepts loopback-traversing IPv4 TCP only; steering real
         // outbound (en0) traffic stays a manual, documented pf detour rather
         // than something meow rewrites the host's pf config for. Surface that
         // at startup so "tproxy is on but my browser isn't proxied" is
-        // explained by the log, not a silent surprise.
+        // explained by the log, not a silent surprise. Under external
+        // management meow's ruleset isn't installed — the deployer's rules
+        // decide the scope, so the note would be misleading.
         #[cfg(target_os = "macos")]
-        info!(
-            "TProxy on macOS intercepts loopback IPv4 TCP only; real outbound \
-             traffic needs the manual route-to detour (docs/tproxy-macos.md) — \
-             for full transparent proxying use the TUN inbound (docs/tun.md)"
-        );
+        if self.firewall {
+            info!(
+                "TProxy on macOS intercepts loopback IPv4 TCP only; real outbound \
+                 traffic needs the manual route-to detour (docs/tproxy-macos.md) — \
+                 for full transparent proxying use the TUN inbound (docs/tun.md)"
+            );
+        }
 
         let tunnel = self.tunnel;
         let sniffer = self.sniffer;
@@ -593,6 +652,83 @@ mod tests {
             max_observed.load(Ordering::SeqCst),
             CLIENTS,
             "max_connections=0 must allow more concurrent handlers than any small cap"
+        );
+    }
+
+    /// Issue #563: `firewall: false` delegates rule management to an
+    /// external system — `run_on` must bind, accept, and stay up without
+    /// invoking nftables/pfctl. The managed path needs privileges a test
+    /// environment does not have, so this test pins the externally-managed
+    /// contract: no early error return from `FirewallGuard::setup`, and
+    /// client connects still reach the accept loop.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn run_on_external_firewall_accepts_without_setup() {
+        let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let tunnel = meow_tunnel::Tunnel::new(resolver);
+
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+
+        let listener = TProxyListener::new(tunnel, addr, false, None, "ext-fw".to_string())
+            .with_firewall(false);
+        let mut task = tokio::spawn(listener.run_on(socket));
+
+        // A client connect must be accepted — the accept loop runs without
+        // any firewall tooling being invoked. The connection itself is then
+        // closed by the handler (no REDIRECT metadata to recover), which is
+        // irrelevant here.
+        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr))
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+
+        // The listener must still be running — if firewall setup had been
+        // attempted it would have returned an error on this unprivileged
+        // host before the accept loop started. Waiting out the timeout means
+        // the task stayed alive; finishing means an early error return.
+        match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
+            Err(_) => {}
+            Ok(res) => panic!("firewall: false listener exited early: {res:?}"),
+        }
+        task.abort();
+    }
+
+    /// The inverse contract on platforms without orig-dest recovery:
+    /// `firewall: false` must not smuggle a dead listener up — `run_on`
+    /// refuses before accepting (issue #563).
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[tokio::test]
+    async fn run_on_external_firewall_errors_on_unsupported_platform() {
+        let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let tunnel = meow_tunnel::Tunnel::new(resolver);
+
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+
+        let listener = TProxyListener::new(tunnel, addr, false, None, "ext-fw".to_string())
+            .with_firewall(false);
+        let err = listener
+            .run_on(socket)
+            .await
+            .expect_err("external management must refuse on this platform");
+        assert!(
+            err.to_string().contains("not supported"),
+            "unexpected error: {err}"
         );
     }
 

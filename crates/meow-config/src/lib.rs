@@ -142,8 +142,13 @@ pub enum ListenerSpec {
     Socks5,
     /// Transparent-proxy listener; `sni` is the per-listener override of the
     /// global `tproxy-sni` sniffer default (resolved at config-build time).
+    /// `firewall` (default `true`) selects whether meow installs and owns the
+    /// platform firewall rules; `false` delegates rule management to an
+    /// external system (issue #563).
     TProxy {
         sni: bool,
+        #[serde(default = "default_tproxy_firewall")]
+        firewall: bool,
     },
     /// Shadowsocks encrypted-server inbound. The listener terminates SS
     /// encryption (TCP stream cipher / AEAD, UDP relay), reads the SOCKS
@@ -168,6 +173,12 @@ pub struct SsListenerConfig {
 }
 
 fn default_ss_udp() -> bool {
+    true
+}
+
+/// `ListenerSpec::TProxy::firewall` serde default: managed firewall rules
+/// stay on when a persisted spec predates the field (issue #563).
+fn default_tproxy_firewall() -> bool {
     true
 }
 
@@ -2997,15 +3008,18 @@ pub(crate) fn resolve_listener_bind(
 /// Parse `type:` string from a `listeners:` entry into a `ListenerSpec`.
 /// Hard errors on unknown types (Class A per ADR-0002).
 ///
-/// `per_listener_sni` / `global_tproxy_sni` are folded into the `TProxy`
-/// variant here so the returned spec is always complete — callers never
-/// need to overwrite a placeholder `sni` value. Both parameters are ignored
-/// for non-TProxy types. `Shadowsocks` returns a placeholder spec;
-/// `build_named_listeners` completes it via `build_ss_listener_spec`.
+/// `per_listener_sni` / `global_tproxy_sni` / `per_listener_firewall` are
+/// folded into the `TProxy` variant here so the returned spec is always
+/// complete — callers never need to overwrite a placeholder value. All
+/// three are ignored for non-TProxy types; only `firewall` misuse is
+/// diagnosed by the caller (which has the listener name in scope).
+/// `Shadowsocks` returns a placeholder spec; `build_named_listeners`
+/// completes it via `build_ss_listener_spec`.
 fn parse_listener_spec(
     s: &str,
     per_listener_sni: Option<bool>,
     global_tproxy_sni: bool,
+    per_listener_firewall: Option<bool>,
 ) -> Result<ListenerSpec, anyhow::Error> {
     match s.to_lowercase().as_str() {
         "mixed" => Ok(ListenerSpec::Mixed),
@@ -3013,6 +3027,7 @@ fn parse_listener_spec(
         "socks5" => Ok(ListenerSpec::Socks5),
         "tproxy" => Ok(ListenerSpec::TProxy {
             sni: per_listener_sni.unwrap_or(global_tproxy_sni),
+            firewall: per_listener_firewall.unwrap_or_else(default_tproxy_firewall),
         }),
         "shadowsocks" | "ss" => Ok(ListenerSpec::Shadowsocks(SsListenerConfig {
             cipher: String::new(),
@@ -3170,6 +3185,10 @@ fn build_named_listeners(
             "tproxy",
             ListenerSpec::TProxy {
                 sni: global_tproxy_sni,
+                // The shorthand keeps the managed-firewall default (issue
+                // #563): external management is an explicit `listeners:`
+                // opt-in only.
+                firewall: true,
             },
             port,
             "127.0.0.1",
@@ -3179,7 +3198,19 @@ fn build_named_listeners(
 
     // Explicit `listeners:` entries
     for raw_l in raw.listeners.as_deref().unwrap_or(&[]) {
-        let spec = parse_listener_spec(&raw_l.listener_type, raw_l.tproxy_sni, global_tproxy_sni)?;
+        let spec = parse_listener_spec(
+            &raw_l.listener_type,
+            raw_l.tproxy_sni,
+            global_tproxy_sni,
+            raw_l.firewall,
+        )?;
+        if raw_l.firewall.is_some() && !matches!(spec, ListenerSpec::TProxy { .. }) {
+            warn!(
+                "listeners[{}].firewall: only meaningful on `type: tproxy`, ignored; \
+                 remove it to suppress this warning",
+                raw_l.name
+            );
+        }
         let listen_raw = raw_l.listen.as_deref().unwrap_or({
             if matches!(spec, ListenerSpec::TProxy { .. }) {
                 "127.0.0.1"
