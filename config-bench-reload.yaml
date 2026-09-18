@@ -1,0 +1,64 @@
+# Config-reload benchmark (#558): the proxy runs with external-controller
+# enabled so meow-bench's `reload` workload can PUT /configs while echo
+# load runs.  Port must match `--api-port` (default 17892).
+#
+# The proxy/rule set is deliberately non-trivial so each reload pays a
+# representative parse → build → commit cost instead of rebuilding an
+# empty routing table.  `mode: rule` is required: the workload's
+# datapath verification relies on the `DST-PORT,17895` rule — the harness
+# PUTs a generated variant that flips its target to REJECT and checks the
+# probe actually refuses (proving a commit reached the datapath, not just
+# returned 204).  Load traffic to the ephemeral echo port falls through
+# to MATCH → bench-direct, identical to `mode: direct` for this run.
+mixed-port: 17890
+allow-lan: false
+bind-address: "127.0.0.1"
+mode: rule
+log-level: warning
+ipv6: false
+max-connections: 0
+external-controller: 127.0.0.1:17892
+
+dns:
+  enable: false
+
+proxies:
+  - name: bench-direct
+    type: direct
+  - name: bench-socks-a
+    type: socks5
+    server: 127.0.0.1
+    port: 11080
+  - name: bench-socks-b
+    type: socks5
+    server: 127.0.0.1
+    port: 11081
+  - name: bench-ss
+    type: ss
+    server: 127.0.0.1
+    port: 11082
+    cipher: aes-128-gcm
+    password: bench-reload
+
+proxy-groups:
+  - name: bench-select
+    type: select
+    proxies:
+      - bench-direct
+      - bench-socks-a
+      - bench-socks-b
+      - bench-ss
+      - REJECT
+
+rules:
+  - DOMAIN-SUFFIX,example.com,bench-select
+  - DOMAIN-SUFFIX,example.org,bench-socks-a
+  - DOMAIN-KEYWORD,bench,bench-socks-b
+  - IP-CIDR,10.0.0.0/8,REJECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,bench-select,no-resolve
+  - DST-PORT,53,bench-direct
+  - DST-PORT,853,bench-direct
+  # Datapath-verification probe rule — the harness PUTs a variant with
+  # this target flipped to REJECT.  Do not reorder/remove it.
+  - DST-PORT,17895,bench-direct
+  - MATCH,bench-direct

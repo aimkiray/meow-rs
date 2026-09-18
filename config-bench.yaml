@@ -4,6 +4,10 @@ bind-address: "127.0.0.1"
 mode: direct
 log-level: warning
 ipv6: false
+# Benchmark workloads deliberately exceed the default 256-conn listener
+# cap (idle-conns holds 10k); 0 disables it so measurements aren't
+# silently clipped by the cap's accept back-pressure.
+max-connections: 0
 
 dns:
   enable: false

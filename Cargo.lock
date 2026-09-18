@@ -2464,8 +2464,10 @@ dependencies = [
  "anyhow",
  "clap",
  "hickory-proto",
+ "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

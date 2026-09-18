@@ -1,0 +1,27 @@
+# Proxied-outbound benchmark config (#558): SOCKS5 → tunnel → real VLESS
+# adapter → sing-box server → echo.  meow-bench generates the matching
+# sing-box server config in-process — port and UUID below must match
+# `VLESS_SERVER_PORT` / `VLESS_SERVER_UUID` in crates/meow-bench/src/main.rs.
+# Plain (TLS-less) VLESS on loopback: the workload measures framing and
+# transport cost, not crypto; sing-box is loopback-only and short-lived.
+mixed-port: 17890
+allow-lan: false
+bind-address: "127.0.0.1"
+mode: rule
+log-level: warning
+ipv6: false
+max-connections: 0
+
+dns:
+  enable: false
+
+proxies:
+  - name: bench-vless
+    type: vless
+    server: 127.0.0.1
+    port: 17893
+    uuid: 9b2e0d8a-0000-4000-8000-00000000b1e5
+    udp: false
+
+rules:
+  - MATCH,bench-vless

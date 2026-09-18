@@ -62,6 +62,19 @@ if [ -z "$GO_BINARY" ]; then
 fi
 export MIHOMO_VERSION="${MIHOMO_VERSION:-}"
 
+# Proxied-outbound workload (#558): needs a sing-box binary as the VLESS
+# server half.  Auto-detect on PATH when unset; SINGBOX_BIN (the smux
+# suite's spelling) is accepted as an alias.  Skip the leg (loudly) when
+# no server binary exists.
+SINGBOX_BINARY="${SINGBOX_BINARY:-${SINGBOX_BIN:-$(command -v sing-box || true)}}"
+PROXIED_ARGS=()
+if [ -n "$SINGBOX_BINARY" ]; then
+    PROXIED_ARGS+=(--proxy-config config-bench-vless.yaml --singbox-binary "$SINGBOX_BINARY")
+    echo "sing-box: $SINGBOX_BINARY — proxied workload enabled"
+else
+    echo "sing-box not found — proxied workload skipped (set SINGBOX_BINARY to enable)"
+fi
+
 echo ""
 echo "=== Binary sizes ==="
 echo "Rust: $(du -h "$RUST_BINARY" | cut -f1)"
@@ -79,7 +92,39 @@ mkdir -p target/bench
     --dns-port 15353 \
     --duration "$DURATION" \
     --output target/bench/results.json \
+    ${PROXIED_ARGS[@]+"${PROXIED_ARGS[@]}"} \
     --markdown
 
+# Standalone legs (#558): the ADR-0011 footprint collectors, then
+# config-reload under live load LAST — a failed reload exits non-zero
+# (a regression signal that must fail the run), and ordering it last
+# keeps the footprint trend points from being skipped on that day.
 echo ""
-echo "Results saved to target/bench/results.json"
+echo "=== Footprint: idle connections ==="
+"$BENCH_BINARY" \
+    --rust-binary "$RUST_BINARY" \
+    --config config-bench.yaml \
+    --only idle \
+    --output target/bench/idle.json
+
+echo ""
+echo "=== Footprint: steady state ==="
+"$BENCH_BINARY" \
+    --rust-binary "$RUST_BINARY" \
+    --config config-bench.yaml \
+    --only steady \
+    --duration "$DURATION" \
+    --output target/bench/steady.json
+
+echo ""
+echo "=== Config-reload workload ==="
+"$BENCH_BINARY" \
+    --rust-binary "$RUST_BINARY" \
+    --only reload \
+    --reload-config config-bench-reload.yaml \
+    --duration "$DURATION" \
+    --reloads 10 \
+    --output target/bench/reload.json
+
+echo ""
+echo "Results saved to target/bench/"

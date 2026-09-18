@@ -77,7 +77,7 @@ The workspace has 14 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md)
 | `meow-config` | YAML configuration parsing into typed structs |
 | `meow-api` | REST API server (Axum) for proxies, rules, connections, configs, traffic, DNS query |
 | `meow-app` | CLI entry point (`main.rs`) — wires config → tunnel → listeners → DNS → API → health checks → subscription refresh |
-| `meow-bench` | Standalone benchmark binary (throughput, latency, connection-rate, DNS, memory, binary-size) |
+| `meow-bench` | Standalone benchmark binary (throughput, latency, connection-rate, DNS, memory, binary-size, config-reload, idle/steady footprint, proxied-outbound via sing-box) |
 
 ### Startup Flow
 

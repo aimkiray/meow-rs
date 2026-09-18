@@ -7,6 +7,7 @@
 ///
 /// This is ADR-0011 measurement M-idle from the footprint baseline spec.
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
@@ -14,8 +15,6 @@ use tokio::io::AsyncWriteExt;
 use crate::bench_memory::measure_rss;
 use crate::socks5_client::socks5_connect;
 
-// Not yet wired into main.rs; infrastructure added for M2 close-summary.
-#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IdleConnsResult {
     /// Number of idle connections successfully established.
@@ -26,8 +25,6 @@ pub struct IdleConnsResult {
     pub bytes_per_idle_conn: f64,
 }
 
-// Not yet wired into main.rs; infrastructure added for M2 close-summary.
-#[allow(dead_code)]
 pub async fn bench_idle_conns(
     proxy: SocketAddr,
     echo: SocketAddr,
@@ -40,12 +37,19 @@ pub async fn bench_idle_conns(
     // Record idle RSS before opening connections.
     let rss_before = measure_rss(proxy_pid)?;
 
-    // Open all connections concurrently.
+    // Open connections with bounded in-flight concurrency and a paced
+    // issue rate: firing all N connects at once overflows the listener's
+    // accept backlog and most attempts are refused before the handshake
+    // even runs.  ~1 ms spacing keeps the issue rate ≈1000 conn/s.
+    let permits = Arc::new(tokio::sync::Semaphore::new(64));
     let mut handles = Vec::with_capacity(n_conns);
     for _ in 0..n_conns {
+        let permits = Arc::clone(&permits);
         handles.push(tokio::spawn(async move {
+            let _permit = permits.acquire().await.ok()?;
             socks5_connect(proxy, echo).await.ok()
         }));
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
     // Collect live streams; count successes.

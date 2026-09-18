@@ -38,7 +38,7 @@ The questions the harness alone cannot answer:
 The harness is the *instrument*; this ADR is the *protocol*. Once settled,
 Task #26 (qa baseline + perf-regression guardrail) and Task #27
 (engineer-a perf-measurement lane) execute against it, and team-lead can
-decide M2 exit from a single `bench/results.json` diff.
+decide M2 exit from a single `target/bench/results.json` diff.
 
 ## Decision
 

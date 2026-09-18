@@ -46,8 +46,15 @@ pub struct BenchMeta {
 #[derive(Debug, serde::Serialize)]
 pub struct ComparisonReport {
     pub meta: BenchMeta,
-    pub rust: BenchmarkResults,
+    /// `None` on a `--only proxied` run (the direct leg is skipped).
+    pub rust: Option<BenchmarkResults>,
+    /// W1–W3 through the proxied outbound chain (#558) — present only when
+    /// `--proxy-config` + `--singbox-binary` were provided.
+    pub rust_proxied: Option<BenchmarkResults>,
     pub go: Option<BenchmarkResults>,
+    /// mihomo through the same proxied chain — the YAML shape is shared,
+    /// so `config-bench-vless.yaml` runs on both binaries.
+    pub go_proxied: Option<BenchmarkResults>,
 }
 
 fn fmt_dns_rows(rust: Option<&DnsResult>, go: Option<&DnsResult>) -> String {
@@ -64,6 +71,10 @@ fn fmt_dns_rows(rust: Option<&DnsResult>, go: Option<&DnsResult>) -> String {
         (Some(r), None) => format!(
             "| DNS QPS | N/A | {:.0} | N/A |\n| DNS p99 latency | N/A | {:.0} µs | N/A |\n",
             r.qps, r.p99_us,
+        ),
+        (None, Some(g)) => format!(
+            "| DNS QPS | {:.0} | N/A | N/A |\n| DNS p99 latency | {:.0} µs | N/A | N/A |\n",
+            g.qps, g.p99_us,
         ),
         _ => String::new(),
     }
@@ -120,8 +131,9 @@ fn fmt_meta_line(meta: &BenchMeta) -> String {
     format!("meow-rs {tested}{sha}{rustc}{mihomo}")
 }
 
-pub fn render_markdown(report: &ComparisonReport) -> String {
-    let r = &report.rust;
+/// One per-leg table: `rust` (or the single side) vs optional `go`.
+/// `heading` distinguishes the direct path from a proxied chain.
+fn render_leg(r: &BenchmarkResults, g: Option<&BenchmarkResults>, heading: &str) -> String {
     // `None` when a `--only` run skipped throughput entirely.
     let headline_tp = r
         .throughput
@@ -136,7 +148,7 @@ pub fn render_markdown(report: &ComparisonReport) -> String {
     let lat_p99 = r.latency.as_ref().map(|l| l.p99_us);
     let cr = r.conn_rate.as_ref().map(|c| c.connections_per_sec);
 
-    if let Some(g) = &report.go {
+    if let Some(g) = g {
         let go_tp = g
             .throughput
             .iter()
@@ -156,11 +168,7 @@ pub fn render_markdown(report: &ComparisonReport) -> String {
         };
 
         format!(
-            r#"## Benchmarks
-
-Measured on {}, loopback (`127.0.0.1`). Both binaries use identical config (`mode: direct`, SOCKS5 listener). Run with `bash bench.sh`.
-
-{}
+            r#"{heading}
 
 | Metric | mihomo (Go) | meow-rs | Delta |
 |--------|-------------|-------------|-------|
@@ -172,8 +180,6 @@ Measured on {}, loopback (`127.0.0.1`). Both binaries use identical config (`mod
 | Latency p99 | {} | {} | {} |
 | Connections/sec | {} | {} | {} |
 {}"#,
-            report.meta.platform,
-            fmt_meta_line(&report.meta),
             fmt_bytes(g.binary_size_bytes),
             fmt_bytes(r.binary_size_bytes),
             fmt_delta(
@@ -202,13 +208,8 @@ Measured on {}, loopback (`127.0.0.1`). Both binaries use identical config (`mod
             fmt_dns_rows(r.dns.as_ref(), g.dns.as_ref()),
         )
     } else {
-        // Rust-only results
         format!(
-            r#"## Benchmarks
-
-Measured on {}, loopback (`127.0.0.1`). Config: `mode: direct`, SOCKS5 listener. Run with `bash bench.sh`.
-
-{}
+            r#"{heading}
 
 | Metric | meow-rs |
 |--------|-------------|
@@ -220,8 +221,6 @@ Measured on {}, loopback (`127.0.0.1`). Config: `mode: direct`, SOCKS5 listener.
 | Latency p99 | {} |
 | Connections/sec | {} |
 {}"#,
-            report.meta.platform,
-            fmt_meta_line(&report.meta),
             fmt_bytes(r.binary_size_bytes),
             fmt_bytes(r.rss_idle_bytes),
             fmt_bytes(r.rss_load_bytes),
@@ -232,4 +231,27 @@ Measured on {}, loopback (`127.0.0.1`). Config: `mode: direct`, SOCKS5 listener.
             fmt_dns_rows_rust_only(r.dns.as_ref()),
         )
     }
+}
+
+pub fn render_markdown(report: &ComparisonReport) -> String {
+    let mut out = format!(
+        "## Benchmarks\n\nMeasured on {}, loopback (`127.0.0.1`). Run with `bash bench.sh`.\n\n{}\n",
+        report.meta.platform,
+        fmt_meta_line(&report.meta),
+    );
+    if let Some(r) = &report.rust {
+        out.push_str(&render_leg(
+            r,
+            report.go.as_ref(),
+            "### Direct (`mode: direct`, SOCKS5 listener)",
+        ));
+    }
+    if let Some(r) = &report.rust_proxied {
+        out.push_str(&render_leg(
+            r,
+            report.go_proxied.as_ref(),
+            "### Proxied (SOCKS5 → VLESS adapter → sing-box → echo)",
+        ));
+    }
+    out
 }

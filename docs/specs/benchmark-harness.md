@@ -14,6 +14,7 @@ The bench infrastructure is partially implemented:
 - `crates/meow-bench/` — standalone binary that runs both implementations
 - `bench.sh` — orchestration script: builds both binaries, downloads Go mihomo via
   `gh release download`, runs `meow-bench`, writes `target/bench/results.json`
+  plus `reload.json`/`idle.json`/`steady.json` for the #558 standalone legs
 - `config-bench.yaml` — shared workload config
 
 **What is missing:**
@@ -94,7 +95,7 @@ criterion_group!(benches, udp_fastpath);
 ### M2.B-1
 - [ ] Create `docs/benchmarks/methodology.md`.
 - [ ] Run `bench.sh` on reference machine; save output to `docs/benchmarks/baseline-YYYY-MM-DD.json`.
-- [ ] Add `.github/workflows/bench.yml` (workflow_dispatch, bench job, artifact upload).
+- [ ] Add a benchmark workflow (workflow_dispatch, bench job, artifact upload) — done as `bench-daily.yml`.
 - [ ] Commit both files.
 
 ### M2.B-2

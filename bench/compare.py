@@ -56,12 +56,13 @@ def get_throughput(rust_obj, label):
     return None
 
 
-def load_baseline_rust(baseline, current_path=None):
-    """Return the `rust` object to compare `current` against."""
+def load_baseline_rust(baseline, current_path=None, key="rust"):
+    """Return the baseline object (``rust`` / ``rust_proxied``) to compare
+    ``current[key]`` against."""
     p = Path(baseline)
     if not p.is_dir():
         with open(p) as f:
-            return json.load(f).get("rust", {})
+            return json.load(f).get(key, {})
 
     current_resolved = Path(current_path).resolve() if current_path else None
     rusts = []
@@ -79,7 +80,7 @@ def load_baseline_rust(baseline, current_path=None):
             continue
         if not isinstance(doc, dict):
             continue
-        rust = doc.get("rust")
+        rust = doc.get(key)
         if isinstance(rust, dict) and rust:
             rusts.append(rust)
             files.append(f)
@@ -112,38 +113,50 @@ def load_baseline_rust(baseline, current_path=None):
     return base
 
 
-def compare(baseline_path, current_path, threshold):
-    base_rust = load_baseline_rust(baseline_path, current_path)
-    with open(current_path) as f:
-        current = json.load(f)
-    curr_rust = current.get("rust", {})
-
-    regressions = []
-    rows = []
-
+def compare_leg(base_obj, curr_obj, prefix, threshold, rows, regressions):
+    """Append one leg's metric rows; `prefix` labels proxied vs direct."""
     for path, label, higher_is_better in METRICS:
-        base_val = get_nested(base_rust, path)
-        curr_val = get_nested(curr_rust, path)
+        base_val = get_nested(base_obj, path)
+        curr_val = get_nested(curr_obj, path)
         if base_val is None or curr_val is None or base_val == 0:
             continue
 
         delta = (curr_val - base_val) / abs(base_val)
         regressed = (delta < -threshold) if higher_is_better else (delta > threshold)
         flag = "REGRESSED" if regressed else "ok"
-        rows.append((label, base_val, curr_val, delta * 100, flag))
+        rows.append((f"{prefix}{label}", base_val, curr_val, delta * 100, flag))
         if regressed:
-            regressions.append(label)
+            regressions.append(f"{prefix}{label}")
 
     # Throughput
-    base_tp = get_throughput(base_rust, THROUGHPUT_LABEL)
-    curr_tp = get_throughput(curr_rust, THROUGHPUT_LABEL)
+    base_tp = get_throughput(base_obj, THROUGHPUT_LABEL)
+    curr_tp = get_throughput(curr_obj, THROUGHPUT_LABEL)
     if base_tp and curr_tp and base_tp != 0:
         delta = (curr_tp - base_tp) / abs(base_tp)
         regressed = delta < -threshold
         flag = "REGRESSED" if regressed else "ok"
-        rows.append((f"throughput {THROUGHPUT_LABEL} (Gbps)", base_tp, curr_tp, delta * 100, flag))
+        rows.append((f"{prefix}throughput {THROUGHPUT_LABEL} (Gbps)", base_tp, curr_tp, delta * 100, flag))
         if regressed:
-            regressions.append(f"throughput {THROUGHPUT_LABEL}")
+            regressions.append(f"{prefix}throughput {THROUGHPUT_LABEL}")
+
+
+def compare(baseline_path, current_path, threshold):
+    with open(current_path) as f:
+        current = json.load(f)
+
+    regressions = []
+    rows = []
+
+    # Direct leg + (when measured) the proxied-outbound leg (#558).
+    for key, prefix in (("rust", ""), ("rust_proxied", "proxied: ")):
+        base_obj = load_baseline_rust(baseline_path, current_path, key=key)
+        curr_obj = current.get(key) or {}
+        before = len(rows)
+        compare_leg(base_obj, curr_obj, prefix, threshold, rows, regressions)
+        if curr_obj and len(rows) == before:
+            print(f"note: '{key}' present in current run but no baseline data — skipped")
+        if not curr_obj and base_obj:
+            print(f"note: '{key}' present in baseline but missing from current run — skipped")
 
     # Print table
     print(f"\n{'Metric':<35} {'Baseline':>12} {'Current':>12} {'Delta':>8}  Status")

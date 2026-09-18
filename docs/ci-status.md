@@ -4,15 +4,14 @@ Last updated: 2026-09-18 (owner: qa)
 
 ## Current CI Pipelines
 
-Ten GitHub Actions workflows live under `.github/workflows/`:
+Nine GitHub Actions workflows live under `.github/workflows/`:
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `test.yml` | `push` / `pull_request` touching code, Cargo files, tests, or workflows | Required build, lint, test, feature, MSRV, macOS, and TProxy gates |
 | `audit.yml` | Weekly cron, lockfile/workflow changes, manual dispatch | RustSec advisory audit |
 | `coverage.yml` | Scheduled/manual coverage run | Workspace coverage signal |
-| `bench.yml` | Manual benchmark dispatch | Ad hoc benchmark artifact generation |
-| `bench-daily.yml` | Scheduled benchmark run | Daily benchmark trend artifact |
+| `bench-daily.yml` | Scheduled/manual benchmark run | Daily benchmark trend artifact |
 | `feature-powerset-daily.yml` | Scheduled feature-matrix run | Deeper cargo-hack feature powersets |
 | `toolchain-drift.yml` | Weekly cron, manual dispatch | Floating-stable lint canary for the `rust-toolchain.toml` pin |
 | `release.yml` | `v*` tags and manual dispatch | Static Linux release artifacts via `cargo-zigbuild` |
@@ -120,7 +119,7 @@ Runs on Ubuntu after `lint`:
 | MSRV | Workspace `rust-version` | Yes |
 | Dependency advisories | `audit.yml` | Yes |
 | Coverage | `coverage.yml` | Scheduled/manual |
-| Benchmarks | `bench.yml`, `bench-daily.yml` | Manual/scheduled |
+| Benchmarks | `bench-daily.yml` | Scheduled/manual |
 | Release artifacts | `release.yml` | Tags/manual |
 
 ## Known Gaps

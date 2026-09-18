@@ -142,6 +142,30 @@ the canonical, in-repo source a release is cut from.
   adapter via its `dialer-proxy` field. Public API signatures changed:
   `parse_rules_full`, `ProxyProvider::new`, `load_proxy_providers`, and
   `rule_provider::load_providers_prefetched`. (#533)
+- **Benchmark coverage for proxied outbound and config-reload paths
+  (#558).** `meow-bench` gains a proxied leg (`--proxy-config` +
+  `--singbox-binary`): W1–W3 (throughput, latency, conn-rate) run through
+  a real VLESS adapter into a spawned sing-box server, reported alongside
+  the direct leg as `rust_proxied`/`go_proxied` and compared by
+  `bench/compare.py`. A standalone config-reload workload
+  (`--only reload`, `--reload-config`, `--api-port`, `--reloads`) holds
+  steady echo load while alternating `PUT /configs` between the config
+  and a generated variant whose probe rule flips to REJECT, then
+  verifies through the datapath that each committed generation actually
+  landed — a rejected reload, a 204 that never reached the listener, or
+  a post-rate far below the pre-reload baseline all exit non-zero. The
+  previously-unwired ADR-0011 footprint collectors are now
+  runnable as `--only idle` (M-idle, N idle conns + RSS) and
+  `--only steady` (M-steady). Harness hardening for conn-heavy runs:
+  `RLIMIT_NOFILE` raised toward the hard limit (children inherit it),
+  pre-flight port-squatter detection, and early-exit checks on every
+  spawned process. `bench.sh` runs all new legs; `bench-daily.yml`
+  installs sing-box, archives the per-leg artifacts, and runs the
+  criterion micro-benches (`--bench`-pinned so the args reach only
+  criterion harnesses). The default perf config now sets
+  `max-connections: 0` so measurements aren't clipped by the 256-conn
+  listener cap. The superseded `bench.yml` workflow and the unused
+  `bench/results/` dir are removed.
 
 ### Changed
 

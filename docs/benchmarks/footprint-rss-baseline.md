@@ -36,7 +36,10 @@ Run duration: 25 seconds (middle-third sampling window: seconds 8–16).
 ### Steady-State Bytes per Connection (M-steady)
 
 Sampled at 1 Hz over the middle third of the run window (seconds 8–16, 8 samples).
-`bytes_per_conn = rss_bytes / concurrency` (concurrency == 64 converges to live connections at steady state).
+`bytes_per_conn = (rss_bytes − idle_rss) / concurrency` — the DELTA over the idle baseline
+(11.4 − 9.2 MB = 2.2 MB / 64 ≈ 35 KB). Absolute `rss_bytes / concurrency` would report
+~180 KB/conn and can never reach the <32 KB target. Since #558 the wired
+`bench_connrate_steady_state` computes exactly this delta.
 
 | Metric | Value |
 |--------|-------|
@@ -55,7 +58,7 @@ The dominant cost is kernel socket buffers, not the Rust struct layout. The M2 s
 (`Metadata` −80–120 B, `ConnectionInfo` −260 B, `UdpSession` −16 B) are expected to reduce the
 struct overhead component but will not substantially move the headline bytes/conn figure.
 
-### Idle Connections (M-idle — N=1000)
+### Idle Connections (M-idle — N=10000)
 
 Measurement infrastructure: `bench_idle_conns` (added in M2 baseline sprint, `crates/meow-bench/src/bench_idle_conns.rs`).
 **Not run at baseline** — requires the bench harness to be wired into `main.rs` fully and a live benchmark run.
@@ -85,7 +88,8 @@ Two new measurement functions were added to `crates/meow-bench/`:
 | Function | File | Purpose |
 |----------|------|---------|
 | `bench_idle_conns` | `bench_idle_conns.rs` | M-idle: hold N connections, sample peak RSS |
-| `bench_connrate_steady_state` | `bench_connrate.rs` | M-steady: sample RSS/conn at 1 Hz over middle window |
+| `bench_connrate_steady_state` | `bench_connrate.rs` | M-steady: sample (RSS − idle baseline)/conn at 1 Hz over middle window |
 
-These are compilable but not yet wired into the benchmark `main.rs` flow as named workloads.
-They will be exercised in the M2 close-summary run.
+Wired as standalone workloads since #558: `meow-bench --only idle` and
+`meow-bench --only steady` (each spawns the proxy on the perf config,
+runs the collector, and prints the metric JSON).
