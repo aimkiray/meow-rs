@@ -53,6 +53,24 @@ the canonical, in-repo source a release is cut from.
   `skip-cert-verify`/`fingerprint` have no effect there), and the cover
   session is torn down quietly rather than completed. (#533)
 
+- **In-process `restls` for Shadowsocks** — `plugin: restls` now runs
+  natively (mihomo `transport/restls` parity). Because restls commits its
+  BLAKE3 authentication tag into the TLS `session_id` — part of the
+  handshake transcript — no generic TLS stack can speak it; the client is
+  implemented at the record level in `meow-transport` (the pattern
+  established by `reality_tls`), driving real TLS 1.3 *and* TLS 1.2
+  handshakes with full certificate-chain, hostname, CertificateVerify and
+  optional SHA-256-pin verification. After the handshake the cover's
+  first encrypted record is unmasked to detect a restls relay; a plain
+  cover falls back to transparent TLS automatically. Data then travels in
+  script-shaped tagged records with per-direction BLAKE3 MACs and rolling
+  counters (`250?100<1,350~100<1,600~100,300~200,300~100` by default).
+  Options mirror upstream: `host`, `password` and `version-hint`
+  (`tls12`/`tls13`) are required, `restls-script`, `skip-cert-verify`,
+  `name-cert-verify` and `fingerprint` (SHA-256 certificate pin) are
+  supported; the upstream `force-tls12` test knob maps to the `tls12`
+  path. UDP relay is unsupported, matching upstream. (#533)
+
 ### Changed
 
 - **BoringSSL is now the only crypto library; rustls is gone from the runtime.**

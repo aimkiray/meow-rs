@@ -62,6 +62,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::record_io::{poll_drain_outbox, serve_pending, RecordAssembler};
 use crate::tls::{ConnectTypedError, TlsLayer};
 use crate::{Result, Stream, TransportError};
 
@@ -74,7 +75,7 @@ const RECORD_HANDSHAKE: u8 = 22;
 const RECORD_APPDATA: u8 = 23;
 const RECORD_ALERT: u8 = 21;
 
-const RECORD_HDR: usize = 5;
+const RECORD_HDR: usize = crate::record_io::RECORD_HDR;
 /// Handshake message types (`record[5]` on a handshake record).
 const HANDSHAKE_CLIENT_HELLO: u8 = 1;
 const HANDSHAKE_SERVER_HELLO: u8 = 2;
@@ -130,153 +131,6 @@ fn xor_in_place(data: &mut [u8], key: &[u8; 32]) {
     for (i, b) in data.iter_mut().enumerate() {
         *b ^= key[i % 32];
     }
-}
-
-/// Incremental TLS-record assembler shared by the handshake shim and the
-/// post-handshake stream wrappers — one copy keeps the framing logic
-/// (header-then-payload reads, read caps at the record boundary, EOF
-/// rules) from drifting between three near-identical copies.
-struct RecordAssembler {
-    /// Bytes accumulated so far for the record under construction.
-    rec: Vec<u8>,
-    /// Byte count that completes the record: `RECORD_HDR` until the
-    /// 5-byte header lands, then `RECORD_HDR + declared_len`.
-    want: usize,
-}
-
-impl RecordAssembler {
-    fn new() -> Self {
-        Self {
-            rec: Vec::new(),
-            want: 0,
-        }
-    }
-
-    /// Read one complete record into `rec`.
-    ///
-    /// `inbox` bytes (shim read-ahead) are consumed before touching
-    /// `inner`.  `header_gate` runs once per record as soon as the header
-    /// completes — *before* the payload is read — so a caller can reject
-    /// a bad record type early, exactly like upstream.
-    ///
-    /// Returns `Some(())` with the record buffered in `rec`, `None` on
-    /// clean EOF at a record boundary (only when `boundary_eof_ok`),
-    /// otherwise `UnexpectedEof`.
-    fn poll_fill(
-        &mut self,
-        inner: &mut dyn Stream,
-        cx: &mut Context<'_>,
-        mut inbox: Option<&mut VecDeque<u8>>,
-        boundary_eof_ok: bool,
-        header_gate: &mut dyn FnMut(&[u8; RECORD_HDR]) -> io::Result<()>,
-    ) -> Poll<io::Result<Option<()>>> {
-        loop {
-            if self.want == 0 {
-                self.want = RECORD_HDR;
-                self.rec.clear();
-            }
-            let mut tmp = [0u8; 8192];
-            while self.rec.len() < self.want {
-                if let Some(inbox) = inbox.as_deref_mut() {
-                    if !inbox.is_empty() {
-                        let take = (self.want - self.rec.len()).min(inbox.len());
-                        let (a, b) = inbox.as_slices();
-                        let from_a = take.min(a.len());
-                        self.rec.extend_from_slice(&a[..from_a]);
-                        if from_a < take {
-                            self.rec.extend_from_slice(&b[..take - from_a]);
-                        }
-                        inbox.drain(..take);
-                        continue;
-                    }
-                }
-                // Cap the read at the record boundary — a bigger slice
-                // would glue head bytes of the *next* record onto this
-                // one and corrupt both parsing and the HMAC chain.
-                let need = (self.want - self.rec.len()).min(8192);
-                let mut rb = ReadBuf::new(&mut tmp[..need]);
-                match Pin::new(&mut *inner).poll_read(cx, &mut rb) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Ok(())) => {
-                        let filled = rb.filled();
-                        if filled.is_empty() {
-                            if boundary_eof_ok && self.rec.is_empty() && self.want == RECORD_HDR {
-                                return Poll::Ready(Ok(None));
-                            }
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "shadow-tls: EOF mid-record",
-                            )));
-                        }
-                        self.rec.extend_from_slice(filled);
-                    }
-                }
-            }
-            if self.want == RECORD_HDR {
-                let mut hdr = [0u8; RECORD_HDR];
-                hdr.copy_from_slice(&self.rec);
-                header_gate(&hdr)?;
-                let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
-                self.want = RECORD_HDR + len;
-                if self.rec.len() < self.want {
-                    continue;
-                }
-                // len == 0 — the header was gated above; the record is
-                // already complete.
-            }
-            self.want = 0;
-            return Poll::Ready(Ok(Some(())));
-        }
-    }
-
-    /// Serve the assembled record's payload (from `*rec_serve`) into
-    /// `buf`; clears `rec` once fully consumed.  Returns false when no
-    /// payload remains — the caller should assemble the next record.
-    fn serve(&mut self, rec_serve: &mut usize, buf: &mut ReadBuf<'_>) -> bool {
-        if *rec_serve == 0 {
-            return false;
-        }
-        if *rec_serve >= self.rec.len() {
-            // A zero-payload record left the cursor armed with nothing
-            // to serve — disarm it, or bytes of the *next* record would
-            // be served as payload as it assembles.
-            *rec_serve = 0;
-            return false;
-        }
-        let n = (self.rec.len() - *rec_serve).min(buf.remaining());
-        buf.put_slice(&self.rec[*rec_serve..*rec_serve + n]);
-        *rec_serve += n;
-        if *rec_serve == self.rec.len() {
-            self.rec.clear();
-            *rec_serve = 0;
-        }
-        true
-    }
-}
-
-/// Drain `outbox` into `inner` — shared by the shim and both stream
-/// wrappers so the write-zero/partial-write rules stay identical.
-fn poll_drain_outbox(
-    inner: &mut dyn Stream,
-    outbox: &mut VecDeque<u8>,
-    cx: &mut Context<'_>,
-) -> Poll<io::Result<()>> {
-    while !outbox.is_empty() {
-        let slice = outbox.make_contiguous();
-        match Pin::new(&mut *inner).poll_write(cx, slice) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(0)) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "shadow-tls: write zero",
-                )));
-            }
-            Poll::Ready(Ok(n)) => outbox.drain(..n),
-        };
-    }
-    Poll::Ready(Ok(()))
 }
 
 /// Dial `inner` through the shadow-tls transport.
@@ -669,7 +523,7 @@ impl HandshakeShim {
         let inner = self.inner.as_mut().expect("shim polled after inner taken");
         match self
             .asm
-            .poll_fill(&mut **inner, cx, None, false, &mut |_| Ok(()))
+            .poll_fill(&mut **inner, cx, None, false, &mut |_| Ok(()), "shadow-tls")
         {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -882,17 +736,18 @@ fn is_server_hello_tls13(record: &[u8]) -> bool {
 /// `HMAC-SHA1(password, hello[..39] || sid[..28] || 0x00000000 || hello[71..])`
 /// — the 4-byte tag slot is zeroed inside the MAC input.
 fn patch_client_hello(record: &mut [u8], password: &[u8]) -> io::Result<[u8; SESSION_ID_LEN]> {
-    if record.len() <= RECORD_HDR
+    if record.len() <= CH_SID_LEN_INDEX
         || record[0] != RECORD_HANDSHAKE
         || record[RECORD_HDR] != HANDSHAKE_CLIENT_HELLO
-        || record.len() < CH_SID_LEN_INDEX + 1 + SESSION_ID_LEN
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "shadow-tls: first client record is not a ClientHello",
         ));
     }
-    if record[CH_SID_LEN_INDEX] as usize != SESSION_ID_LEN {
+    if record[CH_SID_LEN_INDEX] as usize != SESSION_ID_LEN
+        || record.len() < CH_SID_LEN_INDEX + 1 + SESSION_ID_LEN
+    {
         // BoringSSL emits a 32-byte compat session id whenever TLS 1.3 is
         // enabled; a 0 here means max_version pinned the ClientHello to
         // TLS 1.2, which v3 cannot speak.
@@ -923,18 +778,6 @@ fn patch_client_hello(record: &mut [u8], password: &[u8]) -> io::Result<[u8; SES
 
 fn io_err(msg: impl Into<String>) -> io::Error {
     io::Error::other(msg.into())
-}
-
-/// Move up to `buf.remaining()` bytes off `pending` into the read buffer.
-fn serve_pending(pending: &mut VecDeque<u8>, buf: &mut ReadBuf<'_>) {
-    let n = pending.len().min(buf.remaining());
-    let (a, b) = pending.as_slices();
-    let from_a = n.min(a.len());
-    buf.put_slice(&a[..from_a]);
-    if from_a < n {
-        buf.put_slice(&b[..n - from_a]);
-    }
-    pending.drain(..n);
 }
 
 impl AsyncRead for HandshakeShim {
@@ -992,7 +835,7 @@ impl HandshakeShim {
             self.outbox.clear();
             return Poll::Ready(Ok(()));
         };
-        poll_drain_outbox(&mut **inner, &mut self.outbox, cx)
+        poll_drain_outbox(&mut **inner, &mut self.outbox, cx, "shadow-tls")
     }
 }
 
@@ -1112,7 +955,7 @@ impl FramedStream {
     }
 
     fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        poll_drain_outbox(&mut *self.inner, &mut self.outbox, cx)
+        poll_drain_outbox(&mut *self.inner, &mut self.outbox, cx, "shadow-tls")
     }
 
     /// Stage one framed record into the outbox.
@@ -1173,16 +1016,23 @@ impl AsyncRead for FramedStream {
             // Upstream rejects non-appdata as soon as the 5-byte header
             // lands — before any payload is read (the version bytes are
             // deliberately not checked, matching upstream).
-            let ready = asm.poll_fill(&mut **inner, cx, Some(&mut *inbox), true, &mut |hdr| {
-                if hdr[0] == RECORD_APPDATA {
-                    Ok(())
-                } else {
-                    Err(io_err(format!(
-                        "shadow-tls: unexpected TLS record type {}",
-                        hdr[0]
-                    )))
-                }
-            });
+            let ready = asm.poll_fill(
+                &mut **inner,
+                cx,
+                Some(&mut *inbox),
+                true,
+                &mut |hdr| {
+                    if hdr[0] == RECORD_APPDATA {
+                        Ok(())
+                    } else {
+                        Err(io_err(format!(
+                            "shadow-tls: unexpected TLS record type {}",
+                            hdr[0]
+                        )))
+                    }
+                },
+                "shadow-tls",
+            );
             match ready {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -1300,7 +1150,7 @@ impl VerifiedStream {
     }
 
     fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        poll_drain_outbox(&mut *self.inner, &mut self.outbox, cx)
+        poll_drain_outbox(&mut *self.inner, &mut self.outbox, cx, "shadow-tls")
     }
 
     /// Queue a random-payload alert record — upstream `sendAlert` keeps a
@@ -1325,7 +1175,7 @@ impl VerifiedStream {
         msg: impl Into<String>,
     ) -> Poll<io::Result<()>> {
         Self::queue_alert(outbox);
-        let _ = poll_drain_outbox(inner, outbox, cx);
+        let _ = poll_drain_outbox(inner, outbox, cx, "shadow-tls");
         Poll::Ready(Err(io_err(msg)))
     }
 
@@ -1371,7 +1221,7 @@ impl AsyncRead for VerifiedStream {
             if asm.serve(rec_serve, buf) {
                 return Poll::Ready(Ok(()));
             }
-            match asm.poll_fill(&mut **inner, cx, None, true, &mut |_| Ok(())) {
+            match asm.poll_fill(&mut **inner, cx, None, true, &mut |_| Ok(()), "shadow-tls") {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 // Clean close at a record boundary.

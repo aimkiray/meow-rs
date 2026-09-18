@@ -132,7 +132,7 @@ pub fn node_selects_external_plugin(config: &HashMap<String, serde_yaml::Value>)
 /// external SIP003 executable is rejected: that name reaches `Command::new`
 /// during adapter construction, so provider content would select a local
 /// binary (issue #513). Built-in/in-process plugins (`obfs`,
-/// `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`,
+/// `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`,
 /// `ech-tls-tunnel`) stay allowed — mihomo
 /// implements those in-process too, so gating them would diverge.
 pub fn parse_proxy_provider_node(
@@ -3039,6 +3039,38 @@ tls: true
             panic!("version=9 must reach the shadow-tls parser and fail");
         };
         assert!(err.contains("version"), "msg: {err}");
+    }
+
+    /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
+    /// the in-process restls parser → adapter construction.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn test_restls_node_parse_e2e() {
+        let cfg = proxy_config(
+            "name: restls\ntype: ss\nserver: 1.2.3.4\nport: 8388\n\
+             cipher: aes-256-gcm\npassword: pw\n\
+             plugin: restls\nplugin-opts:\n  host: cover.example.com\n  \
+             password: psk\n  version-hint: tls13\n  \
+             restls-script: '250?100<1'\n",
+        );
+        let adapter = parse_proxy(&cfg).expect("restls node must parse");
+        assert_eq!(adapter.name(), "restls");
+        assert!(
+            !is_external_sip003_plugin(Some("restls")),
+            "provider/subscription path must treat restls as built-in"
+        );
+
+        // A missing required opt proves the serialized string reached the
+        // restls parser — a misrouted plugin would parse as a no-op.
+        let cfg = proxy_config(
+            "name: restls\ntype: ss\nserver: 1.2.3.4\nport: 8388\n\
+             cipher: aes-256-gcm\npassword: pw\n\
+             plugin: restls\nplugin-opts:\n  host: cover.example.com\n  password: psk\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("missing version-hint must reach the restls parser and fail");
+        };
+        assert!(err.contains("version-hint"), "msg: {err}");
     }
 
     // ─── direct proxy with per-proxy DNS (issue #67) ─────────────────────────

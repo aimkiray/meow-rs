@@ -58,7 +58,9 @@ Out of scope (deferred per ADR-0001 §Open questions):
 - **Server-side `Transport::accept`.** Client-only trait in M1. Any
   VMess/VLESS spec that tries to introduce inbound listener code is a
   scope bug and must be bounced back.
-- **Reality, ShadowTLS, SMUX / mux, restls.** Separate future ADRs.
+- **Reality, SMUX / mux.** Separate future ADRs. (`shadow-tls` and `restls`
+  have since landed as SIP003 plugin transports: `meow-transport` owns the
+  record-level protocol, `meow-proxy` owns the plugin option surface.)
 - **uTLS full fingerprint spoofing.** We accept a
   `client-fingerprint:` YAML key but stub it to a no-op with a
   `tracing::warn!` at startup if set. Surface the warning exactly
@@ -536,8 +538,9 @@ own binary so they can be filtered individually.
 
 - Do not add a `Transport::accept` method. Server-side is a separate
   ADR, not a spec revision.
-- Do not add `shadowtls`, `reality`, `restls`, `smux`, or any layer
-  not listed in ADR-0001 §3.
+- Do not add `reality`, `smux`, or any layer not listed in ADR-0001 §3.
+  (`shadow-tls` and `restls` were added later as SIP003 plugin transports
+  — new layers still need an ADR.)
 - Do not route YAML parsing through `meow-transport`. Config lives
   in `meow-config` and hands pre-built structs across the crate
   boundary.

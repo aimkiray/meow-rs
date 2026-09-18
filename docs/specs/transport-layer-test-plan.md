@@ -30,8 +30,10 @@ test cases** — flag the discrepancy so the spec can be updated.
   server must put the server code in `tests/support/` and name it
   clearly (e.g. `tests/support/loopback.rs`) so the grep-check can
   whitelist `tests/**`.
-- Reality / ShadowTLS / restls / SMUX / mux — not in this spec, not in
-  this plan. If engineer asks about them, bounce to architect.
+- Reality / SMUX / mux — not in this spec, not in this plan. ShadowTLS
+  and restls have since landed (`shadow_tls.rs`, `restls/`); their tests
+  live beside them rather than in this plan. If engineer asks about the
+  remaining items, bounce to architect.
 - Server-side `Transport::accept` trait method. If it appears in any
   M1.A PR, fail the review.
 - Touching `crates/meow-proxy/src/simple_obfs.rs`. Any diff against
@@ -233,7 +235,9 @@ it pass") are scope bugs.
 - **Server-side `Transport::accept`** — future ADR.
 - **uTLS fingerprint spoofing handshake bytes** — we accept the knob
   and warn; no test asserts handshake shape.
-- **Reality / ShadowTLS / SMUX / restls** — future ADRs.
+- **Reality / SMUX / mux** — future ADRs. (ShadowTLS and restls landed
+  as SIP003 transports; their wire formats are documented in their module
+  docs and exercised by `shadow_tls_test` / `restls_e2e`.)
 - **Performance benchmarks** — M2 owns.
 - **Cross-layer stacking beyond the existing pairs** — only `tls+ws` and
   the gun stack are exercised. If VMess/VLESS specs later introduce

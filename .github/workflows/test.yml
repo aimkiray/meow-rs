@@ -172,6 +172,7 @@ jobs:
             --test v2ray_plugin_integration \
             --test gost_plugin_integration \
             --test shadow_tls_test \
+            --test restls_e2e \
             --test pre_resolve_test \
             --test tls_test \
             --test ws_test \

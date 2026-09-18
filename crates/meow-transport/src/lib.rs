@@ -52,11 +52,23 @@ pub mod httpupgrade;
 #[cfg(feature = "xhttp")]
 pub mod xhttp;
 
+/// Shared TLS-record assembly / outbox machinery for the record-framed
+/// SIP003 transports (`shadow_tls`, `restls`).
+#[cfg(any(feature = "shadow-tls", feature = "restls"))]
+mod record_io;
+
 /// shadow-tls client transport (v1/v2/v3) — real cover TLS handshake over
 /// a sniffer/patcher shim, then record-framed data.  Used by the
 /// `shadow-tls` Shadowsocks plugin in `meow-proxy`.
 #[cfg(feature = "shadow-tls")]
 pub mod shadow_tls;
+
+/// restls client transport — a record-level TLS client whose session_id
+/// authenticates the restls relay; post-handshake data rides tagged
+/// records shaped by the record script.  Used by the `restls`
+/// Shadowsocks plugin in `meow-proxy`.
+#[cfg(feature = "restls")]
+pub mod restls;
 
 /// SIP004 simple-obfs HTTP/TLS obfuscation codec (client +, later, server).
 /// Gated by the `simple-obfs` feature; see [`simple_obfs::client`] for the

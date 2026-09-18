@@ -151,7 +151,7 @@ cargo test --lib --bin meow \
   --test config_persistence_test --test systemd_config_test \
   --test trojan_integration --test vless_config_test --test vless_integration \
   --test v2ray_plugin_integration --test gost_plugin_integration \
-  --test shadow_tls_test --test pre_resolve_test \
+  --test shadow_tls_test --test restls_e2e --test pre_resolve_test \
   --test tls_test --test ws_test --test crate_invariants_test \
   --test crate_publish_metadata_test \
   --test smux_singbox_integration

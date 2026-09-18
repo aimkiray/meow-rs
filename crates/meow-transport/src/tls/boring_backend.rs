@@ -273,7 +273,7 @@ fn resolve_fingerprint(fp: &str) -> Option<&'static FingerprintParams> {
 /// the certs are.)
 static BORING_ROOTS: OnceLock<Vec<boring::x509::X509>> = OnceLock::new();
 
-fn boring_roots() -> &'static [boring::x509::X509] {
+pub(crate) fn boring_roots() -> &'static [boring::x509::X509] {
     BORING_ROOTS.get_or_init(|| {
         webpki_root_certs::TLS_SERVER_ROOT_CERTS
             .iter()
@@ -287,7 +287,9 @@ fn boring_roots() -> &'static [boring::x509::X509] {
 
 /// Build a fresh Mozilla-roots `X509StoreBuilder`, optionally seeded with extra
 /// DER roots. Called once per distinct connector cache key, not per proxy.
-fn build_root_store(additional_roots: &[Vec<u8>]) -> Result<boring::x509::store::X509StoreBuilder> {
+pub(crate) fn build_root_store(
+    additional_roots: &[Vec<u8>],
+) -> Result<boring::x509::store::X509StoreBuilder> {
     let mut builder = boring::x509::store::X509StoreBuilder::new()
         .map_err(|e| TransportError::Config(format!("X509StoreBuilder::new: {e}")))?;
     for cert in boring_roots() {

@@ -25,6 +25,8 @@ pub mod gost_plugin;
 #[cfg(feature = "ss")]
 mod plugin_util;
 #[cfg(feature = "ss")]
+pub mod restls_plugin;
+#[cfg(feature = "ss")]
 pub mod shadow_tls_plugin;
 #[cfg(feature = "ss")]
 pub mod shadowsocks_adapter;

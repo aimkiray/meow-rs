@@ -47,7 +47,7 @@ use tracing::warn;
 
 use crate::{Result, Stream, Transport, TransportError};
 
-mod boring_backend;
+pub(crate) mod boring_backend;
 
 use boring_backend::{BoringInner, LazyBoringInner};
 
