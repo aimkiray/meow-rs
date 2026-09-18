@@ -301,7 +301,7 @@ These surfaced during the audit and warrant engineer follow-up even before new f
 2. **API auth bypass**: `AppState.secret` carries `#[allow(dead_code)]` — the REST API is unauthenticated even when `secret` is configured. Security regression vs upstream.
 3. **`RuleMatchHelper.find_process`**: `Box<dyn Fn()>` with no arguments, no return value. Process-name matching silently does nothing. Either wire up real platform lookup (netlink on Linux, `libproc` on macOS) or surface an error for `PROCESS-NAME` rules.
 4. **GEOIP parser gap**: `parse_rule` returns an error for `GEOIP`. Users who put GEOIP rules in YAML will get config-load failures. Shared `Arc<MaxMindDB>` needs to be threaded through the parser, not bolted on separately.
-5. **Rule-providers `interval`**: accepted and ignored. Either drop from schema or implement periodic refresh.
+5. **Rule-providers `interval`**: implemented for HTTP providers since M1.D-5 (background refresh task); ignored with a warning for `file` providers and rejected for `inline`.
 6. **Hosts trie**: allocated in `Resolver::new` but never populated from config.
 7. **In-flight dedup**: allocated but unused (`#[allow(dead_code)]`).
 8. **Logic rules reachability**: `meow-rules/src/logic.rs` exists but `parser.rs` never dispatches `AND/OR/NOT` — verify whether logic rules can be loaded from YAML at all.

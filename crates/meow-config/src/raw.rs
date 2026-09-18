@@ -489,8 +489,10 @@ pub struct RawHealthCheck {
 
 /// A single entry in the top-level `rule-providers:` map.
 ///
-/// `interval` is accepted for upstream-config compatibility but is currently
-/// ignored — providers are loaded exactly once at startup.
+/// `interval` is the refresh period in seconds for HTTP providers (0 =
+/// loaded once at startup); ignored (warn) for `file` providers and
+/// rejected — provider fails to load, fatal under `strict: true` — for
+/// `inline` providers.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawRuleProvider {

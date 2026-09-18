@@ -40,6 +40,7 @@ Use it as a pre-flight check.
 | `rules` | list | — | Routing rules — [Rules](./rules) |
 | `rule-providers` | map | — | External rule sets — [Providers](./providers) |
 | `sub-rules` | map | — | Named rule blocks referenced by `SUB-RULE` |
+| `subscriptions` | list | — | Remote Clash configs applied wholesale — [Subscriptions](#subscriptions) |
 | `dns` | block | — | DNS resolver/server config — [DNS](./dns) |
 | `sniffer` | block | — | Domain sniffing config — [Sniffer](./sniffer) |
 | `listeners` | list | — | Explicit named listeners — [Listeners](./listeners) |
@@ -83,6 +84,79 @@ hosts:
   example.com: [10.0.0.1, 10.0.0.2]
   "+.internal.corp": 10.0.0.254
 ```
+
+## Subscriptions
+
+`subscriptions` declares named remote Clash-format configs to pull on a
+schedule:
+
+```yaml
+subscriptions:
+  - name: airport
+    url: https://example.com/clash.yaml
+    interval: 86400 # seconds; omit to fetch once at startup
+```
+
+Each entry takes `name`, `url`, `interval` (seconds, optional), and
+`last-updated` (a unix timestamp the daemon writes back itself — not meant
+to be set by hand). The semantics differ sharply from `proxy-providers`:
+
+- **Wholesale replace, not merge.** A refresh replaces the entire
+  `proxies:`, `proxy-groups:`, and `rules:` sections with the fetched
+  document's — local entries in those sections are overwritten. Everything
+  else (`dns:`, `mode:`, listeners, `proxy-providers:`…) is untouched —
+  and `use:`/`include-all` groups keep resolving against the declared
+  `proxy-providers:` on scheduled refreshes too.
+- **The config file is rewritten.** After a successful fetch and rebuild
+  the daemon saves the resulting config — fetched sections plus the
+  `last-updated` stamp — back to disk, so subscription data survives
+  restarts. The save re-serialises the whole file: hand-written comments,
+  formatting, and keys meow-rs does not model are lost (the previous file
+  is kept once as `<config>.bak`). The save writes the daemon's
+  **in-memory** config, so it also persists runtime mutations made through
+  the API (e.g. `PATCH /configs`) — and conversely, hand-edits made to the
+  file while the daemon runs are clobbered by the next save. If the file
+  is not writable the refresh still applies at runtime but persists
+  nothing; if the committed `dns:` section fails to rebuild, the refresh
+  is not committed at all — the previous routing stays live and nothing
+  is saved.
+- **Refetch cadence.** A background task polls every 60 s: an entry is
+  fetched when it has no `last-updated` (first run) or when `interval`
+  seconds have elapsed. An entry without `interval` fetches once at
+  startup and — once a fetch succeeds — never again; a fetch that keeps
+  failing is retried every poll. Note that an explicit `interval: 0`
+  behaves differently than on providers: it refetches every poll
+  (60 s), not "never". Fetches go over a direct connection, not
+  through the tunnel.
+- **One subscription at a time.** Every entry wholesale-replaces the
+  same three sections, so multiple subscriptions perpetually clobber
+  each other — last refresh wins. Declaring several is almost never
+  what you want.
+- **Only three sections are taken from the remote document.** A remote
+  `dns:`, `proxy-providers:`, `sub-rules:`, listener or `mode:` setting
+  is ignored — only `proxies`, `proxy-groups`, and `rules` are applied.
+  A document missing `proxy-groups:`/`rules:` *empties* those sections;
+  missing `proxies:` is a fetch error instead.
+- **`-t` does not fetch subscriptions.** Config-test mode validates the
+  file exactly as written — including whatever a previous refresh wrote
+  back — and exits before the refresh loop starts. (It is not fully
+  network-free: `load_config` still fetches `proxy-providers:`,
+  prefetches `rule-providers:` payloads, and may download geodata.)
+- **Safety.** `ss` nodes carrying external SIP003 `plugin:` values are
+  dropped at parse time: remote content must not select a local
+  executable, and unlike `proxy-providers` there is no
+  `allow-external-plugin` opt-in for subscriptions. If a fetch fails,
+  the entry is retried on the next poll; if a fetched document fails to
+  rebuild, the previous routing stays live and `last-updated` is still
+  stamped, so a broken document is only retried after `interval`. Under
+  `strict: true`, payload *shape* defects (a non-mapping `proxies:`
+  entry, a malformed `proxy-groups:`/`rules:` item) are fetch errors
+  instead — retried every poll.
+
+Subscriptions can also be managed at runtime via the
+[REST API](../reference/rest-api) (`GET`/`POST`/`DELETE` `/api/subscriptions`,
+`POST /api/subscriptions/{name}/refresh`); those endpoints follow the same
+replace-and-write-back semantics.
 
 ## A complete example
 
@@ -161,8 +235,11 @@ defect. The same applies to `rule-providers:`: a definition defect or an unparse
 acquired payload is fatal under strict, while a failed download is not.
 
 Two scope notes: `PUT /configs` rebuilds apply strictness to the candidate's
-`proxies:`/`proxy-groups:`/`rules:`/`rule-providers:` — `proxy-providers:` objects are
-constructed at startup and are not re-validated on PUT (their `strict` flag is the
-startup one). And `strict: true` combined with `subscriptions:` means a subscription
-delivering an unparseable node makes every refresh rebuild fail — the previous config is
-kept, but check subscription contents before enabling strict.
+`proxies:`/`proxy-groups:`/`rules:`/`rule-providers:`/`proxy-providers:` —
+unchanged provider defs are reused unvalidated, but new or changed defs are
+constructed (and validated) on PUT, and every committed provider adopts the
+candidate's `strict` flag. A provider's already-fetched *payload* is not
+re-validated on PUT. And `strict: true` combined with `subscriptions:` means a
+subscription delivering an unparseable node makes every refresh fail — the
+previous config is kept, but check subscription contents before enabling
+strict.

@@ -38,7 +38,7 @@ proxy-groups:
 | `exclude-type` | string \| list | `[]` | Drop proxy types, e.g. `[ss]` |
 | `health-check` | block | — | Periodic probing (below) |
 | `header` | map | `{}` | Extra HTTP request headers (`http` only) |
-| `allow-external-plugin` | bool | `false` | Permit `ss` nodes to launch external SIP003 plugin executables. **Security-sensitive opt-in**: provider content is remote-controlled and the plugin name reaches `Command::new`, so off means such nodes are rejected. Built-in plugins (`obfs`, `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`, `kcptun`, `ech-tls-tunnel`) are always allowed. meow-rs extension; absent in mihomo |
+| `allow-external-plugin` | bool | `false` | Permit `ss` nodes to launch external SIP003 plugin executables. **Security-sensitive opt-in**: provider content is remote-controlled and the plugin name reaches `Command::new`, so off means such nodes are rejected. Built-in plugins (`obfs`, `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`, `kcptun`, `ech-tls-tunnel` — all in the default feature set) are always allowed; a non-default build without one treats its name as external. meow-rs extension; absent in mihomo |
 
 ### `type: http`
 
@@ -46,9 +46,10 @@ proxy-groups:
 | --- | --- | --- | --- |
 | `url` | string | — | **Required.** Source URL |
 | `path` | string | `provider_{name}.yaml` | Local cache (absolute or relative to config dir) |
-| `interval` | u64 | `0` | Accepted for compatibility; proxy-provider payloads are not refreshed on a timer — refresh manually with `PUT /providers/proxies/{name}` |
+| `interval` | u64 | `0` | Accepted for compatibility; proxy-provider payloads are not refreshed on a timer — refresh manually with `PUT /providers/proxies/{name}` or restart |
 
-The cached file is reused on startup for instant boot and offline resilience.
+The cached file is the offline fallback: startup always fetches first and
+writes the cache; the file is read only when that fetch fails.
 
 ### `type: file`
 
@@ -93,7 +94,7 @@ rules:
 | `type` | string | — | **Required.** `http` · `file` · `inline` |
 | `behavior` | string | — | **Required.** `domain` · `ipcidr` · `classical` |
 | `format` | string | auto | `yaml` · `text` · `mrs` (auto-detected for http/file) |
-| `interval` | u64 | `0` | Refresh seconds (ignored for `file` / `inline`) |
+| `interval` | u64 | `0` | Refresh seconds (ignored with a warning for `file`; rejected for `inline` — the provider fails to load, fatal under `strict: true`) |
 
 `behavior` describes the payload: `domain` (domain list), `ipcidr` (CIDR list), or
 `classical` (full `TYPE,payload` rule lines). `mrs` is the compiled binary format.
@@ -101,7 +102,8 @@ rules:
 ### `type: http` / `file`
 
 - `http` — needs `url`; caches to `path` (default `rule-providers/{name}.yaml`).
-- `file` — needs `path`; loaded from disk, no refresh.
+- `file` — needs `path`; loaded from disk, no scheduled refresh (manual
+  `PUT /providers/rules/{name}` re-reads the file).
 
 ### `type: inline`
 
@@ -117,18 +119,43 @@ rule-providers:
       - IP-CIDR,192.168.0.0/16,Corporate
 ```
 
-`interval > 0` on an inline provider is a hard error (nothing to refresh).
+`interval > 0` on an inline provider is rejected (nothing to refresh) — the
+provider fails to load with a warning, and `RULE-SET` entries referencing it
+warn-and-skip; under `strict: true` it is a hard config error.
+
+Only HTTP **rule providers** with a non-zero `interval` are refreshed
+automatically by a background task; proxy providers reload on manual
+refresh (`PUT /providers/proxies/{name}` — a `file` provider re-reads its
+file) or restart, and `inline` providers never refresh.
 
 ## Subscriptions
 
-Subscriptions are managed at runtime through the [REST API](../reference/rest-api) — they
-fetch a remote Clash-format document and apply its proxies, groups, and rules:
+`subscriptions:` is the blunt instrument next to providers. `proxy-providers`
+entries feed *nodes* into a named pool that groups pull from via `use:` —
+local `proxies:` and `rules:` stay yours. A subscription instead **replaces the
+whole `proxies:` / `proxy-groups:` / `rules:` sections** with the remote
+document's contents, and the result is **written back to the config file**
+on every successful refresh.
 
-- `GET /api/subscriptions` — list, with per-subscription counts and last-updated times.
+```yaml
+subscriptions:
+  - name: airport
+    url: https://example.com/clash.yaml
+    interval: 86400
+```
+
+See [Configuration — Subscriptions](./configuration#subscriptions) for the
+full semantics (replace-not-merge, write-back, `-t` behaviour).
+
+Subscriptions are also managed at runtime through the
+[REST API](../reference/rest-api):
+
+- `GET /api/subscriptions` — list, with the applied proxy/group/rule counts
+  and last-updated times.
 - `POST /api/subscriptions` — add `{ name, url, interval? }` and apply immediately.
 - `POST /api/subscriptions/{name}/refresh` — re-fetch.
-- `DELETE /api/subscriptions/{name}` — remove and clear its contents.
-
-HTTP **rule**-providers with a non-zero `interval` are also refreshed automatically by a
-background task. (Proxy-providers have no scheduled payload refresh; use the manual
-`PUT /providers/proxies/{name}` endpoint.)
+- `DELETE /api/subscriptions/{name}` — remove the entry **and empty all three
+  sections** — previously-replaced local content is not restored. Note the
+  delete itself saves, so `.bak` afterwards holds the *subscription-applied*
+  file; the original local sections survive on disk only if no earlier
+  write-back already rotated them out.

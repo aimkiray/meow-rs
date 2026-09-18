@@ -73,7 +73,8 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `rules:` — SUB-RULE | ✓ | Named rule subsets with cycle detection. |
 | `rules:` — AND, OR, NOT | ✓ | Logic composition supported. |
 | `rules:` — MATCH | ✓ | Fully supported. |
-| `rule-providers:` — http, file | ✓ | With interval refresh (M1.D-5). |
+| `rule-providers:` — http | ✓ | With interval refresh (M1.D-5). |
+| `rule-providers:` — file | ✓ | Loaded once; `interval` is ignored (warn). |
 | `rule-providers:` — inline | ✓ | M1.D-5. |
 | `dns:` — udp, tcp nameservers | ✓ | Fully supported. |
 | `dns:` — DoH (`https://`) | ✓ | See §DNS. |
@@ -539,7 +540,7 @@ tools built for Go mihomo will ignore them.
 | Feature | Path / Field | Notes |
 |---------|-------------|-------|
 | Prometheus metrics | `GET /metrics` | Native scrape endpoint; Go mihomo has no equivalent (M1.H-2) |
-| Subscription management API | `GET\|POST\|DELETE /api/subscriptions[/:name]` | meow-rs-specific |
+| Subscription management API | `GET\|POST\|DELETE /api/subscriptions[/:name]`, `POST /api/subscriptions/{name}/refresh` | meow-rs-specific |
 | Extended proxy group API | `GET\|POST\|PUT\|DELETE /api/proxy-groups[/:name]` | meow-rs-specific |
 | Rule CRUD API | `POST\|PUT\|DELETE /rules[/:index]` | Runtime rule editing |
 
@@ -617,7 +618,10 @@ Most common format from public providers. Typical issues:
 
 1. **`proxy-providers:`** — supported in M1.H-1 (http + file sources, health-check,
    `include-all` shorthand).
-2. **`interval:` refresh** — supported in M1.D-5. No config change needed.
+2. **`interval:` refresh** — the field is accepted for compatibility, but
+   proxy providers are not refreshed on a schedule; reload via
+   `PUT /providers/proxies/{name}` or restart. Scheduled refresh exists only
+   for HTTP **rule** providers.
 3. **`use:` in proxy groups** — wired for proxy providers. Provider filters and
    `include-all` shorthands are applied when groups are resolved.
 

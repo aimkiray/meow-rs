@@ -146,3 +146,16 @@ rules:
 
   # Final fallback
   - MATCH,Proxy
+
+# Subscriptions (remote Clash configs applied wholesale).
+# WARNING: a refresh REPLACES the entire proxies/proxy-groups/rules sections
+# above with the fetched document's — local entries there are overwritten —
+# and the result is written back to this file (re-serialised — comments are
+# lost; a .bak of the previous file is kept once). `interval` is in seconds;
+# omit it to fetch once — a failing fetch is retried every 60 s until one
+# succeeds, then never again. `-t` validates the file as written and does
+# not fetch subscriptions. See website/guide/configuration.md.
+# subscriptions:
+#   - name: airport
+#     url: https://example.com/clash.yaml
+#     interval: 86400

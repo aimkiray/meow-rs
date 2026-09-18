@@ -221,6 +221,13 @@ the canonical, in-repo source a release is cut from.
   `toolchain-drift` workflow runs the lint gate on floating `stable` as an
   early-warning canary for the next pin bump. (#533)
 
+- **The `subscriptions:` config key is documented.** The guide now covers
+  its wholesale-replace of `proxies:`/`proxy-groups:`/`rules:`, the config
+  write-back on every successful refresh, the `-t`-doesn't-fetch boundary,
+  and a providers.md contrast note against `use:` provider pools. The
+  proxy-provider `interval` field is also corrected: no scheduled refresh
+  exists for proxy providers. (#533)
+
 ### Fixed
 
 - **Provider-sourced group members are now health-checked** (#543 item 1,
