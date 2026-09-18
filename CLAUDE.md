@@ -9,7 +9,8 @@ meow-rs is a Rust implementation of the [mihomo](https://github.com/MetaCubeX/mi
 ## Build Commands
 
 ```bash
-# Build (requires Rust 1.89+, pinned via workspace rust-version)
+# Build (requires Rust 1.89+ via workspace rust-version; the checkout
+# resolves the pinned channel in rust-toolchain.toml automatically)
 cargo build --release
 
 # Run with config
@@ -124,6 +125,11 @@ Explicitly suppressed workspace-wide (too noisy without benefit): `module_name_r
 When a specific site cannot be fixed cleanly, use `#[allow(clippy::lint_name, reason = "…")]` inline — no silent allows.
 
 ## Regression Bar
+
+The toolchain is pinned by `rust-toolchain.toml` (issue #533) — rustup
+resolves it automatically in the checkout, so the bar below runs on the
+same version as CI. Bump the pin deliberately (see the file's header); a
+weekly `toolchain-drift` workflow canaries the next stable.
 
 Run before every commit and push:
 

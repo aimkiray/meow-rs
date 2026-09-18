@@ -16,7 +16,7 @@ This file records the hardware spec for the M2 reference baseline.
 | RAM | _(e.g. 36 GB)_ |
 | OS / kernel | _(e.g. macOS 15.4, Darwin 24.4.0)_ |
 | CPU governor | macOS: charger plugged, Low Power Mode off |
-| Rust toolchain | _(output of `rustup show active-toolchain`)_ |
+| Rust toolchain | _(output of `rustup show active-toolchain`; in a repo checkout this is the `rust-toolchain.toml` pin, so a pin bump is a deliberate baseline discontinuity)_ |
 | Go mihomo version | _(output of `./target/bench/mihomo-go -v`)_ |
 | Run date | _(YYYY-MM-DD)_ |
 

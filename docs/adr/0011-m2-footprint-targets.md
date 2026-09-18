@@ -80,10 +80,10 @@ invent.
 It produces three artefacts checked in under `docs/benchmarks/`:
 
 a. **`footprint-types-baseline.md`** — `cargo +nightly rustc --crate-type
-   lib -- -Zprint-type-sizes` per crate (the workspace pins stable 1.88
-   but nightly is installed; the nightly invocation is the canonical
-   `-Zprint-type-sizes` source). Filter output to types ≥ 64 B; sort
-   descending; capture the top 50.
+   lib -- -Zprint-type-sizes` per crate (`cargo +nightly` bypasses the
+   repo's `rust-toolchain.toml` pin; the nightly invocation is the
+   canonical `-Zprint-type-sizes` source). Filter output to types ≥ 64 B;
+   sort descending; capture the top 50.
 b. **`footprint-rss-baseline.md`** — RSS under synthetic load: bench
    harness already exists at `crates/meow-bench/`. Run `bench_connrate
    duration=60s concurrency=64`; record peak RSS via `getrusage` or

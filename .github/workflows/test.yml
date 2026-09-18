@@ -3,9 +3,9 @@ name: Test
 on:
   push:
     branches: [main]
-    paths: ["crates/**", "tests/**", "Cargo.toml", "Cargo.lock", ".github/workflows/**"]
+    paths: ["crates/**", "tests/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
   pull_request:
-    paths: ["crates/**", "tests/**", "Cargo.toml", "Cargo.lock", ".github/workflows/**"]
+    paths: ["crates/**", "tests/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
 
 # One active run per ref: a superseded push to the same PR/branch cancels the
 # in-flight run instead of racing it to completion. `push` is limited to
@@ -48,6 +48,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # This gate runs on the rust-toolchain.toml pin via rustup's
+      # toolchain-file resolution (the file beats `rustup default`; the
+      # @stable step just provides rustup + a fallback toolchain).
+      # Mirrored on floating stable by toolchain-drift.yml — keep the step
+      # set in sync.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -344,6 +349,11 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
 
+      # rust-toolchain.toml outranks `rustup default` — a directory
+      # override outranks the file, so without this the check would
+      # silently run on the pin (and rust-cache would key on it too).
+      - run: rustup override set ${{ steps.msrv.outputs.version }}
+
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -358,9 +368,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # No `components:` — the clippy steps run in the checkout, where
+      # rust-toolchain.toml resolves the pin and auto-installs its
+      # declared components; @stable only provides rustup + a fallback.
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -475,8 +486,22 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The musl target must be added to the *pinned* toolchain cargo
+      # resolves via rust-toolchain.toml — a `targets:` input on `@stable`
+      # would install it on the wrong channel.
+      - name: Read pinned toolchain channel
+        id: tc
+        # sed (not grep | sed): tolerates leading whitespace and a quoted
+        # trailing comment, prints nothing on no match; the empty check
+        # keeps a malformed toml fail-loud instead of writing `channel=`.
+        run: |
+          tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          test -n "$tc"
+          echo "channel=$tc" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.tc.outputs.channel }}
           targets: aarch64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2

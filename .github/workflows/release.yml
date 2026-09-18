@@ -86,9 +86,15 @@ jobs:
       - name: Setup Rust toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-          rustup target add "${{ matrix.target }}"
+          # rust-toolchain.toml overrides `rustup default` inside the
+          # checkout — install the pinned channel and add the target to it
+          # explicitly, not to floating stable. The sed pattern tolerates
+          # leading whitespace and prints nothing on no match, so a
+          # malformed toml fails here instead of installing "".
+          tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          test -n "$tc"
+          rustup toolchain install "$tc" --profile minimal --no-self-update
+          rustup target add --toolchain "$tc" "${{ matrix.target }}"
 
       - uses: Swatinem/rust-cache@v2
         with:

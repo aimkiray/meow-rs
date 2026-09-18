@@ -1,2 +1,5 @@
 target/
 .git/
+# The image builds with its own stable — the repo pin would trigger a
+# toolchain download on every source-busted layer.
+rust-toolchain.toml

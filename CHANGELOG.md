@@ -209,6 +209,18 @@ the canonical, in-repo source a release is cut from.
   the full address list, so an IPv4 connect failure no longer discards the IPv6
   candidate — IPv6 remains a connection fallback.
 
+- **CI and local builds share a pinned toolchain.** `rust-toolchain.toml`
+  pins channel 1.98.1 (with `rustfmt`/`clippy`), so every cargo invocation
+  in the checkout — CI steps and local runs alike — resolves the same
+  rustc/clippy/rustfmt; a floating `@stable` can no longer fail CI on lints
+  that do not exist yet locally. Jobs needing a different toolchain opt out
+  explicitly — MSRV via a directory `rustup override` (it stays on
+  `rust-version`), the drift canary via `RUSTUP_TOOLCHAIN` — and
+  cross-target / llvm-tools jobs now attach components to the pinned
+  channel. A weekly
+  `toolchain-drift` workflow runs the lint gate on floating `stable` as an
+  early-warning canary for the next pin bump. (#533)
+
 ### Fixed
 
 - **Provider-sourced group members are now health-checked** (#543 item 1,

@@ -9,7 +9,8 @@ meow-rs is a Rust implementation of the [mihomo](https://github.com/MetaCubeX/mi
 ## Build Commands
 
 ```bash
-# Build (requires Rust 1.88+, pinned via workspace rust-version)
+# Build (requires Rust 1.89+, pinned via workspace rust-version; the
+# repo pins a specific channel via rust-toolchain.toml — see its header)
 cargo build --release
 
 # Run with config

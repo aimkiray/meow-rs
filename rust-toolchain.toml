@@ -1,0 +1,27 @@
+# Pinned toolchain for CI and local development (issue #533). The rustup
+# proxy resolves this file ahead of `rustup default`/installed channels,
+# so every cargo/fmt/clippy invocation in the checkout — CI steps and
+# local runs alike — uses the pinned version: the lint gate can no longer
+# drift when a new stable ships (a clippy lint that only existed on the
+# newer toolchain once failed CI on code that passed locally).
+#
+# Bump procedure: raise `channel` to the new stable, run the regression
+# bar (CLAUDE.md), and land any fixups in the same commit. The weekly
+# `toolchain-drift` workflow runs the lint gate on floating `stable` and
+# goes red early when the next release introduces new warnings — that is
+# the signal to bump this pin. Note a bump is exercised on PR by the
+# lint/test matrix only; the release.yml cross-compile matrix is tag-only,
+# so a target-specific toolchain regression surfaces at release time.
+# Tool builds (`cargo install` of ssserver/zigbuild/etc.) also resolve the
+# pin — deterministic, but a future tool release requiring a NEWER rustc
+# fails loudly at install time; bump the pin (or version-pin the tool).
+#
+# Override trap: this file outranks `rustup default` and dtolnay action
+# installs, so any CI job that needs a *different* toolchain must use a
+# directory override (see test.yml's `msrv` job), `RUSTUP_TOOLCHAIN`, or
+# `cargo +<tc>`; targets/components must be added to the pinned channel,
+# not to stable (see coverage.yml, release.yml, test.yml's `openwrt` job).
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

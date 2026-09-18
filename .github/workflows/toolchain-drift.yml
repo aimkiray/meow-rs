@@ -1,0 +1,73 @@
+name: Toolchain drift canary
+
+# Weekly early-warning for the pinned toolchain (issue #533): the lint
+# gate in test.yml runs on `rust-toolchain.toml`'s fixed channel, so a new
+# stable release introducing warnings would otherwise surprise the next
+# PR after a pin bump. This job runs the same gate on floating `stable`;
+# a red run means "bump rust-toolchain.toml and fix the new warnings".
+on:
+  schedule:
+    # GitHub only fires `schedule` from the default branch — the canary can
+    # be exercised via workflow_dispatch only after this file lands on main.
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# A manual dispatch landing on the weekly run should supersede, not queue.
+concurrency:
+  group: toolchain-drift
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  stable-lint:
+    runs-on: ubuntu-latest
+    # Scheduled workflows also fire on forks that enable Actions — don't
+    # burn the fork owner's minutes on a canary only the upstream cares
+    # about.
+    if: github.event.repository.fork == false
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # rust-toolchain.toml pins the repo's channel, so cargo would resolve
+      # to the pin even on a floating-stable runner. RUSTUP_TOOLCHAIN
+      # outranks the file — floating stable is exactly what this canary
+      # measures.
+      - name: Use floating stable despite rust-toolchain.toml
+        run: echo "RUSTUP_TOOLCHAIN=stable" >> "$GITHUB_ENV"
+
+      # Proof the canary measured floating stable, not the pin — and an
+      # assertion, so a future edit that drops the RUSTUP_TOOLCHAIN step
+      # fails the canary instead of silently measuring the pin forever.
+      - name: Assert floating stable is active
+        run: |
+          rustc --version
+          rustup show active-toolchain | grep -q '^stable'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: toolchain-drift
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: Doc check
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps

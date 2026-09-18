@@ -9,14 +9,35 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   coverage:
     runs-on: ubuntu-latest
+    # Nightly schedule also fires on forks that enable Actions — don't burn
+    # fork owners' minutes on a run that cannot upload without upstream's
+    # Codecov token anyway.
+    if: github.event.repository.fork == false
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      # llvm-tools-preview must land on the *pinned* toolchain cargo
+      # resolves via rust-toolchain.toml — a bare `@stable` step would
+      # install the component on the wrong channel.
+      - name: Read pinned toolchain channel
+        id: tc
+        # sed (not grep | sed): tolerates leading whitespace and a quoted
+        # trailing comment, prints nothing on no match; the empty check
+        # keeps a malformed toml fail-loud instead of writing `channel=`.
+        run: |
+          tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          test -n "$tc"
+          echo "channel=$tc" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.tc.outputs.channel }}
           components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
@@ -36,7 +57,11 @@ jobs:
 
       - name: Install ssserver
         if: steps.cache-ssserver.outputs.cache-hit != 'true'
-        run: cargo install shadowsocks-rust --features "stream-cipher aead-cipher-2022" --locked
+        # --force: on a Cargo.lock change this step's cache misses, but the
+        # rust-cache restore may already have an ssserver in ~/.cargo/bin,
+        # and a plain `cargo install` refuses to overwrite it (same trap as
+        # test.yml's install step).
+        run: cargo install shadowsocks-rust --features "stream-cipher aead-cipher-2022" --locked --force
 
       - name: Install simple-obfs
         run: |
