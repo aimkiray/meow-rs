@@ -194,7 +194,21 @@ pub(crate) async fn fetch_ech_from_dns(name: &str) -> Result<Vec<u8>, String> {
 /// downstream parser will then see `enable: true` with no `config:` and
 /// silently skip ECH for that proxy (matches Go upstream behaviour:
 /// "ECH lookup failed, proceed without ECH").
-pub async fn preresolve_ech(proxies: &mut [HashMap<String, Value>]) {
+///
+/// `strict` (top-level `strict: true`, issue #533): `enable: true` with no
+/// `config:`, no `query-server-name:`, and no `server:` to query is a
+/// config *defect* (ECH can never engage) and returns `Err` — DNS lookup
+/// failures stay lenient in both modes since they are transient.
+///
+/// The defect check alone (no network I/O) is [`check_ech_defects`] —
+/// runtime mutation paths already holding the config-mutation lane call
+/// that instead of this function so no DNS lookup serializes other
+/// commits (issue #533 review).
+pub async fn preresolve_ech(
+    proxies: &mut [HashMap<String, Value>],
+    strict: bool,
+) -> Result<(), String> {
+    check_ech_defects(proxies, strict)?;
     for proxy in proxies {
         let proxy_name = proxy
             .get("name")
@@ -233,11 +247,9 @@ pub async fn preresolve_ech(proxies: &mut [HashMap<String, Value>]) {
             .and_then(|v| v.as_str())
             .map(String::from)
             .or(server);
+        // No query source: `check_ech_defects` above already warned
+        // (lenient) or returned Err (strict), so just skip the lookup.
         let Some(query_name) = query_name else {
-            tracing::warn!(
-                proxy = %proxy_name,
-                "ech-opts.enable=true with no `config:`, no `query-server-name:`, and no `server:` to fall back on; skipping ECH"
-            );
             continue;
         };
 
@@ -262,6 +274,59 @@ pub async fn preresolve_ech(proxies: &mut [HashMap<String, Value>]) {
             }
         }
     }
+    Ok(())
+}
+
+/// The pure-defect half of [`preresolve_ech`], with no network I/O:
+/// `ech-opts.enable: true` without `config:` and without any name to query
+/// (`query-server-name:` or `server:`) is a config defect that can never
+/// engage ECH — under `strict` it returns `Err`; leniently it warns.
+/// Runtime paths holding the config-mutation lane run this instead of the
+/// full preresolve so no DNS lookup serializes other commits (issue #533
+/// review); writers are expected to have preresolved before storing.
+pub fn check_ech_defects(proxies: &[HashMap<String, Value>], strict: bool) -> Result<(), String> {
+    for proxy in proxies {
+        let proxy_name = proxy
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let server = proxy.get("server").and_then(|v| v.as_str());
+        let has_query_source = server.is_some()
+            || proxy
+                .get("ech-opts")
+                .and_then(|v| v.as_mapping())
+                .is_some_and(|m| {
+                    m.get(Value::String("query-server-name".into()))
+                        .and_then(|v| v.as_str())
+                        .is_some()
+                });
+        let enabled_without_config = proxy
+            .get("ech-opts")
+            .and_then(|v| v.as_mapping())
+            .is_some_and(|m| {
+                m.get(Value::String("enable".into()))
+                    .and_then(serde_yaml::Value::as_bool)
+                    .unwrap_or(false)
+                    && m.get(Value::String("config".into()))
+                        .and_then(|v| v.as_str())
+                        .is_none()
+            });
+        if !enabled_without_config {
+            continue;
+        }
+        if !has_query_source {
+            let msg = format!(
+                "proxy '{proxy_name}': ech-opts.enable=true with no `config:`, no \
+                 `query-server-name:`, and no `server:` to fall back on"
+            );
+            if strict {
+                return Err(msg);
+            }
+            tracing::warn!(proxy = %proxy_name, "{msg}; skipping ECH");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]

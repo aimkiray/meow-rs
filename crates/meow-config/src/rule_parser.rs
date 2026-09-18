@@ -8,8 +8,15 @@ use tracing::warn;
 use crate::sub_rules_parser::{build_sub_rule_rule, parse_sub_rule_reference, SubRuleBlocks};
 
 /// Parse rules with no rule-providers or sub-rule blocks available.
-pub fn parse_rules(raw_rules: &[String], ctx: &ParserContext) -> Vec<Box<dyn Rule>> {
-    parse_rules_with_providers(raw_rules, &HashMap::new(), ctx)
+///
+/// `strict` (top-level `strict: true`, issue #533) promotes an unparseable
+/// rule from warn-and-skip to a hard error.
+pub fn parse_rules(
+    raw_rules: &[String],
+    ctx: &ParserContext,
+    strict: bool,
+) -> Result<Vec<Box<dyn Rule>>, anyhow::Error> {
+    parse_rules_with_providers(raw_rules, &HashMap::new(), ctx, strict)
 }
 
 /// Parse the `rules:` block, resolving `RULE-SET,<name>,...` entries against
@@ -19,18 +26,23 @@ pub fn parse_rules_with_providers(
     raw_rules: &[String],
     providers: &HashMap<String, Arc<dyn RuleSet>>,
     ctx: &ParserContext,
-) -> Vec<Box<dyn Rule>> {
-    parse_rules_full(raw_rules, providers, ctx, &HashMap::new())
+    strict: bool,
+) -> Result<Vec<Box<dyn Rule>>, anyhow::Error> {
+    parse_rules_full(raw_rules, providers, ctx, &HashMap::new(), strict)
 }
 
 /// Parse the `rules:` block with full resolver context — providers, ctx,
 /// and pre-resolved sub-rule blocks for `SUB-RULE,<name>` entries.
+///
+/// `strict` (top-level `strict: true`, issue #533) promotes an unparseable
+/// rule from warn-and-skip to a hard config error.
 pub fn parse_rules_full(
     raw_rules: &[String],
     providers: &HashMap<String, Arc<dyn RuleSet>>,
     ctx: &ParserContext,
     sub_rules: &SubRuleBlocks,
-) -> Vec<Box<dyn Rule>> {
+    strict: bool,
+) -> Result<Vec<Box<dyn Rule>>, anyhow::Error> {
     let mut rules: Vec<Box<dyn Rule>> = Vec::new();
     for line in raw_rules {
         let line = line.trim();
@@ -39,10 +51,15 @@ pub fn parse_rules_full(
         }
         match parse_one_rule_or_subrule(line, providers, ctx, sub_rules) {
             Ok(rule) => rules.push(rule),
+            Err(e) if strict => {
+                return Err(anyhow::anyhow!(
+                    "rules: failed to parse '{line}' (strict mode): {e}"
+                ));
+            }
             Err(e) => warn!("Failed to parse rule '{}': {}", line, e),
         }
     }
-    rules
+    Ok(rules)
 }
 
 /// Parse a single rule line. Handles `RULE-SET,<name>,...`,

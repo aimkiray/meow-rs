@@ -46,7 +46,7 @@ proxy-groups:
 | --- | --- | --- | --- |
 | `url` | string | — | **Required.** Source URL |
 | `path` | string | `provider_{name}.yaml` | Local cache (absolute or relative to config dir) |
-| `interval` | u64 | `0` | Refresh seconds; `0` = no periodic refresh |
+| `interval` | u64 | `0` | Accepted for compatibility; proxy-provider payloads are not refreshed on a timer — refresh manually with `PUT /providers/proxies/{name}` |
 
 The cached file is reused on startup for instant boot and offline resilience.
 
@@ -129,5 +129,6 @@ fetch a remote Clash-format document and apply its proxies, groups, and rules:
 - `POST /api/subscriptions/{name}/refresh` — re-fetch.
 - `DELETE /api/subscriptions/{name}` — remove and clear its contents.
 
-HTTP providers with a non-zero `interval` are also refreshed automatically by a background
-task.
+HTTP **rule**-providers with a non-zero `interval` are also refreshed automatically by a
+background task. (Proxy-providers have no scheduled payload refresh; use the manual
+`PUT /providers/proxies/{name}` endpoint.)

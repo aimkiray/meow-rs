@@ -4,6 +4,7 @@
 //! directly can wire the same auto-refresh behavior in without
 //! reimplementing it.
 
+use meow_config::proxy_provider::ProxyProvider;
 use meow_config::raw::RawConfig;
 use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
@@ -26,6 +27,10 @@ pub async fn run_loop(
     rule_providers: Arc<
         RwLock<std::collections::HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>>,
     >,
+    // The live proxy-provider registry — group `use:` references resolve
+    // against it on every rebuild. Passing an empty map instead would make
+    // `strict: true` reject every `use:` group on each refresh.
+    proxy_providers: Arc<dashmap::DashMap<String, Arc<ProxyProvider>>>,
 ) {
     // Same provider-cache directory `load_config` used at startup — trusted
     // rebuilds of the daemon's own config must keep resolving relative
@@ -63,7 +68,11 @@ pub async fn run_loop(
 
         for (name, url) in subs_to_refresh {
             info!("Auto-refreshing subscription '{}'", name);
-            match meow_config::subscription::fetch_subscription(&url).await {
+            // `strict` is a property of the daemon's live config, not the
+            // fetched subscription payload — it gates both payload shape
+            // errors in the parser and ECH pre-resolution below.
+            let strict = raw_config.read().strict.unwrap_or(false);
+            match meow_config::subscription::fetch_subscription(&url, strict).await {
                 Ok(mut fetched) => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -73,7 +82,27 @@ pub async fn run_loop(
                     // Pre-resolve any DNS-sourced ECH configs before taking the
                     // mutation lane — preresolve_ech is async network I/O and
                     // must not serialize other config commits.
-                    meow_config::ech_dns::preresolve_ech(&mut fetched.proxies).await;
+                    if let Err(e) =
+                        meow_config::ech_dns::preresolve_ech(&mut fetched.proxies, strict).await
+                    {
+                        warn!(
+                            "subscription '{}': ECH pre-resolution failed (strict mode): {}; \
+                             skipping refresh",
+                            name, e
+                        );
+                        // Same stamping as the rebuild-error arms below —
+                        // a statically-defective payload shouldn't
+                        // re-download every 60 s either (issue #533 review).
+                        let mut live = raw_config.write();
+                        if let Some(sub) = live
+                            .subscriptions
+                            .as_mut()
+                            .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
+                        {
+                            sub.last_updated = Some(now);
+                        }
+                        continue;
+                    }
 
                     // Issue #514: the commit runs inside the same
                     // `CONFIG_MUTATION` lane every API mutation uses, and
@@ -103,11 +132,18 @@ pub async fn run_loop(
                     let rebuild = tokio::task::spawn_blocking({
                         let candidate = candidate.clone();
                         let cache_dir = cache_dir.clone();
+                        // Snapshot inside the mutation lane so the rebuild
+                        // resolves `use:` against the committed provider set.
+                        let proxy_providers: std::collections::HashMap<_, _> = proxy_providers
+                            .iter()
+                            .map(|e| (e.key().clone(), Arc::clone(e.value())))
+                            .collect();
                         move || {
                             meow_config::rebuild_from_raw_with_resolver(
                                 &candidate,
                                 Some(&resolver),
                                 Some(cache_dir.as_path()),
+                                &proxy_providers,
                                 // Commit path: the candidate's provider set
                                 // loads fresh and is swapped into the live
                                 // registry only once validated (issue #533).
@@ -124,13 +160,14 @@ pub async fn run_loop(
                                 rules: new_rules,
                                 dialer_registry: new_registry,
                                 rule_providers: new_rule_providers,
+                                proxy_providers: new_proxy_providers,
                             } = result;
                             // A swapped proxy set changes the objects a
                             // `#name` nameserver or `rule-set:` policy key
                             // references — reconcile BEFORE the raw write so
                             // the old-vs-candidate comparison still sees the
                             // previous raw (issue #514 review).
-                            let dns = meow_api::routes::reconcile_dns_config(
+                            let dns = match meow_api::routes::reconcile_dns_config(
                                 &raw_config,
                                 &candidate,
                                 &config_path,
@@ -139,7 +176,33 @@ pub async fn run_loop(
                                 Some(tunnel.resolver()),
                                 Some(&new_registry),
                             )
-                            .await;
+                            .await
+                            {
+                                Ok(dns) => dns,
+                                Err((_status, msg)) => {
+                                    // reconcile_dns_config's contract: Err
+                                    // rejects the whole mutation. Committing
+                                    // anyway would swap routing while the
+                                    // retained resolver's `#name` adapters
+                                    // lose their registry cell — dead refs
+                                    // that fail closed forever (issue #533
+                                    // review). Skip the commit entirely; the
+                                    // next interval retries.
+                                    warn!(
+                                        "subscription '{name}': dns reconcile failed; \
+                                         NOT committing: {msg}"
+                                    );
+                                    let mut live = raw_config.write();
+                                    if let Some(sub) = live
+                                        .subscriptions
+                                        .as_mut()
+                                        .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
+                                    {
+                                        sub.last_updated = Some(now);
+                                    }
+                                    continue;
+                                }
+                            };
 
                             // Publish the rebuilt resolver to every
                             // consumer before the route swap drops the old
@@ -147,7 +210,7 @@ pub async fn run_loop(
                             // through the standalone DNS server's or host
                             // hook's OLD resolver would fail closed until
                             // `publish_dns` runs (issue #533).
-                            if let Ok(Some(dns)) = &dns {
+                            if let Some(dns) = &dns {
                                 meow_api::routes::install_resolver_everywhere(
                                     &tunnel,
                                     dns_server.as_ref(),
@@ -155,28 +218,24 @@ pub async fn run_loop(
                                 );
                             }
                             tunnel.update_routing(new_proxies, new_rules, new_registry);
-                            // Commit point: the candidate's provider set —
+                            // Commit point: the candidate's provider sets —
                             // already referenced by the rules and DNS
-                            // `rule-set:` matchers — becomes the live
-                            // registry (issue #533 review).
+                            // `rule-set:` matchers — become the live
+                            // registries (issue #533 review).
                             *rule_providers.write() = new_rule_providers;
+                            meow_api::routes::commit_proxy_providers(
+                                &proxy_providers,
+                                &new_proxy_providers,
+                                candidate.strict.unwrap_or(false),
+                            );
                             // Commit raw + routing together inside the lane:
                             // the on-disk/dashboard view and the running
                             // router can no longer diverge on failure.
                             *raw_config.write() = candidate.clone();
-                            let dns_ok = match dns {
-                                Ok(Some(dns)) => {
-                                    meow_api::routes::publish_dns(&tunnel, &dns_server, dns).await;
-                                    true
-                                }
-                                Ok(None) => true,
-                                Err((_status, msg)) => {
-                                    warn!(
-                                        "subscription '{name}' committed; dns republish skipped: {msg}"
-                                    );
-                                    false
-                                }
-                            };
+                            if let Some(dns) = dns {
+                                meow_api::routes::publish_dns(&tunnel, dns_server.as_ref(), dns)
+                                    .await;
+                            }
                             // Health-check tasks follow the new group set
                             // (issue #514).
                             tunnel.reconcile_health_checks(
@@ -190,23 +249,8 @@ pub async fn run_loop(
                             // does not serialize concurrent config commits
                             // (issue #514 review).
                             drop(_lane);
-                            if dns_ok {
-                                let _ =
-                                    meow_config::save_raw_config_async(&config_path, &candidate)
-                                        .await;
-                            } else {
-                                // The committed dns section failed to
-                                // build — persisting it would leave a file
-                                // the next cold start cannot parse
-                                // (`parse_dns` is a hard error in
-                                // build_config). Keep the runtime commit;
-                                // skip the save (issue #514 review).
-                                warn!(
-                                    "subscription '{name}': dns rebuild failed; \
-                                     NOT persisting — the file would fail to load \
-                                     on next start"
-                                );
-                            }
+                            let _ =
+                                meow_config::save_raw_config_async(&config_path, &candidate).await;
                         }
                         Ok(Err(e)) => {
                             error!("Failed to rebuild after refreshing '{}': {}", name, e);

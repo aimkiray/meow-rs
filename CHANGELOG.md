@@ -122,6 +122,24 @@ the canonical, in-repo source a release is cut from.
   note: `KcpStream` progress is poll-driven — retransmits and
   dead-link detection advance while the stream is polled, which the
   smux session reader guarantees for pooled sessions. (#533)
+- **Opt-in `strict: true` config mode** — by default an entry that fails
+  to parse (a `proxies:` node, a `proxy-groups:` block, a `rules:` line,
+  a `proxy-providers:`/`rule-providers:` definition, or a node inside a
+  provider payload) is logged and skipped so one bad line cannot take
+  down the whole config. `strict: true` promotes every such skip to a
+  hard load-time error — plus group members/`use:` names that resolve to
+  nothing, entries shadowing built-in adapter names, and malformed
+  `dialer-proxy` values. Applies on startup and on `PUT /configs`
+  rebuilds of those sections; `proxy-providers:` objects themselves are
+  startup-only (not re-validated on PUT). It is opt-in because it
+  rejects real-world mihomo subscriptions that mix in node types meow-rs
+  does not support; provider *fetch* failures stay lenient (a transient
+  download error starts the provider empty rather than failing the
+  config). Also fixes a pre-existing hole where a dropped
+  built-in-shadowing `proxies:` entry could still chain the built-in
+  adapter via its `dialer-proxy` field. Public API signatures changed:
+  `parse_rules_full`, `ProxyProvider::new`, `load_proxy_providers`, and
+  `rule_provider::load_providers_prefetched`. (#533)
 
 ### Changed
 

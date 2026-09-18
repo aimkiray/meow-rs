@@ -353,3 +353,24 @@ sniffer:
     assert!(!cfg.sniffer.parse_pure_ip);
     assert!(cfg.sniffer.override_destination);
 }
+
+// ─── S19: strict: true promotes an unknown protocol key to a hard error ──
+
+#[tokio::test]
+async fn s19_strict_unknown_protocol_is_a_hard_error() {
+    let yaml = r#"
+strict: true
+sniffer:
+  enable: true
+  sniff:
+    PIRATE-PROTOCOL:
+      ports: [443]
+    TLS:
+      ports: [443]
+"#;
+    let err = expect_load_err(yaml).await;
+    assert!(
+        err.contains("PIRATE-PROTOCOL"),
+        "error must name the dead key, got: {err}"
+    );
+}

@@ -168,12 +168,29 @@ proxy-groups:
 
 | Field | Type | Required | Default | Meaning |
 |-------|------|:-------:|---------|---------|
-| `use` | `[]string` | no | `[]` | Provider names to merge into this group's proxy list. Unknown provider name = warn-once at load (not a hard error — the provider may not be defined in all config variants). |
+| `use` | `[]string` | no | `[]` | Provider names to merge into this group's proxy list. Unknown provider name = warn-once at load (not a hard error — the provider may not be defined in all config variants); under top-level `strict: true` it is a hard error. Inert on `relay` groups and under `include-all*` — an unknown name there never fails. |
 | `include-all` | bool | no | `false` | If true, merge proxies from all defined providers — providers only (upstream's `include-all` also pulls statics; use `include-all-proxies` for that). Wins over `use:` when both are set. |
 | `include-all-proxies` | bool | no | `false` | Merge every static `proxies:` entry into the group — NOT a provider alias. Upstream parity. |
 | `filter` | string | no | `""` | Applied to provider-sourced members only (`use:` / `include-all`), matching upstream mihomo — explicit `proxies:` entries are never filtered (otherwise `proxies: [DIRECT]` + `filter: "^HK"` would drop DIRECT). |
 | `exclude-filter` | string | no | `""` | Applied after `filter`. Provider-sourced members only. |
 | `exclude-type` | string | no | `""` | Applied after `filter`/`exclude-filter`. Provider-sourced members only. |
+
+#### Runtime rebuilds (`PUT /configs`, subscription refresh)
+
+The candidate config's own `proxy-providers:` section is the `use:`/
+`include-all` authority for that rebuild — not the live registry. A still-
+declared name reuses its live `ProxyProvider` object (slots, fetched content,
+and health state carry over); a newly declared name is constructed empty and
+gets a detached initial fetch on commit; a dropped name stops resolving `use:`
+(zombie-binding is impossible). A failed rebuild never mutates the live
+registry. `strict` follows the committed generation: reused providers adopt
+the new flag, so a `strict: true` PUT makes their next refresh strict too.
+
+Subscription payloads only carry `proxies:`/`proxy-groups:`/`rules:` — a
+`proxy-providers:` section inside a subscription is ignored (upstream parity).
+Consequently, under `strict: true` a subscription group may `use:` only
+providers declared in the local config; subscription-internal provider names
+fail the strict `use:` check (issue #533 review).
 
 ### Override
 

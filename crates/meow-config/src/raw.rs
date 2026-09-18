@@ -188,6 +188,17 @@ pub struct RawConfig {
     /// section. Referenced from `rules:` via `SUB-RULE,<name>`.
     pub sub_rules: Option<HashMap<String, Vec<String>>>,
     pub subscriptions: Option<Vec<RawSubscription>>,
+    /// Opt-in strict parsing (issue #533): when `true`, an entry that fails
+    /// to parse — a `proxies:`/`proxy-groups:`/`rules:` item, a
+    /// `proxy-providers:`/`rule-providers:` definition, or a proxy node
+    /// inside a provider payload — is a hard config error instead of a
+    /// warn-and-skip. Group members/`use:` names that don't resolve,
+    /// entries shadowing built-in adapter names, and malformed
+    /// `dialer-proxy` values are also promoted. Transient fetch failures
+    /// (provider downloads, unreadable files) stay lenient. Off by default
+    /// because it rejects real-world mihomo subscriptions that mix in node
+    /// types meow-rs does not support.
+    pub strict: Option<bool>,
     pub tproxy_port: Option<u16>,
     pub tproxy_sni: Option<bool>,
     pub routing_mark: Option<u32>,
@@ -433,7 +444,7 @@ pub struct RawProxyGroup {
     pub include_all_providers: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawProxyProvider {
     #[serde(rename = "type")]
@@ -460,7 +471,7 @@ pub struct RawProxyProvider {
     pub allow_external_plugin: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawHealthCheck {
     pub enable: Option<bool>,

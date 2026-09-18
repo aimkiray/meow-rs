@@ -2637,7 +2637,9 @@ fn parse_proxy_group_inner(
             }
             match providers.get(pname.as_str()) {
                 Some(p) => slots.push(provider_slot(p)),
-                None if strict => {
+                // Relay drops provider slots below anyway — an unknown
+                // `use:` name there is inert, not a defect (issue #533).
+                None if strict && config.group_type != "relay" => {
                     return Err(format!(
                         "group '{}' references unknown provider '{}'",
                         config.name, pname
@@ -4025,7 +4027,8 @@ tls: true
         };
         let cache_dir = path.parent().expect("temp file has a parent dir");
         let provider =
-            crate::proxy_provider::ProxyProvider::new(name, &raw, Some(cache_dir), true).unwrap();
+            crate::proxy_provider::ProxyProvider::new(name, &raw, Some(cache_dir), true, false)
+                .unwrap();
         provider.refresh().await.unwrap();
         Arc::new(provider)
     }
@@ -4385,7 +4388,7 @@ tls: true
              - name: ok\n  type: ss\n  server: 1.2.3.4\n  port: 8389\n  \
              password: p\n  cipher: aes-128-gcm\n  plugin: v2ray-plugin\n\
              - name: plain\n  type: trojan\n  server: 1.2.3.4\n  port: 443\n  password: p\n";
-        let data = crate::subscription::parse_subscription_yaml(text).unwrap();
+        let data = crate::subscription::parse_subscription_yaml(text, false).unwrap();
         let names: Vec<&str> = data
             .proxies
             .iter()

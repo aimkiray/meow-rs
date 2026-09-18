@@ -65,7 +65,7 @@ uuid: b831381d-6324-4d53-ad4f-8cda48b30811
 "#,
     )];
     let snapshot = proxies.clone();
-    preresolve_ech(&mut proxies).await;
+    preresolve_ech(&mut proxies, false).await.unwrap();
     assert_eq!(proxies, snapshot, "no ech-opts → no mutation");
 }
 
@@ -86,7 +86,7 @@ ech-opts:
 "#,
     )];
     let snapshot = proxies.clone();
-    preresolve_ech(&mut proxies).await;
+    preresolve_ech(&mut proxies, false).await.unwrap();
     assert_eq!(proxies, snapshot, "enable: false → no mutation");
 }
 
@@ -110,7 +110,7 @@ ech-opts:
 "#,
     )];
     let before = ech_config_str(&proxies[0]).expect("inline config present pre-call");
-    preresolve_ech(&mut proxies).await;
+    preresolve_ech(&mut proxies, false).await.unwrap();
     let after = ech_config_str(&proxies[0]).expect("inline config still present post-call");
     assert_eq!(before, after, "preresolve must not overwrite inline config");
 }
@@ -130,7 +130,7 @@ ech-opts:
 "#,
     )];
     let snapshot = proxies.clone();
-    preresolve_ech(&mut proxies).await;
+    preresolve_ech(&mut proxies, false).await.unwrap();
     assert_eq!(
         proxies, snapshot,
         "no query target → no mutation (warn fires via tracing)"
@@ -152,7 +152,7 @@ ech-opts: "this should be a mapping but is a string"
 "#,
     )];
     let snapshot = proxies.clone();
-    preresolve_ech(&mut proxies).await;
+    preresolve_ech(&mut proxies, false).await.unwrap();
     assert_eq!(
         proxies, snapshot,
         "non-mapping ech-opts → skipped without mutation or panic"
@@ -175,9 +175,9 @@ ech-opts:
   config: AEX/CgBA/wgAQA0AIAAg
 "#,
     )];
-    preresolve_ech(&mut proxies).await;
+    preresolve_ech(&mut proxies, false).await.unwrap();
     let first = proxies.clone();
-    preresolve_ech(&mut proxies).await;
+    preresolve_ech(&mut proxies, false).await.unwrap();
     assert_eq!(
         proxies, first,
         "running preresolve twice on already-inline config must be a no-op"
@@ -309,7 +309,7 @@ ech-opts:
         ),
     ];
     let snapshot = proxies.clone();
-    preresolve_ech(&mut proxies).await;
+    preresolve_ech(&mut proxies, false).await.unwrap();
     assert_eq!(
         proxies, snapshot,
         "every proxy here should be skipped (no ech-opts, disabled, or already inline) — no mutations"

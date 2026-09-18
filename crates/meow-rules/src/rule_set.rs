@@ -111,6 +111,40 @@ pub fn build_rule_set(
     }
 }
 
+/// Checked variant of [`build_rule_set`] (issue #533 `strict: true`): the
+/// first malformed entry is returned as an error instead of being
+/// warn-skipped, so a provider payload with corrupt lines fails the load
+/// rather than silently installing a partial rule set.
+pub fn build_rule_set_checked(
+    behavior: RuleSetBehavior,
+    entries: &[String],
+    ctx: &ParserContext,
+) -> Result<Box<dyn RuleSet>, String> {
+    match behavior {
+        RuleSetBehavior::Domain => {
+            let mut builder = DomainRuleSetBuilder::new();
+            for entry in entries {
+                builder.push_checked(entry)?;
+            }
+            Ok(Box::new(builder.build()))
+        }
+        RuleSetBehavior::IpCidr => {
+            let mut builder = IpCidrRuleSetBuilder::new();
+            for entry in entries {
+                builder.push_checked(entry)?;
+            }
+            Ok(Box::new(builder.build()))
+        }
+        RuleSetBehavior::Classical => {
+            let mut builder = ClassicalRuleSetBuilder::new(ctx);
+            for entry in entries {
+                builder.push_checked(entry)?;
+            }
+            Ok(Box::new(builder.build()))
+        }
+    }
+}
+
 /// Return `true` if `bytes` starts with the MRS magic `"MRS!"`.
 pub fn is_mrs_bytes(bytes: &[u8]) -> bool {
     bytes.len() >= 4
@@ -124,7 +158,7 @@ pub fn build_rule_set_from_mrs(
     bytes: &[u8],
     ctx: &ParserContext,
 ) -> Result<Box<dyn RuleSet>, String> {
-    build_rule_set_from_mrs_with_behavior(bytes, ctx, None)
+    build_rule_set_from_mrs_with_behavior(bytes, ctx, None, false)
 }
 
 /// Parse an MRS binary payload and optionally validate it against the
@@ -133,10 +167,16 @@ pub fn build_rule_set_from_mrs(
 /// Entries stream from the zstd decoder straight into the set builders: no
 /// decompressed copy of the payload and no per-entry `String` list is held,
 /// so the load peak is the finished set plus a small buffer.
+///
+/// `strict` (issue #533): the first malformed entry fails the build instead
+/// of being warn-skipped — parity with [`build_rule_set_checked`] for the
+/// yaml/text payload path. The streaming callbacks return `()`, so the first
+/// `push_checked` error is captured and reported after the stream ends.
 pub fn build_rule_set_from_mrs_with_behavior(
     bytes: &[u8],
     ctx: &ParserContext,
     expected: Option<RuleSetBehavior>,
+    strict: bool,
 ) -> Result<Box<dyn RuleSet>, String> {
     use crate::mrs_parser::{
         parse_header, stream_ipcidr_list, stream_string_list, UpstreamRuleSetReader,
@@ -155,9 +195,23 @@ pub fn build_rule_set_from_mrs_with_behavior(
         return match actual {
             RuleSetBehavior::Domain => {
                 let mut builder = DomainRuleSetBuilder::new();
+                let mut first_err = None;
                 reader
-                    .for_each_domain(|d| builder.push(d))
+                    .for_each_domain(|d| {
+                        if first_err.is_none() {
+                            if strict {
+                                if let Err(e) = builder.push_checked(d) {
+                                    first_err = Some(e);
+                                }
+                            } else {
+                                builder.push(d);
+                            }
+                        }
+                    })
                     .map_err(|e| e.to_string())?;
+                if let Some(e) = first_err {
+                    return Err(e);
+                }
                 Ok(Box::new(builder.build()))
             }
             RuleSetBehavior::IpCidr => {
@@ -184,24 +238,51 @@ pub fn build_rule_set_from_mrs_with_behavior(
     }
     let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(compressed))
         .map_err(|e| format!("mrs: zstd decompression failed: {e}"))?;
-    match hdr.type_tag {
+    let mut first_err = None;
+    let result = match hdr.type_tag {
         TYPE_DOMAIN => {
             let mut builder = DomainRuleSetBuilder::new();
-            stream_string_list(decoder, |entry| builder.push(entry)).map_err(|e| e.to_string())?;
-            Ok(Box::new(builder.build()))
+            stream_string_list(decoder, |entry| {
+                if first_err.is_none() {
+                    if strict {
+                        if let Err(e) = builder.push_checked(entry) {
+                            first_err = Some(e);
+                        }
+                    } else {
+                        builder.push(entry);
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+            Box::new(builder.build()) as Box<dyn RuleSet>
         }
         TYPE_IPCIDR => {
             let mut builder = IpCidrRuleSetBuilder::new();
             stream_ipcidr_list(decoder, |net| builder.push_net(net)).map_err(|e| e.to_string())?;
-            Ok(Box::new(builder.build()))
+            Box::new(builder.build()) as Box<dyn RuleSet>
         }
         TYPE_CLASSICAL => {
             let mut builder = ClassicalRuleSetBuilder::new(ctx);
-            stream_string_list(decoder, |entry| builder.push(entry)).map_err(|e| e.to_string())?;
-            Ok(Box::new(builder.build()))
+            stream_string_list(decoder, |entry| {
+                if first_err.is_none() {
+                    if strict {
+                        if let Err(e) = builder.push_checked(entry) {
+                            first_err = Some(e);
+                        }
+                    } else {
+                        builder.push(entry);
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+            Box::new(builder.build()) as Box<dyn RuleSet>
         }
-        other => Err(format!("mrs: unsupported type tag {other}")),
+        other => return Err(format!("mrs: unsupported type tag {other}")),
+    };
+    if let Some(e) = first_err {
+        return Err(e);
     }
+    Ok(result)
 }
 
 fn behavior_from_type_tag(type_tag: u8) -> Result<RuleSetBehavior, String> {
@@ -247,9 +328,20 @@ impl DomainRuleSetBuilder {
     }
 
     pub fn push(&mut self, entry: &str) {
+        if let Err(e) = self.push_checked(entry) {
+            warn!(
+                "rule-set (domain): skipping invalid entry '{}': {}",
+                entry, e
+            );
+        }
+    }
+
+    /// Checked variant of [`push`](Self::push) — the first malformed entry
+    /// returns `Err` instead of being warn-skipped (issue #533 strict mode).
+    pub fn push_checked(&mut self, entry: &str) -> Result<(), String> {
         let entry = entry.trim();
         if entry.is_empty() {
-            return;
+            return Ok(());
         }
         let inserted = self.trie.insert(entry, ());
         // `+.foo.com` should match both the bare `foo.com` and any
@@ -262,8 +354,9 @@ impl DomainRuleSetBuilder {
         };
         if inserted || bare_inserted {
             self.count += 1;
+            Ok(())
         } else {
-            warn!("rule-set (domain): skipping invalid entry '{}'", entry);
+            Err(format!("'{entry}' is not a valid domain pattern"))
         }
     }
 
@@ -338,16 +431,27 @@ impl IpCidrRuleSetBuilder {
 
     /// Add one textual CIDR; invalid entries are logged and skipped.
     pub fn push(&mut self, entry: &str) {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            return;
-        }
-        match entry.parse::<IpNet>() {
-            Ok(net) => self.push_net(net),
-            Err(e) => warn!(
+        if let Err(e) = self.push_checked(entry) {
+            warn!(
                 "rule-set (ipcidr): skipping invalid entry '{}': {}",
                 entry, e
-            ),
+            );
+        }
+    }
+
+    /// Checked variant of [`push`](Self::push) — invalid CIDRs return `Err`
+    /// (issue #533 strict mode).
+    pub fn push_checked(&mut self, entry: &str) -> Result<(), String> {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Ok(());
+        }
+        match entry.parse::<IpNet>() {
+            Ok(net) => {
+                self.push_net(net);
+                Ok(())
+            }
+            Err(e) => Err(format!("'{entry}': {e}")),
         }
     }
 
@@ -415,9 +519,17 @@ impl<'a> ClassicalRuleSetBuilder<'a> {
     }
 
     pub fn push(&mut self, entry: &str) {
+        if let Err(e) = self.push_checked(entry) {
+            warn!("rule-set (classical): skipping '{}': {}", entry, e);
+        }
+    }
+
+    /// Checked variant of [`push`](Self::push) — the first unparseable rule
+    /// returns `Err` (issue #533 strict mode).
+    pub fn push_checked(&mut self, entry: &str) -> Result<(), String> {
         let entry = entry.trim();
         if entry.is_empty() {
-            return;
+            return Ok(());
         }
         // Classical entries are `TYPE,PAYLOAD[,extra]` without an adapter.
         // The existing parser expects an adapter column, so splice a
@@ -426,8 +538,11 @@ impl<'a> ClassicalRuleSetBuilder<'a> {
         // classical sets and would be meaningless anyway.
         let patched = splice_placeholder_adapter(entry);
         match parse_rule(&patched, self.ctx) {
-            Ok(rule) => self.rules.push(rule),
-            Err(e) => warn!("rule-set (classical): skipping '{}': {}", entry, e),
+            Ok(rule) => {
+                self.rules.push(rule);
+                Ok(())
+            }
+            Err(e) => Err(format!("'{entry}': {e}")),
         }
     }
 
@@ -662,5 +777,36 @@ mod tests {
             RuleSetBehavior::Classical
         );
         assert!("nope".parse::<RuleSetBehavior>().is_err());
+    }
+
+    /// MRS payloads take the same strict gate as yaml/text — a malformed
+    /// entry inside the zstd stream fails the build instead of being
+    /// warn-skipped (issue #533 review).
+    #[test]
+    fn mrs_strict_rejects_malformed_entry() {
+        use crate::mrs_parser::{write_ruleset_mrs, TYPE_DOMAIN};
+        let bytes = write_ruleset_mrs(TYPE_DOMAIN, &["ok.example", "+."]).unwrap();
+        let ctx = ParserContext::default();
+
+        // Lenient: the bad entry is warn-skipped, the good one survives.
+        let set = build_rule_set_from_mrs_with_behavior(
+            &bytes,
+            &ctx,
+            Some(RuleSetBehavior::Domain),
+            false,
+        )
+        .expect("lenient build keeps good entries");
+        assert!(set.matches(&meta_host("ok.example"), &helper()));
+
+        // Strict: the same payload errors, naming the entry.
+        let Err(err) = build_rule_set_from_mrs_with_behavior(
+            &bytes,
+            &ctx,
+            Some(RuleSetBehavior::Domain),
+            true,
+        ) else {
+            panic!("strict must reject a malformed mrs entry");
+        };
+        assert!(err.contains("+."), "unexpected: {err}");
     }
 }

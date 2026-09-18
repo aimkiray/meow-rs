@@ -512,6 +512,15 @@ pub struct RebuildResult {
     /// live, since their fetch contexts pin this generation's dialer cell
     /// (issue #533 review).
     pub rule_providers: HashMap<String, Arc<rule_provider::RuleProvider>>,
+    /// The proxy-provider set this build's groups resolved `use:`/
+    /// `include-all` against — the candidate's own declarations
+    /// materialized by `materialize_proxy_providers`: live objects reused
+    /// for still-declared names, empty providers constructed for new defs.
+    /// Committing callers install it into `state.proxy_providers` after all
+    /// validation passes, so a removed provider's `use:` can't zombie-bind
+    /// and a newly declared provider becomes refreshable (issue #533
+    /// review).
+    pub proxy_providers: HashMap<String, Arc<ProxyProvider>>,
 }
 
 /// Rebuild proxies and rules from a RawConfig (used for runtime updates).
@@ -559,17 +568,24 @@ pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::E
 /// would diverge on the next refresh (issue #533 review). Committing
 /// callers pass `None` — their candidate set must load fresh so a
 /// rejected build never aliases live state.
+///
+/// `providers` is the live proxy-provider map — group `use:` names
+/// resolve against it. Callers that hold no providers pass an empty map;
+/// under `strict: true` every `use:` reference then fails the build
+/// (there is nothing to resolve against), so background refresh callers
+/// must pass the live map, not a placeholder.
 pub fn rebuild_from_raw_with_resolver(
     raw: &raw::RawConfig,
     resolver: Option<&meow_dns::ResolverSlot>,
     cache_dir: Option<&Path>,
+    providers: &HashMap<String, Arc<ProxyProvider>>,
     shared_rule_providers: Option<HashMap<String, Arc<rule_provider::RuleProvider>>>,
 ) -> Result<RebuildResult, anyhow::Error> {
     rebuild_from_raw_impl(
         raw,
         cache_dir,
         resolver,
-        &HashMap::new(),
+        providers,
         None,
         None,
         None,
@@ -681,6 +697,7 @@ pub async fn parse_dns_from_raw(
                     proxy_registry.clone(),
                     Arc::new(payloads),
                     dialer_registry.cloned(),
+                    raw.strict.unwrap_or(false),
                 )
                 .await?
             }
@@ -750,6 +767,7 @@ fn apply_dialer_proxies(
     raw_groups: &[raw::RawProxyGroup],
     registry: &meow_proxy::dialer::ProxyRegistry,
     ipv6: bool,
+    strict: bool,
 ) -> Result<Vec<(SmolStr, SmolStr)>, anyhow::Error> {
     // Collect proxy -> dialer edges from the raw config.
     //
@@ -767,10 +785,20 @@ fn apply_dialer_proxies(
         if !seen_names.insert(name) {
             continue;
         }
+        // Entries shadowing a built-in are dropped by `insert_parsed_leaves`;
+        // collecting their edge would wrap the *built-in* in a
+        // `DialerProxyAdapter` (or replace it via re-parse), chaining global
+        // `DIRECT`/`REJECT` traffic through the shadowed node's dialer.
+        if BUILTIN_ADAPTER_NAMES.contains(&name) {
+            continue;
+        }
         let dialer = match raw_proxy.get("dialer-proxy") {
             None => continue,
             Some(v) => match v.as_str() {
                 Some(s) if !s.is_empty() => s,
+                _ if strict => {
+                    anyhow::bail!("proxy '{name}': malformed dialer-proxy value (strict mode)");
+                }
                 _ => {
                     warn!("proxy '{name}': ignoring malformed dialer-proxy value");
                     continue;
@@ -853,6 +881,14 @@ fn apply_dialer_proxies(
         match proxy_parser::parse_proxy_with_dialer(raw, &proxy_dialer, ipv6) {
             Ok(rebuilt) => {
                 proxies.insert(name.clone(), rebuilt);
+            }
+            Err(e) if strict => {
+                // Under `strict` the dial-time failure the relay wrapper
+                // defers to is not acceptable — surface it at load.
+                return Err(anyhow::anyhow!(
+                    "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
+                     (strict mode): {e}"
+                ));
             }
             Err(e) => {
                 // The adapter type cannot carry an injected dialer (anytls,
@@ -1088,7 +1124,8 @@ fn insert_parsed_leaves(
     static_proxy_names: &mut std::collections::HashSet<SmolStr>,
     raw_proxies: &[HashMap<String, serde_yaml::Value>],
     ipv6: bool,
-) {
+    strict: bool,
+) -> Result<(), anyhow::Error> {
     for raw_proxy in raw_proxies {
         match proxy_parser::parse_proxy(raw_proxy, ipv6) {
             Ok(proxy) => {
@@ -1103,6 +1140,11 @@ fn insert_parsed_leaves(
                     .unwrap_or_else(|| proxy.name())
                     .into();
                 if BUILTIN_ADAPTER_NAMES.contains(&key.as_str()) {
+                    if strict {
+                        return Err(anyhow::anyhow!(
+                            "proxies: '{key}' shadows a built-in adapter (strict mode)"
+                        ));
+                    }
                     warn!(
                         "Proxy named '{key}' shadows a built-in adapter; the \
                          entry is dropped and the built-in stays"
@@ -1112,9 +1154,76 @@ fn insert_parsed_leaves(
                 static_proxy_names.insert(key.clone());
                 proxies.insert(key, proxy);
             }
+            Err(e) if strict => {
+                let name = raw_proxy
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unnamed>");
+                return Err(anyhow::anyhow!(
+                    "proxies: failed to parse '{name}' (strict mode): {e}"
+                ));
+            }
             Err(e) => warn!("Failed to parse proxy: {}", e),
         }
     }
+    Ok(())
+}
+
+/// Materialize the proxy-provider set for one candidate build (issue #533
+/// strict-mode review): the candidate's own `proxy-providers:` declarations
+/// are the `use:`/`include-all` authority — not the caller's live map.
+///
+/// - A name still declared with an unchanged definition reuses the live
+///   [`Arc`] — provider slots, fetched content, and health state carry over
+///   into the rebuilt groups. A *changed* definition rebuilds the provider:
+///   reusing the old object would keep fetching the old `url`/`path` with the
+///   old filters forever while the committed config claims otherwise
+///   (issue #533 review).
+/// - A newly declared def constructs an empty [`ProxyProvider`] (no fetch —
+///   this path is sync); the committing caller installs it into the live
+///   registry and spawns the initial refresh, so `use:`/`include-all` wire a
+///   real slot instead of dangling until restart.
+/// - A def that fails construction is warn-skipped leniently and a hard
+///   error under `strict` — the same gate startup's
+///   [`proxy_provider::load_proxy_providers`] applies, so a committed
+///   candidate cannot carry a def that would fail the next boot.
+///
+/// Providers absent from the candidate's declarations drop out: `use:` of a
+/// removed name then fails loudly (strict) or warns (lenient) instead of
+/// silently resolving to the zombie object.
+fn materialize_proxy_providers(
+    raw: &raw::RawConfig,
+    live: &HashMap<String, Arc<ProxyProvider>>,
+    cache_dir: Option<&Path>,
+    strict: bool,
+) -> Result<HashMap<String, Arc<ProxyProvider>>, anyhow::Error> {
+    let Some(raw_map) = raw.proxy_providers.as_ref() else {
+        return Ok(HashMap::new());
+    };
+    let ipv6 = effective_ipv6(raw.ipv6);
+    let mut out = HashMap::with_capacity(raw_map.len());
+    for (name, def) in raw_map {
+        if let Some(provider) = live.get(name) {
+            if provider.matches_def(def, ipv6) {
+                out.insert(name.clone(), Arc::clone(provider));
+                continue;
+            }
+        }
+        match ProxyProvider::new(name, def, cache_dir, ipv6, strict) {
+            Ok(provider) => {
+                out.insert(name.clone(), Arc::new(provider));
+            }
+            Err(e) if strict => {
+                return Err(anyhow::anyhow!(
+                    "proxy-provider '{name}' failed to load (strict mode): {e}"
+                ));
+            }
+            Err(e) => {
+                warn!("failed to create proxy-provider '{name}': {e}");
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Build the complete proxy layer for one config: built-ins, `proxies:` leaf
@@ -1129,13 +1238,15 @@ fn insert_parsed_leaves(
 /// no-resolver stage.
 /// `registry` is the cell the `dialer-proxy` targets bind to weakly — the
 /// caller publishes the returned map into it and must keep the cell alive
-/// for as long as the adapters are used.
+/// for as long as the adapters are used. `providers` is the candidate
+/// provider set from [`materialize_proxy_providers`].
 fn build_proxy_layer(
     raw: &raw::RawConfig,
     resolver: Option<&meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
     registry: &meow_proxy::dialer::ProxyRegistry,
+    strict: bool,
 ) -> Result<HashMap<SmolStr, Arc<dyn Proxy>>, anyhow::Error> {
     let ipv6 = effective_ipv6(raw.ipv6);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
@@ -1205,7 +1316,8 @@ fn build_proxy_layer(
         &mut static_proxy_names,
         raw.proxies.as_deref().unwrap_or(&[]),
         ipv6,
-    );
+        strict,
+    )?;
 
     let raw_groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
 
@@ -1220,6 +1332,7 @@ fn build_proxy_layer(
         raw_groups,
         registry,
         ipv6,
+        strict,
     )?;
 
     // Mihomo expands `include-all-proxies` from the top-level `proxies:`
@@ -1238,6 +1351,57 @@ fn build_proxy_layer(
         .into_iter()
         .map(|(_, proxy)| proxy)
         .collect();
+
+    // Duplicate group names: every declaration builds, but only the last
+    // survives `proxies.insert` — a dependent declared between two same-named
+    // decls captures the *first* object's Arc while the committed map holds
+    // the second (silent divergence, issue #533 review). Strict rejects it;
+    // lenient warns and keeps upstream's last-wins.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for raw_group in raw_groups {
+            if !seen.insert(raw_group.name.as_str()) {
+                if strict {
+                    return Err(anyhow::anyhow!(
+                        "proxy-groups: duplicate group name '{}' (strict mode)",
+                        raw_group.name
+                    ));
+                }
+                warn!(
+                    "proxy-groups: duplicate group name '{}'; the last declaration wins",
+                    raw_group.name
+                );
+            }
+        }
+    }
+
+    // Strict mode: a `use:` name that resolves to nothing is a permanent
+    // miss — providers are all loaded before groups, so check upfront rather
+    // than letting the lenient group passes silently drop the reference.
+    if strict {
+        for raw_group in raw_groups {
+            // `use:` is never consulted when `include-all`/
+            // `include-all-providers` supplies the membership, or when the
+            // group is a `relay` (chains only static `proxies:` members —
+            // the parser ignores provider slots) — don't reject a name the
+            // build would never look up (issue #533 review).
+            if raw_group.include_all.unwrap_or(false)
+                || raw_group.include_all_providers.unwrap_or(false)
+                || raw_group.group_type == "relay"
+            {
+                continue;
+            }
+            for pname in raw_group.use_providers.as_deref().unwrap_or(&[]) {
+                if !providers.contains_key(pname.as_str()) {
+                    return Err(anyhow::anyhow!(
+                        "proxy-groups: group '{}' references unknown proxy-provider \
+                         '{pname}' (strict mode)",
+                        raw_group.name
+                    ));
+                }
+            }
+        }
+    }
 
     // Multi-pass group resolution: groups can reference other groups.
     // Keep trying until no new groups are resolved.
@@ -1269,11 +1433,26 @@ fn build_proxy_layer(
                     let name = SmolStr::from(group.name());
                     built_group_names.insert(name.clone());
                     if BUILTIN_ADAPTER_NAMES.contains(&name.as_str()) {
+                        if strict {
+                            return Err(anyhow::anyhow!(
+                                "proxy-groups: '{name}' shadows a built-in adapter \
+                                 (strict mode)"
+                            ));
+                        }
                         warn!(
                             "Proxy group '{name}' shadows a built-in adapter; \
                              the group is dropped and the built-in stays"
                         );
                     } else {
+                        // A group silently overwriting a same-named leaf
+                        // changes which object a `proxies:`/rule reference
+                        // resolves to — a defect under strict (issue #533).
+                        if strict && static_proxy_names.contains(&name) {
+                            return Err(anyhow::anyhow!(
+                                "proxy-groups: '{name}' duplicates a proxies: entry \
+                                 (strict mode)"
+                            ));
+                        }
                         proxies.insert(name, group);
                     }
                     strict_progress = true;
@@ -1285,11 +1464,39 @@ fn build_proxy_layer(
         }
 
         if still_remaining.is_empty() {
+            remaining.clear();
             break;
         }
         if strict_progress {
             remaining = still_remaining;
             continue;
+        }
+
+        // Strict member-resolution has stalled. Under `strict: true` there is
+        // no lenient rescue: every group left here has a permanent failure —
+        // a missing static member, an invalid definition, or a declared group
+        // dependency that itself failed to build (unknown `use:` providers
+        // were already rejected upfront). Re-parse each strictly so the
+        // reported error names the offending member, then fail the load with
+        // all of them.
+        if strict {
+            let mut details = Vec::new();
+            for raw_group in &still_remaining {
+                if let Err(e) = proxy_parser::parse_proxy_group_with_store(
+                    raw_group,
+                    &proxies,
+                    &include_all_proxies,
+                    providers,
+                    selector_store,
+                ) {
+                    details.push(format!("'{}': {e}", raw_group.name));
+                }
+            }
+            return Err(anyhow::anyhow!(
+                "proxy-groups: strict mode rejected {} group(s): {}",
+                details.len(),
+                details.join("; ")
+            ));
         }
 
         // Strict parsing stalled. Leniently build only groups whose declared
@@ -1357,12 +1564,28 @@ fn build_proxy_layer(
                             proxies.insert(name, group);
                         }
                     }
+                    // Unreachable under `strict` — a stalled strict pass
+                    // already returned above — so no strict arm here.
                     Err(e) => warn!("Failed to parse proxy group '{}': {}", raw_group.name, e),
                 }
             }
             break;
         }
         remaining = lenient_remaining;
+    }
+
+    // Defensive: `max_passes` (groups + 1) is provably sufficient — every
+    // pass either shrinks `remaining` or stalls out loudly — but never let
+    // an exhausted loop silently drop groups under `strict` (issue #533
+    // review).
+    if strict && !remaining.is_empty() {
+        let names: Vec<&str> = remaining.iter().map(|g| g.name.as_str()).collect();
+        return Err(anyhow::anyhow!(
+            "proxy-groups: strict mode could not resolve {} group(s) after {} passes: {}",
+            names.len(),
+            raw_groups.len() + 1,
+            names.join(", ")
+        ));
     }
 
     // Auto-create GLOBAL selector if not defined by user (mihomo compatibility).
@@ -1480,7 +1703,14 @@ fn prefetch_proxy_map(
     // real build with the same error; surface it now instead of letting
     // default-proxy provider/geodata fetches egress direct on a config that
     // intends chained egress.
-    let map = build_proxy_layer(raw, None, providers, selector_store, &registry)?;
+    let map = build_proxy_layer(
+        raw,
+        None,
+        providers,
+        selector_store,
+        &registry,
+        raw.strict.unwrap_or(false),
+    )?;
     registry.publish(Arc::new(map.clone()));
     Ok(Some(PrefetchProxies {
         map,
@@ -1535,7 +1765,32 @@ fn rebuild_from_raw_impl(
     // object per provider). `None` = parse `raw.rule_providers` fresh.
     shared_providers: Option<HashMap<String, Arc<rule_provider::RuleProvider>>>,
 ) -> Result<RebuildResult, anyhow::Error> {
-    let proxies = build_proxy_layer(raw, resolver, providers, selector_store, registry)?;
+    // Top-level `strict: true` (issue #533): warn-skipped entries become
+    // hard errors — proxies, proxy-groups and rules are covered inside
+    // `build_proxy_layer`/`parse_rules_full`; proxy-provider definitions
+    // and provider payload nodes are gated by the caller (they are async).
+    let strict = raw.strict.unwrap_or(false);
+
+    // Materialize this candidate's proxy-provider set: reuse the caller's
+    // live objects for still-declared names (their slots, health state, and
+    // fetched content carry over) and construct empty providers for newly
+    // declared defs. The candidate's own `proxy-providers:` declarations —
+    // not the caller's live map — are the `use:`/`include-all` authority:
+    // a `PUT /configs` that drops a provider must not leave `use:`
+    // resolving to a zombie Arc, and one adding a provider must let groups
+    // wire its (initially empty) slot instead of failing "unknown
+    // provider" (issue #533 review). `strict` also validates newly
+    // declared defs here so a bad def can't be committed and then fail the
+    // next startup.
+    let candidate_providers = materialize_proxy_providers(raw, providers, cache_dir, strict)?;
+    let proxies = build_proxy_layer(
+        raw,
+        resolver,
+        &candidate_providers,
+        selector_store,
+        registry,
+        strict,
+    )?;
 
     // Publish the finished registry: the `dialer-proxy` chains bound during
     // the layer build resolve their front hop by name against it, and only
@@ -1607,7 +1862,8 @@ fn rebuild_from_raw_impl(
                 &proxy_lookup,
                 payloads,
                 Some(registry),
-            ),
+                strict,
+            )?,
             _ => HashMap::new(),
         },
     };
@@ -1625,7 +1881,8 @@ fn rebuild_from_raw_impl(
         &ruleset_map,
         ctx,
         &sub_rules,
-    );
+        strict,
+    )?;
 
     // Validate: any `SUB-RULE,<name>` in top-level rules must reference a
     // defined block. `parse_rules_full` warns on unknown blocks; promote
@@ -1651,6 +1908,7 @@ fn rebuild_from_raw_impl(
         rules,
         dialer_registry: registry.clone(),
         rule_providers,
+        proxy_providers: candidate_providers,
     })
 }
 
@@ -1750,6 +2008,10 @@ async fn rebuild_from_raw_impl_async(
     .map_err(|e| anyhow::anyhow!("config rebuild task failed: {e}"))?
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct piece of one provider's load context"
+)]
 async fn load_rule_providers_async(
     raw_providers: HashMap<String, raw::RawRuleProvider>,
     cache_dir: Option<PathBuf>,
@@ -1761,6 +2023,7 @@ async fn load_rule_providers_async(
     // adapter keeps resolving its `dialer-proxy` front hop on refreshes that
     // outlive this route generation (issue #533).
     dialer_registry: Option<meow_proxy::dialer::ProxyRegistry>,
+    strict: bool,
 ) -> Result<HashMap<String, Arc<rule_provider::RuleProvider>>, anyhow::Error> {
     spawn_blocking_with_current_dispatcher(move || {
         let lookup = |name: &str| proxies.get(name).cloned();
@@ -1772,13 +2035,17 @@ async fn load_rule_providers_async(
             &lookup,
             &provider_payloads,
             dialer_registry.as_ref(),
+            strict,
         )
     })
     .await
-    .map_err(|e| anyhow::anyhow!("rule-provider load task failed: {e}"))
+    .map_err(|e| anyhow::anyhow!("rule-provider load task failed: {e}"))?
 }
 
-fn parse_sniffer_config(raw: &raw::RawConfig) -> Result<SnifferConfig, anyhow::Error> {
+fn parse_sniffer_config(
+    raw: &raw::RawConfig,
+    strict: bool,
+) -> Result<SnifferConfig, anyhow::Error> {
     // Deprecated alias: tproxy_sni (pre-spec) synthesises a minimal config.
     let has_tproxy_sni = raw.tproxy_sni.unwrap_or(false);
 
@@ -1818,6 +2085,15 @@ fn parse_sniffer_config(raw: &raw::RawConfig) -> Result<SnifferConfig, anyhow::E
                         }
                         "QUIC" => {
                             warn!("sniffer.sniff.QUIC is not implemented in meow-rs; ignoring");
+                        }
+                        // An unrecognized key is a typo'd/dead declaration —
+                        // a defect under strict (issue #533 review), unlike
+                        // the valid-but-unimplemented `QUIC` Class-B shim.
+                        other if strict => {
+                            anyhow::bail!(
+                                "sniffer.sniff.{other}: unknown protocol (strict mode); \
+                                 supported: TLS, HTTP"
+                            );
                         }
                         other => {
                             warn!("sniffer.sniff.{}: unknown protocol, ignoring", other);
@@ -2615,9 +2891,12 @@ async fn build_config(
 ) -> Result<Config, anyhow::Error> {
     // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
     // sync `parse_proxy` path that follows can stay sync. Failures warn
-    // and leave the map unchanged.
+    // and leave the map unchanged — except the `enable: true` with no
+    // query-source defect, which `strict` promotes to an error.
     if let Some(ps) = raw.proxies.as_mut() {
-        ech_dns::preresolve_ech(ps).await;
+        ech_dns::preresolve_ech(ps, raw.strict.unwrap_or(false))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e} (strict mode)"))?;
     }
 
     // Geodata config — parse and validate early so path errors surface before
@@ -2655,7 +2934,13 @@ async fn build_config(
         if raw_pp.is_empty() {
             HashMap::new()
         } else {
-            proxy_provider::load_proxy_providers(raw_pp, cache_dir, general.ipv6).await
+            proxy_provider::load_proxy_providers(
+                raw_pp,
+                cache_dir,
+                general.ipv6,
+                raw.strict.unwrap_or(false),
+            )
+            .await?
         }
     } else {
         HashMap::new()
@@ -2759,6 +3044,7 @@ async fn build_config(
                 proxies.clone(),
                 Arc::clone(&provider_payloads),
                 Some(dialer_registry.clone()),
+                raw.strict.unwrap_or(false),
             )
             .await?
         }
@@ -2851,7 +3137,7 @@ async fn build_config(
     };
 
     // Sniffer config — also handles deprecated `tproxy_sni` alias.
-    let sniffer = parse_sniffer_config(&raw)?;
+    let sniffer = parse_sniffer_config(&raw, raw.strict.unwrap_or(false))?;
 
     // Auth config.
     let auth = auth::parse_auth_config(
@@ -2975,7 +3261,7 @@ mod dialer_proxy_tests {
         raw_groups: &[raw::RawProxyGroup],
     ) -> Result<meow_proxy::dialer::ProxyRegistry, anyhow::Error> {
         let registry = meow_proxy::dialer::ProxyRegistry::default();
-        let edges = apply_dialer_proxies(proxies, raw_proxies, raw_groups, &registry, true)?;
+        let edges = apply_dialer_proxies(proxies, raw_proxies, raw_groups, &registry, true, false)?;
         for group in raw_groups {
             proxies
                 .entry(SmolStr::from(group.name.as_str()))
@@ -4630,9 +4916,11 @@ rules:
 
         // `rebuild_from_raw_with_resolver` — used by subscription_refresh
         // and geodata_fetch.
-        let result = rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), None).expect(
-            "trusted rebuild with the real cache dir must not hard-fail on a file provider",
-        );
+        let result =
+            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
+                .expect(
+                    "trusted rebuild with the real cache dir must not hard-fail on a file provider",
+                );
         assert_eq!(result.rules.len(), 2);
 
         // `rebuild_from_raw_runtime` — used by meow-api's `PUT /configs`
@@ -4678,15 +4966,22 @@ rules:
 
         // Commit path: swap the returned set in after validation succeeds.
         let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), None).expect("rebuild ok");
+            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
+                .expect("rebuild ok");
         *live.write() = result.rule_providers;
         assert!(live.read().contains_key("ads"));
 
         // A candidate that drops `rule-providers:` empties the registry.
         let raw_bare: raw::RawConfig =
             serde_yaml::from_str("rules:\n  - \"MATCH,DIRECT\"\n").unwrap();
-        let result = rebuild_from_raw_with_resolver(&raw_bare, None, Some(dir.path()), None)
-            .expect("rebuild ok");
+        let result = rebuild_from_raw_with_resolver(
+            &raw_bare,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+        )
+        .expect("rebuild ok");
         *live.write() = result.rule_providers;
         assert!(live.read().is_empty());
 
@@ -4696,12 +4991,20 @@ rules:
             "rule-providers:\n  ads:\n    type: file\n    behavior: domain\n    format: yaml\n    path: ads.yaml\nrules:\n  - RULE-SET,ads,REJECT\n  - \"MATCH,DIRECT\"\n",
         )
         .unwrap();
-        let result = rebuild_from_raw_with_resolver(&raw_ok, None, Some(dir.path()), None)
-            .expect("rebuild ok");
+        let result =
+            rebuild_from_raw_with_resolver(&raw_ok, None, Some(dir.path()), &HashMap::new(), None)
+                .expect("rebuild ok");
         *live.write() = result.rule_providers;
         let raw_bad: raw::RawConfig =
             serde_yaml::from_str("rules:\n  - SUB-RULE,(MATCH,DIRECT),missing\n").unwrap();
-        assert!(rebuild_from_raw_with_resolver(&raw_bad, None, Some(dir.path()), None).is_err());
+        assert!(rebuild_from_raw_with_resolver(
+            &raw_bad,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None
+        )
+        .is_err());
         assert!(
             live.read().contains_key("ads"),
             "a failed rebuild must leave the live provider registry untouched"
@@ -4726,6 +5029,855 @@ rule-providers:
             panic!("`..` traversal in rule-provider path must fail the rebuild");
         };
         assert!(err.to_string().contains("escapes"), "unexpected: {err}");
+    }
+}
+
+#[cfg(test)]
+mod strict_mode_tests {
+    //! Issue #533: top-level `strict: true` turns warn-skipped entries —
+    //! unparseable `proxies:`/`proxy-groups:`/`rules:` items, a bad
+    //! `proxy-providers:` definition, and bad nodes inside a provider
+    //! payload — into hard config errors.
+    use super::*;
+
+    fn raw_config(yaml: &str) -> raw::RawConfig {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    const BASE: &str = r#"
+strict: {STRICT}
+proxies:
+  - { name: ok, type: direct }
+  - { name: broken, type: nosuchtype }
+proxy-groups:
+  - { name: g-ok, type: select, proxies: [ok] }
+  - { name: g-broken, type: nosuchgrouptype, proxies: [ok] }
+rules:
+  - "MATCH,DIRECT"
+  - "NOSUCHRULE,x,DIRECT"
+"#;
+
+    fn build(yaml: &str) -> Result<RebuildResult, anyhow::Error> {
+        let raw = raw_config(&yaml.replace("{STRICT}", "true"));
+        rebuild_from_raw(&raw)
+    }
+
+    fn expect_strict_failure(yaml: &str, ctx: &str) -> anyhow::Error {
+        let Err(e) = build(yaml) else {
+            panic!("strict must reject {ctx}");
+        };
+        e
+    }
+
+    #[test]
+    fn strict_rejects_unparseable_proxy_entry() {
+        let yaml = BASE
+            .replace(
+                "  - { name: g-broken, type: nosuchgrouptype, proxies: [ok] }\n",
+                "",
+            )
+            .replace("  - \"NOSUCHRULE,x,DIRECT\"\n", "");
+        let err = expect_strict_failure(&yaml, "a bad proxies: entry");
+        assert!(err.to_string().contains("strict mode"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn strict_rejects_unparseable_proxy_group() {
+        let yaml = BASE
+            .replace("  - { name: broken, type: nosuchtype }\n", "")
+            .replace("  - \"NOSUCHRULE,x,DIRECT\"\n", "");
+        let err = expect_strict_failure(&yaml, "a bad proxy-groups: entry");
+        assert!(err.to_string().contains("strict mode"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn strict_rejects_unparseable_rule() {
+        let yaml = BASE
+            .replace("  - { name: broken, type: nosuchtype }\n", "")
+            .replace(
+                "  - { name: g-broken, type: nosuchgrouptype, proxies: [ok] }\n",
+                "",
+            );
+        let err = expect_strict_failure(&yaml, "a bad rules: entry");
+        assert!(err.to_string().contains("strict mode"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn lenient_still_skips_unparseable_entries() {
+        let raw = raw_config(&BASE.replace("{STRICT}", "false"));
+        let RebuildResult { proxies, rules, .. } =
+            rebuild_from_raw(&raw).expect("lenient mode must tolerate bad entries");
+        assert!(proxies.contains_key("ok"));
+        assert!(!proxies.contains_key("broken"));
+        assert!(proxies.contains_key("g-ok"));
+        assert!(!proxies.contains_key("g-broken"));
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn strict_rejects_bad_proxy_provider_definition() {
+        let yaml = r#"
+proxy-providers:
+  bad:
+    type: bogusvehicle
+"#;
+        let raw = raw_config(yaml);
+        let result = proxy_provider::load_proxy_providers(
+            raw.proxy_providers.as_ref().unwrap(),
+            None,
+            false,
+            true,
+        )
+        .await;
+        let Err(err) = result else {
+            panic!("strict must reject a bad proxy-providers: entry");
+        };
+        assert!(err.to_string().contains("bad"), "unexpected: {err}");
+
+        // Lenient keeps the provider map empty instead of failing.
+        let raw = raw_config(yaml);
+        let map = proxy_provider::load_proxy_providers(
+            raw.proxy_providers.as_ref().unwrap(),
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("lenient load never errors");
+        assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn strict_rejects_unparseable_provider_node() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            r#"proxies:
+  - { name: ok, type: ss, server: 127.0.0.1, port: 8388, cipher: aes-128-gcm, password: x }
+  - { name: broken, type: nosuchtype }
+"#,
+        )
+        .unwrap();
+        let yaml = format!(
+            r#"
+proxy-providers:
+  airport:
+    type: file
+    path: '{}'
+"#,
+            dir.path().join("nodes.yaml").display()
+        );
+        let raw = raw_config(&yaml);
+        let result = proxy_provider::load_proxy_providers(
+            raw.proxy_providers.as_ref().unwrap(),
+            Some(dir.path()),
+            false,
+            true,
+        )
+        .await;
+        let Err(err) = result else {
+            panic!("strict must reject a bad node inside a provider payload");
+        };
+        assert!(err.to_string().contains("broken"), "unexpected: {err}");
+
+        // Lenient keeps the parseable node and drops the broken one.
+        let map = proxy_provider::load_proxy_providers(
+            raw.proxy_providers.as_ref().unwrap(),
+            Some(dir.path()),
+            false,
+            false,
+        )
+        .await
+        .expect("lenient load never errors");
+        let provider = map.get("airport").expect("provider must still load");
+        let proxies = provider.proxies();
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].name(), "ok");
+    }
+
+    #[test]
+    fn strict_rejects_group_with_missing_member() {
+        let yaml = r#"
+strict: {STRICT}
+proxies:
+  - { name: ok, type: direct }
+proxy-groups:
+  - { name: g, type: select, proxies: [ok, typo] }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let err = expect_strict_failure(yaml, "a group with a missing member");
+        assert!(err.to_string().contains("typo"), "unexpected: {err}");
+
+        // Lenient builds the group with the resolvable members only.
+        let raw = raw_config(&yaml.replace("{STRICT}", "false"));
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw).expect("lenient mode must tolerate a missing member");
+        assert!(proxies.contains_key("g"));
+    }
+
+    #[test]
+    fn strict_rejects_group_with_unknown_use_provider() {
+        let yaml = r#"
+strict: {STRICT}
+proxies:
+  - { name: ok, type: direct }
+proxy-groups:
+  - { name: g, type: select, proxies: [ok], use: [missing-provider] }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let err = expect_strict_failure(yaml, "a group with an unknown use: provider");
+        assert!(
+            err.to_string().contains("missing-provider"),
+            "unexpected: {err}"
+        );
+
+        let raw = raw_config(&yaml.replace("{STRICT}", "false"));
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw).expect("lenient mode must tolerate a missing use: provider");
+        assert!(proxies.contains_key("g"));
+    }
+
+    #[test]
+    fn strict_rejects_forward_group_reference_that_dead_ends() {
+        // `dep` has an unresolvable member; `dependent` is declared first and
+        // forwards to it. Under strict both must be reported — the dependent's
+        // error names the failed dep, not a phantom.
+        let yaml = r#"
+strict: {STRICT}
+proxies:
+  - { name: ok, type: direct }
+proxy-groups:
+  - { name: dependent, type: select, proxies: [dep] }
+  - { name: dep, type: select, proxies: [ok, typo] }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let err = expect_strict_failure(yaml, "a broken group dependency chain");
+        let msg = err.to_string();
+        assert!(msg.contains("typo"), "unexpected: {err}");
+        assert!(msg.contains("dep"), "unexpected: {err}");
+
+        // Lenient still resolves the chain by skipping the bad member.
+        let raw = raw_config(&yaml.replace("{STRICT}", "false"));
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw).expect("lenient mode must resolve the chain");
+        assert!(proxies.contains_key("dependent"));
+        assert!(proxies.contains_key("dep"));
+    }
+
+    #[test]
+    fn strict_rejects_builtin_shadowing_entry() {
+        let yaml = r#"
+strict: {STRICT}
+proxies:
+  - { name: DIRECT, type: ss, server: 127.0.0.1, port: 8388, cipher: aes-128-gcm, password: x }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let err = expect_strict_failure(yaml, "a proxies: entry shadowing a built-in");
+        assert!(err.to_string().contains("DIRECT"), "unexpected: {err}");
+
+        // Lenient drops the entry and keeps the built-in.
+        let raw = raw_config(&yaml.replace("{STRICT}", "false"));
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw).expect("lenient mode must tolerate a shadowing entry");
+        assert_eq!(
+            proxies.get("DIRECT").unwrap().adapter_type(),
+            meow_common::AdapterType::Direct
+        );
+    }
+
+    #[test]
+    fn strict_rejects_malformed_dialer_proxy() {
+        let yaml = r#"
+strict: {STRICT}
+proxies:
+  - { name: front, type: direct }
+  - { name: leaf, type: socks5, server: 127.0.0.1, port: 1080, dialer-proxy: 123 }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let err = expect_strict_failure(yaml, "a malformed dialer-proxy value");
+        assert!(
+            err.to_string().contains("dialer-proxy"),
+            "unexpected: {err}"
+        );
+
+        // Lenient drops the malformed chain and the leaf dials direct.
+        let raw = raw_config(&yaml.replace("{STRICT}", "false"));
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw).expect("lenient mode must tolerate a malformed dialer-proxy");
+        assert!(proxies.contains_key("leaf"));
+    }
+
+    /// A `dialer-proxy` on an adapter that cannot carry an injected dialer
+    /// (`direct`, `anytls`, `hysteria2`, SS + external SIP003) fails the
+    /// by-name re-parse. Lenient falls back to the relay-based
+    /// `DialerProxyAdapter` wrapper; strict surfaces the defect at load
+    /// (issue #533 review).
+    #[test]
+    fn strict_rejects_uninjectable_dialer_reparse() {
+        let yaml = r#"
+strict: {STRICT}
+proxies:
+  - { name: front, type: direct }
+  - { name: leaf, type: direct, dialer-proxy: front }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let err = expect_strict_failure(yaml, "a dialer-proxy on an uninjectable adapter type");
+        assert!(err.to_string().contains("leaf"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("dialer-proxy"),
+            "unexpected: {err}"
+        );
+
+        let raw = raw_config(&yaml.replace("{STRICT}", "false"));
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw).expect("lenient falls back to the relay-based wrapper");
+        assert!(proxies.contains_key("leaf"));
+    }
+
+    #[test]
+    fn shadowed_dialer_edge_does_not_wrap_builtin() {
+        // A leaf named DIRECT is dropped for shadowing; its `dialer-proxy`
+        // edge must be skipped too — otherwise the *built-in* DIRECT gets
+        // wrapped/re-parsed and global direct traffic is chained through the
+        // shadowed node's dialer.
+        let yaml = r#"
+strict: false
+proxies:
+  - { name: front, type: direct }
+  - { name: DIRECT, type: socks5, server: 127.0.0.1, port: 1080, dialer-proxy: front }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let raw = raw_config(yaml);
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw).expect("lenient build must succeed");
+        // If the shadowed entry's edge were collected, `DIRECT` would be
+        // re-parsed as the entry's real type (Socks5) with the dialer
+        // injected — the built-in must instead stay the Direct adapter.
+        assert_eq!(
+            proxies
+                .get("DIRECT")
+                .expect("built-in DIRECT present")
+                .adapter_type(),
+            meow_common::AdapterType::Direct
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_fetch_failure_stays_lenient() {
+        // A `file` provider whose path does not exist is an acquisition
+        // failure, not a parse defect: strict mode still starts it empty.
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+proxy-providers:
+  gone:
+    type: file
+    path: '{}'
+"#,
+            dir.path().join("missing.yaml").display()
+        );
+        let raw = raw_config(&yaml);
+        let map = proxy_provider::load_proxy_providers(
+            raw.proxy_providers.as_ref().unwrap(),
+            Some(dir.path()),
+            false,
+            true,
+        )
+        .await
+        .expect("an unfetchable provider must stay lenient even under strict");
+        let provider = map.get("gone").expect("provider must be registered");
+        assert!(provider.proxies().is_empty());
+    }
+
+    #[test]
+    fn strict_rejects_bad_rule_provider_definition() {
+        let yaml = r#"
+strict: {STRICT}
+rule-providers:
+  bad:
+    type: bogusvehicle
+    behavior: domain
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let err = expect_strict_failure(yaml, "a bad rule-providers: entry");
+        assert!(err.to_string().contains("bad"), "unexpected: {err}");
+
+        let raw = raw_config(&yaml.replace("{STRICT}", "false"));
+        rebuild_from_raw(&raw).expect("lenient mode must tolerate a bad rule-provider");
+    }
+
+    /// Issue #533 review: a `PUT /configs` candidate that DECLARES a new
+    /// provider must satisfy `use:` under strict — the live registry is not
+    /// the authority, the candidate's own `proxy-providers:` section is.
+    #[test]
+    fn strict_use_resolves_candidate_declared_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nodes.yaml"), "proxies: []\n").unwrap();
+        let yaml = r#"
+strict: true
+proxy-providers:
+  airport:
+    type: file
+    path: nodes.yaml
+proxy-groups:
+  - { name: g, type: select, use: [airport] }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let raw = raw_config(yaml);
+        // Empty live map — the declaration itself must authorize `use:`.
+        let result =
+            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
+                .expect("strict must accept use: of a candidate-declared provider");
+        assert!(result.proxies.contains_key("g"));
+        assert!(result.proxy_providers.contains_key("airport"));
+    }
+
+    /// The mirror image: a candidate that DROPS a provider declaration must
+    /// fail `use:` under strict even while the live registry still holds the
+    /// object — otherwise the removal would zombie-bind for one generation.
+    #[test]
+    fn strict_use_fails_when_candidate_removes_provider() {
+        let live_def: raw::RawProxyProvider =
+            serde_yaml::from_str("type: http\nurl: http://127.0.0.1:1/x.yaml").unwrap();
+        let live_provider = ProxyProvider::new("airport", &live_def, None, false, false).unwrap();
+        let live: HashMap<String, Arc<ProxyProvider>> =
+            HashMap::from([("airport".to_string(), Arc::new(live_provider))]);
+
+        let yaml = r#"
+strict: {STRICT}
+proxies:
+  - { name: ok, type: direct }
+proxy-groups:
+  - { name: g, type: select, proxies: [ok], use: [airport] }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let raw = raw_config(&yaml.replace("{STRICT}", "true"));
+        let Err(err) = rebuild_from_raw_with_resolver(&raw, None, None, &live, None) else {
+            panic!("use: of a removed provider must fail strict");
+        };
+        assert!(err.to_string().contains("airport"), "unexpected: {err}");
+
+        // Lenient keeps the group — the zombie Arc is not consulted.
+        let raw = raw_config(&yaml.replace("{STRICT}", "false"));
+        let result = rebuild_from_raw_with_resolver(&raw, None, None, &live, None)
+            .expect("lenient mode must tolerate the removal");
+        assert!(result.proxies.contains_key("g"));
+        assert!(
+            result.proxy_providers.is_empty(),
+            "the candidate must not resurrect an undeclared provider"
+        );
+    }
+
+    /// A malformed `proxy-providers:` def in a CANDIDATE is a strict defect
+    /// even when nothing references it — committing it would fail the next
+    /// startup, so the rebuild must fail now.
+    #[test]
+    fn strict_rejects_malformed_candidate_provider_def() {
+        let yaml = r#"
+strict: {STRICT}
+proxy-providers:
+  bad:
+    type: bogusvehicle
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let err = expect_strict_failure(yaml, "a malformed proxy-providers def");
+        assert!(err.to_string().contains("bad"), "unexpected: {err}");
+
+        let raw = raw_config(&yaml.replace("{STRICT}", "false"));
+        let result = rebuild_from_raw(&raw).expect("lenient mode must skip a bad provider def");
+        assert!(result.proxy_providers.is_empty());
+    }
+
+    /// `use:` is never consulted under `include-all*` — an unknown name in
+    /// the ignored list must not fail strict (issue #533 review).
+    #[test]
+    fn strict_tolerates_unknown_use_when_include_all_supplies_members() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nodes.yaml"), "proxies: []\n").unwrap();
+        for flag in ["include-all: true", "include-all-providers: true"] {
+            let yaml = format!(
+                r#"
+strict: true
+proxy-providers:
+  airport:
+    type: file
+    path: nodes.yaml
+proxy-groups:
+  - {{ name: g, type: select, use: [nonexistent], {flag} }}
+rules:
+  - "MATCH,DIRECT"
+"#
+            );
+            let raw = raw_config(&yaml);
+            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
+                .unwrap_or_else(|e| panic!("strict must ignore inert use: under {flag}: {e}"));
+        }
+    }
+
+    /// `type: relay` chains only static `proxies:` members — provider slots
+    /// are dropped with a warn — so an unknown `use:` name is inert there
+    /// too (issue #533 review).
+    #[test]
+    fn strict_tolerates_unknown_use_on_relay_group() {
+        let yaml = r#"
+strict: true
+proxies:
+  - { name: a, type: direct }
+  - { name: b, type: direct }
+proxy-groups:
+  - { name: r, type: relay, proxies: [a, b], use: [nonexistent] }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let raw = raw_config(yaml);
+        rebuild_from_raw(&raw).expect("strict must ignore inert use: on a relay group");
+    }
+
+    /// A rule-provider whose payload can't be acquired is transient — the
+    /// provider registers empty in BOTH modes so `RULE-SET` references
+    /// resolve and a later refresh can heal it (issue #533 review).
+    #[test]
+    fn strict_rule_provider_acquisition_failure_registers_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+strict: {STRICT}
+rule-providers:
+  remote:
+    type: file
+    behavior: domain
+    format: yaml
+    path: missing.yaml
+rules:
+  - RULE-SET,remote,REJECT
+  - "MATCH,DIRECT"
+"#;
+        let raw = raw_config(&yaml.replace("{STRICT}", "true"));
+        let result =
+            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
+                .expect("strict must keep an unreadable provider as a known-empty set");
+        assert!(result.rule_providers.contains_key("remote"));
+        assert_eq!(
+            result.rules.len(),
+            2,
+            "RULE-SET must resolve to the empty set"
+        );
+    }
+
+    /// A bad `format:` is a DEFECT in the definition, not an acquisition
+    /// failure — strict rejects it even though no bytes were ever fetched.
+    #[test]
+    fn strict_rejects_bad_rule_provider_format() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("r.yaml"), "payload: []\n").unwrap();
+        let yaml = r#"
+strict: {STRICT}
+rule-providers:
+  bad:
+    type: file
+    behavior: domain
+    format: bogus
+    path: r.yaml
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let raw = raw_config(&yaml.replace("{STRICT}", "true"));
+        let Err(err) =
+            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
+        else {
+            panic!("a bogus format: is a defect — strict must reject");
+        };
+        assert!(err.to_string().contains("bad"), "unexpected: {err}");
+    }
+
+    /// A malformed line inside a provider payload fails strict instead of
+    /// silently installing a partial set; lenient keeps the good lines.
+    #[test]
+    fn strict_rejects_malformed_rule_provider_payload_line() {
+        let dir = tempfile::tempdir().unwrap();
+        // A non-string `payload:` item is dropped leniently (mihomo parity)
+        // but is a malformed payload under strict.
+        std::fs::write(
+            dir.path().join("mixed.yaml"),
+            "payload:\n  - example.com\n  - 123\n",
+        )
+        .unwrap();
+        let yaml = r#"
+strict: {STRICT}
+rule-providers:
+  mixed:
+    type: file
+    behavior: domain
+    format: yaml
+    path: mixed.yaml
+rules:
+  - RULE-SET,mixed,REJECT
+  - "MATCH,DIRECT"
+"#;
+        let raw = raw_config(&yaml.replace("{STRICT}", "true"));
+        if rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
+            .is_ok()
+        {
+            panic!("strict must reject a non-string payload item");
+        }
+
+        let raw = raw_config(&yaml.replace("{STRICT}", "false"));
+        let result =
+            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
+                .expect("lenient drops the non-string item and keeps the provider");
+        assert!(result.rule_providers.contains_key("mixed"));
+    }
+
+    /// A `file` rule-provider without `path:` must name the missing field —
+    /// not an implicit name-derived location the user never wrote.
+    #[test]
+    fn file_rule_provider_without_path_names_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+rule-providers:
+  p:
+    type: file
+    behavior: domain
+    format: yaml
+"#;
+        let raw = raw_config(yaml);
+        let providers = raw.rule_providers.as_ref().unwrap();
+        let ctx = meow_rules::ParserContext::empty();
+        let err = rule_provider::load_providers(providers, Some(dir.path()), &ctx, None, true)
+            .map(|_| ())
+            .expect_err("strict must reject a file provider without path");
+        assert!(
+            err.to_string().contains("requires a 'path'"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// `set_strict` follows the committed generation: a provider built
+    /// leniently must honor strict parsing after the flag flips — and a
+    /// torn payload must keep the last-good slot contents (issue #533
+    /// review).
+    #[tokio::test]
+    async fn provider_strict_flag_governs_refresh_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - { name: ok, type: ss, server: 127.0.0.1, port: 8388, cipher: aes-128-gcm, password: x }\n  - { name: broken, type: nosuchtype }\n",
+        )
+        .unwrap();
+        let def: raw::RawProxyProvider = serde_yaml::from_str(&format!(
+            "type: file\npath: '{}'",
+            dir.path().join("nodes.yaml").display()
+        ))
+        .unwrap();
+        let provider = ProxyProvider::new("p", &def, Some(dir.path()), false, false).unwrap();
+
+        // Lenient refresh: bad node skipped, good node lands.
+        provider
+            .refresh()
+            .await
+            .expect("lenient refresh tolerates a bad node");
+        assert_eq!(provider.proxies().len(), 1);
+
+        // Strict generation: the same payload now fails the refresh and the
+        // last-good set is retained.
+        provider.set_strict(true);
+        provider
+            .refresh()
+            .await
+            .expect_err("strict refresh must reject a bad node");
+        assert_eq!(provider.proxies().len(), 1, "torn refresh keeps last-good");
+
+        provider.set_strict(false);
+        provider.refresh().await.expect("lenient again");
+    }
+
+    /// A group named the same as a `proxies:` leaf silently overwrites it —
+    /// every reference then resolves to the group, not the leaf. Strict
+    /// treats the collision as a defect (issue #533 review).
+    #[test]
+    fn strict_rejects_group_leaf_name_collision() {
+        let yaml = r#"
+strict: {STRICT}
+proxies:
+  - { name: dup, type: direct }
+proxy-groups:
+  - { name: dup, type: select, proxies: [DIRECT] }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let err = expect_strict_failure(yaml, "a group shadowing a proxies: leaf");
+        assert!(err.to_string().contains("dup"), "unexpected: {err}");
+
+        let raw = raw_config(&yaml.replace("{STRICT}", "false"));
+        rebuild_from_raw(&raw).expect("lenient keeps the last-wins overwrite");
+    }
+
+    /// `ech-opts.enable: true` with no `config:`, no `query-server-name:`,
+    /// and no `server:` is a defect — strict turns it into an error while
+    /// lenient just skips ECH (issue #533 review).
+    #[tokio::test]
+    async fn strict_rejects_ech_enable_with_no_query_source() {
+        let mut proxies = vec![serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(
+            "{ name: p, type: ss, ech-opts: { enable: true } }",
+        )
+        .unwrap()];
+        let err = ech_dns::preresolve_ech(&mut proxies, true)
+            .await
+            .expect_err("strict must reject enable:true with no query source");
+        assert!(err.contains("p"), "unexpected: {err}");
+
+        let mut proxies = vec![serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(
+            "{ name: p, type: ss, ech-opts: { enable: true } }",
+        )
+        .unwrap()];
+        ech_dns::preresolve_ech(&mut proxies, false)
+            .await
+            .expect("lenient skips ECH silently");
+    }
+
+    /// Two groups with the same name: both decls build, but a dependent
+    /// declared between them captures the first object while the committed
+    /// map holds the second — a silent divergence (issue #533 review).
+    #[test]
+    fn strict_rejects_duplicate_group_name() {
+        let yaml = r#"
+strict: {STRICT}
+proxies:
+  - { name: ok, type: direct }
+proxy-groups:
+  - { name: dup, type: select, proxies: [ok] }
+  - { name: mid, type: select, proxies: [dup] }
+  - { name: dup, type: select, proxies: [ok, DIRECT] }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let err = expect_strict_failure(yaml, "duplicate group names");
+        assert!(err.to_string().contains("dup"), "unexpected: {err}");
+
+        let raw = raw_config(&yaml.replace("{STRICT}", "false"));
+        rebuild_from_raw(&raw).expect("lenient keeps last-wins");
+    }
+
+    /// A re-declared provider whose definition changed must NOT reuse the
+    /// live object — it would keep fetching the old source forever while the
+    /// committed config claims otherwise (issue #533 review).
+    #[test]
+    fn provider_def_change_rebuilds_instead_of_reusing() {
+        let yaml = r#"
+strict: false
+proxy-providers:
+  p:
+    type: file
+    path: nodes.yaml
+proxies:
+  - { name: ok, type: direct }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let cache_dir = std::path::Path::new("/tmp");
+        let raw = raw_config(yaml);
+        let first = materialize_proxy_providers(&raw, &HashMap::new(), Some(cache_dir), false)
+            .expect("provider materializes");
+        let provider = Arc::clone(first.get("p").unwrap());
+
+        // Unchanged def → same Arc reused.
+        let again =
+            materialize_proxy_providers(&raw, &first, Some(cache_dir), false).expect("reuse");
+        assert!(Arc::ptr_eq(again.get("p").unwrap(), &provider));
+
+        // Changed def (filter added) → a new object materializes.
+        let changed_yaml = yaml.replace("path: nodes.yaml", "path: nodes.yaml\n    filter: '^ok'");
+        let changed_raw = raw_config(&changed_yaml);
+        let rebuilt = materialize_proxy_providers(&changed_raw, &first, Some(cache_dir), false)
+            .expect("changed def materializes fresh");
+        assert!(
+            !Arc::ptr_eq(rebuilt.get("p").unwrap(), &provider),
+            "a changed provider def must not reuse the live object"
+        );
+    }
+
+    /// A malformed `proxy-groups`/`rules`/`proxies` section in a fetched
+    /// subscription is remote-controlled content — under strict it fails the
+    /// fetch instead of silently emptying the committed lists (issue #533
+    /// review).
+    #[test]
+    fn strict_rejects_malformed_subscription_shape() {
+        let bad_groups =
+            "proxies:\n  - {name: ok, type: direct}\nproxy-groups:\n  - {name: g, proxies: [ok]}\n"; // group missing `type`
+        let Err(err) = crate::subscription::parse_subscription_yaml(bad_groups, true) else {
+            panic!("strict must reject a malformed proxy-groups entry");
+        };
+        assert!(
+            err.to_string().contains("proxy-groups"),
+            "unexpected: {err}"
+        );
+        // Lenient warn-skips the malformed entry instead of wiping all groups.
+        crate::subscription::parse_subscription_yaml(bad_groups, false).expect("lenient");
+
+        let bad_shape = "proxies:\n  - {name: ok, type: direct}\nproxy-groups: not-a-list\n";
+        assert!(
+            crate::subscription::parse_subscription_yaml(bad_shape, false).is_err(),
+            "a non-sequence proxy-groups section is a hard error in both modes"
+        );
+
+        let bad_proxy = "proxies:\n  - {name: ok, type: direct}\n  - 42\n";
+        let Err(err) = crate::subscription::parse_subscription_yaml(bad_proxy, true) else {
+            panic!("non-mapping proxy entry must fail strict");
+        };
+        assert!(
+            err.to_string().contains("not a mapping"),
+            "unexpected: {err}"
+        );
+
+        // `rules:` shape defects gate the same way: a non-sequence section
+        // is a hard error in both modes; a non-string entry is strict-only.
+        let bad_rules = "proxies:\n  - {name: ok, type: direct}\nrules: not-a-list\n";
+        assert!(
+            crate::subscription::parse_subscription_yaml(bad_rules, false).is_err(),
+            "a non-sequence rules section is a hard error in both modes"
+        );
+
+        let bad_entry =
+            "proxies:\n  - {name: ok, type: direct}\nrules:\n  - MATCH,DIRECT\n  - 42\n";
+        let Err(err) = crate::subscription::parse_subscription_yaml(bad_entry, true) else {
+            panic!("non-string rule entry must fail strict");
+        };
+        assert!(
+            err.to_string().contains("not a string"),
+            "unexpected: {err}"
+        );
+        crate::subscription::parse_subscription_yaml(bad_entry, false)
+            .expect("lenient skips a non-string rule entry");
+    }
+
+    /// An empty or comments-only provider file is `Value::Null` — treated as
+    /// an empty provider (parity with the missing-file acquisition path),
+    /// not a payload defect (issue #533 review).
+    #[tokio::test]
+    async fn empty_provider_file_is_an_empty_provider() {
+        let dir = std::env::temp_dir().join(format!("meow-empty-prov-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("empty.yaml"), "# nothing here\n").unwrap();
+        let raw: raw::RawProxyProvider =
+            serde_yaml::from_str("type: file\npath: empty.yaml\n").unwrap();
+        let provider = ProxyProvider::new("p", &raw, Some(&dir), false, true)
+            .expect("file provider constructs");
+        provider
+            .refresh()
+            .await
+            .expect("a Null document refreshes to an empty provider even under strict");
+        assert!(provider.proxies().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

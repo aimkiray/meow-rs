@@ -22,6 +22,7 @@ Use it as a pre-flight check.
 | `mode` | string | `rule` | Tunnel mode: `rule`, `global`, or `direct` |
 | `log-level` | string | `info` | `trace` · `debug` · `info` · `warn` · `error` · `off` |
 | `ipv6` | bool | `false` | Enable IPv6 (AAAA) resolution |
+| `strict` | bool | `false` | Fail on unparseable entries instead of warn-and-skip |
 | `external-controller` | string | — | REST API listen address, e.g. `127.0.0.1:9090` |
 | `secret` | string | — | API bearer-token secret (empty = no auth) |
 | `external-ui` | string | — | Directory of static dashboard files served at `/ui` |
@@ -134,3 +135,34 @@ to upstream mihomo, the following are hard load-time errors instead of warnings:
 
 Forward-compatibility fields that meow-rs does not implement (e.g. some `geodata`
 sub-keys) are accepted and ignored with a one-time warning so upstream configs still load.
+
+### `strict: true` — fail loudly on unparseable entries
+
+By default an entry that fails to parse — a `proxies:` node, a `proxy-groups:` block, a
+`rules:` line, a `proxy-providers:` or `rule-providers:` definition, or a node inside a
+provider payload — is logged and skipped so one bad line cannot take down the whole
+config. Setting `strict: true` promotes every such skip to a hard load-time error:
+
+```yaml
+strict: true
+```
+
+Strict also promotes a few related warn-and-drop behaviors: a group `proxies:` member or
+`use:` provider name that resolves to nothing, a `proxies:`/`proxy-groups:` entry named
+after a built-in adapter (`DIRECT`, `REJECT`, …), and a malformed `dialer-proxy` value
+(which would otherwise silently drop the configured chain).
+
+This is opt-in because it rejects real-world mihomo subscriptions that mix in node types
+meow-rs does not support — under `strict`, one unsupported node fails the whole provider
+load. Fetch failures stay lenient: a provider that cannot be downloaded (or a `type: file`
+provider whose file is unreadable) starts empty and stays empty until a manual
+`PUT /providers/proxies/{name}` refresh or restart, since a network blip is not a config
+defect. The same applies to `rule-providers:`: a definition defect or an unparseable
+acquired payload is fatal under strict, while a failed download is not.
+
+Two scope notes: `PUT /configs` rebuilds apply strictness to the candidate's
+`proxies:`/`proxy-groups:`/`rules:`/`rule-providers:` — `proxy-providers:` objects are
+constructed at startup and are not re-validated on PUT (their `strict` flag is the
+startup one). And `strict: true` combined with `subscriptions:` means a subscription
+delivering an unparseable node makes every refresh rebuild fail — the previous config is
+kept, but check subscription contents before enabling strict.

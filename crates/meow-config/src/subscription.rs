@@ -10,15 +10,25 @@ pub struct SubscriptionData {
 }
 
 /// Fetch a Clash YAML subscription and extract proxies, groups, and rules.
-pub async fn fetch_subscription(url: &str) -> Result<SubscriptionData, anyhow::Error> {
+/// `strict` (issue #533) turns payload shape defects — a `proxy-groups`
+/// section that fails to deserialize, a `proxies` entry that isn't a
+/// mapping — into hard errors instead of warn-and-skip, so a garbled
+/// subscription cannot silently empty every group under `strict: true`.
+pub async fn fetch_subscription(
+    url: &str,
+    strict: bool,
+) -> Result<SubscriptionData, anyhow::Error> {
     let bytes = crate::internal_http::fetch_direct(url).await?;
     let text = String::from_utf8(bytes)
         .map_err(|e| anyhow::anyhow!("subscription body is not UTF-8: {e}"))?;
-    parse_subscription_yaml(&text)
+    parse_subscription_yaml(&text, strict)
 }
 
 /// Parse a Clash YAML string and extract proxies, proxy-groups, and rules.
-pub fn parse_subscription_yaml(text: &str) -> Result<SubscriptionData, anyhow::Error> {
+pub fn parse_subscription_yaml(
+    text: &str,
+    strict: bool,
+) -> Result<SubscriptionData, anyhow::Error> {
     let mut root: Value =
         serde_yaml::from_str(text).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     // Expand `<<: *anchor` merge keys so subscriptions that share anchor
@@ -66,27 +76,80 @@ pub fn parse_subscription_yaml(text: &str) -> Result<SubscriptionData, anyhow::E
                 continue;
             }
             proxies.push(hm);
+        } else {
+            // A non-mapping `proxies:` entry is a payload shape defect — it
+            // cannot be interpreted as a node. Silent-skip under strict would
+            // let a garbled subscription drop nodes unnoticed (issue #533).
+            if strict {
+                return Err(anyhow::anyhow!(
+                    "subscription 'proxies' entry is not a mapping (strict mode): {proxy:?}"
+                ));
+            }
+            tracing::warn!("subscription 'proxies' entry is not a mapping; skipping");
         }
     }
 
-    // Extract proxy-groups
+    // Extract proxy-groups. Deserialize per entry so one malformed group
+    // doesn't wipe the whole list: strict fails the subscription, lenient
+    // warn-skips the entry — a whole-section `from_value` failure used to
+    // silently yield `[]`, emptying every group on commit (issue #533).
     let groups_key = Value::String("proxy-groups".to_string());
-    let proxy_groups: Vec<RawProxyGroup> = mapping
-        .get(&groups_key)
-        .and_then(|v| serde_yaml::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let mut proxy_groups: Vec<RawProxyGroup> = Vec::new();
+    match mapping.get(&groups_key) {
+        None => {}
+        Some(v) => {
+            let Some(seq) = v.as_sequence() else {
+                return Err(anyhow::anyhow!(
+                    "subscription 'proxy-groups' is not a sequence"
+                ));
+            };
+            for entry in seq {
+                match serde_yaml::from_value::<RawProxyGroup>(entry.clone()) {
+                    Ok(group) => proxy_groups.push(group),
+                    Err(e) if strict => {
+                        return Err(anyhow::anyhow!(
+                            "subscription 'proxy-groups' entry failed to parse \
+                             (strict mode): {e}"
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "subscription 'proxy-groups' entry failed to parse; \
+                             skipping: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
-    // Extract rules
+    // Extract rules — same shape-defect gating as proxies/groups: a
+    // non-sequence `rules:` or a non-string entry is a payload defect, not a
+    // transient condition (issue #533).
     let rules_key = Value::String("rules".to_string());
-    let rules: Vec<String> = mapping
-        .get(&rules_key)
-        .and_then(|v| v.as_sequence())
-        .map(|seq| {
-            seq.iter()
-                .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut rules: Vec<String> = Vec::new();
+    match mapping.get(&rules_key) {
+        None => {}
+        Some(v) => {
+            let Some(seq) = v.as_sequence() else {
+                return Err(anyhow::anyhow!("subscription 'rules' is not a sequence"));
+            };
+            for entry in seq {
+                match entry.as_str() {
+                    Some(rule) => rules.push(rule.to_string()),
+                    None if strict => {
+                        return Err(anyhow::anyhow!(
+                            "subscription 'rules' entry is not a string \
+                             (strict mode): {entry:?}"
+                        ));
+                    }
+                    None => {
+                        tracing::warn!("subscription 'rules' entry is not a string; skipping");
+                    }
+                }
+            }
+        }
+    }
 
     Ok(SubscriptionData {
         proxies,

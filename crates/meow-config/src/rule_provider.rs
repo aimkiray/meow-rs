@@ -15,8 +15,8 @@ use meow_common::adapter::Proxy;
 use meow_common::atomic::AtomicU;
 use meow_common::{Metadata, RuleMatchHelper};
 use meow_rules::{
-    build_rule_set, build_rule_set_from_mrs_with_behavior, is_mrs_bytes, ParserContext, RuleSet,
-    RuleSetBehavior, RuleSetFormat,
+    build_rule_set, build_rule_set_checked, build_rule_set_from_mrs_with_behavior, is_mrs_bytes,
+    ParserContext, RuleSet, RuleSetBehavior, RuleSetFormat,
 };
 use parking_lot::RwLock;
 use std::sync::atomic::Ordering;
@@ -81,6 +81,21 @@ pub struct RuleProvider {
     updated_at: AtomicU,
     rules: RwLock<Arc<dyn RuleSet>>,
     fetch: FetchContext,
+    /// Top-level `strict: true` (issue #533): a malformed entry in a
+    /// refreshed payload fails the parse — and thus the refresh — instead
+    /// of being warn-skipped, so the last-good set stays installed rather
+    /// than being replaced by a partial one.
+    strict: bool,
+    /// The parser context this provider was loaded with, retained so
+    /// `refresh()` re-parses against the same geoip/geosite/asn handles —
+    /// a `classical` payload containing GEOIP/GEOSITE entries must not
+    /// degrade (lenient) or permanently fail (strict) just because the
+    /// refresh caller handed in an empty context (issue #533 review).
+    ctx: ParserContext,
+    /// The declared `format:` (None = auto-detect from magic bytes).
+    /// Retained for `refresh()` — a `format: text` file whose bytes aren't
+    /// MRS must not be reparsed as YAML on refresh (issue #533 review).
+    format: Option<RuleSetFormat>,
 }
 
 impl std::fmt::Debug for RuleProvider {
@@ -153,23 +168,39 @@ impl RuleProvider {
         self.updated_at.load(Ordering::Relaxed).into()
     }
 
-    /// Fetch a fresh payload from the HTTP URL and swap the rule set atomically.
-    /// Parse work runs on a blocking thread so the tokio executor is not stalled.
-    /// Logs `warn!` on failure; keeps the last-good set. No-op for non-HTTP.
-    pub async fn refresh(&self, ctx: &ParserContext) -> Result<()> {
-        if self.provider_type != ProviderType::Http {
-            return Ok(());
-        }
-        let bytes = fetch_http_async(
-            &self.vehicle,
-            self.fetch.proxy.as_ref(),
-            &self.fetch.headers,
-        )
-        .await?;
+    /// Fetch a fresh payload and swap the rule set atomically: http
+    /// providers re-download through their captured fetch context, file
+    /// providers re-read their resolved path, inline providers are a no-op.
+    /// Parse work runs on a blocking thread so the tokio executor is not
+    /// stalled. On any failure the last-good set stays installed; under
+    /// `strict` a malformed entry fails the whole parse instead of being
+    /// warn-skipped (issue #533).
+    ///
+    /// The payload is re-parsed in the *load-time* parser context
+    /// (`self.ctx`): geo-dependent entries resolve against the same geo
+    /// databases the initial load saw. Refresh callers therefore cannot
+    /// accidentally pass a different (e.g. empty) context.
+    pub async fn refresh(&self) -> Result<()> {
+        let bytes = match self.provider_type {
+            ProviderType::Http => {
+                fetch_http_async(
+                    &self.vehicle,
+                    self.fetch.proxy.as_ref(),
+                    &self.fetch.headers,
+                )
+                .await?
+            }
+            ProviderType::File => tokio::fs::read(&self.vehicle)
+                .await
+                .with_context(|| format!("reading provider file {}", self.vehicle))?,
+            ProviderType::Inline => return Ok(()),
+        };
         let behavior = self.behavior;
-        let ctx_clone = ctx.clone();
+        let strict = self.strict;
+        let ctx_clone = self.ctx.clone();
+        let format = self.format;
         let boxed: Box<dyn RuleSet> = crate::spawn_blocking_with_current_dispatcher(move || {
-            parse_bytes_to_ruleset(&bytes, behavior, &ctx_clone)
+            parse_bytes_to_ruleset_with_format(&bytes, behavior, format, &ctx_clone, strict)
         })
         .await
         .map_err(|e| anyhow!("parse task panicked: {e}"))??;
@@ -202,6 +233,13 @@ impl RuleProvider {
             .as_secs();
         self.updated_at
             .store(now as meow_common::atomic::Uint, Ordering::Relaxed);
+    }
+
+    /// Atomically install a freshly-parsed rule set (initial fill after an
+    /// acquisition-then-parse load, or a refresh).
+    fn swap_rules(&self, rules: Box<dyn RuleSet>) {
+        *self.rules.write() = Arc::from(rules);
+        self.touch();
     }
 }
 
@@ -317,13 +355,17 @@ fn read_payload_bytes(
 /// Load every configured rule-provider at startup.
 ///
 /// Returns a map from provider name to `Arc<RuleProvider>`.  Providers that
-/// fail to load are skipped with a `warn!` (best-effort keep-running).
+/// fail to load are skipped with a `warn!` (best-effort keep-running);
+/// under `strict` definition/payload defects return `Err` instead, while
+/// pure acquisition failures still register the provider empty (issue
+/// #533).
 pub fn load_providers(
     raw_providers: &HashMap<String, RawRuleProvider>,
     cache_dir: Option<&Path>,
     ctx: &ParserContext,
     download_proxy: Option<&Arc<dyn Proxy>>,
-) -> HashMap<String, Arc<RuleProvider>> {
+    strict: bool,
+) -> Result<HashMap<String, Arc<RuleProvider>>> {
     load_providers_prefetched(
         raw_providers,
         cache_dir,
@@ -332,6 +374,7 @@ pub fn load_providers(
         &|_| None,
         &HashMap::new(),
         None,
+        strict,
     )
 }
 
@@ -343,6 +386,10 @@ pub fn load_providers(
 /// a chained adapter still resolves its front hop on later refreshes (issue
 /// #533). `None` is fine only when no retained adapter can carry a
 /// `dialer-proxy` chain.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct piece of one provider's load context"
+)]
 pub fn load_providers_prefetched(
     raw_providers: &HashMap<String, RawRuleProvider>,
     cache_dir: Option<&Path>,
@@ -351,16 +398,23 @@ pub fn load_providers_prefetched(
     lookup: ProxyLookup<'_>,
     prefetched: &PrefetchedPayloads,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
-) -> HashMap<String, Arc<RuleProvider>> {
+    strict: bool,
+) -> Result<HashMap<String, Arc<RuleProvider>>, anyhow::Error> {
     let mut out = HashMap::new();
     if raw_providers.is_empty() {
-        return out;
+        return Ok(out);
     }
     for (name, cfg) in raw_providers {
         let download_proxy = if cfg.provider_type == "http" {
             match effective_download_proxy(cfg, default_proxy, lookup) {
                 Ok(p) => p,
                 Err(e) => {
+                    if strict {
+                        return Err(anyhow::anyhow!(
+                            "rule-provider '{name}': download-proxy resolution failed \
+                             (strict mode): {e:#}"
+                        ));
+                    }
                     warn!("Failed to load rule-provider '{}': {:#}", name, e);
                     continue;
                 }
@@ -377,6 +431,7 @@ pub fn load_providers_prefetched(
             download_proxy.as_ref(),
             payload,
             dialer_registry,
+            strict,
         ) {
             Ok(provider) => {
                 debug!(
@@ -388,12 +443,55 @@ pub fn load_providers_prefetched(
                 );
                 out.insert(name.clone(), Arc::new(provider));
             }
+            Err(LoadError::Acquisition(provider, e)) => {
+                // A fetch/read failure is transient, not a config defect —
+                // register the provider with an empty rule set in BOTH
+                // modes so `RULE-SET,<name>` references resolve (instead of
+                // failing strict validation as "unknown provider") and a
+                // later `PUT /providers/rules/{name}` refresh can heal it.
+                // Matches mihomo, which registers failed providers.
+                warn!("rule-provider '{name}': payload unavailable, starting empty: {e:#}");
+                out.insert(name.clone(), Arc::new(*provider));
+            }
+            Err(e) if strict => {
+                return Err(anyhow::anyhow!(
+                    "rule-provider '{name}' failed to load (strict mode): {e:#}"
+                ));
+            }
             Err(e) => {
                 warn!("Failed to load rule-provider '{}': {:#}", name, e);
             }
         }
     }
-    out
+    Ok(out)
+}
+
+/// Why a provider failed to load — the strict gate needs the failure
+/// *stage*, not a post-hoc guess from whether payload bytes were present
+/// (a malformed `format:` or a `file` provider on a cache-dir-less build
+/// would otherwise masquerade as an acquisition failure — issue #533
+/// review).
+enum LoadError {
+    /// Defective definition: bad `type`/`behavior`/`format`, missing
+    /// `url:`/`path:`/`payload:`, a path escaping the provider cache dir,
+    /// or `interval` on a type that cannot refresh.
+    Defect(anyhow::Error),
+    /// The payload could not be fetched/read — transient. Carries the
+    /// fully-constructed provider (boxed: this variant would otherwise make
+    /// the whole `Result` very large) so the caller can register it empty.
+    Acquisition(Box<RuleProvider>, anyhow::Error),
+    /// Acquired bytes (or an inline `payload:`) failed to parse.
+    Payload(anyhow::Error),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Defect(e) | Self::Payload(e) | Self::Acquisition(_, e) => {
+                write!(f, "{e:#}")
+            }
+        }
+    }
 }
 
 /// Build the `HashMap<name, Arc<dyn RuleSet>>` the rule parser needs.
@@ -416,6 +514,10 @@ pub fn live_ruleset_map(
         .collect()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct piece of one provider's load context"
+)]
 fn load_one(
     name: &str,
     cfg: &RawRuleProvider,
@@ -424,11 +526,15 @@ fn load_one(
     download_proxy: Option<&Arc<dyn Proxy>>,
     prefetched: Option<&[u8]>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
-) -> Result<RuleProvider> {
-    let behavior: RuleSetBehavior = cfg.behavior.parse().map_err(|e: String| anyhow!("{e}"))?;
+    strict: bool,
+) -> Result<RuleProvider, LoadError> {
+    let behavior: RuleSetBehavior = cfg
+        .behavior
+        .parse()
+        .map_err(|e: String| LoadError::Defect(anyhow!("{e}")))?;
     match cfg.provider_type.as_str() {
-        "inline" => load_inline(name, cfg, behavior, ctx),
-        "file" => load_file(name, cfg, cache_dir, behavior, ctx, prefetched),
+        "inline" => load_inline(name, cfg, behavior, ctx, strict),
+        "file" => load_file(name, cfg, cache_dir, behavior, ctx, prefetched, strict),
         "http" => load_http(
             name,
             cfg,
@@ -438,8 +544,35 @@ fn load_one(
             download_proxy,
             prefetched,
             dialer_registry,
+            strict,
         ),
-        other => Err(anyhow!("unknown rule-provider type: {other}")),
+        other => Err(LoadError::Defect(anyhow!(
+            "unknown rule-provider type: {other}"
+        ))),
+    }
+}
+
+/// An empty rule set of the right behavior for a provider whose payload is
+/// unavailable — registered so `RULE-SET` references resolve and a later
+/// refresh can fill it.
+fn empty_rule_set(behavior: RuleSetBehavior, ctx: &ParserContext) -> Box<dyn RuleSet> {
+    build_rule_set(behavior, &[], ctx)
+}
+
+/// Parse payload bytes into a rule set, honoring `strict` per-entry: strict
+/// uses [`build_rule_set_checked`] so one malformed line fails the payload
+/// instead of installing a partial set (issue #533).
+fn entries_to_rule_set(
+    behavior: RuleSetBehavior,
+    entries: &[String],
+    ctx: &ParserContext,
+    strict: bool,
+) -> Result<Box<dyn RuleSet>, LoadError> {
+    if strict {
+        build_rule_set_checked(behavior, entries, ctx)
+            .map_err(|e| LoadError::Payload(anyhow!("{e}")))
+    } else {
+        Ok(build_rule_set(behavior, entries, ctx))
     }
 }
 
@@ -448,18 +581,20 @@ fn load_inline(
     cfg: &RawRuleProvider,
     behavior: RuleSetBehavior,
     ctx: &ParserContext,
-) -> Result<RuleProvider> {
+    strict: bool,
+) -> Result<RuleProvider, LoadError> {
     if cfg.interval.is_some_and(|i| i > 0) {
-        return Err(anyhow!(
+        return Err(LoadError::Defect(anyhow!(
             "rule-provider '{name}': inline providers cannot refresh; \
              remove the `interval:` field (Class A per ADR-0002)"
-        ));
+        )));
     }
-    let payload = cfg
-        .payload
-        .as_deref()
-        .ok_or_else(|| anyhow!("rule-provider '{name}': inline type requires `payload:`"))?;
-    let rules = build_rule_set(behavior, payload, ctx);
+    let payload = cfg.payload.as_deref().ok_or_else(|| {
+        LoadError::Defect(anyhow!(
+            "rule-provider '{name}': inline type requires `payload:`"
+        ))
+    })?;
+    let rules = entries_to_rule_set(behavior, payload, ctx, strict)?;
     Ok(make_provider(
         name,
         ProviderType::Inline,
@@ -468,6 +603,9 @@ fn load_inline(
         0,
         rules,
         FetchContext::default(),
+        strict,
+        ctx.clone(),
+        None,
     ))
 }
 
@@ -478,7 +616,8 @@ fn load_file(
     behavior: RuleSetBehavior,
     ctx: &ParserContext,
     prefetched: Option<&[u8]>,
-) -> Result<RuleProvider> {
+    strict: bool,
+) -> Result<RuleProvider, LoadError> {
     if cfg.interval.is_some_and(|i| i > 0) {
         warn!(
             provider = %name,
@@ -486,25 +625,51 @@ fn load_file(
              (Class B per ADR-0002)"
         );
     }
-    let path = resolve_path(cfg, cache_dir, name, false)?
-        .ok_or_else(|| anyhow!("file provider '{name}' requires a 'path'"))?;
-    let bytes = match prefetched {
-        Some(b) => b.to_vec(),
-        None => std::fs::read(&path)
-            .with_context(|| format!("reading provider file {}", path.display()))?,
-    };
-    let explicit_format = parse_explicit_format(cfg)?;
-    let rules = parse_bytes_to_ruleset_with_format(&bytes, behavior, explicit_format, ctx)?;
-    let vehicle = path.display().to_string();
-    Ok(make_provider(
+    // Check the field itself before `resolve_path` — without it the
+    // implicit name-derived location would report a confusing error naming
+    // a path the user never wrote (issue #533 review).
+    if cfg.path.is_none() {
+        return Err(LoadError::Defect(anyhow!(
+            "file provider '{name}' requires a 'path'"
+        )));
+    }
+    let path = resolve_path(cfg, cache_dir, name, false)
+        .map_err(LoadError::Defect)?
+        .ok_or_else(|| LoadError::Defect(anyhow!("file provider '{name}' requires a 'path'")))?;
+    let explicit_format = parse_explicit_format(cfg).map_err(LoadError::Defect)?;
+    // The provider object is constructed before acquisition so a read
+    // failure can register it empty — a manual refresh re-reads the path.
+    let provider = make_provider(
         name,
         ProviderType::File,
         behavior,
-        vehicle,
+        path.display().to_string(),
         0,
-        rules,
+        empty_rule_set(behavior, ctx),
         FetchContext::default(),
-    ))
+        strict,
+        ctx.clone(),
+        explicit_format,
+    );
+    let bytes = match prefetched {
+        Some(b) => b.to_vec(),
+        None => match std::fs::read(&path) {
+            Ok(b) => b,
+            // Move the empty provider into the error so the caller can
+            // register it — the name stays resolvable for `RULE-SET` and a
+            // manual refresh re-reads the path.
+            Err(e) => {
+                return Err(LoadError::Acquisition(
+                    Box::new(provider),
+                    anyhow!(e).context(format!("reading provider file {}", path.display())),
+                ));
+            }
+        },
+    };
+    let rules = parse_bytes_to_ruleset_with_format(&bytes, behavior, explicit_format, ctx, strict)
+        .map_err(LoadError::Payload)?;
+    provider.swap_rules(rules);
+    Ok(provider)
 }
 
 #[allow(
@@ -520,41 +685,58 @@ fn load_http(
     download_proxy: Option<&Arc<dyn Proxy>>,
     prefetched: Option<&[u8]>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
-) -> Result<RuleProvider> {
+    strict: bool,
+) -> Result<RuleProvider, LoadError> {
     let url = cfg
         .url
         .as_deref()
-        .ok_or_else(|| anyhow!("http provider '{name}' requires a 'url'"))?;
-    let cache_path = resolve_path(cfg, cache_dir, name, false)?;
-    let explicit_format = parse_explicit_format(cfg)?;
+        .ok_or_else(|| LoadError::Defect(anyhow!("http provider '{name}' requires a 'url'")))?;
+    let cache_path = resolve_path(cfg, cache_dir, name, false).map_err(LoadError::Defect)?;
+    let explicit_format = parse_explicit_format(cfg).map_err(LoadError::Defect)?;
     let interval = cfg.interval.unwrap_or(0);
     let headers = provider_headers(cfg);
-    let bytes = match prefetched {
-        Some(b) => b.to_vec(),
-        None => fetch_http_blocking_with_cache(
-            url,
-            cache_path.as_deref(),
-            download_proxy,
-            interval > 0,
-            &headers,
-        )?,
-    };
-    let rules = parse_bytes_to_ruleset_with_format(&bytes, behavior, explicit_format, ctx)?;
-    Ok(make_provider(
+    // Constructed before acquisition: a fetch failure registers this
+    // provider empty so `RULE-SET` references resolve and the interval
+    // refresh task can heal it (issue #533 review).
+    let provider = make_provider(
         name,
         ProviderType::Http,
         behavior,
         url.to_string(),
         interval,
-        rules,
+        empty_rule_set(behavior, ctx),
         FetchContext {
             proxy: download_proxy.cloned(),
-            headers,
+            headers: headers.clone(),
             _dialer_registry: dialer_registry.cloned(),
         },
-    ))
+        strict,
+        ctx.clone(),
+        explicit_format,
+    );
+    let bytes = match prefetched {
+        Some(b) => b.to_vec(),
+        None => match fetch_http_blocking_with_cache(
+            url,
+            cache_path.as_deref(),
+            download_proxy,
+            interval > 0,
+            &headers,
+        ) {
+            Ok(b) => b,
+            Err(e) => return Err(LoadError::Acquisition(Box::new(provider), e)),
+        },
+    };
+    let rules = parse_bytes_to_ruleset_with_format(&bytes, behavior, explicit_format, ctx, strict)
+        .map_err(LoadError::Payload)?;
+    provider.swap_rules(rules);
+    Ok(provider)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct piece of one provider's construction context"
+)]
 fn make_provider(
     name: &str,
     provider_type: ProviderType,
@@ -563,6 +745,9 @@ fn make_provider(
     interval: u64,
     rules: Box<dyn RuleSet>,
     fetch: FetchContext,
+    strict: bool,
+    ctx: ParserContext,
+    format: Option<RuleSetFormat>,
 ) -> RuleProvider {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -578,6 +763,9 @@ fn make_provider(
         updated_at: AtomicU::new(now as meow_common::atomic::Uint),
         rules: RwLock::new(rules_arc),
         fetch,
+        strict,
+        ctx,
+        format,
     }
 }
 
@@ -600,46 +788,51 @@ fn parse_explicit_format(cfg: &RawRuleProvider) -> Result<Option<RuleSetFormat>>
         .transpose()
 }
 
-fn parse_bytes_to_ruleset(
-    bytes: &[u8],
-    behavior: RuleSetBehavior,
-    ctx: &ParserContext,
-) -> Result<Box<dyn RuleSet>> {
-    parse_bytes_to_ruleset_with_format(bytes, behavior, None, ctx)
-}
-
 fn parse_bytes_to_ruleset_with_format(
     bytes: &[u8],
     behavior: RuleSetBehavior,
     explicit_format: Option<RuleSetFormat>,
     ctx: &ParserContext,
+    strict: bool,
 ) -> Result<Box<dyn RuleSet>> {
     let use_mrs = explicit_format == Some(RuleSetFormat::Mrs) || is_mrs_bytes(bytes);
     if use_mrs {
-        return build_rule_set_from_mrs_with_behavior(bytes, ctx, Some(behavior))
+        return build_rule_set_from_mrs_with_behavior(bytes, ctx, Some(behavior), strict)
             .map_err(|e| anyhow!("mrs parse error: {e}"));
     }
     let text = std::str::from_utf8(bytes).context("payload is not valid UTF-8")?;
     let entries = match explicit_format.unwrap_or(RuleSetFormat::Yaml) {
-        RuleSetFormat::Yaml => parse_yaml_payload(text)?,
+        RuleSetFormat::Yaml => parse_yaml_payload(text, strict)?,
         RuleSetFormat::Text => parse_text_payload(text),
         RuleSetFormat::Mrs => unreachable!("handled above"),
     };
+    if strict {
+        return build_rule_set_checked(behavior, &entries, ctx)
+            .map_err(|e| anyhow!("rule-set entry error: {e}"));
+    }
     Ok(build_rule_set(behavior, &entries, ctx))
 }
 
-fn parse_yaml_payload(raw: &str) -> Result<Vec<String>> {
+fn parse_yaml_payload(raw: &str, strict: bool) -> Result<Vec<String>> {
     let root: serde_yaml::Value = serde_yaml::from_str(raw).context("rule-set yaml parse error")?;
     let payload = root
         .get("payload")
         .ok_or_else(|| anyhow!("rule-set yaml missing 'payload' key"))?
         .as_sequence()
         .ok_or_else(|| anyhow!("rule-set 'payload' is not a sequence"))?;
-    Ok(payload
-        .iter()
-        .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
-        .filter(|s| !s.is_empty())
-        .collect())
+    let mut entries = Vec::with_capacity(payload.len());
+    for (i, v) in payload.iter().enumerate() {
+        match v.as_str() {
+            Some(s) if !s.trim().is_empty() => entries.push(s.trim().to_string()),
+            // Non-string items are silently dropped leniently (mihomo
+            // parity); strict treats them as a malformed payload.
+            None if strict => {
+                return Err(anyhow!("rule-set 'payload' item {i} is not a string"));
+            }
+            _ => {}
+        }
+    }
+    Ok(entries)
 }
 
 fn parse_text_payload(raw: &str) -> Vec<String> {
@@ -919,8 +1112,17 @@ mod tests {
         // provider is skipped rather than loaded via the wrong proxy.
         let mut prefetched = HashMap::new();
         prefetched.insert("p".to_string(), b"payload:\n  - example.com\n".to_vec());
-        let out =
-            load_providers_prefetched(&providers, None, &ctx(), None, &|_| None, &prefetched, None);
+        let out = load_providers_prefetched(
+            &providers,
+            None,
+            &ctx(),
+            None,
+            &|_| None,
+            &prefetched,
+            None,
+            false,
+        )
+        .unwrap();
         assert!(out.is_empty());
     }
 
@@ -930,8 +1132,17 @@ mod tests {
         providers.insert("p".to_string(), http_cfg(Some("DIRECT")));
         let mut prefetched = HashMap::new();
         prefetched.insert("p".to_string(), b"payload:\n  - example.com\n".to_vec());
-        let out =
-            load_providers_prefetched(&providers, None, &ctx(), None, &|_| None, &prefetched, None);
+        let out = load_providers_prefetched(
+            &providers,
+            None,
+            &ctx(),
+            None,
+            &|_| None,
+            &prefetched,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out.get("p").unwrap().rule_count(), 1);
     }
@@ -956,7 +1167,8 @@ mod tests {
                 payload: None,
             },
         );
-        let out = load_providers(&providers, Some(dir.path()), &ctx(), None);
+        let out =
+            load_providers(&providers, Some(dir.path()), &ctx(), None, false).expect("load failed");
         assert_eq!(out.len(), 1);
     }
 
@@ -980,7 +1192,8 @@ mod tests {
                 payload: None,
             },
         );
-        let out = load_providers(&providers, Some(dir.path()), &ctx(), None);
+        let out =
+            load_providers(&providers, Some(dir.path()), &ctx(), None, false).expect("load failed");
         assert_eq!(out.len(), 1);
         let p = out.get("test").unwrap();
         assert_eq!(p.behavior, RuleSetBehavior::Domain);
@@ -1004,7 +1217,7 @@ mod tests {
                 payload: Some(vec!["example.com".to_string(), "+.foo.com".to_string()]),
             },
         );
-        let out = load_providers(&providers, None, &ctx(), None);
+        let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
         assert_eq!(out.len(), 1);
         let p = out.get("my-rules").unwrap();
         assert_eq!(p.provider_type, ProviderType::Inline);
@@ -1024,7 +1237,8 @@ mod tests {
             header: None,
             payload: Some(vec!["example.com".to_string()]),
         };
-        let err = load_inline("p", &cfg, RuleSetBehavior::Domain, &ctx())
+        let err = load_inline("p", &cfg, RuleSetBehavior::Domain, &ctx(), false)
+            .map(|_| ())
             .expect_err("inline + interval must hard-error");
         assert!(
             err.to_string().contains("inline providers cannot refresh"),
@@ -1053,7 +1267,8 @@ mod tests {
                 payload: None,
             },
         );
-        let out = load_providers(&providers, Some(dir.path()), &ctx(), None);
+        let out =
+            load_providers(&providers, Some(dir.path()), &ctx(), None, false).expect("load failed");
         let p = out.get("mrs-test").expect("provider should load");
         assert_eq!(p.rule_count(), 2);
     }
@@ -1079,7 +1294,8 @@ mod tests {
                 payload: None,
             },
         );
-        let out = load_providers(&providers, Some(dir.path()), &ctx(), None);
+        let out =
+            load_providers(&providers, Some(dir.path()), &ctx(), None, false).expect("load failed");
         assert_eq!(out.get("x").unwrap().rule_count(), 1);
     }
 
@@ -1100,7 +1316,7 @@ mod tests {
                 payload: None,
             },
         );
-        let out = load_providers(&providers, None, &ctx(), None);
+        let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
         assert!(out.is_empty());
     }
 
@@ -1124,7 +1340,8 @@ mod tests {
                 payload: None,
             },
         );
-        let out = load_providers(&providers, Some(dir.path()), &ctx(), None);
+        let out =
+            load_providers(&providers, Some(dir.path()), &ctx(), None, false).expect("load failed");
         assert_eq!(out.len(), 1);
     }
 
@@ -1181,7 +1398,7 @@ mod tests {
             },
         );
 
-        let out = load_providers(&providers, None, &ctx(), None);
+        let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
         server.join().unwrap();
         let provider = out.get("http-test").expect("HTTP provider should load");
         assert_eq!(provider.provider_type, ProviderType::Http);
@@ -1293,7 +1510,7 @@ header:
             },
         );
 
-        let out = load_providers(&providers, None, &ctx(), None);
+        let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
         let head = server.join().unwrap();
         let provider = out.get("hdr-test").expect("HTTP provider should load");
         assert_eq!(provider.rule_count(), 1);
@@ -1371,7 +1588,7 @@ header:
             },
         );
 
-        let out = load_providers(&providers, None, &ctx(), None);
+        let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
         let head = server.join().unwrap();
         let provider = out
             .get("hdr-single-test")
@@ -1420,7 +1637,7 @@ header:
                 payload: Some(vec!["10.0.0.0/8".to_string()]),
             },
         );
-        let out = load_providers(&providers, None, &ctx(), None);
+        let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
         let ruleset_map = live_ruleset_map(&out);
         assert_eq!(ruleset_map.len(), 2);
         assert!(ruleset_map.contains_key("p1"));
@@ -1496,7 +1713,7 @@ header:
                 ..http_cfg(None)
             },
         );
-        let out = load_providers(&providers, None, &ctx(), None);
+        let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
         let provider = out.get("live").expect("HTTP provider should load");
         assert_eq!(provider.rule_count(), 1);
 
@@ -1508,7 +1725,9 @@ header:
             &map,
             &ctx(),
             &HashMap::new(),
-        );
+            false,
+        )
+        .expect("RULE-SET parses");
         assert_eq!(rules.len(), 1);
         let rule = &rules[0];
         let helper = RuleMatchHelper;
@@ -1524,7 +1743,7 @@ header:
         assert!(!rule.match_metadata(&new, &helper));
 
         let before = provider.updated_at_secs();
-        provider.refresh(&ctx()).await.expect("refresh");
+        provider.refresh().await.expect("refresh");
         server.join().unwrap();
         assert!(provider.updated_at_secs() >= before);
 
@@ -1622,7 +1841,8 @@ header:
             .expect("stray inline path must not be containment-checked");
 
         // And the provider itself still loads normally.
-        let out = load_providers(&providers, Some(dir.path()), &ctx(), None);
+        let out =
+            load_providers(&providers, Some(dir.path()), &ctx(), None, false).expect("load failed");
         assert_eq!(out.get("i").expect("inline must load").rule_count(), 1);
     }
 
@@ -1670,7 +1890,7 @@ header:
         let mut providers = HashMap::new();
         providers.insert("x".to_string(), cfg);
 
-        let out = load_providers(&providers, None, &ctx(), None);
+        let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
         server.join().unwrap();
 
         // The provider still loads — payload fetched straight to memory…
@@ -1718,6 +1938,68 @@ header:
         assert!(
             err.to_string().contains("exceeds max body size"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    /// Regression test for the issue #533 review: `refresh()` must re-parse
+    /// the payload in the provider's *load-time* `ParserContext`, not a
+    /// caller-supplied one. Both refresh callers (the interval task and
+    /// `PUT /providers/rules/{name}`) previously passed
+    /// `ParserContext::empty()`, which turned every `GEOSITE` entry in a
+    /// refreshed classical payload into a never-matching rule — silent in
+    /// lenient mode, a permanent refresh failure in strict mode.
+    #[tokio::test]
+    async fn file_provider_refresh_uses_load_time_parser_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rules.txt");
+        std::fs::write(&path, "GEOSITE,testcat,DIRECT\n").unwrap();
+
+        let mut geosite = meow_rules::geosite::GeositeDB::empty();
+        geosite.insert("testcat", "first.example");
+        let mut parse_ctx = ctx();
+        parse_ctx.geosite = Some(Arc::new(geosite));
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "geo-file".to_string(),
+            RawRuleProvider {
+                provider_type: "file".to_string(),
+                behavior: "classical".to_string(),
+                format: Some("text".to_string()),
+                url: None,
+                path: Some(path.to_string_lossy().to_string()),
+                interval: None,
+                proxy: None,
+                header: None,
+                payload: None,
+            },
+        );
+        let out = load_providers(&providers, Some(dir.path()), &parse_ctx, None, false)
+            .expect("load failed");
+        let provider = out.get("geo-file").expect("provider must load");
+        assert!(
+            provider.snapshot().matches_domain("first.example"),
+            "initial GEOSITE entry must match"
+        );
+
+        // Refresh with a payload that pairs the geosite entry with a plain
+        // domain rule — proves both the swap happened (new rule visible)
+        // and that the geosite entry still resolves (stored ctx used).
+        std::fs::write(
+            &path,
+            "GEOSITE,testcat,DIRECT\nDOMAIN-SUFFIX,second.example,DIRECT\n",
+        )
+        .unwrap();
+        provider.refresh().await.expect("refresh must succeed");
+        let snap = provider.snapshot();
+        assert_eq!(snap.len(), 2, "refreshed payload must replace the old");
+        assert!(
+            snap.matches_domain("second.example"),
+            "new DOMAIN-SUFFIX rule must match"
+        );
+        assert!(
+            snap.matches_domain("first.example"),
+            "GEOSITE entry must keep matching — refresh used the stored ctx"
         );
     }
 }

@@ -1055,7 +1055,7 @@ async fn save_config(
 /// the caller passes it to [`swap_config_and_reconcile_tun`] so the TUN
 /// fake-IP comparison sees the true old state (issue #533 review).
 async fn apply_raw_to_tunnel(
-    mut raw: RawConfig,
+    raw: RawConfig,
     state: &AppState,
 ) -> Result<(Option<meow_config::DnsConfig>, Arc<meow_dns::Resolver>), (StatusCode, String)> {
     let expected_groups: Vec<String> = raw
@@ -1065,8 +1065,14 @@ async fn apply_raw_to_tunnel(
         .iter()
         .map(|group| group.name.clone())
         .collect();
-    if let Some(ps) = raw.proxies.as_mut() {
-        meow_config::ech_dns::preresolve_ech(ps).await;
+    // Defect-check only, no DNS: every writer preresolves ECH into the
+    // stored raw before the lane (PUT /configs, subscription add/refresh),
+    // so remaining work here would be retrying a previously-failed lookup —
+    // an async network call that would serialize every other commit behind
+    // it (issue #533 review).
+    if let Some(ps) = raw.proxies.as_ref() {
+        meow_config::ech_dns::check_ech_defects(ps, raw.strict.unwrap_or(false))
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e} (strict mode)")))?;
     }
     let providers = state
         .proxy_providers
@@ -1082,15 +1088,18 @@ async fn apply_raw_to_tunnel(
     // Share the tunnel's resolver slot so the rebuilt map's DIRECT adapter
     // tracks later `set_resolver` swaps (issue #514).
     let resolver_slot = state.tunnel.resolver_slot();
+    // A rebuild failure is a defect in the candidate config the caller
+    // supplied — 400, not 500 (issue #533 review).
     let result =
         rebuild_from_raw_with_resolver_async(raw.clone(), resolver_slot, providers, cache_dir)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let meow_config::RebuildResult {
         proxies,
         rules,
         dialer_registry,
         rule_providers,
+        proxy_providers,
     } = result;
     if let Some(missing) = expected_groups
         .iter()
@@ -1131,10 +1140,15 @@ async fn apply_raw_to_tunnel(
     }
     state.tunnel.update_routing(proxies, rules, dialer_registry);
     // Commit point reached: every fallible check passed. The candidate's
-    // provider set becomes the live registry — the rules and DNS `rule-set:`
-    // matchers installed above already reference these Arcs (issue #533
-    // review).
+    // provider sets become the live registries — the rules and DNS
+    // `rule-set:` matchers installed above already reference these Arcs
+    // (issue #533 review).
     *state.rule_providers.write() = rule_providers;
+    commit_proxy_providers(
+        &state.proxy_providers,
+        &proxy_providers,
+        raw.strict.unwrap_or(false),
+    );
     Ok((dns, prior_resolver))
 }
 
@@ -1145,6 +1159,50 @@ async fn commit_raw_candidate(
     let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
     swap_config_and_reconcile_tun(state, candidate, dns, prior_resolver).await;
     Ok(())
+}
+
+/// Commit a validated candidate proxy-provider set into the live registry.
+/// Call only after the rebuild's commit point — the groups installed by the
+/// routing swap already reference these Arcs (still-declared names reuse the
+/// live objects; new declarations are fresh empty providers).
+///
+/// Insert-before-prune ordering: a concurrent `use:`/refresh lookup never
+/// observes a declared provider missing. Each committed provider adopts the
+/// candidate generation's `strict` flag so reused objects follow the new
+/// config (issue #533 review). Providers whose object is new — newly
+/// declared names, or re-declared names whose definition changed — get a
+/// detached initial fetch so `use:` groups populate without a manual
+/// refresh; acquisition failure is a runtime condition, not a config defect.
+pub fn commit_proxy_providers(
+    registry: &DashMap<String, Arc<ProxyProvider>>,
+    candidate: &std::collections::HashMap<String, Arc<ProxyProvider>>,
+    strict: bool,
+) {
+    for (name, provider) in candidate {
+        provider.set_strict(strict);
+        // Reused providers may carry dead derived slots from failed
+        // candidate builds — prune now that the committed groups hold their
+        // views alive (issue #533 review).
+        provider.prune_dead_derived();
+        // Fetch when the committed object is *not* the one already live —
+        // a newly declared name inserts fresh, and a re-declared name whose
+        // definition changed carries a rebuilt provider that has never
+        // fetched (issue #533 review).
+        let needs_fetch = match registry.insert(name.clone(), Arc::clone(provider)) {
+            Some(prev) => !Arc::ptr_eq(&prev, provider),
+            None => true,
+        };
+        if needs_fetch {
+            let provider = Arc::clone(provider);
+            let name = name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = provider.refresh().await {
+                    tracing::warn!("proxy-provider '{name}': initial fetch failed: {e}");
+                }
+            });
+        }
+    }
+    registry.retain(|name, _| candidate.contains_key(name));
 }
 
 /// `true` when the `dns:` section references runtime objects outside
@@ -1470,9 +1528,19 @@ async fn add_subscription(
     State(state): State<Arc<AppState>>,
     Json(body): Json<AddSubscriptionRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let fetched = meow_config::subscription::fetch_subscription(&body.url)
+    // `strict` follows the daemon's live config — the subscription payload
+    // doesn't carry the flag (issue #533).
+    let strict = state.raw_config.read().strict.unwrap_or(false);
+    let mut fetched = meow_config::subscription::fetch_subscription(&body.url, strict)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("fetch failed: {e}")))?;
+    // Resolve DNS-sourced ECH configs BEFORE the mutation lane — this is
+    // async network I/O and must not serialize other config commits; the
+    // stored snapshot then carries inline `ech-opts.config` so the in-lane
+    // preresolve in `apply_raw_to_tunnel` is a no-op scan (issue #533).
+    meow_config::ech_dns::preresolve_ech(&mut fetched.proxies, strict)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e} (strict mode)")))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1560,18 +1628,24 @@ async fn refresh_subscription(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let url = {
+    let (url, strict) = {
         let raw = state.raw_config.read();
-        raw.subscriptions
+        let url = raw
+            .subscriptions
             .as_ref()
             .and_then(|subs| subs.iter().find(|s| s.name == name))
             .map(|s| s.url.clone())
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "subscription not found".into()))?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "subscription not found".into()))?;
+        (url, raw.strict.unwrap_or(false))
     };
 
-    let fetched = meow_config::subscription::fetch_subscription(&url)
+    let mut fetched = meow_config::subscription::fetch_subscription(&url, strict)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("fetch failed: {e}")))?;
+    // Same pre-lane ECH resolution as `add_subscription` (issue #533).
+    meow_config::ech_dns::preresolve_ech(&mut fetched.proxies, strict)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e} (strict mode)")))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2328,9 +2402,23 @@ async fn put_configs(
         }
     };
 
-    // Pre-resolve any DNS-sourced ECH configs into inline base64.
+    // Pre-resolve any DNS-sourced ECH configs into inline base64. Under
+    // `force`, a strict-ECH defect is retried leniently so it degrades the
+    // same way as every other strict defect class (issue #533 review).
     if let Some(ps) = raw_config.proxies.as_mut() {
-        meow_config::ech_dns::preresolve_ech(ps).await;
+        if let Err(e) =
+            meow_config::ech_dns::preresolve_ech(ps, raw_config.strict.unwrap_or(false)).await
+        {
+            if !force {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"message": format!("{e} (strict mode)")})),
+                )
+                    .into_response();
+            }
+            tracing::warn!("config reload: {e}; retrying ECH preresolve leniently under force");
+            let _ = meow_config::ech_dns::preresolve_ech(ps, false).await;
+        }
     }
 
     let _mutation = CONFIG_MUTATION.lock().await;
@@ -2339,25 +2427,56 @@ async fn put_configs(
     // slot so the rebuilt map's DIRECT adapter tracks later
     // `set_resolver` swaps (issue #514).
     let resolver_slot = state.tunnel.resolver_slot();
-    let providers = state
+    let providers: std::collections::HashMap<_, _> = state
         .proxy_providers
         .iter()
         .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
         .collect();
     let cache_dir = meow_config::resource_cache_dir_for_config_path(&state.config_path);
+    // When the strict rebuild fails and `force` retries leniently, the
+    // DNS reconcile below must parse with the SAME effective strictness —
+    // a `#name` reference to a proxy the lenient build dropped is a hard
+    // error under `strict: true` but resolvable under the mode that
+    // actually built `proxies` (issue #533 review).
+    let mut dns_raw: Option<RawConfig> = None;
     let result = match rebuild_from_raw_with_resolver_async(
         raw_config.clone(),
-        resolver_slot,
-        providers,
-        cache_dir,
+        Arc::clone(&resolver_slot),
+        providers.clone(),
+        cache_dir.clone(),
     )
     .await
     {
-        Ok(r) => r,
+        Ok(r) => Some(r),
         Err(e) => {
             if force {
-                tracing::error!("config reload forced despite validation error: {e}");
-                Default::default()
+                // `force` overrides `strict`: retry the rebuild leniently so
+                // a strict-only defect doesn't wipe routing with an empty
+                // `Default` result (issue #533 review).
+                tracing::error!(
+                    "config reload: rebuild failed ({e}); retrying leniently under force"
+                );
+                let mut lenient = raw_config.clone();
+                lenient.strict = Some(false);
+                match rebuild_from_raw_with_resolver_async(
+                    lenient.clone(),
+                    resolver_slot,
+                    providers,
+                    cache_dir,
+                )
+                .await
+                {
+                    Ok(r) => {
+                        dns_raw = Some(lenient);
+                        Some(r)
+                    }
+                    Err(e2) => {
+                        tracing::error!(
+                            "forced config reload still failed: {e2}; keeping previous routing"
+                        );
+                        None
+                    }
+                }
             } else {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -2367,20 +2486,29 @@ async fn put_configs(
             }
         }
     };
+    let Some(result) = result else {
+        // The force contract accepts the config even when nothing in it
+        // builds — persist the raw config but keep the previous routing,
+        // resolver, and provider registries untouched.
+        let prior_resolver = state.tunnel.resolver();
+        swap_config_and_reconcile_tun(&state, raw_config, None, prior_resolver).await;
+        return StatusCode::NO_CONTENT.into_response();
+    };
     let meow_config::RebuildResult {
         proxies,
         rules,
         dialer_registry,
         rule_providers,
+        proxy_providers,
     } = result;
 
     // Issue #514: rebuild the DNS runtime too when its inputs changed —
     // failing here rejects the PUT before `reload_routing` publishes
-    // anything (under `force` a broken dns section degrades to warn + keep
-    // the old resolver, matching how force tolerates proxy errors).
+    // anything (under `force` a broken dns section degrades to warn +
+    // fallback, matching how force tolerates proxy errors).
     let dns = match reconcile_dns_config(
         &state.raw_config,
-        &raw_config,
+        dns_raw.as_ref().unwrap_or(&raw_config),
         &state.config_path,
         &proxies,
         Some(&rule_providers),
@@ -2393,7 +2521,36 @@ async fn put_configs(
         Err((status, msg)) => {
             if force {
                 tracing::error!("config reload forced despite dns rebuild error: {msg}");
-                None
+                // Keeping the old resolver is only safe when it references
+                // no runtime objects — `#name`/`rule-set:` adapters capture
+                // refs whose registry/provider generation dies with the
+                // route swap below. In that case fall back to a dns-less
+                // candidate: a default resolver beats a dead one under the
+                // force contract (issue #533 review).
+                if dns_uses_runtime_refs(&state.raw_config.read()) {
+                    let mut stripped = dns_raw.clone().unwrap_or_else(|| raw_config.clone());
+                    stripped.dns = None;
+                    stripped.strict = Some(false);
+                    reconcile_dns_config(
+                        &state.raw_config,
+                        &stripped,
+                        &state.config_path,
+                        &proxies,
+                        Some(&rule_providers),
+                        Some(state.tunnel.resolver()),
+                        Some(&dialer_registry),
+                    )
+                    .await
+                    .unwrap_or_else(|(status2, msg2)| {
+                        tracing::error!(
+                            "dns-stripped reconcile failed ({status2}: {msg2}); \
+                             keeping previous resolver"
+                        );
+                        None
+                    })
+                } else {
+                    None
+                }
             } else {
                 return (status, Json(serde_json::json!({"message": msg}))).into_response();
             }
@@ -2426,10 +2583,15 @@ async fn put_configs(
             "connection closure requested for cold reload"
         );
     }
-    // Commit point: install the candidate's provider set — the rules and
+    // Commit point: install the candidate's provider sets — the rules and
     // DNS `rule-set:` matchers above already reference these Arcs
     // (issue #533 review).
     *state.rule_providers.write() = rule_providers;
+    commit_proxy_providers(
+        &state.proxy_providers,
+        &proxy_providers,
+        raw_config.strict.unwrap_or(false),
+    );
 
     swap_config_and_reconcile_tun(&state, raw_config, dns, prior_resolver).await;
 
@@ -3075,8 +3237,10 @@ async fn refresh_rule_provider(
     let Some(p) = provider else {
         return StatusCode::NOT_FOUND;
     };
-    let ctx = meow_rules::ParserContext::empty();
-    match p.refresh(&ctx).await {
+    // The provider re-parses in its own load-time ParserContext, so a
+    // classical payload with GEOIP/GEOSITE entries survives the refresh
+    // (issue #533 review).
+    match p.refresh().await {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(e) => {
             tracing::warn!(provider = %name, "rule-provider refresh failed: {:#}", e);
@@ -3214,5 +3378,40 @@ mod tests {
             inputs(&candidate_changed),
             "a fake-IP range change must be visible across generations"
         );
+    }
+
+    /// Issue #533 review: committing a candidate provider set must reuse the
+    /// SAME Arc for still-declared names (provider slots bound into rebuilt
+    /// groups keep tracking the live object), install newly declared ones,
+    /// drop removed ones, and propagate the generation's `strict` flag onto
+    /// every committed provider.
+    #[tokio::test]
+    async fn commit_proxy_providers_swaps_registry_membership() {
+        use meow_config::proxy_provider::ProxyProvider;
+        use meow_config::raw::RawProxyProvider;
+
+        let mk = |name: &str| {
+            let def: RawProxyProvider =
+                serde_yaml::from_str("type: http\nurl: http://127.0.0.1:1/x.yaml").unwrap();
+            Arc::new(ProxyProvider::new(name, &def, None, false, false).unwrap())
+        };
+        let registry: DashMap<String, Arc<ProxyProvider>> = DashMap::new();
+        let keep = mk("keep");
+        registry.insert("keep".to_string(), Arc::clone(&keep));
+        registry.insert("gone".to_string(), mk("gone"));
+
+        let candidate: HashMap<String, Arc<ProxyProvider>> = HashMap::from([
+            ("keep".to_string(), Arc::clone(&keep)), // reused Arc
+            ("fresh".to_string(), mk("fresh")),
+        ]);
+        commit_proxy_providers(&registry, &candidate, true);
+
+        assert!(Arc::ptr_eq(registry.get("keep").unwrap().value(), &keep));
+        assert!(registry.contains_key("fresh"));
+        assert!(!registry.contains_key("gone"), "removed decls are pruned");
+
+        // A candidate with no providers at all clears the registry.
+        commit_proxy_providers(&registry, &HashMap::new(), false);
+        assert!(registry.is_empty());
     }
 }

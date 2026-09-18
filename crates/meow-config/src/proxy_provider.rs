@@ -5,7 +5,7 @@ use meow_common::{ProviderSlot, Proxy};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -36,10 +36,24 @@ pub struct ProxyProvider {
     /// SIP003 executable. Provider content is remote-controlled; without the
     /// opt-in such nodes are rejected before reaching `Command::new`.
     allow_external_plugin: bool,
+    /// Top-level `strict: true` (issue #533): an unparseable node in the
+    /// payload fails the parse instead of being warn-skipped — at load time
+    /// that rejects the whole config; on refresh it keeps the last-good set.
+    /// Atomic so a committed `strict`-flip (`PUT /configs`) reaches provider
+    /// objects that were reused across the rebuild.
+    strict: AtomicBool,
     /// Group-level filtered views of `slot` (issue #358), re-populated on
     /// every refresh. Weak: each view is kept alive by the group built from
     /// it, so views belonging to dropped or rebuilt groups get pruned here.
     derived: RwLock<Vec<(GroupFilter, WeakSlot)>>,
+    /// The declaration this provider was built from (plus the effective
+    /// `ipv6` it was parsed under — not part of `def`), normalized by
+    /// [`Self::def_identity`]. Runtime rebuilds reuse a live provider only
+    /// when the candidate def matches; a changed `url`/`path`/`filter`/
+    /// `health-check`/`allow-external-plugin` must produce a fresh
+    /// provider, not silently keep fetching the old one (issue #533
+    /// review).
+    def: RawProxyProvider,
 }
 
 /// Weak counterpart of [`ProviderSlot`].
@@ -131,6 +145,7 @@ impl ProxyProvider {
         raw: &RawProxyProvider,
         cache_dir: Option<&Path>,
         ipv6: bool,
+        strict: bool,
     ) -> Result<Self, String> {
         // Any on-disk location (read or write) must stay inside `cache_dir`
         // (issue #429): `path:` — and the provider *name* feeding the implicit
@@ -210,8 +225,37 @@ impl ProxyProvider {
             header,
             ipv6,
             allow_external_plugin: raw.allow_external_plugin.unwrap_or(false),
+            strict: AtomicBool::new(strict),
             derived: RwLock::new(Vec::new()),
+            def: Self::def_identity(raw),
         })
+    }
+
+    /// The fields of a declaration that determine provider identity.
+    /// `interval` is excluded: no periodic proxy-provider refresh task
+    /// consumes it (only the manual PUT endpoint exists), so changing it
+    /// alone must not force a rebuild + refetch (issue #533 review).
+    fn def_identity(raw: &RawProxyProvider) -> RawProxyProvider {
+        RawProxyProvider {
+            interval: None,
+            ..raw.clone()
+        }
+    }
+
+    /// Update the strict flag after a committed config rebuild — providers
+    /// reused across a `PUT /configs` must follow the new generation's
+    /// strictness (issue #533 review).
+    pub fn set_strict(&self, strict: bool) {
+        self.strict.store(strict, Ordering::Relaxed);
+    }
+
+    /// `true` when this provider was built from `def` under the same
+    /// effective `ipv6` — the identity check `use:`/`include-all` rebuilds
+    /// apply before deciding to reuse the live object. A changed
+    /// declaration rebuilds the provider instead of silently fetching the
+    /// old source forever (issue #533 review).
+    pub fn matches_def(&self, def: &RawProxyProvider, ipv6: bool) -> bool {
+        self.ipv6 == ipv6 && self.def == Self::def_identity(def)
     }
 
     /// Create a live filtered view of this provider's proxies for one group
@@ -245,6 +289,17 @@ impl ProxyProvider {
                 .collect();
             true
         });
+    }
+
+    /// Drop derived slots whose owning group is gone. Candidate builds
+    /// register views on *live* reused providers before validation finishes,
+    /// so a failed build leaves dead `Weak`s behind — pruning at commit
+    /// keeps that bounded instead of waiting for the next refresh
+    /// (issue #533 review).
+    pub fn prune_dead_derived(&self) {
+        self.derived
+            .write()
+            .retain(|(_, weak)| weak.upgrade().is_some());
     }
 
     async fn fetch_content(&self) -> Result<String, String> {
@@ -282,31 +337,53 @@ impl ProxyProvider {
         }
     }
 
-    async fn parse_proxies(&self, content: &str) -> Vec<Arc<dyn Proxy>> {
+    /// Parse a fetched provider payload into proxies. `Err` only under
+    /// `strict` (`strict: true`, issue #533) — a malformed document or an
+    /// unparseable node; the lenient path warns and skips instead.
+    async fn parse_proxies(&self, content: &str) -> Result<Vec<Arc<dyn Proxy>>, String> {
+        let strict = self.strict.load(Ordering::Relaxed);
         let doc: serde_yaml::Value = match serde_yaml::from_str(content) {
             Ok(v) => v,
             Err(e) => {
+                if strict {
+                    return Err(format!("provider YAML is malformed (strict mode): {e}"));
+                }
                 warn!(provider = %self.name, error = %e, "failed to parse provider YAML");
-                return Vec::new();
+                return Ok(Vec::new());
             }
         };
 
-        // Accept both `proxies: [...]` wrapper and a bare list.
-        let list_val = doc.get("proxies").cloned().unwrap_or_else(|| doc.clone());
+        // Accept both `proxies: [...]` wrapper and a bare list. A
+        // `Value::Null` document is an empty or comments-only file — treat
+        // it as an empty provider rather than a parse defect so an editor /
+        // external tool mid-rewrite doesn't hard-fail strict mode
+        // (parity with the missing-file acquisition path, issue #533).
+        let list_val = match doc.get("proxies").cloned().unwrap_or_else(|| doc.clone()) {
+            serde_yaml::Value::Null => serde_yaml::Value::Sequence(Vec::new()),
+            v => v,
+        };
 
         let mut proxy_maps: Vec<HashMap<String, serde_yaml::Value>> = match serde_yaml::from_value(
             list_val,
         ) {
             Ok(v) => v,
             Err(e) => {
+                if strict {
+                    return Err(format!(
+                        "provider content is not a proxy list (strict mode): {e}"
+                    ));
+                }
                 warn!(provider = %self.name, error = %e, "provider content is not a proxy list");
-                return Vec::new();
+                return Ok(Vec::new());
             }
         };
 
         // Pre-resolve any DNS-sourced ECH configs into inline base64 — keeps
-        // `parse_proxy` itself sync.
-        crate::ech_dns::preresolve_ech(&mut proxy_maps).await;
+        // `parse_proxy` itself sync. An `ech-opts.enable: true` node with no
+        // query source at all is a defect — strict turns it into an error.
+        crate::ech_dns::preresolve_ech(&mut proxy_maps, strict)
+            .await
+            .map_err(|e| format!("{e} (strict mode)"))?;
 
         let mut result = Vec::new();
         for raw_map in &proxy_maps {
@@ -339,30 +416,50 @@ impl ProxyProvider {
             ) {
                 Ok(proxy) => result.push(proxy),
                 Err(e) => {
+                    if strict {
+                        return Err(format!(
+                            "node '{raw_name}' failed to parse (strict mode): {e}"
+                        ));
+                    }
                     warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
                 }
             }
         }
 
-        result
+        Ok(result)
+    }
+
+    /// Publish a freshly parsed node set — shared by `refresh` and the
+    /// strict-gated initial load in [`load_proxy_providers`].
+    fn commit(&self, proxies: Vec<Arc<dyn Proxy>>) {
+        info!(provider = %self.name, count = proxies.len(), "proxy-provider refreshed");
+        // Main slot first, then the derived views — readers can never
+        // observe new derived contents against a stale main slot.
+        *self.slot.write() = proxies;
+        self.update_derived(&self.slot.read());
+        self.updated_at.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as meow_common::atomic::Uint,
+            Ordering::Relaxed,
+        );
     }
 
     pub async fn refresh(&self) -> Result<(), String> {
         match self.fetch_content().await {
-            Ok(content) => {
-                let proxies = self.parse_proxies(&content).await;
-                info!(provider = %self.name, count = proxies.len(), "proxy-provider refreshed");
-                self.update_derived(&proxies);
-                *self.slot.write() = proxies;
-                self.updated_at.store(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as meow_common::atomic::Uint,
-                    Ordering::Relaxed,
-                );
-                Ok(())
-            }
+            Ok(content) => match self.parse_proxies(&content).await {
+                Ok(proxies) => {
+                    self.commit(proxies);
+                    Ok(())
+                }
+                Err(e) => {
+                    // Reachable only under `strict` — a torn payload keeps the
+                    // last-good set instead of replacing it with nothing.
+                    warn!(provider = %self.name, error = %e, "proxy-provider refresh failed");
+                    Err(e)
+                }
+            },
             Err(e) => {
                 warn!(provider = %self.name, error = %e, "proxy-provider refresh failed");
                 Err(e)
@@ -427,21 +524,47 @@ pub async fn load_proxy_providers(
     raw_map: &HashMap<String, RawProxyProvider>,
     cache_dir: Option<&Path>,
     ipv6: bool,
-) -> HashMap<String, Arc<ProxyProvider>> {
+    strict: bool,
+) -> Result<HashMap<String, Arc<ProxyProvider>>, anyhow::Error> {
     let mut result = HashMap::new();
     for (name, raw) in raw_map {
-        match ProxyProvider::new(name, raw, cache_dir, ipv6) {
+        match ProxyProvider::new(name, raw, cache_dir, ipv6, strict) {
             Ok(provider) => {
                 let provider = Arc::new(provider);
-                let _ = provider.refresh().await;
+                if strict {
+                    // Strict gates the *parse*, not the fetch: a transient
+                    // download failure is not a config defect, so a provider
+                    // that can't be fetched still starts empty and stays
+                    // empty until a manual refresh or restart.
+                    match provider.fetch_content().await {
+                        Ok(content) => {
+                            let proxies = provider
+                                .parse_proxies(&content)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("proxy-provider '{name}': {e}"))?;
+                            provider.commit(proxies);
+                        }
+                        Err(e) => {
+                            warn!(provider = %name, error = %e,
+                                "initial fetch failed; starting empty");
+                        }
+                    }
+                } else {
+                    let _ = provider.refresh().await;
+                }
                 result.insert(name.clone(), provider);
+            }
+            Err(e) if strict => {
+                return Err(anyhow::anyhow!(
+                    "proxy-provider '{name}' failed to load (strict mode): {e}"
+                ));
             }
             Err(e) => {
                 warn!(provider = %name, error = %e, "failed to create proxy-provider, skipping");
             }
         }
     }
-    result
+    Ok(result)
 }
 
 fn compile_opt_regex(
@@ -514,7 +637,7 @@ mod tests {
     fn file_provider_new_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let raw = raw_file_provider("proxies.yaml");
-        let p = ProxyProvider::new("test", &raw, Some(dir.path()), true).unwrap();
+        let p = ProxyProvider::new("test", &raw, Some(dir.path()), true, false).unwrap();
         assert_eq!(p.name, "test");
         assert_eq!(p.vehicle_type, "File");
         assert!(p.header.is_empty());
@@ -523,7 +646,7 @@ mod tests {
     #[test]
     fn file_provider_requires_cache_dir_for_path() {
         let raw = raw_file_provider("/tmp/proxies.yaml");
-        let Err(err) = ProxyProvider::new("test", &raw, None, true) else {
+        let Err(err) = ProxyProvider::new("test", &raw, None, true, false) else {
             panic!("file path without a cache dir must fail");
         };
         assert!(err.contains("cache directory"), "unexpected: {err}");
@@ -534,7 +657,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for path in ["../../etc/pwned", "/etc/pwned"] {
             let raw = raw_file_provider(path);
-            let Err(err) = ProxyProvider::new("test", &raw, Some(dir.path()), true) else {
+            let Err(err) = ProxyProvider::new("test", &raw, Some(dir.path()), true, false) else {
                 panic!("escaping path {path} must be rejected");
             };
             assert!(err.contains("escapes"), "path {path}: unexpected: {err}");
@@ -556,7 +679,7 @@ mod tests {
             allow_external_plugin: None,
             header: None,
         };
-        let Err(err) = ProxyProvider::new("test", &raw, Some(dir.path()), true) else {
+        let Err(err) = ProxyProvider::new("test", &raw, Some(dir.path()), true, false) else {
             panic!("escaping http cache path must be rejected");
         };
         assert!(err.contains("escapes"), "unexpected: {err}");
@@ -622,7 +745,7 @@ mod tests {
             allow_external_plugin: None,
             header: Some(headers),
         };
-        let p = ProxyProvider::new("airport", &raw, None, true).unwrap();
+        let p = ProxyProvider::new("airport", &raw, None, true, false).unwrap();
         assert_eq!(p.vehicle_type, "HTTP");
         assert!(p
             .header
@@ -656,7 +779,7 @@ mod tests {
             allow_external_plugin: None,
             header: Some(headers),
         };
-        let p = ProxyProvider::new("airport", &raw, None, true).unwrap();
+        let p = ProxyProvider::new("airport", &raw, None, true, false).unwrap();
         // Multi-value entries repeat the name (one field line per value),
         // sorted by name like Go net/http.
         assert_eq!(
@@ -728,7 +851,7 @@ header:
         let yaml = "type: file\npath: proxies.yaml\n";
         let raw: RawProxyProvider = serde_yaml::from_str(yaml).unwrap();
         assert!(raw.header.is_none());
-        let p = ProxyProvider::new("p", &raw, Some(dir.path()), true).unwrap();
+        let p = ProxyProvider::new("p", &raw, Some(dir.path()), true, false).unwrap();
         assert!(p.header.is_empty());
     }
 
@@ -769,7 +892,7 @@ header:
     async fn file_provider(path: &std::path::Path) -> ProxyProvider {
         let raw = raw_file_provider(path.to_str().unwrap());
         let cache_dir = path.parent().expect("temp file has a parent dir");
-        let p = ProxyProvider::new("airport", &raw, Some(cache_dir), true).unwrap();
+        let p = ProxyProvider::new("airport", &raw, Some(cache_dir), true, false).unwrap();
         p.refresh().await.unwrap();
         p
     }

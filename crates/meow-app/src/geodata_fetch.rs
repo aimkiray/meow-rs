@@ -8,6 +8,7 @@
 
 use meow_common::adapter::Proxy;
 use meow_config::geodata::download_and_replace;
+use meow_config::proxy_provider::ProxyProvider;
 use meow_config::raw::RawConfig;
 use meow_config::rule_provider::RuleProvider;
 use meow_config::GeoDataConfig;
@@ -98,6 +99,9 @@ pub async fn run_on_startup(
     tunnel: Tunnel,
     raw_config: Arc<RwLock<RawConfig>>,
     rule_providers: Arc<RwLock<std::collections::HashMap<String, Arc<RuleProvider>>>>,
+    // Live proxy providers — group `use:` names resolve against them;
+    // an empty map fails every `use:` group under `strict: true`.
+    proxy_providers: Arc<dashmap::DashMap<String, Arc<ProxyProvider>>>,
     cache_dir: PathBuf,
 ) {
     let targets = compute_targets(&geo);
@@ -125,11 +129,16 @@ pub async fn run_on_startup(
     let rebuild = tokio::task::spawn_blocking({
         let cache_dir = cache_dir.clone();
         let rule_providers = Arc::clone(&rule_providers);
+        let proxy_providers: std::collections::HashMap<_, _> = proxy_providers
+            .iter()
+            .map(|e| (e.key().clone(), Arc::clone(e.value())))
+            .collect();
         move || {
             meow_config::rebuild_from_raw_with_resolver(
                 &raw,
                 Some(&resolver),
                 Some(cache_dir.as_path()),
+                &proxy_providers,
                 // Rules-only refresh — bind the rebuilt RULE-SET rules to
                 // the LIVE provider set so `PUT /providers/rules/{name}`
                 // refreshes keep reaching them (issue #533 review).
@@ -172,6 +181,8 @@ pub async fn auto_update_loop(
     tunnel: Tunnel,
     raw_config: Arc<RwLock<RawConfig>>,
     rule_providers: Arc<RwLock<std::collections::HashMap<String, Arc<RuleProvider>>>>,
+    // Same contract as `run_on_startup` — the live provider registry.
+    proxy_providers: Arc<dashmap::DashMap<String, Arc<ProxyProvider>>>,
     cache_dir: PathBuf,
 ) {
     let interval = std::time::Duration::from_secs(geo.auto_update_interval as u64 * 3600);
@@ -240,11 +251,16 @@ pub async fn auto_update_loop(
         let rebuild = tokio::task::spawn_blocking({
             let cache_dir = cache_dir.clone();
             let rule_providers = Arc::clone(&rule_providers);
+            let proxy_providers: std::collections::HashMap<_, _> = proxy_providers
+                .iter()
+                .map(|e| (e.key().clone(), Arc::clone(e.value())))
+                .collect();
             move || {
                 meow_config::rebuild_from_raw_with_resolver(
                     &raw,
                     Some(&resolver),
                     Some(cache_dir.as_path()),
+                    &proxy_providers,
                     // Rules-only refresh — bind the rebuilt RULE-SET rules
                     // to the LIVE provider set so API/provider refreshes
                     // keep reaching them (issue #533 review).

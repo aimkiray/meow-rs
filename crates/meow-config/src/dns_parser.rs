@@ -34,10 +34,13 @@ pub async fn parse_dns(
     rule_providers: &HashMap<String, Arc<RuleProvider>>,
     prior: Option<&Resolver>,
 ) -> Result<DnsConfig, anyhow::Error> {
+    // `strict` (top-level `strict: true`, issue #533): static config defects
+    // become hard errors; transient resolution failures stay lenient.
+    let strict = raw.strict.unwrap_or(false);
     let dns = match &raw.dns {
         Some(dns) if dns.enable.unwrap_or(false) => dns,
         _ => {
-            let hosts = build_hosts_trie(raw.hosts.as_ref())?;
+            let hosts = build_hosts_trie(raw.hosts.as_ref(), strict)?;
             let use_hosts = raw.dns.as_ref().and_then(|d| d.use_hosts).unwrap_or(true);
             let resolver = Resolver::new(
                 vec!["8.8.8.8:53".parse().unwrap()],
@@ -75,7 +78,7 @@ pub async fn parse_dns(
     };
 
     let listen_addr = crate::parse_optional_socket_addr("dns.listen", dns.listen.as_deref())?;
-    let mut hosts = build_hosts_trie(raw.hosts.as_ref())?;
+    let mut hosts = build_hosts_trie(raw.hosts.as_ref(), strict)?;
 
     if use_hosts && use_system_hosts {
         merge_system_hosts(&mut hosts).await;
@@ -100,7 +103,7 @@ pub async fn parse_dns(
                  hosts:, give it an IP-literal server:, or drop the #{proxy} tag."
             );
         }
-        let mut proxy_hosts = build_hosts_trie(raw.hosts.as_ref())?;
+        let mut proxy_hosts = build_hosts_trie(raw.hosts.as_ref(), strict)?;
         if use_hosts && use_system_hosts {
             merge_system_hosts(&mut proxy_hosts).await;
         }
@@ -135,6 +138,7 @@ pub async fn parse_dns(
                     &bootstrap_clients,
                     proxy_registry,
                     rule_providers,
+                    strict,
                 )
                 .await?,
             )
@@ -151,10 +155,10 @@ pub async fn parse_dns(
         let mmdb_path = mmdb_path.map(std::path::Path::to_path_buf);
         Some(
             crate::spawn_blocking_with_current_dispatcher(move || {
-                build_fallback_filter(raw_filter.as_ref(), mmdb_path.as_deref())
+                build_fallback_filter(raw_filter.as_ref(), mmdb_path.as_deref(), strict)
             })
             .await
-            .map_err(|e| anyhow::anyhow!("fallback-filter build task failed: {e}"))?,
+            .map_err(|e| anyhow::anyhow!("fallback-filter build task failed: {e}"))??,
         )
     };
 
@@ -407,6 +411,12 @@ async fn build_nameserver_policy(
     bootstrap_clients: &[Arc<DnsClient>],
     proxy_registry: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
     rule_providers: &HashMap<String, Arc<RuleProvider>>,
+    // `strict` (top-level `strict: true`, issue #533): static defects in a
+    // policy *value* — an unparseable URL, or a `#name` tag referencing an
+    // unknown proxy — become hard errors instead of warn-and-skip.
+    // Resolution-dependent skips (bootstrap lookup failed, no addresses)
+    // stay lenient: those are transient, not config defects.
+    strict: bool,
 ) -> Result<NameserverPolicy, anyhow::Error> {
     let mut policy = NameserverPolicy::new();
     let mut warned_unsupported_prefix = false;
@@ -419,9 +429,26 @@ async fn build_nameserver_policy(
             if let Some(category) = key_lower.strip_prefix("geosite:") {
                 let category = category.trim();
                 if category.is_empty() {
+                    if strict {
+                        return Err(anyhow::anyhow!(
+                            "nameserver-policy: 'geosite:' key has an empty category \
+                             (strict mode)"
+                        ));
+                    }
                     continue;
                 }
                 let Some(db) = geosite else {
+                    // A `geosite:` policy key with no loaded DB silently drops
+                    // the whole entry — the declared domains fall back to the
+                    // default nameservers, contradicting `rule-set:`'s
+                    // unconditional hard error below (issue #533 review).
+                    if strict {
+                        return Err(anyhow::anyhow!(
+                            "nameserver-policy: 'geosite:{category}' requires a loaded \
+                             geosite DB (strict mode); set `geodata:` / fix the \
+                             database files, or drop the key"
+                        ));
+                    }
                     if !warned_missing_geosite {
                         warn!(
                             "nameserver-policy: geosite: patterns require a loaded geosite DB; \
@@ -444,6 +471,12 @@ async fn build_nameserver_policy(
                 // original-case `expanded_key`, not `key_lower`.
                 let name = expanded_key["rule-set:".len()..].trim();
                 if name.is_empty() {
+                    if strict {
+                        return Err(anyhow::anyhow!(
+                            "nameserver-policy: 'rule-set:' key has an empty provider \
+                             name (strict mode)"
+                        ));
+                    }
                     continue;
                 }
                 let provider = rule_providers.get(name).ok_or_else(|| {
@@ -477,6 +510,15 @@ async fn build_nameserver_policy(
             }
 
             if key_lower.contains(':') {
+                // A typo'd prefix (`geosite:`/`rule-set:` misspelled, or an
+                // unknown scheme) is dead config — the entry silently routes
+                // those domains to the default nameservers (issue #533 review).
+                if strict {
+                    return Err(anyhow::anyhow!(
+                        "nameserver-policy: unsupported prefixed key '{expanded_key}' \
+                         (strict mode); supported prefixes: geosite:, rule-set:"
+                    ));
+                }
                 if !warned_unsupported_prefix {
                     warn!(
                         "nameserver-policy: unsupported prefixed patterns containing ':' \
@@ -499,7 +541,7 @@ async fn build_nameserver_policy(
         }
 
         let resolvers =
-            build_policy_resolvers(key, value, bootstrap_clients, proxy_registry).await?;
+            build_policy_resolvers(key, value, bootstrap_clients, proxy_registry, strict).await?;
 
         let entry = PolicyEntry {
             nameservers: resolvers,
@@ -572,6 +614,7 @@ async fn build_policy_resolvers(
     value: &crate::raw::RawNspValue,
     bootstrap_clients: &[Arc<DnsClient>],
     proxy_registry: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
+    strict: bool,
 ) -> Result<Vec<Arc<meow_dns::DnsClient>>, anyhow::Error> {
     let url_strs = value.as_urls();
     let empty_resolved = HashMap::new();
@@ -587,25 +630,40 @@ async fn build_policy_resolvers(
                 // `#PROXY` fragment: route this upstream's exchanges through
                 // the named adapter, matching the nameserver/fallback entry
                 // semantics (issue #67 phase 2, ADR-0012). An unknown name
-                // degrades to a direct dial like the main path does, but
-                // warn loudly — a policy upstream is usually proxied
-                // precisely because the direct path is untrusted.
-                let proxy = entry.proxy.as_deref().and_then(|name| {
-                    let handle = proxy_registry.get(name).cloned();
-                    if handle.is_none() {
-                        warn!(
-                            "nameserver-policy entry '{}': URL '{}' references unknown \
-                            proxy '{}'; dialing direct",
-                            key, url_str, name
-                        );
-                    }
-                    handle
-                });
+                // degrades to a direct dial like the main path does — under
+                // `strict` that silent downgrade is a hard error instead
+                // (issue #533 review).
+                let proxy = match entry.proxy.as_deref() {
+                    Some(name) => match proxy_registry.get(name).cloned() {
+                        Some(handle) => Some(handle),
+                        None if strict => {
+                            return Err(anyhow::anyhow!(
+                                "nameserver-policy entry '{key}': URL '{url_str}' references \
+                                 unknown proxy '{name}' (strict mode)"
+                            ));
+                        }
+                        None => {
+                            warn!(
+                                "nameserver-policy entry '{}': URL '{}' references unknown \
+                                proxy '{}'; dialing direct",
+                                key, url_str, name
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 let resolver =
                     Resolver::build_single_resolver_with_proxy(&url, &empty_resolved, proxy);
                 resolvers.push(resolver);
             }
             Err(e) => {
+                if strict {
+                    return Err(anyhow::anyhow!(
+                        "nameserver-policy entry '{key}': invalid URL '{url_str}' \
+                         (strict mode): {e}"
+                    ));
+                }
                 warn!(
                     "nameserver-policy entry '{}': skipping invalid URL '{}': {}",
                     key, url_str, e
@@ -729,7 +787,8 @@ async fn resolve_policy_host(
 fn build_fallback_filter(
     raw: Option<&crate::raw::RawFallbackFilter>,
     explicit_mmdb_path: Option<&std::path::Path>,
-) -> FallbackFilter {
+    strict: bool,
+) -> Result<FallbackFilter, anyhow::Error> {
     let geoip = raw.and_then(|f| f.geoip).unwrap_or(true);
     let geoip_code = raw
         .and_then(|f| f.geoip_code.clone())
@@ -742,6 +801,14 @@ fn build_fallback_filter(
         match s.parse::<ipnet::IpNet>() {
             Ok(net) => ipcidr.push(net),
             Err(e) => {
+                // An unparseable CIDR is a static config defect — under
+                // strict it fails the build instead of silently weakening
+                // the fallback filter (issue #533 review).
+                if strict {
+                    return Err(anyhow::anyhow!(
+                        "fallback-filter.ipcidr: invalid CIDR '{s}': {e} (strict mode)"
+                    ));
+                }
                 warn!(
                     "fallback-filter.ipcidr: skipping invalid CIDR '{}': {}",
                     s, e
@@ -786,13 +853,13 @@ fn build_fallback_filter(
 
     let geoip_enabled = geoip && geoip_reader.is_some();
 
-    FallbackFilter {
+    Ok(FallbackFilter {
         geoip_enabled,
         geoip_code,
         ipcidr,
         domain,
         geoip_reader,
-    }
+    })
 }
 
 /// Build the hosts trie from top-level mihomo-compatible `hosts:` entries.
@@ -800,6 +867,7 @@ fn build_fallback_filter(
 /// Malformed values and alias cycles are hard errors (Class A per ADR-0002).
 fn build_hosts_trie(
     hosts: Option<&HashMap<String, HostsValue>>,
+    strict: bool,
 ) -> Result<DomainTrie<HostEntry>, anyhow::Error> {
     let mut trie: DomainTrie<HostEntry> = DomainTrie::new();
     let Some(hosts) = hosts else {
@@ -809,6 +877,13 @@ fn build_hosts_trie(
     for (host, value) in hosts {
         let values = value.as_slice();
         if values.is_empty() {
+            // An empty `hosts:` entry is a static defect — the declared name
+            // silently resolves nothing (issue #533 review).
+            if strict {
+                return Err(anyhow::anyhow!(
+                    "hosts: entry '{host}' has no values (strict mode)"
+                ));
+            }
             warn!("hosts: entry '{}' has no values, skipping", host);
             continue;
         }
@@ -838,6 +913,11 @@ fn build_hosts_trie(
         // Rewrite *.foo → +.foo for DomainTrie wildcard semantics at parse time.
         let entry = normalize_hosts_wildcard(host.trim());
         if !trie.insert(&entry, host_entry.clone()) {
+            if strict {
+                return Err(anyhow::anyhow!(
+                    "hosts: '{entry}' is not a valid domain pattern (strict mode)"
+                ));
+            }
             warn!("hosts: failed to insert '{}' into trie", host);
         }
         // DomainTrie's +. semantics don't include the root domain itself — insert
@@ -979,7 +1059,7 @@ mod tests {
 
     #[test]
     fn build_hosts_trie_none_is_empty() {
-        let trie = build_hosts_trie(None).unwrap();
+        let trie = build_hosts_trie(None, false).unwrap();
         assert!(trie.search("example.com").is_none());
     }
 
@@ -1417,7 +1497,7 @@ mod tests {
     fn build_hosts_trie_single_ip() {
         let mut map = HashMap::new();
         map.insert("example.com".to_string(), one("1.2.3.4"));
-        let trie = build_hosts_trie(Some(&map)).unwrap();
+        let trie = build_hosts_trie(Some(&map), false).unwrap();
         let v = trie.search("example.com").expect("must hit");
         assert_eq!(addresses(v), &[IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
     }
@@ -1426,7 +1506,7 @@ mod tests {
     fn build_hosts_trie_many_ips() {
         let mut map = HashMap::new();
         map.insert("dual.test".to_string(), many(&["1.1.1.1", "::1"]));
-        let trie = build_hosts_trie(Some(&map)).unwrap();
+        let trie = build_hosts_trie(Some(&map), false).unwrap();
         let v = trie.search("dual.test").expect("must hit");
         assert_eq!(addresses(v).len(), 2);
     }
@@ -1435,7 +1515,7 @@ mod tests {
     fn build_hosts_trie_domain_alias() {
         let mut map = HashMap::new();
         map.insert("node.example".to_string(), one("origin.example"));
-        let trie = build_hosts_trie(Some(&map)).unwrap();
+        let trie = build_hosts_trie(Some(&map), false).unwrap();
         assert_eq!(
             trie.search("node.example"),
             Some(&HostEntry::Alias("origin.example".into()))
@@ -1447,7 +1527,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("a.example".to_string(), one("b.example"));
         map.insert("b.example".to_string(), one("a.example"));
-        let err = build_hosts_trie(Some(&map))
+        let err = build_hosts_trie(Some(&map), false)
             .err()
             .expect("domain alias cycles must be rejected");
         assert!(err.to_string().contains("alias cycle"));
@@ -1460,7 +1540,7 @@ mod tests {
             "bad.example".to_string(),
             many(&["192.0.2.1", "origin.example"]),
         );
-        let err = build_hosts_trie(Some(&map))
+        let err = build_hosts_trie(Some(&map), false)
             .err()
             .expect("multi-value hosts entries may contain only IPs");
         assert!(err.to_string().contains("lists may contain only IP"));
@@ -1472,7 +1552,7 @@ mod tests {
     fn build_hosts_trie_malformed_ip_hard_error() {
         let mut map = HashMap::new();
         map.insert("bad.test".to_string(), one("not-an-ip"));
-        let result = build_hosts_trie(Some(&map));
+        let result = build_hosts_trie(Some(&map), false);
         let err = result
             .err()
             .expect("malformed hosts value must be a hard error (Class A)");
@@ -1487,7 +1567,7 @@ mod tests {
     fn build_hosts_trie_wildcard_and_bare() {
         let mut map = HashMap::new();
         map.insert("+.corp.example".to_string(), one("10.0.0.1"));
-        let trie = build_hosts_trie(Some(&map)).unwrap();
+        let trie = build_hosts_trie(Some(&map), false).unwrap();
         assert!(trie.search("host.corp.example").is_some());
         assert!(trie.search("corp.example").is_some());
     }
@@ -1498,7 +1578,7 @@ mod tests {
     fn build_hosts_trie_star_wildcard_rewritten() {
         let mut map = HashMap::new();
         map.insert("*.corp.internal".to_string(), one("10.0.0.50"));
-        let trie = build_hosts_trie(Some(&map)).unwrap();
+        let trie = build_hosts_trie(Some(&map), false).unwrap();
         assert!(
             trie.search("foo.corp.internal").is_some(),
             "subdomain of *.corp.internal must match"
@@ -1518,7 +1598,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("*.corp.internal".to_string(), one(wild_ip));
         map.insert("dns.corp.internal".to_string(), one(exact_ip));
-        let trie = build_hosts_trie(Some(&map)).unwrap();
+        let trie = build_hosts_trie(Some(&map), false).unwrap();
         let exact = trie.search("dns.corp.internal").expect("must hit exact");
         let exact_addr: IpAddr = exact_ip.parse().unwrap();
         assert_eq!(
@@ -1558,7 +1638,7 @@ mod tests {
             RawNspValue::One("rcode://success".to_string()),
         );
         let result =
-            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new()).await;
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false).await;
         assert!(result.is_ok(), "geosite: prefix must not hard-error");
         let pol = result.unwrap();
         assert!(
@@ -1580,9 +1660,16 @@ mod tests {
             "geosite:cn,private".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let pol = build_nameserver_policy(&map, Some(&db), &[], &HashMap::new(), &HashMap::new())
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &map,
+            Some(&db),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
         assert!(pol.lookup("example.cn").is_some());
         assert!(pol.lookup("lan").is_some());
         assert!(pol.lookup("example.com").is_none());
@@ -1600,7 +1687,7 @@ mod tests {
             RawNspValue::Many(vec!["quic://bad.example".to_string()]),
         );
         let result =
-            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new()).await;
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false).await;
         assert!(
             result.is_err(),
             "policy entry with no valid servers must be a hard error"
@@ -1616,7 +1703,7 @@ mod tests {
             "+.corp.internal".to_string(),
             RawNspValue::One("192.168.1.53".to_string()),
         );
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new())
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
             .await
             .unwrap();
         assert!(pol.lookup("foo.corp.internal").is_some());
@@ -1647,7 +1734,7 @@ mod tests {
             );
         }
         let ctx = meow_rules::ParserContext::empty();
-        crate::rule_provider::load_providers(&raw, None, &ctx, None)
+        crate::rule_provider::load_providers(&raw, None, &ctx, None, false).expect("load failed")
     }
 
     // rule-set: domain behavior compiles into a matcher that hits the
@@ -1665,7 +1752,7 @@ mod tests {
             "rule-set:cn".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers)
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
             .await
             .unwrap();
         assert!(pol.lookup("example.cn").is_some());
@@ -1683,7 +1770,8 @@ mod tests {
             "rule-set:missing".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let result = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers).await;
+        let result =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false).await;
         assert!(result.is_err());
         let msg = result.err().unwrap().to_string();
         assert!(msg.contains("not found rule-set"), "msg was: {msg}");
@@ -1699,7 +1787,8 @@ mod tests {
             "rule-set:ips".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let result = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers).await;
+        let result =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false).await;
         assert!(result.is_err());
         let msg = result.err().unwrap().to_string();
         assert!(msg.contains("IpCidr"), "msg was: {msg}");
@@ -1719,7 +1808,7 @@ mod tests {
             "rule-set:cls".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers)
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
             .await
             .unwrap();
         assert!(pol.lookup("mail.google.com").is_some());
@@ -1739,7 +1828,7 @@ mod tests {
             "rule-set:a,b".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers)
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
             .await
             .unwrap();
         assert!(pol.lookup("a.example").is_some());
@@ -1757,7 +1846,7 @@ mod tests {
             "rule-set:CN".to_string(),
             RawNspValue::One("rcode://success".to_string()),
         );
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers)
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
             .await
             .unwrap();
         assert!(pol.lookup("example.cn").is_some());
@@ -1766,7 +1855,7 @@ mod tests {
     // Fallback-filter defaults when no raw config provided.
     #[test]
     fn build_fallback_filter_defaults() {
-        let ff = build_fallback_filter(None, None);
+        let ff = build_fallback_filter(None, None, false).unwrap();
         assert_eq!(ff.geoip_code, "CN");
         assert!(ff.ipcidr.is_empty());
         assert!(ff.domain.search("anything").is_none());
@@ -1782,7 +1871,7 @@ mod tests {
             ipcidr: Some(vec!["240.0.0.0/4".to_string()]),
             domain: None,
         };
-        let ff = build_fallback_filter(Some(&raw), None);
+        let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
         let bogon: IpAddr = "240.1.2.3".parse().unwrap();
         let clean: IpAddr = "8.8.8.8".parse().unwrap();
         assert!(ff.ip_gated(&[bogon]));
@@ -1800,7 +1889,7 @@ mod tests {
             ipcidr: None,
             domain: Some(vec!["+.google.cn".to_string()]),
         };
-        let ff = build_fallback_filter(Some(&raw), None);
+        let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
         assert!(ff.domain_gated("www.google.cn"));
         assert!(ff.domain_gated("google.cn"));
         assert!(!ff.domain_gated("www.google.com"));
@@ -1884,7 +1973,7 @@ mod tests {
             }),
         );
         let value = crate::raw::RawNspValue::One("tcp://8.8.8.8#Proxy".to_string());
-        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry)
+        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false)
             .await
             .expect("proxy-tagged policy entry builds");
         assert_eq!(resolvers.len(), 1);
@@ -1901,13 +1990,112 @@ mod tests {
             "tcp://8.8.8.8#NoSuchProxy".to_string(),
             "1.1.1.1#NoSuchProxy".to_string(),
         ]);
-        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry)
+        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false)
             .await
             .expect("unknown proxy name must not fail the policy build");
         assert_eq!(resolvers.len(), 2);
         assert!(
             resolvers.iter().all(|r| !r.is_proxied()),
             "unknown names degrade to direct dials"
+        );
+
+        // Strict: the same silent direct-dial downgrade is a hard error —
+        // the upstream was proxied precisely because direct is untrusted
+        // (issue #533 review).
+        let Err(err) = build_policy_resolvers("geosite:gfw", &value, &[], &registry, true).await
+        else {
+            panic!("strict must reject an unknown #proxy reference");
+        };
+        assert!(err.to_string().contains("NoSuchProxy"), "unexpected: {err}");
+    }
+
+    #[tokio::test]
+    async fn policy_resolver_invalid_url_fails_under_strict() {
+        let registry: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
+        // A scheme the URL parser doesn't know is warn-skipped leniently…
+        let value = crate::raw::RawNspValue::Many(vec![
+            "bogus://8.8.8.8".to_string(),
+            "1.1.1.1".to_string(),
+        ]);
+        let resolvers = build_policy_resolvers("example.com", &value, &[], &registry, false)
+            .await
+            .expect("lenient keeps the valid entries");
+        assert_eq!(resolvers.len(), 1);
+
+        // …but under strict the unparseable entry is a config defect.
+        let Err(err) = build_policy_resolvers("example.com", &value, &[], &registry, true).await
+        else {
+            panic!("strict must reject an invalid policy URL");
+        };
+        assert!(err.to_string().contains("bogus"), "unexpected: {err}");
+    }
+
+    /// `geosite:` policy keys with no loaded DB silently dropped the whole
+    /// entry — asymmetric with `rule-set:`'s hard error. Strict escalates
+    /// (issue #533 review).
+    #[tokio::test]
+    async fn strict_rejects_geosite_policy_without_db() {
+        let mut map = HashMap::new();
+        map.insert(
+            "geosite:gfw".to_string(),
+            crate::raw::RawNspValue::One("8.8.8.8".to_string()),
+        );
+        // Lenient: warn + entry skipped.
+        build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
+            .await
+            .expect("lenient drops geosite keys without a DB");
+        // Strict: hard error naming the key.
+        let Err(err) =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), true).await
+        else {
+            panic!("strict must reject geosite: policy with no DB");
+        };
+        assert!(err.to_string().contains("geosite"), "unexpected: {err}");
+    }
+
+    /// A `foo:`-prefixed policy key is dead config — strict rejects it
+    /// (issue #533 review).
+    #[tokio::test]
+    async fn strict_rejects_unsupported_policy_prefix() {
+        let mut map = HashMap::new();
+        map.insert(
+            "geoip:cn".to_string(),
+            crate::raw::RawNspValue::One("8.8.8.8".to_string()),
+        );
+        build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
+            .await
+            .expect("lenient skips unknown prefixes");
+        let Err(err) =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), true).await
+        else {
+            panic!("strict must reject an unsupported policy prefix");
+        };
+        assert!(err.to_string().contains("geoip"), "unexpected: {err}");
+    }
+
+    /// `fallback-filter.ipcidr` with an unparseable CIDR and a `hosts:`
+    /// entry with an empty value list are static defects — strict errors
+    /// (issue #533 review).
+    #[test]
+    fn strict_rejects_bad_fallback_cidr_and_empty_hosts() {
+        use crate::raw::{HostsValue, RawFallbackFilter};
+        let raw = RawFallbackFilter {
+            geoip: Some(false),
+            ipcidr: Some(vec!["not-a-cidr".to_string()]),
+            ..Default::default()
+        };
+        build_fallback_filter(Some(&raw), None, false).expect("lenient skips bad CIDRs");
+        assert!(
+            build_fallback_filter(Some(&raw), None, true).is_err(),
+            "strict must reject an invalid fallback-filter CIDR"
+        );
+
+        let mut hosts = HashMap::new();
+        hosts.insert("empty.test".to_string(), HostsValue::Many(vec![]));
+        build_hosts_trie(Some(&hosts), false).expect("lenient skips empty hosts entries");
+        assert!(
+            build_hosts_trie(Some(&hosts), true).is_err(),
+            "strict must reject an empty hosts entry"
         );
     }
 
@@ -1917,7 +2105,7 @@ mod tests {
         // parsing as before and never consult the registry.
         let registry: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
         let value = crate::raw::RawNspValue::One("tls://8.8.4.4#dns.google".to_string());
-        let resolvers = build_policy_resolvers("example.com", &value, &[], &registry)
+        let resolvers = build_policy_resolvers("example.com", &value, &[], &registry, false)
             .await
             .expect("tls entry with SNI fragment builds");
         assert_eq!(resolvers.len(), 1);

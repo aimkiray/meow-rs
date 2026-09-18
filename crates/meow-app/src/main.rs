@@ -851,7 +851,6 @@ async fn run(
             let provider_name = provider.name.clone();
             let registry = Arc::clone(&rule_providers);
             tokio::spawn(async move {
-                let ctx = meow_rules::ParserContext::empty();
                 let mut ticker =
                     tokio::time::interval(std::time::Duration::from_secs(interval_secs));
                 ticker.tick().await; // skip the immediate first tick
@@ -860,11 +859,13 @@ async fn run(
                     // Resolve by name each tick — config reloads swap the
                     // provider objects under the registry, and refreshing a
                     // detached startup-era Arc would never reach the live
-                    // matchers (issue #514 review).
+                    // matchers (issue #514 review). The provider re-parses
+                    // the payload in its own load-time ParserContext, so
+                    // geo-dependent entries survive refreshes (issue #533).
                     let Some(provider) = registry.read().get(&provider_name).cloned() else {
                         continue;
                     };
-                    if let Err(e) = provider.refresh(&ctx).await {
+                    if let Err(e) = provider.refresh().await {
                         error!(provider = %provider.name, "background refresh failed: {:#}", e);
                     }
                 }
@@ -879,6 +880,7 @@ async fn run(
         let config_path = config_path.clone();
         let dns_server = Arc::clone(&dns_server_handle);
         let rule_providers = Arc::clone(&rule_providers);
+        let proxy_providers = Arc::clone(&proxy_providers);
         tokio::spawn(async move {
             meow_app::subscription_refresh::run_loop(
                 raw_config,
@@ -886,6 +888,7 @@ async fn run(
                 config_path,
                 dns_server,
                 rule_providers,
+                proxy_providers,
             )
             .await;
         });
@@ -899,6 +902,7 @@ async fn run(
         let tunnel = tunnel.clone();
         let raw_config = Arc::clone(&raw_config);
         let rule_providers = Arc::clone(&rule_providers);
+        let proxy_providers = Arc::clone(&proxy_providers);
         let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
         tokio::spawn(async move {
             meow_app::geodata_fetch::run_on_startup(
@@ -906,6 +910,7 @@ async fn run(
                 tunnel,
                 raw_config,
                 rule_providers,
+                proxy_providers,
                 cache_dir,
             )
             .await;
@@ -918,6 +923,7 @@ async fn run(
         let tunnel = tunnel.clone();
         let raw_config = Arc::clone(&raw_config);
         let rule_providers = Arc::clone(&rule_providers);
+        let proxy_providers = Arc::clone(&proxy_providers);
         let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
         tokio::spawn(async move {
             meow_app::geodata_fetch::auto_update_loop(
@@ -925,6 +931,7 @@ async fn run(
                 tunnel,
                 raw_config,
                 rule_providers,
+                proxy_providers,
                 cache_dir,
             )
             .await;

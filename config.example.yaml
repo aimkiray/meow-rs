@@ -26,6 +26,12 @@ bind-address: "127.0.0.1"
 mode: rule
 log-level: info
 ipv6: false
+# Fail startup (and reject `PUT /configs`) on unparseable entries instead of
+# warn-and-skip: malformed proxies/groups/rules, bad provider definitions or
+# payloads, and dangling `use:`/`RULE-SET` references all become hard errors.
+# Transient provider fetch failures stay lenient — the provider registers
+# empty and refreshes heal it later. `?force=true` overrides strict.
+# strict: true
 
 # REST API
 external-controller: 127.0.0.1:9090
