@@ -155,6 +155,7 @@ cargo test -p meow-proxy --features anytls --lib
 cargo test --lib --bin meow \
   --test socks5_udp_user \
   --test common_test --test dns_cache_test --test config_test \
+  --test tun_config_test \
   --test statistics_test --test rules_test --test api_test \
   --test raii_guard_test --test http_connection_close \
   --test config_persistence_test --test systemd_config_test \
@@ -166,6 +167,12 @@ cargo test --lib --bin meow \
   --test tls_test --test ws_test --test crate_invariants_test \
   --test crate_publish_metadata_test \
   --test smux_singbox_integration
+
+# `-p meow-api` builds api_test WITHOUT `listener-tun` (meow-app's `full`
+# never enters the graph), so the `cfg(not(feature = "listener-tun"))`
+# TUN-reconcile tests actually execute — the unified invocation above
+# compiles them out via feature unification.
+cargo test -p meow-api --test api_test
 ```
 
 `smux_singbox_integration` runs the full stack (config → mixed listener →

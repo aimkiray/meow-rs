@@ -2,7 +2,7 @@
 //!
 //! These exercise [`meow_config::load_config_from_str`] end-to-end and
 //! assert on the resulting `Config.tun` (a [`meow_config::TunConfig`]) —
-//! the parser itself (`parse_tun_config`) is private.
+//! the parser itself (`parse_tun_config`) is exercised through it.
 //!
 //! # Test plan coverage (T-series)
 //!
@@ -18,6 +18,8 @@
 //! | T8  | upstream-only fields (`stack`, `strict-route`, …) → warn, not err  |
 //! | T9  | `udp-timeout: 0` → hard error                                      |
 //! | T10 | `enable: false` with other fields set → parsed but disabled        |
+//! | T16 | `TunConfig` semantic equality — the PUT reconcile diff boundary    |
+//! |     | (issue #543): respellings/ignored fields equal, real params not  |
 
 use std::time::Duration;
 
@@ -283,4 +285,80 @@ tun:
 "#;
     let cfg = load_config_from_str(yaml).await.expect("config must load");
     assert_eq!(cfg.tun.max_connections, 0);
+}
+
+// ─── T16: semantic equality — the PUT reconcile diff boundary (issue #543) ──
+// `PUT /configs` restarts a running TUN listener when the parsed
+// `TunConfig` changes, so respellings/ignored fields must compare equal
+// and real parameters must not.
+
+#[tokio::test]
+async fn t16_tun_config_semantic_equality_boundary() {
+    async fn tun(yaml: &str) -> meow_config::TunConfig {
+        load_config_from_str(yaml)
+            .await
+            .expect("config must load")
+            .tun
+    }
+
+    let explicit_bool = tun("tun:\n  enable: true\n  auto-route: true\n").await;
+    let fake_ip_mode = tun("tun:\n  enable: true\n  auto-route: fake-ip\n").await;
+    let omitted = tun("tun:\n  enable: true\n").await;
+    assert_eq!(explicit_bool, fake_ip_mode, "`true` ≡ `fake-ip` mode");
+    assert_eq!(explicit_bool, omitted, "omitted ≡ default fake-ip scope");
+
+    let ignored_fields = tun("tun:\n  enable: true\n  stack: gvisor\n  strict-route: true\n").await;
+    assert_eq!(
+        explicit_bool, ignored_fields,
+        "warn-only upstream fields must not change the diff"
+    );
+
+    let explicit_mtu = tun("tun:\n  enable: true\n  mtu: 1500\n").await;
+    assert_eq!(explicit_mtu, omitted, "explicit default ≡ omitted");
+
+    assert_ne!(
+        omitted,
+        tun("tun:\n  enable: true\n  mtu: 9000\n").await,
+        "a real mtu change must differ"
+    );
+    assert_ne!(
+        omitted,
+        tun("tun:\n  enable: true\n  dns-hijack:\n    - any:53\n").await,
+        "a real dns-hijack change must differ"
+    );
+    assert_ne!(
+        omitted,
+        tun("max-connections: 512\ntun:\n  enable: true\n").await,
+        "inherited max-connections must differ"
+    );
+
+    // `outbound-interface` is ignored outside `auto-route: global` — a
+    // value that does nothing must not reach the diff, or a PUT touching
+    // only it would bounce a healthy fake-ip listener (issue #543
+    // review).
+    let ignored_iface = tun("tun:\n  enable: true\n  outbound-interface: eth9\n").await;
+    assert_eq!(
+        omitted, ignored_iface,
+        "outbound-interface under fake-ip scope must not change the diff"
+    );
+    assert_ne!(
+        ignored_iface,
+        tun("tun:\n  enable: true\n  auto-route: global\n  outbound-interface: eth9\n").await,
+        "the same field under `global` is real and must differ"
+    );
+
+    // Remaining listener inputs are covered by the derived PartialEq —
+    // pin a representative from each family so the diff can't silently
+    // stop noticing a field (issue #543 review).
+    for (yaml, what) in [
+        ("tun:\n  enable: true\n  device: tun7\n", "device"),
+        (
+            "tun:\n  enable: true\n  inet4-address: 10.9.0.1/24\n",
+            "inet4-address",
+        ),
+        ("tun:\n  enable: true\n  udp-timeout: 30\n", "udp-timeout"),
+        ("tun:\n  enable: true\n  auto-route: global\n", "route_mode"),
+    ] {
+        assert_ne!(omitted, tun(yaml).await, "a real {what} change must differ");
+    }
 }

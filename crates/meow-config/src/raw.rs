@@ -253,7 +253,13 @@ impl HostsValue {
 /// (`stack`, `strict-route`, `auto-detect-interface`, …) are accepted and
 /// produce a `warn!` (Class B per ADR-0002, forward-compat), never a parse
 /// error — the same policy as [`RawGeoDataConfig`] and #328.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+///
+/// `PartialEq` backs the config-commit TUN reconcile: the primary diff
+/// compares the parsed [`crate::TunConfig`]s, and this raw equality is the
+/// fallback when either side fails to parse — a `tun:` parameter change
+/// under an unchanged `enable` must restart the running listener, not be
+/// silently ignored (issue #543).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawTun {
     /// Master switch; the listener is spawned only when true.
@@ -297,7 +303,7 @@ pub struct RawTun {
 
 /// `tun.auto-route` value: mihomo's boolean or a #375 mode string.
 /// Untagged so `auto-route: true` and `auto-route: global` both parse.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum RawAutoRoute {
     Enabled(bool),

@@ -623,6 +623,21 @@ the canonical, in-repo source a release is cut from.
   single, predictable switch — dual-stack operators who pin addresses in
   `hosts:` must enable `ipv6: true` for the v6 entries to be served.
 
+- **`tun:` parameter changes now restart the running listener.** A `PUT
+  /configs` that left `tun.enable: true` untouched but changed `mtu`,
+  `auto-route`, `dns-hijack`, the address fields, or the inherited
+  `max-connections` cap committed the new raw while the listener kept
+  running on the old parameters — the two silently diverged until the next
+  restart. The reconcile now diffs the parsed `TunConfig` (not just
+  `enable`) and restarts a listener on any semantic difference, alongside
+  the existing fake-IP-input trigger; no-op respellings and warn-only
+  ignored fields do not bounce the device, a dead-but-enabled listener is
+  respawned rather than skipped, and a restart failure rolls `enable`
+  back to `false`. `PUT /configs` also validates the `tun:` section at
+  admission — an unparsable section is a 400 (bypassed by `?force`)
+  instead of being committed and tearing the healthy listener down when
+  the restart hits the spawn-side parse error.
+
 - **VMess body ciphers no longer pay for unused key schedules.** Every
   connection built two `BodyCipher` objects — one per relay task — and each
   expanded *both* directions' AEAD key schedules, so four schedules were

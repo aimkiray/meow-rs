@@ -228,7 +228,7 @@ pub struct NamedListener {
 /// Parsed + validated `tun:` section (issue #326). Consumed by the app
 /// layer, which maps it onto `meow_listener::TunListenerConfig` when the
 /// `listener-tun` feature is compiled in.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunConfig {
     pub enable: bool,
     /// Device name; `None` = platform default.
@@ -384,6 +384,12 @@ pub fn parse_tun_config(
              ignored in fake-ip mode"
         );
     }
+    // Normalise the ignored value out: the commit path diffs parsed
+    // `TunConfig`s to decide on a restart, and a field that does nothing
+    // must not trigger one — a PUT touching only `outbound-interface`
+    // under fake-ip scope would otherwise bounce a healthy listener
+    // (issue #543 review).
+    let outbound_interface = outbound_interface.filter(|_| route_mode == TunRouteMode::Global);
 
     Ok(TunConfig {
         enable: r.enable,

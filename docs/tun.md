@@ -166,6 +166,13 @@ mihomo fields meow does not implement (`stack`, `strict-route`,
 UID filters, …) are accepted with a startup warning and ignored — same
 forward-compat policy as the rest of the config surface.
 
+Runtime reloads: `PUT /configs` reconciles the listener against the
+committed `tun:` section — an `enable` transition starts/stops it, and
+any other semantic parameter change (or changed fake-IP inputs)
+restarts it so the running stack matches the stored config (#543).
+No-op respellings and the warn-only fields above do not bounce the
+device; a failed (re)start rolls `tun.enable` back to `false`.
+
 ## Relationship to the tproxy inbound
 
 | | tproxy (`tproxy-port`) | tun (`tun:`) |

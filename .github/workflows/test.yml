@@ -214,6 +214,7 @@ jobs:
             --test socks5_udp_user \
             --test dns_cache_test \
             --test config_test \
+            --test tun_config_test \
             --test statistics_test \
             --test rules_test \
             --test api_test \
@@ -238,6 +239,13 @@ jobs:
             --test crate_invariants_test \
             --test crate_publish_metadata_test \
             --test smux_singbox_integration --retries 2 --no-fail-fast
+
+      # `-p meow-api` builds api_test WITHOUT `listener-tun` (meow-app's
+      # `full` never enters the graph), so the `cfg(not(feature =
+      # "listener-tun"))` TUN-reconcile tests actually execute — in the
+      # unified invocation above feature unification compiles them out.
+      - name: API tests without listener-tun (TUN reconcile)
+        run: cargo nextest run -p meow-api --test api_test --retries 2 --no-fail-fast
 
       - name: UDP routing regression (SOCKS5, Shadowsocks, TUN)
         run: cargo nextest run -p meow-listener --all-features --lib udp_port_53 --retries 2 --no-fail-fast

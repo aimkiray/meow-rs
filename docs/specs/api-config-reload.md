@@ -27,9 +27,12 @@ after the boundary uses the new configuration.
 
 `connections_dropped` counts closure requests for registered TCP flows, not
 completed socket teardowns or rejected unregistered setups. UDP sessions are
-outside this boundary. Ordinary listener bindings/authentication and DNS
-runtime are not rebuilt by PUT; TUN reconciliation currently compares only
-`tun.enable`. These configuration-application gaps remain separate work.
+outside this boundary. Ordinary listener bindings/authentication are not
+rebuilt by PUT. The DNS runtime is republished when its inputs change
+(#514), and TUN reconciliation diffs the parsed `TunConfig` — an `enable`
+transition starts/stops the listener while any other semantic parameter
+change (or changed fake-IP inputs) restarts it (#543). Ordinary listener
+bindings remain separate work.
 
 ## Motivation
 

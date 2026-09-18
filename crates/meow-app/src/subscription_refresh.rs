@@ -289,6 +289,13 @@ pub async fn run_loop(
                             // Commit raw + routing together inside the lane:
                             // the on-disk/dashboard view and the running
                             // router can no longer diverge on failure.
+                            // NB: this bypasses `swap_config_and_reconcile_tun`
+                            // — sound only because a fetched subscription can
+                            // never alter `tun:`/`dns:`/`max-connections`, so
+                            // no TUN/DNS reconcile can be owed. If a future
+                            // merge widens the candidate's sections, route it
+                            // through the reconcile instead (issue #543
+                            // review).
                             *raw_config.write() = candidate.clone();
                             if let Some(dns) = dns {
                                 meow_api::routes::publish_dns(&tunnel, dns_server.as_ref(), &dns)

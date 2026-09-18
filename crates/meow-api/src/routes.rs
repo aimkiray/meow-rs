@@ -2185,9 +2185,9 @@ async fn get_group_delay(
 /// Spawn a TUN listener from a raw config and wait for device readiness.
 /// Returns `Ok(Some(handle))` on success — the [`TunHandle`] carries the
 /// lwIP core's done signal so `stop_tun` can await real teardown
-/// (issue #514) — `Ok(None)` when `tun.enable` is false or the feature is
-/// not compiled in, or `Err(msg)` when startup fails (permission denied,
-/// device-name conflict, timeout, etc.).
+/// (issue #514) — `Ok(None)` when `tun.enable` is false, or `Err(msg)`
+/// when startup fails (permission denied, device-name conflict, timeout,
+/// or the `listener-tun` feature is not compiled in).
 #[cfg(feature = "listener-tun")]
 async fn spawn_tun_from_raw(
     tunnel: &Tunnel,
@@ -2269,7 +2269,10 @@ async fn spawn_tun_from_raw(
 }
 
 /// Commit `candidate` as the new raw config and reconcile the TUN listener
-/// against the `tun.enable` transition. The whole sequence runs inside the
+/// against the `tun:` diff: an `enable` transition starts/stops it, and an
+/// unchanged `enable: true` with any other parameter change (or changed
+/// fake-IP inputs) restarts it so the running stack matches the committed
+/// raw (issue #543). The whole sequence runs inside the
 /// `CONFIG_MUTATION` lane every caller already holds, so two concurrent
 /// mutations cannot interleave their TUN start/stop operations — without
 /// that a disable→stop could run before a sibling enable→start has stored
@@ -2302,9 +2305,38 @@ async fn swap_config_and_reconcile_tun(
     // Snapshot the candidate (only on an off→on transition, before it is
     // moved into the lock) so the parking_lot write guard — which is
     // !Send — is dropped before the first .await below.
-    let (old_enable, snapshot, specs) = {
+    let (old_enable, tun_changed, snapshot, specs) = {
         let mut guard = state.raw_config.write();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
+        // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
+        // any real listener-parameter change (`mtu`, `auto-route`,
+        // `dns-hijack`, addresses, inherited `max-connections`, …)
+        // restarts a running listener while no-op respellings
+        // (`auto-route: true` vs `fake-ip`, explicit defaults) and
+        // warn-only ignored fields (`stack`, `strict-route`, …) do not.
+        // When either side fails to parse, fall back to the raw diff —
+        // a broken candidate stays conservative: restart → spawn fails
+        // → `enable` rolls back.
+        let tun_changed = if guard.tun == candidate.tun
+            && guard.max_connections == candidate.max_connections
+        {
+            // Fast path: identical raw sections cannot differ
+            // semantically — and skipping the parse avoids re-warn!ing
+            // on upstream-only fields (`stack:`, `strict-route:`, …) on
+            // every commit that never touched `tun:`.
+            false
+        } else {
+            match (
+                meow_config::parse_tun_config(guard.tun.as_ref(), guard.max_connections),
+                meow_config::parse_tun_config(candidate.tun.as_ref(), candidate.max_connections),
+            ) {
+                (Ok(o), Ok(n)) => o != n,
+                // Raw sections already known to differ — a broken
+                // candidate stays conservative: restart → spawn fails
+                // → `enable` rolls back.
+                _ => true,
+            }
+        };
         let snapshot = (new_enable && !old).then(|| candidate.clone());
         // Extract health-check specs straight from the candidate before it
         // is moved into the lock — no second read of `raw_config` and no
@@ -2313,7 +2345,7 @@ async fn swap_config_and_reconcile_tun(
             candidate.proxy_groups.as_deref().unwrap_or(&[]),
         );
         *guard = candidate;
-        (old, snapshot, specs)
+        (old, tun_changed, snapshot, specs)
     };
 
     // Reconcile health-check tasks with the committed proxy-group section
@@ -2347,20 +2379,33 @@ async fn swap_config_and_reconcile_tun(
     });
 
     if old_enable == new_enable {
-        if old_enable && fake_ip_changed && state.tunnel.has_tun() {
-            // on → on with changed fake-IP inputs: restart the listener.
+        // on → on with changed fake-IP inputs or any real `tun:` parameter
+        // change: restart the listener so the running stack matches the
+        // committed raw (issue #543). No `has_tun()` gate — a dead
+        // but-enabled listener must attempt a respawn too, and a failed
+        // one rolls `enable` back so it self-limits to one attempt.
+        if old_enable && (fake_ip_changed || tun_changed) {
             state.tunnel.stop_tun().await;
             let raw = state.raw_config.read().clone();
             match spawn_tun_from_raw(&state.tunnel, &raw).await {
                 Ok(Some(handle)) => {
                     state.tunnel.set_tun_handle(handle).await;
-                    info!("TUN listener restarted via config reload (fake-IP inputs changed)");
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(
-                        "TUN listener failed to restart after dns reload: {e} (config rolled back)"
+                    info!(
+                        fake_ip_changed,
+                        tun_changed, "TUN listener restarted via config reload"
                     );
+                }
+                // Unreachable like the off→on arm — `enable` is still true
+                // in the committed raw. Roll back the same way rather than
+                // persist `enable: true` with nothing running.
+                Ok(None) => {
+                    warn!("TUN listener restart returned no handle (config rolled back)");
+                    if let Some(ref mut tun) = state.raw_config.write().tun {
+                        tun.enable = false;
+                    }
+                }
+                Err(e) => {
+                    warn!("TUN listener failed to restart: {e} (config rolled back)");
                     if let Some(ref mut tun) = state.raw_config.write().tun {
                         tun.enable = false;
                     }
@@ -2580,6 +2625,27 @@ async fn put_configs(
         proxy_providers,
         prefetched_payloads,
     } = result;
+
+    // A `tun:` section the listener cannot parse must be rejected before
+    // commit (issue #543): admitted unchecked, the reconcile's restart
+    // would tear down a healthy listener and only then fail the spawn-side
+    // parse — leaving TUN down on a 204. `force` degrades to warn like the
+    // dns arm; the restart's rollback still prevents a false `enable`.
+    // Checked before `reconcile_dns_config` so a doomed PUT cannot trigger
+    // that path's provider-registry side effects.
+    if let Err(e) =
+        meow_config::parse_tun_config(raw_config.tun.as_ref(), raw_config.max_connections)
+    {
+        if force {
+            tracing::error!("config reload forced despite tun config error: {e}");
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"message": format!("tun config error: {e}")})),
+            )
+                .into_response();
+        }
+    }
 
     // Issue #514: rebuild the DNS runtime too when its inputs changed —
     // failing here rejects the PUT before `reload_routing` publishes
