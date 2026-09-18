@@ -566,7 +566,8 @@ pub struct RebuildResult {
     /// The same commit's DNS rebuild should reuse them rather than
     /// fetching again inside `CONFIG_MUTATION`, and its geo-scan needs
     /// them to see `GEOSITE`/`GEOIP`/`IP-ASN` rules that live only inside
-    /// provider payloads (issue #543).
+    /// provider payloads (issue #543). Empty when the rebuild bound a
+    /// caller-shared provider set — nothing parses payloads then.
     pub prefetched_payloads: Arc<rule_provider::PrefetchedPayloads>,
 }
 

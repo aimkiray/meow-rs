@@ -875,6 +875,7 @@ async fn run(
         let raw_config = Arc::clone(&raw_config);
         let rule_providers = Arc::clone(&rule_providers);
         let proxy_providers = Arc::clone(&proxy_providers);
+        let dns_server = Arc::clone(&dns_server_handle);
         let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
         tokio::spawn(async move {
             meow_app::geodata_fetch::run_on_startup(
@@ -883,6 +884,7 @@ async fn run(
                 raw_config,
                 rule_providers,
                 proxy_providers,
+                dns_server,
                 cache_dir,
             )
             .await;
@@ -896,6 +898,7 @@ async fn run(
         let raw_config = Arc::clone(&raw_config);
         let rule_providers = Arc::clone(&rule_providers);
         let proxy_providers = Arc::clone(&proxy_providers);
+        let dns_server = Arc::clone(&dns_server_handle);
         let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
         tokio::spawn(async move {
             meow_app::geodata_fetch::auto_update_loop(
@@ -904,6 +907,7 @@ async fn run(
                 raw_config,
                 rule_providers,
                 proxy_providers,
+                dns_server,
                 cache_dir,
             )
             .await;

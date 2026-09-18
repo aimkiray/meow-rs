@@ -236,6 +236,15 @@ pub struct Resolver {
     ipv6: bool,
 }
 
+impl Resolver {
+    /// The global (main) upstream clients — exposed so config-layer tests
+    /// can assert which adapters `#PROXY`-tagged nameserver entries
+    /// captured.
+    pub fn main_nameservers(&self) -> &[Arc<DnsClient>] {
+        &self.main
+    }
+}
+
 enum HostsLookup<'a> {
     Addresses(&'a Vec<IpAddr>),
     Alias(&'a str),

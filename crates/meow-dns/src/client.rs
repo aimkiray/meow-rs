@@ -369,6 +369,13 @@ impl DnsClient {
         self.proxy.is_some()
     }
 
+    /// The adapter this client's exchanges route through, if any. Exposed
+    /// for tests asserting the captured adapter stays bound to a retained
+    /// dialer-registry generation across resolver republishes.
+    pub fn proxy(&self) -> Option<&DnsProxy> {
+        self.proxy.as_ref()
+    }
+
     /// Human-readable upstream identifier for API/UI surfaces.
     pub fn upstream_label(&self) -> String {
         let mut label = if let Some(label) = &self.label {
