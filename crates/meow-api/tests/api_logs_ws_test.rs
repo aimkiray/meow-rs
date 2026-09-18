@@ -40,7 +40,6 @@ fn make_state_with_cap(cap: usize) -> (Arc<AppState>, broadcast::Sender<LogMessa
         config_path,
         raw_config: Arc::new(RwLock::new(raw)),
         log_tx: log_tx.clone(),
-        config_mutation_lock: tokio::sync::Mutex::new(()),
         proxy_providers: Arc::new(DashMap::new()),
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
         rule_provider_refresh: Default::default(),

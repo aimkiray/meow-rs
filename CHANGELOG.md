@@ -145,6 +145,16 @@ the canonical, in-repo source a release is cut from.
 
 ### Changed
 
+- **`AppState::config_mutation_lock` was removed** — the per-state mutex
+  serialised only `swap_config_and_reconcile_tun`, whose every caller
+  already holds the process-global `CONFIG_MUTATION` lane. The nested
+  lock added no exclusion; the lane is now the sole serialisation of the
+  read-old → write-new → TUN/DNS-reconcile sequence (issue #543).
+  Embedders constructing `AppState` literals drop the field.
+  `POST /api/config/save` now holds the lane too, so a save cannot
+  snapshot mid-commit state (e.g. a `tun.enable` the runtime is about
+  to roll back).
+
 - **BoringSSL is now the only crypto library; rustls is gone from the runtime.**
   Two changes land together. First, every TLS handshake moved off rustls onto
   BoringSSL (`meow_transport::tls::TlsLayer`): proxy handshakes (Trojan, VLESS,

@@ -274,7 +274,7 @@ pub async fn run_loop(
                             // router can no longer diverge on failure.
                             *raw_config.write() = candidate.clone();
                             if let Some(dns) = dns {
-                                meow_api::routes::publish_dns(&tunnel, dns_server.as_ref(), dns)
+                                meow_api::routes::publish_dns(&tunnel, dns_server.as_ref(), &dns)
                                     .await;
                             }
                             // Health-check tasks follow the new group set

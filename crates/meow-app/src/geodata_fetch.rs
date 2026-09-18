@@ -135,7 +135,7 @@ async fn republish_dns_for_geo_dbs(
     })
     .await;
     match parsed {
-        Ok(Ok(dns)) => meow_api::routes::publish_dns(tunnel, dns_server, dns).await,
+        Ok(Ok(dns)) => meow_api::routes::publish_dns(tunnel, dns_server, &dns).await,
         Ok(Err(e)) => warn!("{label}: dns republish skipped: {e:#}"),
         Err(e) => warn!("{label}: dns republish task failed: {e}"),
     }
