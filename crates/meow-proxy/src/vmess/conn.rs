@@ -1,7 +1,7 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::BodyCipher;
-use super::header::{read_aead_response_header, response_body_keys};
+use super::header::{read_aead_response_header, response_body_keys, Security};
 use crate::tasked_duplex::TaskedDuplex;
 
 /// Spawn a VMess relay task that handles AEAD body record framing.
@@ -11,18 +11,27 @@ use crate::tasked_duplex::TaskedDuplex;
 /// (validating the per-connection `resp_v` byte), then encrypts writes into
 /// body records and decrypts reads from body records on the underlying stream.
 ///
+/// The body ciphers are built here — each relay half touches only its own
+/// direction, so the read task gets a `new_reader` (response schedule) and
+/// the write task a `new_writer` (request schedule): one AEAD key expansion
+/// per direction, and the response SHA-256 hop is shared with the header
+/// decode (issue #533). Constructing both inside also makes a swapped
+/// pairing unrepresentable.
+///
 /// Dropping the returned endpoint aborts both relay tasks — the bounded
 /// cleanup path for a silent upstream that never sends data, FIN, or RST
 /// (issue #514). A write-side `shutdown()` alone does not cancel anything:
 /// the read direction keeps delivering upstream data (half-close download).
 pub fn spawn_vmess_relay(
     stream: Box<dyn meow_transport::Stream>,
-    mut read_cipher: BodyCipher,
-    mut write_cipher: BodyCipher,
+    security: Security,
     req_key: [u8; 16],
     req_iv: [u8; 16],
     resp_v: u8,
 ) -> TaskedDuplex {
+    let (resp_body_key, resp_body_iv) = response_body_keys(&req_key, &req_iv);
+    let mut read_cipher = BodyCipher::from_response_keys(security, &resp_body_key, &resp_body_iv);
+    let mut write_cipher = BodyCipher::new_writer(security, &req_key, &req_iv);
     let (client, proxy) = tokio::io::duplex(32768);
     let (mut rd, mut wr) = tokio::io::split(stream);
     let (mut proxy_rd, mut proxy_wr) = tokio::io::split(proxy);
@@ -39,7 +48,6 @@ pub fn spawn_vmess_relay(
     // marks a fatal end (handshake failure, decode error, transport error,
     // or the client endpoint gone), where the write side is stopped too.
     let read_task = tokio::spawn(async move {
-        let (resp_body_key, resp_body_iv) = response_body_keys(&req_key, &req_iv);
         if let Err(e) =
             read_aead_response_header(&mut rd, &resp_body_key, &resp_body_iv, resp_v).await
         {
@@ -133,12 +141,9 @@ mod tests {
         let req_iv = [0x22; 16];
         let resp_v = 0x5a;
         let (transport, mut server) = tokio::io::duplex(4096);
-        let read_cipher = BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, resp_v);
-        let write_cipher = BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, resp_v);
         let mut app = spawn_vmess_relay(
             Box::new(transport),
-            read_cipher,
-            write_cipher,
+            Security::Aes128Gcm,
             req_key,
             req_iv,
             resp_v,
@@ -177,8 +182,7 @@ mod tests {
         let (transport, mut server) = tokio::io::duplex(4096);
         let app = spawn_vmess_relay(
             Box::new(transport),
-            BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, 0x5a),
-            BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, 0x5a),
+            Security::Aes128Gcm,
             req_key,
             req_iv,
             0x5a,
@@ -215,14 +219,8 @@ mod tests {
         let req_iv = [0x22; 16];
         let resp_v = 0x5a;
         let (transport, mut server) = tokio::io::duplex(4096);
-        let mut app = spawn_vmess_relay(
-            Box::new(transport),
-            BodyCipher::new(Security::None, &req_key, &req_iv, resp_v),
-            BodyCipher::new(Security::None, &req_key, &req_iv, resp_v),
-            req_key,
-            req_iv,
-            resp_v,
-        );
+        let mut app =
+            spawn_vmess_relay(Box::new(transport), Security::None, req_key, req_iv, resp_v);
 
         // Client half-closes its write direction (e.g. request fully sent).
         app.shutdown().await.unwrap();
@@ -265,14 +263,8 @@ mod tests {
         let req_iv = [0x22; 16];
         let resp_v = 0x5a;
         let (transport, mut server) = tokio::io::duplex(4096);
-        let mut app = spawn_vmess_relay(
-            Box::new(transport),
-            BodyCipher::new(Security::None, &req_key, &req_iv, resp_v),
-            BodyCipher::new(Security::None, &req_key, &req_iv, resp_v),
-            req_key,
-            req_iv,
-            resp_v,
-        );
+        let mut app =
+            spawn_vmess_relay(Box::new(transport), Security::None, req_key, req_iv, resp_v);
 
         // Server answers the response header, then half-closes its send
         // direction while continuing to read uploads.
@@ -328,14 +320,8 @@ mod tests {
             let req_iv = [0x22; 16];
             let resp_v = 0x5a;
             let (transport, mut server) = tokio::io::duplex(4096);
-            let mut app = spawn_vmess_relay(
-                Box::new(transport),
-                BodyCipher::new(Security::None, &req_key, &req_iv, resp_v),
-                BodyCipher::new(Security::None, &req_key, &req_iv, resp_v),
-                req_key,
-                req_iv,
-                resp_v,
-            );
+            let mut app =
+                spawn_vmess_relay(Box::new(transport), Security::None, req_key, req_iv, resp_v);
 
             server
                 .write_all(&seal_response_header(&req_key, &req_iv, resp_v))

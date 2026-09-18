@@ -4,13 +4,19 @@ use chacha20poly1305::ChaCha20Poly1305;
 use md5::{Digest, Md5};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::header::{response_body_keys, Security};
+#[cfg(test)]
+use super::header::response_body_keys;
+use super::header::Security;
 
 /// Maximum plaintext per body record (matching upstream 16 KiB - 16 tag).
 const MAX_PLAINTEXT: usize = 16384 - 16;
 
 /// Body keys/IVs derived from the per-connection req_key and req_iv. The IVs
 /// are the full 16-byte seeds; each record nonce is `count(2 BE) || iv[2..12]`.
+/// Both directions' material at once — test-only; production builds each
+/// direction separately (`new_writer`/`new_reader`) so no key schedule is
+/// paid for twice (issue #533).
+#[cfg(test)]
 struct DerivedKeys {
     write_key: Vec<u8>,
     write_iv: [u8; 16],
@@ -39,6 +45,7 @@ fn expand_body_key(security: Security, key16: &[u8; 16]) -> Vec<u8> {
     }
 }
 
+#[cfg(test)]
 fn derive_keys(security: Security, req_key: &[u8; 16], req_iv: &[u8; 16]) -> DerivedKeys {
     // Request (write) direction uses the raw per-connection key/iv directly —
     // there is NO "VMess Body AEAD Key" KDF in the wire protocol.
@@ -62,6 +69,12 @@ fn derive_keys(security: Security, req_key: &[u8; 16], req_iv: &[u8; 16]) -> Der
 #[derive(Clone)]
 enum RecordCipher {
     None,
+    /// Direction never constructed — a `BodyCipher` built via
+    /// `new_writer`/`new_reader` carries only its own side's key schedule
+    /// (issue #533). Distinct from `None` (the plaintext `security: none`
+    /// codec): sealing/opening through it is a bug and must error, never
+    /// silently emit plaintext records.
+    Unbuilt,
     /// Boxed: the AES key schedule is ~10× the size of the other variants.
     Aes128Gcm(Box<Aes128Gcm>),
     ChaCha20Poly1305(Box<ChaCha20Poly1305>),
@@ -82,6 +95,9 @@ impl RecordCipher {
 
     fn seal(&self, nonce: &[u8; 12], plaintext: &[u8]) -> std::io::Result<Vec<u8>> {
         match self {
+            Self::Unbuilt => Err(std::io::Error::other(
+                "seal called on an unconstructed cipher direction",
+            )),
             Self::None => Err(std::io::Error::other("seal called with Security::None")),
             Self::Aes128Gcm(c) => c
                 .encrypt(Nonce::from_slice(nonce), plaintext)
@@ -94,6 +110,9 @@ impl RecordCipher {
 
     fn open(&self, nonce: &[u8; 12], ciphertext: &[u8]) -> std::io::Result<Vec<u8>> {
         match self {
+            Self::Unbuilt => Err(std::io::Error::other(
+                "open called on an unconstructed cipher direction",
+            )),
             Self::None => Err(std::io::Error::other("open called with Security::None")),
             Self::Aes128Gcm(c) => c
                 .decrypt(Nonce::from_slice(nonce), ciphertext)
@@ -116,7 +135,9 @@ fn record_nonce(iv: &[u8; 16], counter: u16) -> [u8; 12] {
     nonce
 }
 
-/// Per-connection body cipher state for both directions.
+/// Per-connection body cipher state for one direction — the other half is
+/// `RecordCipher::Unbuilt` on values built via `new_writer`/`new_reader`/
+/// `from_response_keys` (issue #533).
 ///
 /// `*_counter` is one past the last nonce value used. The wire format packs
 /// it into a u16, so record `0xFFFF` is the last safe one — a 65537th record
@@ -138,17 +159,74 @@ pub struct BodyCipher {
 const NONCE_BUDGET: u32 = 1 << 16;
 
 impl BodyCipher {
-    pub fn new(security: Security, req_key: &[u8; 16], req_iv: &[u8; 16], resp_v: u8) -> Self {
+    /// Build both directions' key schedules — test-only. Production relays
+    /// use [`Self::new_writer`]/[`Self::from_response_keys`]: the two halves
+    /// of a spawned relay each touch only their own direction, so a pair of
+    /// `new`s pays for two AEAD key schedules that are never used
+    /// (issue #533). Composed from the directional constructors so the test
+    /// fixture can never drift from production (issue #533 review).
+    #[cfg(test)]
+    pub(crate) fn new(
+        security: Security,
+        req_key: &[u8; 16],
+        req_iv: &[u8; 16],
+        resp_v: u8,
+    ) -> Self {
         // resp_v gates the response *header* validation (in header.rs), not the
         // body IV; the parameter is kept for call-site signature stability.
         let _ = resp_v;
-        let keys = derive_keys(security, req_key, req_iv);
-
+        let w = Self::new_writer(security, req_key, req_iv);
+        let r = Self::new_reader(security, req_key, req_iv);
         Self {
-            write: RecordCipher::new(security, &keys.write_key),
-            write_iv: keys.write_iv,
-            read: RecordCipher::new(security, &keys.read_key),
-            read_iv: keys.read_iv,
+            write: w.write,
+            write_iv: w.write_iv,
+            read: r.read,
+            read_iv: r.read_iv,
+            write_counter: 0,
+            read_counter: 0,
+        }
+    }
+
+    /// Build only the request (write) direction's key schedule — the raw
+    /// per-connection `req_key`/`req_iv` directly (there is no
+    /// "VMess Body AEAD Key" KDF on the wire). The read half is `Unbuilt` —
+    /// `read_record` on this value is a bug and errors rather than emitting
+    /// or accepting anything.
+    pub fn new_writer(security: Security, req_key: &[u8; 16], req_iv: &[u8; 16]) -> Self {
+        Self {
+            write: RecordCipher::new(security, &expand_body_key(security, req_key)),
+            write_iv: *req_iv,
+            read: RecordCipher::Unbuilt,
+            read_iv: [0; 16],
+            write_counter: 0,
+            read_counter: 0,
+        }
+    }
+
+    /// Build only the response (read) direction's key schedule; the write
+    /// half is `Unbuilt`. Takes the request material — the SHA-256 hop to
+    /// the response key/IV happens inside. See [`Self::new_writer`].
+    ///
+    /// `spawn_vmess_relay` calls [`Self::from_response_keys`] instead: it
+    /// needs the derived pair for the response header anyway, so one
+    /// derivation feeds both (issue #533 review). Test-only — production
+    /// never derives the pair without also needing it for the header.
+    #[cfg(test)]
+    pub fn new_reader(security: Security, req_key: &[u8; 16], req_iv: &[u8; 16]) -> Self {
+        let (resp_key, resp_iv) = response_body_keys(req_key, req_iv);
+        Self::from_response_keys(security, &resp_key, &resp_iv)
+    }
+
+    /// The read-direction constructor for callers that already derived the
+    /// response key/IV via [`response_body_keys`] — `spawn_vmess_relay`
+    /// shares one derivation between the response header AEAD and the body
+    /// reader (issue #533 review).
+    pub fn from_response_keys(security: Security, resp_key: &[u8; 16], resp_iv: &[u8; 16]) -> Self {
+        Self {
+            write: RecordCipher::Unbuilt,
+            write_iv: [0; 16],
+            read: RecordCipher::new(security, &expand_body_key(security, resp_key)),
+            read_iv: *resp_iv,
             write_counter: 0,
             read_counter: 0,
         }
@@ -158,6 +236,10 @@ impl BodyCipher {
     /// encrypts (real connections derive read keys from SHA-256 of req material).
     #[cfg(test)]
     fn mirror_write_to_read(&mut self) {
+        debug_assert!(
+            !matches!(self.write, RecordCipher::Unbuilt),
+            "mirroring a reader destroys its only real half"
+        );
         self.read = self.write.clone();
         self.read_iv = self.write_iv;
         self.read_counter = self.write_counter;
@@ -204,6 +286,11 @@ impl BodyCipher {
         writer: &mut W,
         plaintext: &[u8],
     ) -> std::io::Result<()> {
+        if matches!(self.write, RecordCipher::Unbuilt) {
+            return Err(std::io::Error::other(
+                "vmess body: write direction not built (reader cipher)",
+            ));
+        }
         if matches!(self.write, RecordCipher::None) {
             // OPT_STANDARD advertises chunk streaming even when the security
             // type is none, so the payload still carries the 2-byte size.
@@ -239,6 +326,14 @@ impl BodyCipher {
         // at a record boundary; `read_exact` alone cannot tell that apart
         // from a FIN arriving after part of the prefix already landed
         // (both surface as UnexpectedEof) — and mid-record EOF is fatal.
+        // The Unbuilt check must precede the EOF paths too: a wrong-side
+        // cipher returning `Ok(None)` would mask a wiring bug as a clean
+        // half-close (issue #533 review).
+        if matches!(self.read, RecordCipher::Unbuilt) {
+            return Err(std::io::Error::other(
+                "vmess body: read direction not built (writer cipher)",
+            ));
+        }
         let mut len_buf = [0u8; 2];
         match reader.read(&mut len_buf).await {
             Ok(0) => return Ok(None),
@@ -284,6 +379,92 @@ mod tests {
             0x1f, 0x20,
         ];
         (req_key, req_iv)
+    }
+
+    /// Directional constructors (issue #533): each half must derive exactly
+    /// the same key schedule and IV as `BodyCipher::new` — whose derivation
+    /// is pinned to the wire spec by `body_key_derivation_matches_protocol`
+    /// and `read_record_decrypts_independently_encoded_response` — and the
+    /// unbuilt halves must hard-error rather than emit or accept anything.
+    async fn directional_ciphers_round_trip_and_unbuilt_halves_error() {
+        let (req_key, req_iv) = test_keys();
+        let plaintext = b"directional body cipher";
+
+        for security in [Security::Aes128Gcm, Security::ChaCha20Poly1305] {
+            // new_writer's request-direction ciphertext opens under `new`'s
+            // write half mirrored to read — so new_writer's schedule/IV is
+            // the same as `new`'s, not merely self-consistent.
+            let mut writer = BodyCipher::new_writer(security, &req_key, &req_iv);
+            let mut wire = Vec::new();
+            writer.write_record(&mut wire, plaintext).await.unwrap();
+
+            let mut dual = BodyCipher::new(security, &req_key, &req_iv, 0x42);
+            dual.mirror_write_to_read();
+            let mut cursor = std::io::Cursor::new(wire.clone());
+            assert_eq!(
+                dual.read_record(&mut cursor).await.unwrap().as_deref(),
+                Some(plaintext.as_slice())
+            );
+
+            // The same wire must NOT open under the response (read) key —
+            // the SHA-256 hop genuinely separates the directions.
+            let mut reader = BodyCipher::new_reader(security, &req_key, &req_iv);
+            let mut cursor = std::io::Cursor::new(wire.clone());
+            assert!(
+                reader.read_record(&mut cursor).await.is_err(),
+                "request-direction record must fail under the response key"
+            );
+
+            // Response-direction equivalence: seal with new_reader's read
+            // material (mirrored into write), open with `new`'s real read
+            // half — proves new_reader's schedule/IV matches `new`'s.
+            let mut resp_writer = BodyCipher::new_reader(security, &req_key, &req_iv);
+            resp_writer.write = resp_writer.read.clone();
+            resp_writer.write_iv = resp_writer.read_iv;
+            let mut wire2 = Vec::new();
+            resp_writer
+                .write_record(&mut wire2, plaintext)
+                .await
+                .unwrap();
+            let mut dual2 = BodyCipher::new(security, &req_key, &req_iv, 0x42);
+            let mut cursor2 = std::io::Cursor::new(wire2);
+            assert_eq!(
+                dual2.read_record(&mut cursor2).await.unwrap().as_deref(),
+                Some(plaintext.as_slice())
+            );
+
+            // Unbuilt halves must error, not emit plaintext records.
+            let mut sink = Vec::new();
+            assert!(
+                reader.write_record(&mut sink, b"x").await.is_err(),
+                "new_reader must not be able to write"
+            );
+            assert!(sink.is_empty());
+            let mut cursor = std::io::Cursor::new(wire);
+            assert!(
+                writer.read_record(&mut cursor).await.is_err(),
+                "new_writer must not be able to read"
+            );
+        }
+
+        // `security: none` (issue #533 review): the built half passes
+        // framed plaintext through, and the `Unbuilt` half must still error
+        // — it is NOT the `None` plaintext codec.
+        let mut writer = BodyCipher::new_writer(Security::None, &req_key, &req_iv);
+        let mut wire = Vec::new();
+        writer.write_record(&mut wire, plaintext).await.unwrap();
+        // [len(2 BE)][plaintext] — framed, but not encrypted.
+        let mut reader = BodyCipher::new_reader(Security::None, &req_key, &req_iv);
+        let mut cursor = std::io::Cursor::new(wire);
+        assert_eq!(
+            reader.read_record(&mut cursor).await.unwrap().as_deref(),
+            Some(plaintext.as_slice())
+        );
+        let mut sink = Vec::new();
+        assert!(reader.write_record(&mut sink, b"x").await.is_err());
+        assert!(sink.is_empty());
+        let mut empty = std::io::Cursor::new(Vec::new());
+        assert!(writer.read_record(&mut empty).await.is_err());
     }
 
     async fn body_modes_round_trip_with_protocol_framing() {
@@ -413,7 +594,9 @@ mod tests {
         let mut wire = (ct.len() as u16).to_be_bytes().to_vec();
         wire.extend_from_slice(&ct);
 
-        let mut client = BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, 0x42);
+        // `new_reader`, not `new`: the production read path must be pinned
+        // to the independently derived spec keys.
+        let mut client = BodyCipher::new_reader(Security::Aes128Gcm, &req_key, &req_iv);
         let mut cursor = std::io::Cursor::new(wire);
         let decrypted = client.read_record(&mut cursor).await.unwrap();
         assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
@@ -480,6 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_wire_format_matches_protocol() {
+        directional_ciphers_round_trip_and_unbuilt_halves_error().await;
         body_modes_round_trip_with_protocol_framing().await;
         body_key_derivation_matches_protocol();
         record_nonce_overwrites_iv_prefix_and_increments();

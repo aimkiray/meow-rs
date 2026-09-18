@@ -293,10 +293,19 @@ payload. Three variants:
 
 ### `aes-128-gcm`
 
-Derive:
+There is no `"VMess Body AEAD Key"` KDF on the wire. The request
+direction uses the per-connection material **directly**:
+
 ```
-body_key = KDF16("VMess Body AEAD Key", req_key || req_iv)
-body_iv  = KDF(12, "VMess Body AEAD IV", req_key || req_iv)
+req_body_key = req_key            // 16 bytes, as-is
+req_body_iv  = req_iv             // 16 bytes, as-is
+```
+
+The response direction hops through SHA-256:
+
+```
+resp_body_key = SHA256(req_key)[..16]
+resp_body_iv  = SHA256(req_iv)[..16]
 ```
 
 Payload is a sequence of length-prefixed AEAD records:
@@ -305,30 +314,32 @@ Payload is a sequence of length-prefixed AEAD records:
 [len(2) BE] [ciphertext][tag(16)]
 ```
 
-Per-record nonce is `body_iv XOR counter_be16` where `counter` starts
-at 0 and increments per record. Length is the ciphertext length
-**including** the tag (not just the plaintext length) — upstream
-compat, easy to get wrong.
+Per-record nonce is `counter_be16 || body_iv[2..12]` — the counter
+**overwrites** the first two bytes of the IV (starts at 0, increments
+per record; not an XOR). Length is the ciphertext length **including**
+the tag (not just the plaintext length) — upstream compat, easy to get
+wrong.
 
 ### `chacha20-poly1305`
 
-Same record layout. Key derivation differs:
+Same record layout and the same request/response seeds; only the key
+expansion differs (ChaCha wants a 32-byte key):
 
 ```
-body_key = MD5(req_key) || MD5(MD5(req_key))   // 32 bytes
-body_iv  = KDF(12, "VMess Body AEAD IV", req_key || req_iv)
+body_key = MD5(seed) || MD5(MD5(seed))   // 32 bytes, seed = req or resp key
 ```
 
-The MD5-cascade body_key is a v2ray legacy quirk (ChaCha wants a 32-byte
-key, v2ray derived it from the 16-byte VMess key via double MD5
-instead of using KDF). Preserved for compat.
+The MD5-cascade body_key is a v2ray legacy quirk (v2ray derived the
+32-byte ChaCha key from the 16-byte VMess key via double MD5 instead of
+using KDF). Preserved for compat.
 
 ### `none`
 
-No body encryption. Payload is raw bytes, record framing is absent,
-stream is treated as a plain byte pipe. Used for testing and for
-`security: none` nodes that rely on the outer transport (WS+TLS) for
-security.
+No body encryption, but record **framing is still present** —
+`OPT_STANDARD` advertises chunk streaming regardless of security type,
+so the payload still carries `[len(2) BE][plaintext]` records. Used for
+testing and for `security: none` nodes that rely on the outer transport
+(WS+TLS) for security.
 
 ### `auto`
 
@@ -408,7 +419,7 @@ vmess.rs            // VmessAdapter, config parsing, trait impl (~250 LOC)
 vmess/
 ├── mod.rs          // pub use
 ├── aead.rs         // KDF, auth_id, header encrypt/decrypt (~200 LOC)
-├── body.rs         // BodyCipher enum, record framing (~250 LOC)
+├── body.rs         // BodyCipher record framing, directional AEAD schedules
 ├── conn.rs         // VmessConn (TCP wrapper) + VmessPacketConn (~200 LOC)
 └── addr.rs         // Address encoding + decoding (~80 LOC, heavily tested)
 ```

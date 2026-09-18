@@ -517,3 +517,12 @@ the canonical, in-repo source a release is cut from.
   A queries and for `ipv6: true` configs). This keeps the global toggle a
   single, predictable switch — dual-stack operators who pin addresses in
   `hosts:` must enable `ipv6: true` for the v6 entries to be served.
+
+- **VMess body ciphers no longer pay for unused key schedules.** Every
+  connection built two `BodyCipher` objects — one per relay task — and each
+  expanded *both* directions' AEAD key schedules, so four schedules were
+  computed and two dropped unused (the boxed AES-128-GCM schedule is the
+  expensive half). `BodyCipher` now has directional constructors
+  (`new_writer`/`new_reader`); the unbuilt direction is a distinct `Unbuilt`
+  variant that hard-errors on misuse rather than passing as the plaintext
+  `none` codec. Per-connection cost is halved. (#533)

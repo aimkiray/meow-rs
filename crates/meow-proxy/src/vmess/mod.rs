@@ -167,15 +167,12 @@ async fn vmess_over(
         .await
         .map_err(MeowError::Io)?;
 
-    let read_cipher =
-        body::BodyCipher::new(security, &sealed.req_key, &sealed.req_iv, sealed.resp_v);
-    let write_cipher =
-        body::BodyCipher::new(security, &sealed.req_key, &sealed.req_iv, sealed.resp_v);
-
+    // The relay builds each half's body cipher internally — one AEAD key
+    // schedule per direction, and a swapped pairing is unrepresentable
+    // (issue #533).
     let duplex = conn::spawn_vmess_relay(
         stream,
-        read_cipher,
-        write_cipher,
+        security,
         sealed.req_key,
         sealed.req_iv,
         sealed.resp_v,
