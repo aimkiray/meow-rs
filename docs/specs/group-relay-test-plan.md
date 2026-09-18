@@ -24,8 +24,9 @@ PM so the spec can be updated.
   position.
 - Error type: `MeowError::RelayHopFailed { hop, source }` at each hop
   boundary, NOT raw inner error.
-- Parse-time errors: single proxy, empty proxies (Class A); `url`/`interval`
-  warn-once (Class B).
+- Parse-time errors: single proxy, empty proxies (Class A); inert
+  health-check fields (`url`/`interval`/`lazy`/`tolerance`/
+  `expected-status`) and provider-member fields warn-once (Class B).
 - Nested relay (relay-of-relay): flattened at any position.
 - `AdapterType::Relay` and `ProxyAdapter` trait method correctness.
 - Structural invariants: no `anyhow` at public boundary.
@@ -120,9 +121,11 @@ an `AsyncRead + AsyncWrite + ProxyConn` that accepts all bytes and returns EOF.
 |---|------|---------|
 | B1 | `relay_single_proxy_hard_errors_at_parse` | YAML `proxies: [proxy-a]` (length 1) → parse error containing `"at least 2"`. <br/> Upstream: silently acts as passthrough. <br/> NOT a passthrough. NOT a warn. ADR-0002 Class A: user likely intended a different group type. |
 | B2 | `relay_empty_proxies_hard_errors_at_parse` | YAML `proxies: []` → parse error. <br/> Upstream: panics. <br/> NOT a panic. ADR-0002 Class A. |
-| B3 | `relay_url_field_warns_once` | YAML with `url: https://example.com` on a relay group → exactly **one** `warn!` mentioning `"url"`. NOT a parse error. NOT zero warns. ADR-0002 Class B. |
-| B4 | `relay_interval_field_warns_once` | YAML with `interval: 300` → exactly one `warn!` mentioning `"interval"`. |
-| B5 | `relay_url_and_interval_warn_once_each` **[guard-rail]** | Both `url:` and `interval:` present → exactly two warns, one per field. NOT a combined single warn. NOT four warns (guards that warn-once is per-field, not per-call). |
+| B3 | `relay_url_field_warns_not_errors` | YAML with `url: https://example.com` on a relay group → a `warn!` mentioning `"url"`, captured via `capture_warns`. NOT a parse error. NOT zero warns. ADR-0002 Class B. |
+| B4 | `relay_interval_field_warns_not_errors` | YAML with `interval: 300` → a `warn!` mentioning `"interval"`. |
+| B5 | `relay_url_and_interval_warn_not_errors` **[guard-rail]** | Both `url:` and `interval:` present → two captured warns, one per field. NOT a combined single warn. NOT four warns (guards that warn-once is per-field, not per-call). |
+| B6 | `relay_lazy_and_tolerance_warn_not_errors` | `lazy`/`tolerance`/`expected-status` → one captured warn each (#555). |
+| B7 | `relay_provider_fields_warn_not_errors` | `use:`/`filter:` on a relay → one captured warn each; group still builds from `proxies:` (#555). |
 
 ---
 
@@ -190,3 +193,5 @@ All 4 spec divergence rows have test coverage:
 | 2 — Empty proxy list → hard error (not panic) | A | B2 |
 | 3 — Any chain member lacks UDP → `UdpNotSupported` (not silent) | A | C2, C3, C4 |
 | 4 — `url`/`interval` fields → warn-once (not error) | B | B3, B4, B5 |
+| 5 — `lazy`/`tolerance`/`expected-status` fields → warn-once | B | B6 |
+| 6 — provider-member fields (`use`/`filter`/…) → warn-once | B | B7 |

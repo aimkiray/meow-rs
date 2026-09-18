@@ -59,11 +59,13 @@ In scope:
 
 Out of scope:
 
-- **Health-check on relay groups.** Upstream Go mihomo does not run
-  health-check sweeps on relay groups — the group is a fixed chain,
-  not a selection over alternatives. We match. If the user wants
-  health-aware relay, they compose a Fallback group whose members are
-  relay groups.
+- **Health-check on relay groups.** Upstream Go mihomo does run
+  health-check sweeps on a relay group's static members (since
+  `90bf158`, v1.18.4 — the sweep was extended to every group type).
+  We do NOT match: meow relay has no probe loop, so probe fields warn
+  at parse instead (Class B, ADR-0002; parity tracked in #555). If the
+  user wants health-aware relay, they compose a Fallback group whose
+  members are relay groups.
 - **Dynamic selection inside a relay chain.** Each `proxies:` entry
   in a relay group is a fixed proxy name — NOT a group name that gets
   expanded at dial time. If the user lists a Selector group name in a
@@ -131,10 +133,14 @@ Field reference:
 |-------|------|:-------:|---------|---------|
 | `proxies` | `[]string` | yes | — | Ordered list of proxy or group names. Minimum 2 entries. Each entry is a server:port in the chain; the final entry connects to the real target. |
 
-**No `url`, `interval`, `strategy`, or `lazy`** — relay is a fixed
-chain, not a selection pool. Presence of these fields is accepted and
-ignored (forward-compat, not a parse error) with a warn-once at parse
-time.
+**No `url`, `interval`, `lazy`, `tolerance`, or `expected-status`** —
+relay is a fixed chain, not a selection pool, and runs no probe loop.
+Presence of these fields is accepted and ignored (forward-compat, not a
+parse error) with a warn-once per field at parse time. Provider-member
+fields (`use`, `include-all`, `filter`, `exclude-filter`,
+`exclude-type`) warn the same way — upstream relay accepts provider
+members, ours is static-only. `strategy` is silently ignored, matching
+upstream (it is a load-balance-only option there too).
 
 **Divergences from upstream** (classified per
 [ADR-0002](../adr/0002-upstream-divergence-policy.md)):
@@ -144,7 +150,8 @@ time.
 | 1 | Single-proxy relay (`proxies` length 1) — upstream silently acts as a passthrough | A | A single-proxy relay is a misconfiguration: the user likely intended a different group type. Hard-error at parse time: "relay group requires at least 2 proxies; use type: selector or type: direct for a single proxy". |
 | 2 | Empty `proxies` list — upstream panics | A | Hard-error at parse time. |
 | 3 | UDP relay when any chain member lacks UDP — upstream silently returns a non-functional conn | A | We return `UdpNotSupported` immediately from `dial_udp` if any chain member's `support_udp()` is false. NOT a silent partial relay. |
-| 4 | `url`/`interval` present on relay group — upstream ignores | B | Warn-once at parse time. No routing change. |
+| 4 | `url`/`interval`/`lazy`/`tolerance`/`expected-status` present on relay group — upstream probes static members since `90bf158` | B | Warn-once per field at parse time. No routing change. |
+| 5 | `use`/`include-all`/`filter`/`exclude-filter`/`exclude-type` present on relay group — upstream relay accepts provider members | B | Warn-once per field at parse time. Relay is static-only. |
 
 ## Internal design
 
@@ -325,8 +332,10 @@ boundary.
    UDP support. Class A per ADR-0002: NOT a silent partial relay.
 7. Intermediate hop failure surfaces with hop index and inner error
    message. Not a raw inner error with no relay context.
-8. `url`/`interval` on a relay group logs exactly one `warn!` per
-   field. Class B per ADR-0002.
+8. Inert health-check fields (`url`/`interval`/`lazy`/`tolerance`/
+   `expected-status`) and provider-member fields (`use`/`include-all`/
+   `filter`/`exclude-filter`/`exclude-type`) on a relay group each log
+   exactly one `warn!` per field per parse. Class B per ADR-0002.
 9. `AdapterType::Relay` serialises to `"Relay"` in JSON.
 10. Group-reference in relay chain (e.g. a Selector as proxy[0])
     resolves correctly at dial time via `unwrap_proxy` → leaf in
@@ -363,9 +372,11 @@ boundary.
 - `relay_hop_failure_includes_hop_index` — mock proxy[1] errors;
   assert the returned `MeowError::RelayHopFailed` contains `hop == 1`.
   NOT a raw inner error with no relay context. `anyhow` NOT at boundary.
-- `relay_url_interval_fields_warn_once` — YAML with `url:` +
-  `interval:` on a relay group → exactly one `warn!` per unexpected
-  field. Class B per ADR-0002.
+- `relay_url_field_warns_not_errors` / `relay_interval_field_warns_not_errors`
+  / `relay_lazy_and_tolerance_warn_not_errors` /
+  `relay_provider_fields_warn_not_errors` — inert fields on a relay
+  group each produce a captured `warn!` and never a parse error.
+  Class B per ADR-0002.
 - `relay_nested_relay_group` — outer 2-hop relay where proxy[0] is
   itself a 2-hop `RelayGroup` (4 effective hops total). Assert payload
   arrives at mock target. Guards the transparent nesting property

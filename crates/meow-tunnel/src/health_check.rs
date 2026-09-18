@@ -291,6 +291,29 @@ mod tests {
         assert!(!specs[0].lazy);
     }
 
+    /// Issue #555: `select`/`relay` accept `url`/`interval`/`lazy` in the
+    /// flat `RawProxyGroup` shape but never run probes — even when the
+    /// fields are set explicitly, no spec may be emitted.  Upstream
+    /// sweeps static members of every group type (mihomo `90bf158`);
+    /// meow warns at parse instead (Class B, ADR-0002).
+    #[test]
+    fn extract_specs_skips_select_and_relay_with_health_fields() {
+        for group_type in ["select", "relay"] {
+            let g = meow_config::raw::RawProxyGroup {
+                name: "g".into(),
+                group_type: group_type.into(),
+                url: Some("https://example.com/204".into()),
+                interval: Some(60),
+                lazy: Some(true),
+                ..Default::default()
+            };
+            assert!(
+                extract_specs(&[g]).is_empty(),
+                "{group_type} with health fields must not emit a probe spec"
+            );
+        }
+    }
+
     /// A task that died on its own is restarted at the next reconcile.
     #[tokio::test]
     async fn reconcile_restarts_dead_tasks() {

@@ -6319,6 +6319,12 @@ pub fn extract_health_check_specs(
                 group_name: g.name.clone(),
                 url: g.url.as_deref().unwrap_or(DEFAULT_URL).to_string(),
                 interval_secs,
+                // Upstream defaults `lazy: true`
+                // (`GroupCommonOption{Lazy: true}`, parser.go) — groups
+                // probe only after first use.  We default `false`: eager
+                // probing matches this port's historical behaviour and
+                // flipping it silently would change idle traffic for
+                // every existing config (Class B, ADR-0002; #555).
                 lazy: g.lazy.unwrap_or(false),
             })
         })

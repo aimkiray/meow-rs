@@ -15,7 +15,8 @@ exists, no group impl".
 > `load-balance` group, so its members are probed against `url` every
 > `interval` seconds (default 300, `0` disables); `lazy: true` defers probing
 > until the group next carries traffic. The `url`, `interval`, and `lazy`
-> fields are therefore effective. `use:` / `include-all` provider members are
+> fields are therefore effective, as is `expected-status` (probes require the
+> configured HTTP status since #555). `use:` / `include-all` provider members are
 > supported (issue #533 item 3): they join the same pick space as static
 > `proxies:` members — statics first, then each provider slot in order — and
 > a provider refresh is visible to the next selection without rebuilding the
@@ -106,6 +107,7 @@ Field reference:
 | `interval` | integer | no | `300` | Health-check sweep interval in seconds. Each member is probed every `interval` seconds; a member whose probe fails is skipped by both strategies until it recovers. `0` disables the periodic sweep (upstream `HealthCheck.auto()`). |
 | `strategy` | enum | no | `round-robin` | Selection strategy. |
 | `lazy` | bool | no | `false` | When `true`, the periodic sweep is deferred until the group next carries traffic (same as `url-test`/`fallback`). Upstream defaults to `true`; see divergence 5. |
+| `expected-status` | string/int | no | `2xx` | Expected HTTP status for health probes (same handling as `url-test`/`fallback`: int or `"a-b"` range list). Honored by the sweep since #555. |
 
 **Divergences from upstream** (classified per
 [ADR-0002](../adr/0002-upstream-divergence-policy.md)):
@@ -117,7 +119,7 @@ Field reference:
 | 3 | All proxies dead — upstream returns the round-robin slot (dead proxy) | B | We return `NoProxyAvailable` error immediately instead of dialing a known-dead proxy. Same reachability outcome (connection fails), but our failure is fast and named. |
 | 4 | `strategy: consistent-hashing` diverges from upstream on key, hash, and dead-member handling | B | Upstream mihomo (`adapter/outboundgroup/loadbalance.go`) hashes the *destination* (`getKey`: IP-literal host → host, domain → eTLD+1, else `DstIP`) with `utils.MapHash` + `jumpHash` over the **full** member list, retrying `key+1` up to 5× on dead members before a linear alive scan — i.e. "same *target* → same node" with minimal disruption on membership changes. We hash the *client* `src_ip` bytes with FNV-1a and take `hash % alive_count` over the **alive subset** — "same *client* → same node", but a membership change reshuffles most assignments (with provider slots, on every refresh). For a single-client deployment our variant pins all traffic to one member; upstream's still balances across destinations. Deliberate pre-existing divergence (Clash-Premium-style src affinity); noted here so the periodic-refresh reshuffle is not mistaken for a bug. |
 | 5 | `lazy` defaults to `false` — upstream defaults to `true` (`GroupCommonOption{Lazy: true}`, `adapter/outboundgroup/parser.go`) | B | Pre-existing default shared with `url-test`/`fallback`; an unset `lazy` probes eagerly instead of only while the group carries traffic. Subscription-compatible either way; only background probe volume differs. Tracked in #555. |
-| 6 | `expected-status:` on load-balance parses but is ignored — upstream honors it (`HealthCheckOption`) | B | `LoadBalanceGroup` does not store `expected_status`/`test_url` (unlike url-test/fallback's `with_runtime_options`), so the sweep probes with the default 2xx acceptance set. Pre-existing gap, amplified now that provider members balance here. Tracked in #555. |
+| 6 | `test_url` is not stored on `LoadBalanceGroup` — `expected-status` IS honored (via `with_expected_status` → `Proxy::expected_status`), matching url-test/fallback | B | The sweep probes with the configured `expected-status`; only the `testUrl` API surface stays absent on LB (`GET /proxies` emits no `testUrl` for it). Residual parity item, tracked in #555. |
 | 7 | Duplicate `use:` entries are deduped — upstream appends per entry, so `use: [A, A]` double-weights provider A | B | A duplicated provider name can only ever produce an identical member view (group `filter:`/`exclude-*` are group scalars), so double-wiring it is always a weighting accident, never intent. Static `proxies:` duplicates still double-weight, matching upstream. |
 | 8 | `include-all` pulls providers only; upstream's `include-all` also pulls statics (`include-all-providers` is the providers-only alias upstream) | B | Pre-existing shared group semantics — `include-all-proxies` already covers the all-statics case, so `include-all` here equals upstream's `include-all-providers`. Combined with `use:`, `include-all` wins and `use:` is ignored — same as upstream. |
 | 9 | `use:` on a `relay` group warns and is ignored — upstream relay ignores it silently | B | A relay is a fixed static chain; provider members have no place in it. |
@@ -140,6 +142,7 @@ pub struct LoadBalanceGroup {
     name: SmolStr,
     static_proxies: Vec<Arc<dyn Proxy>>,
     provider_slots: Vec<ProviderSlot>,  // live `use:`/`include-all` members
+    expected_status: String,            // probe acceptance set ("" = default 2xx)
     strategy: LbStrategy,
     counter: AtomicUsize,   // only used for round-robin
     health: ProxyHealth,

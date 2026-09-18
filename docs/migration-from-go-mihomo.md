@@ -355,7 +355,8 @@ proxy-groups:
 | Single-proxy relay (`proxies` length 1) | Silently acts as passthrough | Hard parse error — likely misconfiguration (ADR-0002 Class A). |
 | Empty `proxies` list | Panics | Hard parse error (Class A). |
 | UDP relay when any chain member lacks UDP support | Returns a non-functional conn silently | Returns `UdpNotSupported` immediately (Class A). |
-| `url:`/`interval:` on a relay group | Ignored | Warn-once per field (Class B). |
+| `url:`/`interval:`/`lazy:`/`tolerance:`/`expected-status:` on a relay group | Probes static members (since `90bf158`, v1.18.4) | Warn-once per field; no probe loop runs (Class B). |
+| `use:`/`include-all:`/`filter:`/`exclude-*:` on a relay group | Relay accepts provider members | Warn-once per field; relay is static-only (Class B). |
 
 **UDP relay:** works only when every proxy in the chain supports UDP
 (`support_udp() == true` for all hops). If any hop lacks UDP, `dial_udp()`

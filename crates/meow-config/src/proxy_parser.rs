@@ -2666,6 +2666,10 @@ fn parse_proxy_group_inner(
 
     match config.group_type.as_str() {
         "select" => {
+            // Class B (ADR-0002): `select` never runs a health-check loop —
+            // upstream sweeps its static members since mihomo 90bf158, so
+            // warn on the inert probe fields instead of ignoring silently.
+            warn_inert_health_fields("select", &config.name, config);
             let mut group = SelectorGroup::new_with_providers(&config.name, proxies, slots);
             if let Some(store) = selector_store {
                 group = group.with_store(Arc::clone(store));
@@ -2699,27 +2703,79 @@ fn parse_proxy_group_inner(
         }
         "load-balance" => {
             let strategy = parse_lb_strategy(config.strategy.as_deref())?;
-            Ok(Arc::new(LoadBalanceGroup::new_with_providers(
-                &config.name,
-                proxies,
-                strategy,
-                slots,
-            )))
+            Ok(Arc::new(
+                LoadBalanceGroup::new_with_providers(&config.name, proxies, strategy, slots)
+                    .with_expected_status(config.expected_status.clone().unwrap_or_default()),
+            ))
         }
         "relay" => {
             // Relay is a fixed static chain — `use:`/`include-all` provider
-            // members are silently dropped here (upstream's relay likewise
-            // ignores them). Warn so the config author sees the loss.
-            if !slots.is_empty() {
-                tracing::warn!(
-                    "relay group '{}': 'use'/'include-all' provider members are \
-                     ignored — relay chains only static 'proxies' members",
-                    config.name
-                );
-            }
+            // members are dropped here (upstream's relay likewise ignores
+            // them). `parse_relay_group` warns per dropped config field.
             parse_relay_group(&config.name, proxies, config)
         }
         _ => Err(format!("unsupported group type: {}", config.group_type)),
+    }
+}
+
+/// Warn-once for each health-check field present on a group type that
+/// never runs probes (`select`, `relay`).
+///
+/// Since mihomo `90bf158` (v1.18.4) upstream health-checks the static
+/// members of *every* group type; meow sweeps only `fallback`,
+/// `url-test`, and `load-balance` — so `url`/`interval`/`lazy`/
+/// `tolerance`/`expected-status` are inert here.  Warn rather than
+/// silently ignore (Class B, ADR-0002); full parity is tracked in #555.
+/// (`tolerance` is `url-test`-only even upstream, so its "sweeps all
+/// group types" note refers to the probe loop, not that field.)
+fn warn_inert_health_fields(group_type: &str, name: &str, config: &crate::raw::RawProxyGroup) {
+    for (field, present) in [
+        ("url", config.url.is_some()),
+        ("interval", config.interval.is_some()),
+        ("lazy", config.lazy.is_some()),
+        ("tolerance", config.tolerance.is_some()),
+        ("expected-status", config.expected_status.is_some()),
+    ] {
+        if present {
+            tracing::warn!(
+                group = name,
+                "{group_type}: '{field}' is not used by {group_type} groups and will be \
+                 ignored. (upstream: sweeps static members of all group types since \
+                 mihomo 90bf158; meow does not — Class B ADR-0002)"
+            );
+        }
+    }
+}
+
+/// Warn-once for each provider-member field present on a group type that
+/// never consumes provider slots (currently only `relay` — upstream
+/// `NewRelay` takes providers; `RelayGroup` here is static-only).
+/// `filter`/`exclude-*` act on provider members only on every group type,
+/// so they are inert wherever no provider can supply members.
+fn warn_dropped_provider_fields(group_type: &str, name: &str, config: &crate::raw::RawProxyGroup) {
+    let has_use = config
+        .use_providers
+        .as_deref()
+        .is_some_and(|u| !u.is_empty());
+    for (field, present) in [
+        ("use", has_use),
+        ("include-all", config.include_all.unwrap_or(false)),
+        (
+            "include-all-providers",
+            config.include_all_providers.unwrap_or(false),
+        ),
+        ("filter", config.filter.is_some()),
+        ("exclude-filter", config.exclude_filter.is_some()),
+        ("exclude-type", config.exclude_type.is_some()),
+    ] {
+        if present {
+            tracing::warn!(
+                group = name,
+                "{group_type}: '{field}' is not used by {group_type} groups and will be \
+                 ignored; {group_type} members come from 'proxies' only. (upstream: \
+                 {group_type} accepts provider members — Class B ADR-0002)"
+            );
+        }
     }
 }
 
@@ -2733,8 +2789,10 @@ fn parse_proxy_group_inner(
 ///
 /// # Warn-once (Class B per ADR-0002)
 ///
-/// - `url` present — ignored; not meaningful for a fixed chain.
-/// - `interval` present — ignored; relay has no health-check loop.
+/// - `url`/`interval`/`lazy`/`tolerance`/`expected-status` present —
+///   ignored; relay has no health-check loop.
+/// - `use`/`include-all`/`filter`/`exclude-filter`/`exclude-type` present —
+///   ignored; upstream relay accepts provider members, ours is static-only.
 ///
 /// upstream: adapter/outbound/relay.go
 fn parse_relay_group(
@@ -2762,21 +2820,10 @@ fn parse_relay_group(
         ));
     }
 
-    // Warn-once for url and interval (Class B — not meaningful for relay).
-    if config.url.is_some() {
-        tracing::warn!(
-            group = name,
-            "relay: 'url' field is not used by relay groups and will be ignored. \
-             (upstream: silently ignored; we warn — Class B ADR-0002)"
-        );
-    }
-    if config.interval.is_some() {
-        tracing::warn!(
-            group = name,
-            "relay: 'interval' field is not used by relay groups and will be ignored. \
-             (upstream: silently ignored; we warn — Class B ADR-0002)"
-        );
-    }
+    // Warn-once on inert fields (Class B — relay has no probe loop and
+    // consumes no provider slots).
+    warn_inert_health_fields("relay", name, config);
+    warn_dropped_provider_fields("relay", name, config);
 
     Ok(Arc::new(RelayGroup::new(name, proxies)))
 }
@@ -3585,17 +3632,11 @@ tls: true
         assert!(parse_proxy_group(&config, &existing, &[], &Default::default()).is_err());
     }
 
-    // B3: url field on relay group → warn (NOT error)
-    // Class B per ADR-0002. We can't easily assert on tracing::warn output in unit
-    // tests without a subscriber, so we assert the group parses successfully.
+    // B3: url field on relay group → warn (NOT error). Class B per ADR-0002;
+    // the capture asserts the warning actually fires (docs/specs/
+    // group-relay-test-plan.md).
     #[test]
     fn relay_url_field_warns_not_errors() {
-        let existing = {
-            let mut m = std::collections::HashMap::new();
-            m.insert(SmolStr::new_static("DIRECT"), make_direct_proxy("DIRECT"));
-            m.insert(SmolStr::new_static("REJECT"), make_direct_proxy("REJECT"));
-            m
-        };
         let config = crate::raw::RawProxyGroup {
             name: "r".to_string(),
             group_type: "relay".to_string(),
@@ -3603,20 +3644,19 @@ tls: true
             url: Some("https://example.com/test".to_string()),
             ..Default::default()
         };
-        // Must NOT error — url is warn-only (Class B).
-        parse_proxy_group(&config, &existing, &[], &Default::default())
-            .expect("relay with url must not hard-error");
+        let (group, logs) = capture_warns(|| {
+            parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+        });
+        group.expect("relay with url must not hard-error");
+        assert!(
+            logs.contains("relay: 'url' is not used"),
+            "expected 'url' warning, got: {logs}"
+        );
     }
 
     // B4: interval field on relay group → warn (NOT error)
     #[test]
     fn relay_interval_field_warns_not_errors() {
-        let existing = {
-            let mut m = std::collections::HashMap::new();
-            m.insert(SmolStr::new_static("DIRECT"), make_direct_proxy("DIRECT"));
-            m.insert(SmolStr::new_static("REJECT"), make_direct_proxy("REJECT"));
-            m
-        };
         let config = crate::raw::RawProxyGroup {
             name: "r".to_string(),
             group_type: "relay".to_string(),
@@ -3624,19 +3664,19 @@ tls: true
             interval: Some(300),
             ..Default::default()
         };
-        parse_proxy_group(&config, &existing, &[], &Default::default())
-            .expect("relay with interval must not hard-error");
+        let (group, logs) = capture_warns(|| {
+            parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+        });
+        group.expect("relay with interval must not hard-error");
+        assert!(
+            logs.contains("relay: 'interval' is not used"),
+            "expected 'interval' warning, got: {logs}"
+        );
     }
 
     // B5: both url and interval present → two separate warns, still not an error
     #[test]
     fn relay_url_and_interval_warn_not_errors() {
-        let existing = {
-            let mut m = std::collections::HashMap::new();
-            m.insert(SmolStr::new_static("DIRECT"), make_direct_proxy("DIRECT"));
-            m.insert(SmolStr::new_static("REJECT"), make_direct_proxy("REJECT"));
-            m
-        };
         let config = crate::raw::RawProxyGroup {
             name: "r".to_string(),
             group_type: "relay".to_string(),
@@ -3645,8 +3685,125 @@ tls: true
             interval: Some(300),
             ..Default::default()
         };
-        parse_proxy_group(&config, &existing, &[], &Default::default())
-            .expect("relay with url+interval must not hard-error");
+        let (group, logs) = capture_warns(|| {
+            parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+        });
+        group.expect("relay with url+interval must not hard-error");
+        for field in ["url", "interval"] {
+            assert!(
+                logs.contains(&format!("relay: '{field}' is not used")),
+                "expected '{field}' warning, got: {logs}"
+            );
+        }
+    }
+
+    // Provider-member fields on relay → warn (Class B): upstream relay
+    // consumes providers; ours is static-only, so the fields were silently
+    // dropped before (#555).
+    #[test]
+    fn relay_provider_fields_warn_not_errors() {
+        let config = crate::raw::RawProxyGroup {
+            name: "r".to_string(),
+            group_type: "relay".to_string(),
+            proxies: Some(vec!["DIRECT".to_string(), "REJECT".to_string()]),
+            use_providers: Some(vec!["airport".to_string()]),
+            include_all: Some(true),
+            include_all_providers: Some(true),
+            filter: Some("hk".to_string()),
+            exclude_filter: Some("tw".to_string()),
+            exclude_type: Some(vec!["trojan".to_string()]),
+            ..Default::default()
+        };
+        let (group, logs) = capture_warns(|| {
+            parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+        });
+        group.expect("relay with provider fields must not hard-error");
+        for field in [
+            "use",
+            "include-all",
+            "include-all-providers",
+            "filter",
+            "exclude-filter",
+            "exclude-type",
+        ] {
+            assert!(
+                logs.contains(&format!("relay: '{field}' is not used")),
+                "expected '{field}' warning, got: {logs}"
+            );
+        }
+    }
+
+    // ─── inert health fields on select/relay (issue #555) ──────────────────
+
+    // `lazy`/`tolerance`/`expected-status` were accepted silently before —
+    // the shared helper now warns on every inert probe field.
+    #[test]
+    fn relay_lazy_and_tolerance_warn_not_errors() {
+        let config = crate::raw::RawProxyGroup {
+            name: "r".to_string(),
+            group_type: "relay".to_string(),
+            proxies: Some(vec!["DIRECT".to_string(), "REJECT".to_string()]),
+            lazy: Some(true),
+            tolerance: Some(100),
+            expected_status: Some("204".to_string()),
+            ..Default::default()
+        };
+        let (group, logs) = capture_warns(|| {
+            parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+        });
+        group.expect("relay with inert health fields must not hard-error");
+        for field in ["lazy", "tolerance", "expected-status"] {
+            assert!(
+                logs.contains(&format!("relay: '{field}' is not used")),
+                "expected '{field}' warning, got: {logs}"
+            );
+        }
+    }
+
+    // `select` runs no probe loop — the same warn applies to all five
+    // health fields (previously every one was ignored silently).
+    #[test]
+    fn select_with_health_fields_warns_not_errors() {
+        let config = crate::raw::RawProxyGroup {
+            name: "s".to_string(),
+            group_type: "select".to_string(),
+            proxies: Some(vec!["DIRECT".to_string(), "REJECT".to_string()]),
+            url: Some("https://example.com/test".to_string()),
+            interval: Some(300),
+            lazy: Some(true),
+            tolerance: Some(100),
+            expected_status: Some("204".to_string()),
+            ..Default::default()
+        };
+        let (group, logs) = capture_warns(|| {
+            parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+        });
+        group.expect("select with inert health fields must not hard-error");
+        for field in ["url", "interval", "lazy", "tolerance", "expected-status"] {
+            assert!(
+                logs.contains(&format!("select: '{field}' is not used")),
+                "expected '{field}' warning, got: {logs}"
+            );
+        }
+    }
+
+    // Negative: a plain select carries no probe fields → no warning.
+    #[test]
+    fn select_without_health_fields_does_not_warn() {
+        let config = crate::raw::RawProxyGroup {
+            name: "s".to_string(),
+            group_type: "select".to_string(),
+            proxies: Some(vec!["DIRECT".to_string(), "REJECT".to_string()]),
+            ..Default::default()
+        };
+        let (group, logs) = capture_warns(|| {
+            parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+        });
+        group.expect("plain select must parse");
+        assert!(
+            !logs.contains("is not used"),
+            "no health fields must not warn, got: {logs}"
+        );
     }
 
     // ─── load-balance provider members (issue #533 item 3) ──────────────────
@@ -3979,6 +4136,20 @@ tls: true
             !logs.contains("provider"),
             "no provider fields must not warn, got: {logs}"
         );
+    }
+
+    // `expected-status` on load-balance reaches the probe loop — upstream
+    // `GroupCommonOption` honors it on every swept group type; previously
+    // it was silently dropped (#555).
+    #[test]
+    fn load_balance_expected_status_reaches_probe_loop() {
+        let config = crate::raw::RawProxyGroup {
+            expected_status: Some("204".to_string()),
+            ..lb_config_with_providers(None, None)
+        };
+        let group = parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+            .expect("load-balance with expected-status must parse");
+        assert_eq!(group.expected_status(), Some("204"));
     }
 
     // A `use:`-only group wires the provider slot as its whole membership —

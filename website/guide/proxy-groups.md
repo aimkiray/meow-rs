@@ -33,7 +33,9 @@ name contains a region tag.
 ## `select` — manual selection
 
 The user picks the active member (via the dashboard or `PUT /proxies/{name}`). The choice
-is persisted across restarts.
+is persisted across restarts. `url`, `interval`, `lazy`, `tolerance` and
+`expected-status` are accepted for upstream-config compatibility but ignored (with a
+warning): `select` runs no health-check task.
 
 ```yaml
 - name: Proxy
@@ -88,6 +90,10 @@ Spreads connections across members.
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `strategy` | string | `round-robin` | `round-robin` or `consistent-hashing` |
+| `url` | string | — | Health-check URL |
+| `interval` | u64 | — | Probe interval in seconds |
+| `lazy` | bool | `false` | Probe only when in use — housekeeping traffic does not count |
+| `expected-status` | string | — | Probe success expression, e.g. `204` |
 
 `consistent-hashing` keeps the same destination on the same node (sticky). An unknown
 strategy is a hard error.
@@ -102,7 +108,10 @@ strategy is a hard error.
 ## `relay` — chain hops
 
 Chains members in series: `A → B → C`. Requires **at least 2** proxies (fewer is a hard
-error). `url` / `interval` are ignored (with a warning).
+error). `url`, `interval`, `lazy`, `tolerance` and `expected-status` are ignored (with a
+warning): `relay` runs no health-check task. A relay is static-only — provider fields
+(`use`, `include-all`, `include-all-providers`, `filter`, `exclude-filter`,
+`exclude-type`) are ignored with a warning as well.
 
 ```yaml
 - name: Relay
@@ -112,8 +121,8 @@ error). `url` / `interval` are ignored (with a warning).
 
 ## Health checks
 
-`url-test` and `fallback` groups run a background health-check task. You can also trigger
-probes on demand through the REST API:
+`url-test`, `fallback` and `load-balance` groups run a background health-check task;
+`select` and `relay` do not. You can also trigger probes on demand through the REST API:
 
 - `GET /proxies/{name}/delay` — probe one proxy.
 - `GET /group/{name}/delay` — probe every member of a group.

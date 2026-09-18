@@ -284,9 +284,11 @@ Missing: `respect-rules`, `prefer-h3`, `cache-algorithm`.
 
 ### Proxy group sub-keys
 
-Supported: `name`, `type`, `proxies`, `url`, `interval`, `tolerance`, `expected-status`, `strategy` (for load-balance), `use` (proxy-provider reference), `include-all`, `include-all-proxies`, `filter`, `exclude-filter`, `exclude-type` (group-level, applied to provider-sourced members; issue #358).
+Supported: `name`, `type`, `proxies`, `url`, `interval`, `tolerance`, `expected-status`, `strategy` (for load-balance), `lazy`, `use` (proxy-provider reference), `include-all`, `include-all-proxies`, `include-all-providers` (providers-only alias of `include-all`), `filter`, `exclude-filter`, `exclude-type` (group-level, applied to provider-sourced members; issue #358).
 
-Missing: `lazy`, `disable-udp`, `hidden`, `icon`, `include-all-providers`.
+Missing: `disable-udp`, `hidden`, `icon`.
+
+`url`/`interval`/`lazy`/`tolerance`/`expected-status` take effect only on `url-test`/`fallback`/`load-balance` — on `select`/`relay` they are accepted but inert (warn-once per field, Class B; upstream sweeps static members of all group types since `90bf158`, tracked in #555). `lazy` defaults to `false` here vs `true` upstream (Class B, ADR-0002).
 
 ---
 

@@ -28,6 +28,7 @@ pub struct LoadBalanceGroup {
     provider_slots: Vec<ProviderSlot>,
     strategy: LbStrategy,
     counter: AtomicUsize,
+    expected_status: String,
     health: ProxyHealth,
     usage: UsageTracker,
     /// mihomo `GroupBase.onDialFailed` escalation: repeated member dial
@@ -54,6 +55,7 @@ impl LoadBalanceGroup {
             provider_slots: slots,
             strategy,
             counter: AtomicUsize::new(0),
+            expected_status: String::new(),
             health: ProxyHealth::new(),
             usage: UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),
@@ -137,6 +139,15 @@ impl LoadBalanceGroup {
                 (fnv1a(&bytes[..len]) as usize) % alive_count
             }
         }
+    }
+
+    /// Attach the group-level `expected-status` probe expression
+    /// (upstream `GroupCommonOption`; the health sweep reads it via
+    /// `Proxy::expected_status`).
+    #[must_use]
+    pub fn with_expected_status(mut self, expected_status: String) -> Self {
+        self.expected_status = expected_status;
+        self
     }
 
     /// Select a proxy from the alive set for a TCP connection.
@@ -323,6 +334,10 @@ impl Proxy for LoadBalanceGroup {
         self.first_alive_member().map(|p| p.name().to_string())
     }
 
+    fn expected_status(&self) -> Option<&str> {
+        Some(&self.expected_status)
+    }
+
     fn usage_generation(&self) -> u64 {
         self.usage.generation()
     }
@@ -461,6 +476,7 @@ mod tests {
             provider_slots: Vec::new(),
             strategy: LbStrategy::RoundRobin,
             counter: AtomicUsize::new(usize::MAX - 1),
+            expected_status: String::new(),
             health: ProxyHealth::new(),
             usage: super::UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),

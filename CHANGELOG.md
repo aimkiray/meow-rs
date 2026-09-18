@@ -375,6 +375,20 @@ the canonical, in-repo source a release is cut from.
   kcptun session establishment follows the same rule: it is the only
   dial signal a lazy front hop sees for that chain.
 
+- **`select` and `relay` groups now warn when they carry fields they
+  ignore.** Both accept `url`/`interval`/`lazy`/`tolerance`/
+  `expected-status` in the shared group shape but run no probe loop, and
+  `relay` also dropped `use`/`include-all`/`filter`/`exclude-filter`/
+  `exclude-type` silently (upstream relay accepts provider members; ours
+  is static-only). Each inert field now logs a one-line warning at
+  parse — previously `relay` warned on `url`/`interval` only and
+  `select` on nothing. The remaining divergences are recorded in
+  ADR-0002: upstream sweeps static members of every group type since
+  mihomo `90bf158` (v1.18.4), and upstream defaults `lazy: true` while
+  meow keeps `false` so existing configs see no idle-traffic change.
+  `expected-status` on `load-balance` now reaches its probe loop instead
+  of being dropped (#555).
+
 - **Relay groups can now terminate on real protocol adapters, not just
   `http`/`socks5`/`snell`.** Every hop after the first runs
   `ProxyAdapter::connect_over`, which previously only `direct`, `reject`,
