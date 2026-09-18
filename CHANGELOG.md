@@ -416,6 +416,18 @@ the canonical, in-repo source a release is cut from.
   load-balance groups like it already does for `url-test`/`fallback`
   (#555).
 
+- **Duplicate `proxy-groups` names are now a hard error, matching
+  mihomo's `proxy group %s: the duplicate name` check.** A group name may
+  not collide with a built-in (`DIRECT`/`REJECT`/`REJECT-DROP`/
+  `COMPATIBLE`/`PASS`/`PASS-RULE`), a declared `proxies:` entry, or
+  another group. Previously the multi-pass
+  group build resolved duplicates as "last successful build wins" in the
+  registry while parent groups captured member `Arc`s eagerly — a
+  same-named group built in a later pass replaced the registry entry
+  while already-built parents kept the superseded instance, so
+  `proxies["child"]` and `parent`'s member could be two different groups
+  (#561).
+
 - **Relay groups can now terminate on real protocol adapters, not just
   `http`/`socks5`/`snell`.** Every hop after the first runs
   `ProxyAdapter::connect_over`, which previously only `direct`, `reject`,

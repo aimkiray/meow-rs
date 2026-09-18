@@ -348,8 +348,11 @@ mod tests {
         );
     }
 
-    /// Duplicate group names: last spec wins, matching config build — a
-    /// duplicate must not churn the task on every reconcile.
+    /// Duplicate group names: last spec wins. Production rejects
+    /// duplicate names at config build (issue #561), so this is the
+    /// defensive contract for callers that hand `reconcile` raw
+    /// declarations — a duplicate must not churn the task on every
+    /// reconcile.
     #[tokio::test]
     async fn reconcile_dedups_duplicate_names_last_wins() {
         let tunnel = stub_tunnel();
@@ -368,8 +371,8 @@ mod tests {
     }
 
     /// A checkable declaration shadowed by a same-named non-checkable one
-    /// emits no spec — the builder's last-wins applies across types too,
-    /// so the select group that actually got built must not be probed.
+    /// emits no spec — the defensive last-wins resolution applies across
+    /// types too, so the select group would not be probed.
     #[test]
     fn extract_skips_checkable_shadowed_by_select() {
         let groups = [

@@ -276,15 +276,14 @@ rules:
     }
 }
 
-/// Issue #533: a `proxies:` leaf or `proxy-groups:` entry named after a
-/// built-in must not shadow it — a shadowed `PASS` would silently invert
-/// "skip this rule" into "proxy it". The built-in survives; the shadowing
-/// entry is dropped with a warning (upstream hard-errors on the duplicate).
+/// Issue #533: a `proxies:` leaf named after a built-in must not shadow
+/// it — a shadowed `PASS` would silently invert "skip this rule" into
+/// "proxy it". The built-in survives; the shadowing leaf is dropped with
+/// a warning (upstream hard-errors on the duplicate).
 #[test]
-fn builtin_names_cannot_be_shadowed() {
+fn builtin_names_cannot_be_shadowed_by_leaf() {
     // All six built-ins are shadow-proof: a leaf named like one is dropped
-    // (warn), a group named like one is dropped — each name must still
-    // resolve to the built-in adapter type.
+    // (warn) — each name must still resolve to the built-in adapter type.
     let raw: RawConfig = serde_yaml::from_str(
         r#"
 proxies:
@@ -292,10 +291,9 @@ proxies:
   - {name: "PASS-RULE", type: socks5, server: 127.0.0.1, port: 9}
   - {name: "COMPATIBLE", type: socks5, server: 127.0.0.1, port: 9}
   - {name: "DIRECT", type: socks5, server: 127.0.0.1, port: 9}
+  - {name: "REJECT", type: socks5, server: 127.0.0.1, port: 9}
+  - {name: "REJECT-DROP", type: socks5, server: 127.0.0.1, port: 9}
   - {name: "HK 01", type: socks5, server: 127.0.0.1, port: 2}
-proxy-groups:
-  - {name: "REJECT", type: select, proxies: ["HK 01"]}
-  - {name: "REJECT-DROP", type: select, proxies: ["HK 01"]}
 rules:
   - MATCH,HK 01
 "#,
@@ -313,8 +311,34 @@ rules:
         assert_eq!(
             proxies[name].adapter_type(),
             want,
-            "shadowing entry must not replace the {name} built-in"
+            "shadowing leaf must not replace the {name} built-in"
         );
+    }
+}
+
+/// Issue #561: a `proxy-groups:` entry named after a built-in is a hard
+/// error, matching mihomo's `proxy group %s: the duplicate name` check —
+/// a warn-drop is not enough because parents may already have captured
+/// the built-in before the shadowing group is dropped.
+#[test]
+fn builtin_names_cannot_be_shadowed_by_group() {
+    let raw: RawConfig = serde_yaml::from_str(
+        r#"
+proxies:
+  - {name: "HK 01", type: socks5, server: 127.0.0.1, port: 2}
+proxy-groups:
+  - {name: "REJECT", type: select, proxies: ["HK 01"]}
+rules:
+  - MATCH,HK 01
+"#,
+    )
+    .unwrap();
+    match rebuild_from_raw(&raw) {
+        Err(err) => assert!(
+            err.to_string().contains("duplicate name"),
+            "unexpected error: {err}"
+        ),
+        Ok(_) => panic!("a group named REJECT must be rejected"),
     }
 }
 

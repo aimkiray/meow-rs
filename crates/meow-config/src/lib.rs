@@ -1160,9 +1160,8 @@ fn apply_dialer_proxies(
 /// build would miss both.
 ///
 /// Conservative over-approximations, all fail-closed: `include-all-proxies`
-/// expands to the successfully parsed top-level `proxies:` entries;
-/// duplicate group declarations are unioned (the registry keeps the last
-/// *successful* build, not the last declaration); relay members are all
+/// expands to the successfully parsed top-level `proxies:` entries; relay
+/// members are all
 /// treated as reachable heads (only the first member's dialer can actually
 /// fire); provider-slot members (`use:` / `include-all`) are dead ends —
 /// provider nodes never carry a `dialer-proxy`.
@@ -1544,6 +1543,32 @@ fn build_proxy_layer(
 
     let raw_groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
 
+    // Reject duplicate group names before construction (issue #561). The
+    // multi-pass build below captures member `Arc`s eagerly: a same-named
+    // group built in a later pass would replace the registry entry while
+    // parents that already built keep the superseded instance, so the
+    // registry and such parents would disagree about what the name resolves
+    // to. Mirroring mihomo's `proxy group %s: the duplicate name` check, a
+    // group name must not collide with an existing registry entry (built-in
+    // or parsed proxy) or another declared group. All six built-ins —
+    // DIRECT/REJECT/REJECT-DROP plus COMPATIBLE/PASS/PASS-RULE — are
+    // already in `proxies`, so the registry check covers them.
+    let mut seen_group_names: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(raw_groups.len());
+    for group in raw_groups {
+        anyhow::ensure!(
+            !proxies.contains_key(group.name.as_str()),
+            "proxy group '{}': the duplicate name — already used by a \
+             proxy or reserved built-in",
+            group.name
+        );
+        anyhow::ensure!(
+            seen_group_names.insert(group.name.as_str()),
+            "proxy group '{}': the duplicate name — declared more than once",
+            group.name
+        );
+    }
+
     // Apply per-outbound `dialer-proxy` chains (issue #210) *before* groups are
     // built: groups clone their members eagerly, so a chain applied afterwards
     // would only cover direct rule references and a grouped node would silently
@@ -1574,29 +1599,6 @@ fn build_proxy_layer(
         .into_iter()
         .map(|(_, proxy)| proxy)
         .collect();
-
-    // Duplicate group names: every declaration builds, but only the last
-    // survives `proxies.insert` — a dependent declared between two same-named
-    // decls captures the *first* object's Arc while the committed map holds
-    // the second (silent divergence, issue #533 review). Strict rejects it;
-    // lenient warns and keeps upstream's last-wins.
-    {
-        let mut seen = std::collections::HashSet::new();
-        for raw_group in raw_groups {
-            if !seen.insert(raw_group.name.as_str()) {
-                if strict {
-                    return Err(anyhow::anyhow!(
-                        "proxy-groups: duplicate group name '{}' (strict mode)",
-                        raw_group.name
-                    ));
-                }
-                warn!(
-                    "proxy-groups: duplicate group name '{}'; the last declaration wins",
-                    raw_group.name
-                );
-            }
-        }
-    }
 
     // Strict mode: a `use:` name that resolves to nothing is a permanent
     // miss — providers are all loaded before groups, so check upfront rather
@@ -1655,29 +1657,11 @@ fn build_proxy_layer(
                 Ok(group) => {
                     let name = SmolStr::from(group.name());
                     built_group_names.insert(name.clone());
-                    if BUILTIN_ADAPTER_NAMES.contains(&name.as_str()) {
-                        if strict {
-                            return Err(anyhow::anyhow!(
-                                "proxy-groups: '{name}' shadows a built-in adapter \
-                                 (strict mode)"
-                            ));
-                        }
-                        warn!(
-                            "Proxy group '{name}' shadows a built-in adapter; \
-                             the group is dropped and the built-in stays"
-                        );
-                    } else {
-                        // A group silently overwriting a same-named leaf
-                        // changes which object a `proxies:`/rule reference
-                        // resolves to — a defect under strict (issue #533).
-                        if strict && static_proxy_names.contains(&name) {
-                            return Err(anyhow::anyhow!(
-                                "proxy-groups: '{name}' duplicates a proxies: entry \
-                                 (strict mode)"
-                            ));
-                        }
-                        proxies.insert(name, group);
-                    }
+                    // The declaration-level check above already rejected
+                    // every name present in `proxies` (built-ins and
+                    // parsed leaves) and every repeat, so this name is
+                    // fresh by construction.
+                    proxies.insert(name, group);
                     strict_progress = true;
                 }
                 Err(_) => {
@@ -1746,14 +1730,7 @@ fn build_proxy_layer(
                 Ok(group) => {
                     let name = SmolStr::from(group.name());
                     built_group_names.insert(name.clone());
-                    if BUILTIN_ADAPTER_NAMES.contains(&name.as_str()) {
-                        warn!(
-                            "Proxy group '{name}' shadows a built-in adapter; \
-                             the group is dropped and the built-in stays"
-                        );
-                    } else {
-                        proxies.insert(name, group);
-                    }
+                    proxies.insert(name, group);
                     lenient_progress = true;
                 }
                 Err(_) => {
@@ -1778,14 +1755,7 @@ fn build_proxy_layer(
                 ) {
                     Ok(group) => {
                         let name = SmolStr::from(group.name());
-                        if BUILTIN_ADAPTER_NAMES.contains(&name.as_str()) {
-                            warn!(
-                                "Proxy group '{name}' shadows a built-in adapter; \
-                                 the group is dropped and the built-in stays"
-                            );
-                        } else {
-                            proxies.insert(name, group);
-                        }
+                        proxies.insert(name, group);
                     }
                     // Unreachable under `strict` — a stalled strict pass
                     // already returned above — so no strict arm here.
@@ -6099,8 +6069,9 @@ rule-providers:
     }
 
     /// A group named the same as a `proxies:` leaf silently overwrites it —
-    /// every reference then resolves to the group, not the leaf. Strict
-    /// treats the collision as a defect (issue #533 review).
+    /// every reference then resolves to the group, not the leaf. The
+    /// declaration-level check rejects the collision in both modes
+    /// (issues #533, #561).
     #[test]
     fn strict_rejects_group_leaf_name_collision() {
         let yaml = r#"
@@ -6115,8 +6086,13 @@ rules:
         let err = expect_strict_failure(yaml, "a group shadowing a proxies: leaf");
         assert!(err.to_string().contains("dup"), "unexpected: {err}");
 
+        // Lenient rejects too since #561 — a group shadowing a leaf makes
+        // every reference resolve ambiguously in both modes.
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
-        rebuild_from_raw(&raw).expect("lenient keeps the last-wins overwrite");
+        match rebuild_from_raw(&raw) {
+            Err(err) => assert!(err.to_string().contains("dup"), "unexpected: {err}"),
+            Ok(_) => panic!("lenient also rejects a group shadowing a leaf"),
+        }
     }
 
     /// `ech-opts.enable: true` with no `config:`, no `query-server-name:`,
@@ -6161,8 +6137,14 @@ rules:
         let err = expect_strict_failure(yaml, "duplicate group names");
         assert!(err.to_string().contains("dup"), "unexpected: {err}");
 
+        // Lenient rejects too — upstream has no lenient mode for this and
+        // the multi-pass capture makes duplicates ambiguous in both modes
+        // (a parent may hold a different instance than the registry).
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
-        rebuild_from_raw(&raw).expect("lenient keeps last-wins");
+        match rebuild_from_raw(&raw) {
+            Err(err) => assert!(err.to_string().contains("dup"), "unexpected: {err}"),
+            Ok(_) => panic!("lenient also rejects duplicates"),
+        }
     }
 
     /// A re-declared provider whose definition changed must NOT reuse the
@@ -6281,16 +6263,18 @@ rules:
 /// `fallback` / `url-test` / `load-balance` proxy groups get periodic
 /// health checks (load-balance since issue #485) —
 /// extract their probe specs from the raw group list (issue #514). Last
-/// duplicate name wins, matching how `load_config` resolves duplicates —
-/// including a checkable declaration followed by a same-named
-/// non-checkable one, which must NOT emit a spec.
+/// duplicate name wins — production paths reject duplicate group names
+/// before construction (issue #561), but this function takes raw
+/// declarations, so it keeps the last-wins resolution defensively:
+/// a checkable declaration followed by a same-named non-checkable one
+/// must NOT emit a spec.
 pub fn extract_health_check_specs(
     raw_groups: &[raw::RawProxyGroup],
 ) -> Vec<meow_common::HealthCheckSpec> {
     const DEFAULT_URL: &str = "https://www.gstatic.com/generate_204";
     const DEFAULT_INTERVAL_SECS: u64 = 300;
     // First pass: resolve duplicate names against every declaration
-    // (load_config's builder is last-wins on the name regardless of type).
+    // (last declaration wins on the name regardless of type).
     let mut last: Vec<&raw::RawProxyGroup> = Vec::new();
     for g in raw_groups {
         match last.iter_mut().find(|prev| prev.name == g.name) {
