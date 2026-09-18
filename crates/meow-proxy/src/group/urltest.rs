@@ -292,9 +292,14 @@ impl ProxyAdapter for UrlTestGroup {
         attempt.finish(proxy.dial_udp(metadata).await)
     }
 
-    fn unwrap_proxy(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
-        self.usage.touch_user_traffic(metadata);
-        self.fastest_proxy()
+    fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
+        if touch {
+            self.usage.touch_user_traffic(metadata);
+        }
+        // upstream `Unwrap` → `fast(touch)`: `touch` gates only usage
+        // recording — the recompute and the `fastest` update happen on
+        // peeks too, so the probe can never disagree with the next dial.
+        self.pick_for_dial()
     }
 
     fn health(&self) -> &ProxyHealth {

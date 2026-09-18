@@ -51,7 +51,7 @@ fn make_metadata_miss() -> Metadata {
 fn scan_rules(rules: &[Box<dyn Rule>], metadata: &Metadata) -> Option<String> {
     let helper = RuleMatchHelper;
     for rule in rules {
-        if let Some(adapter) = rule.match_and_resolve(metadata, &helper) {
+        if let Some(adapter) = rule.match_and_resolve(metadata, &helper, &|_: &str| true) {
             return Some(adapter.into());
         }
     }

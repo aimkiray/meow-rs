@@ -1417,7 +1417,7 @@ async fn rebuild_from_raw_with_resolver_async(
     tokio::task::spawn_blocking(move || {
         meow_config::rebuild_from_raw_runtime(
             &raw,
-            Some(resolver_slot),
+            Some(&resolver_slot),
             &providers,
             Some(&cache_dir),
         )

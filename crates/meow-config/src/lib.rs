@@ -27,7 +27,7 @@ pub mod subscription;
 pub use geodata::GeoDataConfig;
 
 use meow_common::AuthConfig;
-use meow_common::{Proxy, Rule, SnifferConfig, TunnelMode};
+use meow_common::{AdapterType, Proxy, Rule, SnifferConfig, TunnelMode};
 use meow_dns::Resolver;
 use proxy_provider::ProxyProvider;
 use serde::{Deserialize, Serialize};
@@ -561,7 +561,7 @@ pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::E
 /// rejected build never aliases live state.
 pub fn rebuild_from_raw_with_resolver(
     raw: &raw::RawConfig,
-    resolver: Option<meow_dns::ResolverSlot>,
+    resolver: Option<&meow_dns::ResolverSlot>,
     cache_dir: Option<&Path>,
     shared_rule_providers: Option<HashMap<String, Arc<rule_provider::RuleProvider>>>,
 ) -> Result<RebuildResult, anyhow::Error> {
@@ -586,7 +586,7 @@ pub fn rebuild_from_raw_with_resolver(
 /// [`RebuildResult::rule_providers`] commit contract (issue #533 review).
 pub fn rebuild_from_raw_runtime(
     raw: &raw::RawConfig,
-    resolver: Option<meow_dns::ResolverSlot>,
+    resolver: Option<&meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     cache_dir: Option<&Path>,
 ) -> Result<RebuildResult, anyhow::Error> {
@@ -606,11 +606,12 @@ pub fn rebuild_from_raw_runtime(
 
 /// Same as [`rebuild_from_raw`] but accepts a `cache_dir` used to resolve
 /// relative rule-provider paths and to cache fetched HTTP payloads, and an
-/// optional DNS `resolver` slot injected into the built-in DIRECT adapter.
+/// optional DNS `resolver` slot injected into the built-in DIRECT and
+/// COMPATIBLE adapters.
 pub fn rebuild_from_raw_with_cache_dir(
     raw: &raw::RawConfig,
     cache_dir: Option<&Path>,
-    resolver: Option<meow_dns::ResolverSlot>,
+    resolver: Option<&meow_dns::ResolverSlot>,
 ) -> Result<RebuildResult, anyhow::Error> {
     rebuild_from_raw_impl(
         raw,
@@ -991,14 +992,29 @@ fn reject_group_membership_cycles(
 /// Policy names resolved internally rather than declared as usable outbounds.
 /// They must not become the default member of an auto-created `GLOBAL` group:
 /// choosing `DIRECT` would make global mode silently bypass every proxy.
-const BUILTIN_GLOBAL_POLICIES: [&str; 7] = [
+const BUILTIN_GLOBAL_POLICIES: [&str; 8] = [
     "DIRECT",
     "REJECT",
     "REJECT-DROP",
     "PASS",
+    "PASS-RULE",
     "COMPATIBLE",
     "GLOBAL",
     "BLOCK",
+];
+
+/// Built-in adapter names a `proxies:` leaf or `proxy-groups:` entry must
+/// not shadow. Upstream hard-errors on the duplicate (`proxy %s is the
+/// duplicate name`); meow keeps the built-in and drops the shadowing entry
+/// instead — a shadowed `PASS` would silently invert "skip this rule" into
+/// "proxy it" (issue #533).
+const BUILTIN_ADAPTER_NAMES: [&str; 6] = [
+    "DIRECT",
+    "REJECT",
+    "REJECT-DROP",
+    "COMPATIBLE",
+    "PASS",
+    "PASS-RULE",
 ];
 
 fn is_usable_global_target(name: &str, proxies: &HashMap<SmolStr, Arc<dyn Proxy>>) -> bool {
@@ -1086,6 +1102,13 @@ fn insert_parsed_leaves(
                     .and_then(|v| v.as_str())
                     .unwrap_or_else(|| proxy.name())
                     .into();
+                if BUILTIN_ADAPTER_NAMES.contains(&key.as_str()) {
+                    warn!(
+                        "Proxy named '{key}' shadows a built-in adapter; the \
+                         entry is dropped and the built-in stays"
+                    );
+                    continue;
+                }
                 static_proxy_names.insert(key.clone());
                 proxies.insert(key, proxy);
             }
@@ -1101,14 +1124,15 @@ fn insert_parsed_leaves(
 /// `dialer-proxy`/`proxy:` names against exactly the layer the runtime will
 /// publish (issue #533).
 ///
-/// `resolver` is injected into `DIRECT` (pass 2 of the startup build); the
-/// prefetch map and pass 1 pass `None`, matching their no-resolver stage.
+/// `resolver` is injected into `DIRECT`/`COMPATIBLE` (pass 2 of the startup
+/// build); the prefetch map and pass 1 pass `None`, matching their
+/// no-resolver stage.
 /// `registry` is the cell the `dialer-proxy` targets bind to weakly — the
 /// caller publishes the returned map into it and must keep the cell alive
 /// for as long as the adapters are used.
 fn build_proxy_layer(
     raw: &raw::RawConfig,
-    resolver: Option<meow_dns::ResolverSlot>,
+    resolver: Option<&meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
     registry: &meow_proxy::dialer::ProxyRegistry,
@@ -1116,20 +1140,30 @@ fn build_proxy_layer(
     let ipv6 = effective_ipv6(raw.ipv6);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
     let mut static_proxy_names = std::collections::HashSet::new();
-    // Built-in proxies
-    let mut direct = meow_proxy::DirectAdapter::new();
-    if let Some(mark) = raw.routing_mark {
-        direct = direct.with_routing_mark(mark);
-    }
-    if let Some(slot) = resolver {
-        direct = direct.with_resolver_slot(slot);
-    }
-    if let Some(secs) = raw.tcp_connect_timeout {
-        direct = direct.with_connect_timeout(std::time::Duration::from_secs(secs));
-    }
+    // Built-in proxies — upstream registers DIRECT, REJECT, REJECT-DROP,
+    // COMPATIBLE, PASS, PASS-RULE (`config.go` ~line 891).
+    let make_direct = |compatible: bool| {
+        let mut direct = if compatible {
+            meow_proxy::DirectAdapter::compatible()
+        } else {
+            meow_proxy::DirectAdapter::new()
+        };
+        if let Some(mark) = raw.routing_mark {
+            direct = direct.with_routing_mark(mark);
+        }
+        if let Some(slot) = resolver.cloned() {
+            direct = direct.with_resolver_slot(slot);
+        }
+        if let Some(secs) = raw.tcp_connect_timeout {
+            direct = direct.with_connect_timeout(std::time::Duration::from_secs(secs));
+        }
+        direct
+    };
     proxies.insert(
         SmolStr::new_static("DIRECT"),
-        Arc::new(proxy_parser::WrappedProxy::new(Box::new(direct))),
+        Arc::new(proxy_parser::WrappedProxy::new(Box::new(make_direct(
+            false,
+        )))),
     );
     proxies.insert(
         SmolStr::new_static("REJECT"),
@@ -1141,6 +1175,28 @@ fn build_proxy_layer(
         SmolStr::new_static("REJECT-DROP"),
         Arc::new(proxy_parser::WrappedProxy::new(Box::new(
             meow_proxy::RejectAdapter::new(true),
+        ))),
+    );
+    // `COMPATIBLE` dials direct like DIRECT but carries its own type tag —
+    // upstream uses it as GLOBAL's default member; here rules may target
+    // it for an explicit direct dial.
+    proxies.insert(
+        SmolStr::new_static("COMPATIBLE"),
+        Arc::new(proxy_parser::WrappedProxy::new(Box::new(make_direct(true)))),
+    );
+    // `PASS` / `PASS-RULE` are Reject-shaped nops; the match engines read
+    // their type tags (Pass → silent rule skip, PassRule → inner-rule skip
+    // inside SUB-RULE blocks) instead of ever dialing them.
+    proxies.insert(
+        SmolStr::new_static("PASS"),
+        Arc::new(proxy_parser::WrappedProxy::new(Box::new(
+            meow_proxy::RejectAdapter::pass(),
+        ))),
+    );
+    proxies.insert(
+        SmolStr::new_static("PASS-RULE"),
+        Arc::new(proxy_parser::WrappedProxy::new(Box::new(
+            meow_proxy::RejectAdapter::pass_rule(),
         ))),
     );
 
@@ -1212,7 +1268,14 @@ fn build_proxy_layer(
                 Ok(group) => {
                     let name = SmolStr::from(group.name());
                     built_group_names.insert(name.clone());
-                    proxies.insert(name, group);
+                    if BUILTIN_ADAPTER_NAMES.contains(&name.as_str()) {
+                        warn!(
+                            "Proxy group '{name}' shadows a built-in adapter; \
+                             the group is dropped and the built-in stays"
+                        );
+                    } else {
+                        proxies.insert(name, group);
+                    }
                     strict_progress = true;
                 }
                 Err(_) => {
@@ -1253,7 +1316,14 @@ fn build_proxy_layer(
                 Ok(group) => {
                     let name = SmolStr::from(group.name());
                     built_group_names.insert(name.clone());
-                    proxies.insert(name, group);
+                    if BUILTIN_ADAPTER_NAMES.contains(&name.as_str()) {
+                        warn!(
+                            "Proxy group '{name}' shadows a built-in adapter; \
+                             the group is dropped and the built-in stays"
+                        );
+                    } else {
+                        proxies.insert(name, group);
+                    }
                     lenient_progress = true;
                 }
                 Err(_) => {
@@ -1278,7 +1348,14 @@ fn build_proxy_layer(
                 ) {
                     Ok(group) => {
                         let name = SmolStr::from(group.name());
-                        proxies.insert(name, group);
+                        if BUILTIN_ADAPTER_NAMES.contains(&name.as_str()) {
+                            warn!(
+                                "Proxy group '{name}' shadows a built-in adapter; \
+                                 the group is dropped and the built-in stays"
+                            );
+                        } else {
+                            proxies.insert(name, group);
+                        }
                     }
                     Err(e) => warn!("Failed to parse proxy group '{}': {}", raw_group.name, e),
                 }
@@ -1297,8 +1374,22 @@ fn build_proxy_layer(
     let had_global = proxies.contains_key("GLOBAL");
     if !had_global {
         let mut all_proxy_names: Vec<String> = proxies
-            .keys()
-            .map(std::string::ToString::to_string)
+            .iter()
+            // Upstream seeds the GLOBAL member provider from `proxyList` —
+            // DIRECT, REJECT, user leaves and groups — so RejectDrop and
+            // Compatible never appear as members (COMPATIBLE is only the
+            // default selection), and the Pass/PassRule types are filtered
+            // as match-loop signals (config.go ~line 967).
+            .filter(|(_, p)| {
+                !matches!(
+                    p.adapter_type(),
+                    AdapterType::Pass
+                        | AdapterType::PassRule
+                        | AdapterType::Compatible
+                        | AdapterType::RejectDrop
+                )
+            })
+            .map(|(name, _)| name.to_string())
             .collect();
         all_proxy_names.sort();
         let primary = primary_global_target(raw, &proxies).map(str::to_string);
@@ -1427,7 +1518,7 @@ async fn prefetch_proxy_layer_async(
 fn rebuild_from_raw_impl(
     raw: &raw::RawConfig,
     cache_dir: Option<&Path>,
-    resolver: Option<meow_dns::ResolverSlot>,
+    resolver: Option<&meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
     shared_ctx: Option<&meow_rules::ParserContext>,
@@ -1646,7 +1737,7 @@ async fn rebuild_from_raw_impl_async(
         rebuild_from_raw_impl(
             &raw,
             cache_dir.as_deref(),
-            resolver,
+            resolver.as_ref(),
             &providers,
             selector_store.as_ref(),
             Some(&ctx),

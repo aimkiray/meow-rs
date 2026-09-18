@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 
 pub struct RejectAdapter {
     drop: bool,
+    adapter_type: AdapterType,
     health: ProxyHealth,
 }
 
@@ -13,6 +14,33 @@ impl RejectAdapter {
     pub fn new(drop: bool) -> Self {
         Self {
             drop,
+            adapter_type: if drop {
+                AdapterType::RejectDrop
+            } else {
+                AdapterType::Reject
+            },
+            health: ProxyHealth::new(),
+        }
+    }
+
+    /// `PASS` built-in — upstream `outbound.NewPass()`: a `Reject`-shaped
+    /// nop whose `Pass` type tag tells the match loop to skip the rule
+    /// silently. Never dialed when the matcher honors the tag.
+    pub fn pass() -> Self {
+        Self::typed(AdapterType::Pass)
+    }
+
+    /// `PASS-RULE` built-in — upstream `outbound.NewPassRule()`: skipped
+    /// inside SUB-RULE blocks; at top level it dials as a plain reject
+    /// (immediate EOF), same as upstream.
+    pub fn pass_rule() -> Self {
+        Self::typed(AdapterType::PassRule)
+    }
+
+    fn typed(adapter_type: AdapterType) -> Self {
+        Self {
+            drop: false,
+            adapter_type,
             health: ProxyHealth::new(),
         }
     }
@@ -81,19 +109,16 @@ impl ProxyPacketConn for RejectPacketConn {
 #[async_trait]
 impl ProxyAdapter for RejectAdapter {
     fn name(&self) -> &str {
-        if self.drop {
-            "REJECT-DROP"
-        } else {
-            "REJECT"
+        match self.adapter_type {
+            AdapterType::Pass => "PASS",
+            AdapterType::PassRule => "PASS-RULE",
+            AdapterType::RejectDrop => "REJECT-DROP",
+            _ => "REJECT",
         }
     }
 
     fn adapter_type(&self) -> AdapterType {
-        if self.drop {
-            AdapterType::RejectDrop
-        } else {
-            AdapterType::Reject
-        }
+        self.adapter_type
     }
 
     fn addr(&self) -> &str {

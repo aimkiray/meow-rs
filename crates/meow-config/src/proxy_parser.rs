@@ -71,6 +71,12 @@ impl ProxyAdapter for WrappedProxy {
         self.adapter.connect_over(stream, metadata).await
     }
 
+    /// Forward the peek/commit walk — a wrapped group-typed adapter would
+    /// otherwise hide PASS/PASS-RULE members from the match-time probe.
+    fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
+        self.adapter.unwrap_proxy(metadata, touch)
+    }
+
     fn health(&self) -> &ProxyHealth {
         self.adapter.health()
     }
@@ -3497,7 +3503,7 @@ tls: true
         let meta = meow_common::Metadata::default();
         let mut seen: std::collections::HashSet<String> = Default::default();
         for _ in 0..6 {
-            seen.insert(group.unwrap_proxy(&meta).unwrap().name().to_string());
+            seen.insert(group.unwrap_proxy(&meta, true).unwrap().name().to_string());
         }
         assert_eq!(seen.len(), 3, "every provider member gets picked");
     }

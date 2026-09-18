@@ -109,6 +109,7 @@ that match/no-match based on a predicate and return a fixed target string.
 | A4 | `sub_rule_empty_block_returns_none` | Block with zero rules; `apply()` → `None`. NOT panic. This is the runtime counterpart to the parse-time warn (section D3 handles the warn). |
 | A5 | `sub_rule_match_rule_inside_block` | Block contains `MATCH,Fallback` (unconditional match, target "Fallback"); any `metadata` → `Some("Fallback")`. <br/> Upstream: `matchSubRules` returns on first match; `MATCH` always matches. NOT `None`. |
 | A6 | `sub_rule_target_is_from_matched_rule_not_struct_field` **[guard-rail]** | Build two `SubRule` instances with different `block_name` values but both wrapping the same block that returns `"DIRECT"`. Assert both return `Some("DIRECT")`. Guards that target comes from the inner rule, not from `block_name` or any struct field. |
+| A7 | `sub_rule_inner_pass_rule_skips` | Inner rule resolving to the literal name `PASS-RULE`, or to a target the probe reports `is_pass_rule` (a PassRule-typed chain hop), is skipped and the inner scan continues — upstream `matchSubRules`' `CheckPassRule`. The next inner rule's target is returned. NOT `Some("PASS-RULE")` at the top level. |
 
 ---
 

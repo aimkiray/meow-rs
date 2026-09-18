@@ -106,7 +106,7 @@ pub async fn run_loop(
                         move || {
                             meow_config::rebuild_from_raw_with_resolver(
                                 &candidate,
-                                Some(resolver),
+                                Some(&resolver),
                                 Some(cache_dir.as_path()),
                                 // Commit path: the candidate's provider set
                                 // loads fresh and is swapped into the live

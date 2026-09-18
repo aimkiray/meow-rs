@@ -126,7 +126,7 @@ fn fixture_cases() -> Vec<Metadata> {
 fn scan_linear<'a>(rules: &'a [Box<dyn Rule>], metadata: &Metadata) -> Option<&'a str> {
     let helper = RuleMatchHelper;
     for rule in rules {
-        if let Some(adapter) = rule.match_and_resolve(metadata, &helper) {
+        if let Some(adapter) = rule.match_and_resolve(metadata, &helper, &|_: &str| true) {
             return Some(adapter);
         }
     }
@@ -155,21 +155,21 @@ fn measure_hot_loop(
                         std::hint::black_box(metadata),
                         std::hint::black_box(rules),
                         std::hint::black_box(index),
-                        &|_| true,
+                        &|_: &str| true,
                     ));
                 }
                 Matcher::Ir => {
                     std::hint::black_box(compiled.match_rules(
                         std::hint::black_box(metadata),
                         std::hint::black_box(rules),
-                        &|_| true,
+                        &|_: &str| true,
                     ));
                 }
                 Matcher::LazyIr => {
                     std::hint::black_box(compiled.match_rules_lazy(
                         std::hint::black_box(metadata),
                         std::hint::black_box(rules),
-                        &|_| true,
+                        &|_: &str| true,
                     ));
                 }
             }

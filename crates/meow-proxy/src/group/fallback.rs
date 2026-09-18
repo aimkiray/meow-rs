@@ -195,8 +195,10 @@ impl ProxyAdapter for FallbackGroup {
         attempt.finish(proxy.dial_udp(metadata).await)
     }
 
-    fn unwrap_proxy(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
-        self.usage.touch_user_traffic(metadata);
+    fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
+        if touch {
+            self.usage.touch_user_traffic(metadata);
+        }
         self.first_alive()
     }
 
@@ -414,6 +416,22 @@ mod tests {
         );
         let _ = g.dial_tcp(&Metadata::default()).await;
         assert_eq!(g.usage_generation(), 1, "real traffic still marks use");
+    }
+
+    /// Issue #533: `unwrap_proxy(meta, false)` is the match-time peek —
+    /// it must not record usage; `touch=true` (the real dial path) does.
+    #[test]
+    fn unwrap_peek_does_not_touch_usage() {
+        let g = FallbackGroup::new("fb", vec![MockProxy::new("a")]);
+        let meta = Metadata::default();
+        let _ = g.unwrap_proxy(&meta, false);
+        assert_eq!(
+            g.usage_generation(),
+            0,
+            "peek must not mark the group as used"
+        );
+        let _ = g.unwrap_proxy(&meta, true);
+        assert_eq!(g.usage_generation(), 1, "real unwrap records the use");
     }
 
     #[test]

@@ -186,7 +186,7 @@ impl ProxyAdapter for SelectorGroup {
         proxy.dial_udp(metadata).await
     }
 
-    fn unwrap_proxy(&self, _metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
+    fn unwrap_proxy(&self, _metadata: &Metadata, _touch: bool) -> Option<Arc<dyn Proxy>> {
         self.selected_proxy()
     }
 

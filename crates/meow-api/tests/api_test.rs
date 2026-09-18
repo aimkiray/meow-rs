@@ -304,6 +304,11 @@ async fn get_proxies_contains_builtins() {
     assert!(proxies.contains_key("DIRECT"));
     assert!(proxies.contains_key("REJECT"));
     assert!(proxies.contains_key("REJECT-DROP"));
+    // issue #533: the match-loop signal built-ins are registered and
+    // visible through the API, same as upstream's proxies map.
+    assert!(proxies.contains_key("COMPATIBLE"));
+    assert!(proxies.contains_key("PASS"));
+    assert!(proxies.contains_key("PASS-RULE"));
 }
 
 #[tokio::test]

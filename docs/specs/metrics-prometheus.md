@@ -193,10 +193,11 @@ Add `rule_match: Arc<RuleMatchCounters>` to `Statistics`. Wire into
 `match_engine.rs` at the point a rule match is confirmed (after the final
 rule type + target proxy are known).
 
-`action` string: if `target == "DIRECT"` → `"DIRECT"`;
-if `target == "REJECT"` or `"REJECT-DROP"` → `"REJECT"`;
-else → `"PROXY"`. Do NOT use the proxy name as the action label
-(unbounded cardinality).
+`action` string: bucketed by the resolved target's adapter *type* (not its
+name): the literal `DIRECT`, `Direct`-typed, and `Compatible` targets →
+`"DIRECT"`; `Reject`/`RejectDrop`/`PassRule` targets (and the unreachable
+missing-target fallback) → `"REJECT"`; everything else → `"PROXY"`. Do NOT
+use the proxy name as the action label (unbounded cardinality).
 
 ### Auth
 

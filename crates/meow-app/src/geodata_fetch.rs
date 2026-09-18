@@ -128,7 +128,7 @@ pub async fn run_on_startup(
         move || {
             meow_config::rebuild_from_raw_with_resolver(
                 &raw,
-                Some(resolver),
+                Some(&resolver),
                 Some(cache_dir.as_path()),
                 // Rules-only refresh — bind the rebuilt RULE-SET rules to
                 // the LIVE provider set so `PUT /providers/rules/{name}`
@@ -243,7 +243,7 @@ pub async fn auto_update_loop(
             move || {
                 meow_config::rebuild_from_raw_with_resolver(
                     &raw,
-                    Some(resolver),
+                    Some(&resolver),
                     Some(cache_dir.as_path()),
                     // Rules-only refresh — bind the rebuilt RULE-SET rules
                     // to the LIVE provider set so API/provider refreshes

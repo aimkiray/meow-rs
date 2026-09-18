@@ -36,7 +36,7 @@
 //! block. Sharing via `Arc` is reference-count sharing only; not semantically
 //! observable.
 
-use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
+use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType, TargetProbe};
 use std::sync::Arc;
 
 /// Opaque handle to a shared, resolved sub-rule block.
@@ -70,6 +70,8 @@ impl Rule for SubRuleRule {
 
     fn match_metadata(&self, metadata: &Metadata, helper: &RuleMatchHelper) -> bool {
         // Retained for API compatibility — only asks "did anything match?".
+        // Non-authoritative: it applies no PASS-RULE filtering; the probe-
+        // aware `match_and_resolve` is the contract the engines use.
         self.block
             .iter()
             .any(|r| r.match_metadata(metadata, helper))
@@ -100,10 +102,17 @@ impl Rule for SubRuleRule {
         &'a self,
         metadata: &Metadata,
         helper: &RuleMatchHelper,
+        probe: &dyn TargetProbe,
     ) -> Option<&'a str> {
-        // upstream: rules/logic/logic.go::matchSubRules lines 179–190
+        // upstream: rules/logic/logic.go::matchSubRules — an inner rule
+        // resolving to the literal `PASS-RULE` name or a PASS-RULE-typed
+        // adapter (`CheckPassRule`) is skipped and the scan moves to the
+        // next inner rule.
         for rule in self.block.iter() {
-            if let Some(target) = rule.match_and_resolve(metadata, helper) {
+            if let Some(target) = rule.match_and_resolve(metadata, helper, probe) {
+                if target == "PASS-RULE" || probe.is_pass_rule(target) {
+                    continue;
+                }
                 return Some(target);
             }
         }
@@ -175,7 +184,10 @@ mod tests {
     fn sub_rule_inner_match_returns_inner_target() {
         let sub = SubRuleRule::from_rules("BLOCK", vec![match_rule("DIRECT")]);
         let m = Metadata::default();
-        assert_eq!(sub.match_and_resolve(&m, &helper()), Some("DIRECT"));
+        assert_eq!(
+            sub.match_and_resolve(&m, &helper(), &|_: &str| true),
+            Some("DIRECT")
+        );
     }
 
     /// A2 — block exhaustion propagates as None.
@@ -183,7 +195,7 @@ mod tests {
     fn sub_rule_block_exhausted_returns_none() {
         let sub = SubRuleRule::from_rules("BLOCK", vec![no_match_rule("A")]);
         let m = Metadata::default();
-        assert_eq!(sub.match_and_resolve(&m, &helper()), None);
+        assert_eq!(sub.match_and_resolve(&m, &helper(), &|_: &str| true), None);
     }
 
     /// A3 — first match wins.
@@ -194,7 +206,10 @@ mod tests {
             vec![no_match_rule("A"), match_rule("B"), match_rule("C")],
         );
         let m = Metadata::default();
-        assert_eq!(sub.match_and_resolve(&m, &helper()), Some("B"));
+        assert_eq!(
+            sub.match_and_resolve(&m, &helper(), &|_: &str| true),
+            Some("B")
+        );
     }
 
     /// A4 — empty block returns None.
@@ -202,7 +217,7 @@ mod tests {
     fn sub_rule_empty_block_returns_none() {
         let sub = SubRuleRule::from_rules("BLOCK", vec![]);
         let m = Metadata::default();
-        assert_eq!(sub.match_and_resolve(&m, &helper()), None);
+        assert_eq!(sub.match_and_resolve(&m, &helper(), &|_: &str| true), None);
     }
 
     /// A5 — MATCH inside block always produces a result.
@@ -210,7 +225,10 @@ mod tests {
     fn sub_rule_match_rule_inside_block() {
         let sub = SubRuleRule::from_rules("BLOCK", vec![match_rule("Fallback")]);
         let m = Metadata::default();
-        assert_eq!(sub.match_and_resolve(&m, &helper()), Some("Fallback"));
+        assert_eq!(
+            sub.match_and_resolve(&m, &helper(), &|_: &str| true),
+            Some("Fallback")
+        );
     }
 
     /// A6 — target comes from inner rule, not from block_name.
@@ -220,8 +238,14 @@ mod tests {
         let a = SubRuleRule::new("BLOCK-A", Arc::clone(&block));
         let b = SubRuleRule::new("BLOCK-B", block);
         let m = Metadata::default();
-        assert_eq!(a.match_and_resolve(&m, &helper()), Some("DIRECT"));
-        assert_eq!(b.match_and_resolve(&m, &helper()), Some("DIRECT"));
+        assert_eq!(
+            a.match_and_resolve(&m, &helper(), &|_: &str| true),
+            Some("DIRECT")
+        );
+        assert_eq!(
+            b.match_and_resolve(&m, &helper(), &|_: &str| true),
+            Some("DIRECT")
+        );
     }
 
     /// B1 — nested SubRule returns leaf target.
@@ -231,7 +255,10 @@ mod tests {
         let nested = SubRuleRule::new("B", inner);
         let outer = SubRuleRule::from_rules("A", vec![Box::new(nested)]);
         let m = Metadata::default();
-        assert_eq!(outer.match_and_resolve(&m, &helper()), Some("DIRECT"));
+        assert_eq!(
+            outer.match_and_resolve(&m, &helper(), &|_: &str| true),
+            Some("DIRECT")
+        );
     }
 
     /// B2 — inner no-match propagates as None.
@@ -241,7 +268,10 @@ mod tests {
         let nested = SubRuleRule::new("B", inner);
         let outer = SubRuleRule::from_rules("A", vec![Box::new(nested)]);
         let m = Metadata::default();
-        assert_eq!(outer.match_and_resolve(&m, &helper()), None);
+        assert_eq!(
+            outer.match_and_resolve(&m, &helper(), &|_: &str| true),
+            None
+        );
     }
 
     /// B3 — two-level chain returns leaf target.
@@ -253,6 +283,9 @@ mod tests {
         let top_mid = SubRuleRule::new("B", outer_mid);
         let top = SubRuleRule::from_rules("A", vec![Box::new(top_mid)]);
         let m = Metadata::default();
-        assert_eq!(top.match_and_resolve(&m, &helper()), Some("LEAF"));
+        assert_eq!(
+            top.match_and_resolve(&m, &helper(), &|_: &str| true),
+            Some("LEAF")
+        );
     }
 }

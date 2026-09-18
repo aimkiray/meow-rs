@@ -9,6 +9,10 @@ use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 
 pub struct DirectAdapter {
+    /// `Direct` normally; `Compatible` for the built-in `COMPATIBLE`
+    /// adapter (upstream `outbound.NewCompatible()` — a `*Direct` with the
+    /// `C.Compatible` type tag, used as GLOBAL's default member).
+    adapter_type: AdapterType,
     routing_mark: Option<u32>,
     /// Optional internal DNS resolver. When set, `dial_tcp` resolves
     /// hostnames via this resolver instead of the OS resolver — this is
@@ -34,10 +38,22 @@ pub struct DirectAdapter {
 impl DirectAdapter {
     pub fn new() -> Self {
         Self {
+            adapter_type: AdapterType::Direct,
             routing_mark: None,
             resolver: None,
             connect_timeout: None,
             health: ProxyHealth::new(),
+        }
+    }
+
+    /// `COMPATIBLE` built-in — a direct dialer carrying the `Compatible`
+    /// type tag, like upstream `NewCompatible`. Receives the same
+    /// routing-mark/resolver/timeout options as `DIRECT` via the `with_*`
+    /// builders.
+    pub fn compatible() -> Self {
+        Self {
+            adapter_type: AdapterType::Compatible,
+            ..Self::new()
         }
     }
 
@@ -280,11 +296,14 @@ async fn connect_with_mark(
 #[async_trait]
 impl ProxyAdapter for DirectAdapter {
     fn name(&self) -> &str {
-        "DIRECT"
+        match self.adapter_type {
+            AdapterType::Compatible => "COMPATIBLE",
+            _ => "DIRECT",
+        }
     }
 
     fn adapter_type(&self) -> AdapterType {
-        AdapterType::Direct
+        self.adapter_type
     }
 
     fn addr(&self) -> &str {

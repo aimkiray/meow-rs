@@ -177,18 +177,21 @@ Execution-plan selection is a compiler optimization over the same slots.
 
 ### Runtime Contract
 
-- `CompiledRuleSet::match_rules(metadata, rules, target_exists)` must be called
+- `CompiledRuleSet::match_rules(metadata, rules, probe)` must be called
   with the same source rule list used to build the compiled rule set, plus a
-  registry-membership predicate (`&dyn Fn(&str) -> bool`). A matched slot whose
-  adapter name fails the predicate is warned and skipped, matching mihomo's
-  `continue` in `match()`.
+  `&dyn TargetProbe` registry probe. A matched slot whose adapter name
+  reports `TargetCheck::Missing` is warned and skipped, matching mihomo's
+  `continue` in `match()`; `TargetCheck::Pass` (the target or an adapter in
+  its `unwrap_proxy` chain is `PASS`-typed) skips silently — upstream's
+  `continue GetRules`. A plain `Fn(&str) -> bool` still works as a probe:
+  `true` maps to `Usable`, `false` to `Missing`.
 - Returned `CompiledMatchResult` should borrow from the compiled rule set or the
   source rule; the successful hot path should not allocate.
 - The IR must not mutate runtime state.
 - The IR must not resolve DNS, perform process lookup, or inspect proxies.
 - `needs_ip_resolution()` and `needs_process_lookup()` are aggregate hints
   copied from source rules. The tunnel owns the actual enrichment work.
-- `match_rules_lazy(metadata, rules, target_exists)` is the two-phase
+- `match_rules_lazy(metadata, rules, probe)` is the two-phase
   variant used on the TCP hot path: the scan stops at the first slot whose
   predicate needs a field the caller has not materialized yet
   (`dst_ip`/`process`) and returns `NeedsEnrichment` instead of a silent
@@ -473,7 +476,7 @@ unbounded ordered scans.
 
 ### Match Time
 
-At runtime, `CompiledRuleSet::match_rules(metadata, rules, target_exists)`
+At runtime, `CompiledRuleSet::match_rules(metadata, rules, probe)`
 creates one `MatchInput` view for the request and executes the compiled plan
 without rebuilding or mutating anything.
 
@@ -554,10 +557,10 @@ runtime still resolves it by name in the route snapshot's proxy map.
 
 ## Execution Algorithm
 
-`CompiledRuleSet::match_rules(metadata, rules, target_exists)` preserves the
+`CompiledRuleSet::match_rules(metadata, rules, probe)` preserves the
 ordered first-match semantics of `match_engine::match_rules`, including the
 shared continue-on-missing-target rule (issue #513): a matched rule whose
-adapter name fails `target_exists` is skipped and the scan continues — under
+adapter name reports `Missing` is skipped and the scan continues — under
 the indexed plan the tail scan re-evaluates trie-owned domain slots, so a
 second matching domain rule after a skipped hit still resolves.
 
@@ -599,9 +602,11 @@ TCP connections resolve through `Tunnel::resolve_proxy_lazy()`:
 2. `Global` mode resolves the `GLOBAL` proxy or falls back to DIRECT.
 3. `Rule` mode loads an owned `Arc<RouteTable>` snapshot (held across any
    `.await`) and calls
-   `route.compiled_rules.match_rules_lazy(metadata, route.rules, target_exists)`
-   where `target_exists` checks the same route snapshot's proxy registry
-   (with `DIRECT` hard-coded as always present).
+   `route.compiled_rules.match_rules_lazy(metadata, route.rules, probe)`
+   where the `RouteTargetProbe` checks the same route snapshot's proxy
+   registry: membership, the `unwrap_proxy(metadata, false)` peek walk for
+   `PASS`-typed hops, and UDP `support_udp` (with `DIRECT` hard-coded as
+   always present).
 4. On `Matched`/`NoMatch` the buffered dead-target warnings drain (see the
    lazy contract above) and the result materializes immediately.
 5. On `NeedsEnrichment` the tunnel materializes only the demanded fields —
@@ -611,7 +616,9 @@ TCP connections resolve through `Tunnel::resolve_proxy_lazy()`:
    each once.
 6. On match, statistics are incremented from the returned `RuleType`, and the
    proxy is resolved by the returned adapter name — already proven present by
-   the predicate, so a missing proxy is only a defensive fallback to DIRECT.
+   the probe. A target that is somehow absent at materialization rejects the
+   connection (fail-closed — a silent DIRECT hop is the leak class
+   `dialer-proxy` exists to prevent), never falls through to direct egress.
 7. On no match, the tunnel uses DIRECT.
 
 The eager `resolve_proxy()` (process-enrich-then-scan) remains for non-TCP

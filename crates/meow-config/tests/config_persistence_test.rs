@@ -169,8 +169,9 @@ fn rebuild_from_raw_empty_config() {
     let raw = RawConfig::default();
     let res = rebuild_from_raw(&raw).unwrap();
     let (proxies, rules) = (res.proxies, res.rules);
-    // Should still have built-in proxies + auto-created GLOBAL
-    assert_eq!(proxies.len(), 4);
+    // 6 built-in adapters (DIRECT/REJECT/REJECT-DROP/COMPATIBLE/PASS/
+    // PASS-RULE) + auto-created GLOBAL.
+    assert_eq!(proxies.len(), 7);
     assert!(proxies.contains_key("GLOBAL"));
     assert!(rules.is_empty());
 }
@@ -199,8 +200,8 @@ fn rebuild_from_raw_with_groups() {
     assert!(proxies.contains_key("Select"));
     assert!(proxies.contains_key("Auto"));
     assert!(proxies.contains_key("GLOBAL"));
-    // 3 built-in + 2 groups + 1 auto-created GLOBAL
-    assert_eq!(proxies.len(), 6);
+    // 6 built-ins + 2 groups + 1 auto-created GLOBAL
+    assert_eq!(proxies.len(), 9);
 }
 
 #[test]
@@ -231,6 +232,79 @@ rules:
     assert!(members.contains(&"HK 01".to_string()));
     assert!(members.contains(&"DIRECT".to_string()));
     assert!(members.contains(&"REJECT".to_string()));
+}
+
+/// Issue #533: the match-loop signal adapters register as real built-ins,
+/// and the auto-created GLOBAL member list mirrors upstream `config.go` —
+/// its provider is seeded from `proxyList` (DIRECT, REJECT, user leaves and
+/// groups), so COMPATIBLE/REJECT-DROP never appear as members (COMPATIBLE
+/// is only the default selection upstream) and the Pass/PassRule type tags
+/// are filtered as match-loop signals.
+#[test]
+fn auto_global_excludes_signal_builtins() {
+    let raw: RawConfig = serde_yaml::from_str(
+        r#"
+proxies:
+  - {name: "HK 01", type: socks5, server: 127.0.0.1, port: 2}
+rules:
+  - MATCH,HK 01
+"#,
+    )
+    .unwrap();
+    let proxies = rebuild_from_raw(&raw).unwrap().proxies;
+
+    use meow_common::AdapterType;
+    assert_eq!(proxies["PASS"].adapter_type(), AdapterType::Pass);
+    assert_eq!(proxies["PASS-RULE"].adapter_type(), AdapterType::PassRule);
+    assert_eq!(
+        proxies["COMPATIBLE"].adapter_type(),
+        AdapterType::Compatible
+    );
+
+    let members = proxies["GLOBAL"].members().expect("GLOBAL members");
+    for excluded in ["PASS", "PASS-RULE", "COMPATIBLE", "REJECT-DROP"] {
+        assert!(
+            !members.iter().any(|m| m == excluded),
+            "{excluded} must not be a GLOBAL member"
+        );
+    }
+    for selectable in ["DIRECT", "REJECT", "HK 01"] {
+        assert!(
+            members.iter().any(|m| m == selectable),
+            "{selectable} stays selectable"
+        );
+    }
+}
+
+/// Issue #533: a `proxies:` leaf or `proxy-groups:` entry named after a
+/// built-in must not shadow it — a shadowed `PASS` would silently invert
+/// "skip this rule" into "proxy it". The built-in survives; the shadowing
+/// entry is dropped with a warning (upstream hard-errors on the duplicate).
+#[test]
+fn builtin_names_cannot_be_shadowed() {
+    let raw: RawConfig = serde_yaml::from_str(
+        r#"
+proxies:
+  - {name: "PASS", type: socks5, server: 127.0.0.1, port: 9}
+  - {name: "HK 01", type: socks5, server: 127.0.0.1, port: 2}
+proxy-groups:
+  - {name: "REJECT", type: select, proxies: ["HK 01"]}
+rules:
+  - MATCH,HK 01
+"#,
+    )
+    .unwrap();
+    let proxies = rebuild_from_raw(&raw).unwrap().proxies;
+    assert_eq!(
+        proxies["PASS"].adapter_type(),
+        meow_common::AdapterType::Pass,
+        "shadowing leaf must not replace the PASS built-in"
+    );
+    assert_eq!(
+        proxies["REJECT"].adapter_type(),
+        meow_common::AdapterType::Reject,
+        "shadowing group must not replace the REJECT built-in"
+    );
 }
 
 #[test]

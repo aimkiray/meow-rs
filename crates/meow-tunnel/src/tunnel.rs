@@ -2,7 +2,9 @@ use crate::match_engine::{self, DomainIndex};
 use crate::rule_ir::{CompiledMatchResult, CompiledRuleSet, LazyMatchOutcome};
 use crate::statistics::Statistics;
 use crate::udp::{self, NatTable};
-use meow_common::{Metadata, Network, Proxy, ProxyAdapter, Rule, TunnelMode};
+use meow_common::{
+    AdapterType, Metadata, Network, Proxy, ProxyAdapter, Rule, TargetCheck, TargetProbe, TunnelMode,
+};
 use meow_dns::Resolver;
 use meow_proxy::DirectAdapter;
 use parking_lot::{Mutex, RwLock};
@@ -274,7 +276,7 @@ impl TunnelInner {
                 let result = route.compiled_rules.match_rules(
                     match_metadata,
                     route.rules.as_ref(),
-                    &Self::target_usable(&route, match_metadata),
+                    &Self::target_probe(&route, match_metadata),
                 );
                 Some(self.materialize_rule_match(&route, result))
             }
@@ -300,10 +302,10 @@ impl TunnelInner {
         // Owned `Arc` snapshot: the enrichment arm holds it across an
         // `.await`, which a lock guard must never do.
         let route = self.route();
-        let usable = Self::target_usable(&route, metadata);
+        let probe = Self::target_probe(&route, metadata);
         match route
             .compiled_rules
-            .match_rules_lazy(metadata, route.rules.as_ref(), &usable)
+            .match_rules_lazy(metadata, route.rules.as_ref(), &probe)
         {
             LazyMatchOutcome::Matched(m) => Some(self.materialize_rule_match(&route, Some(m))),
             LazyMatchOutcome::NoMatch => Some(self.materialize_rule_match(&route, None)),
@@ -334,28 +336,21 @@ impl TunnelInner {
                 let result = route.compiled_rules.match_rules(
                     match_metadata,
                     route.rules.as_ref(),
-                    &Self::target_usable(&route, match_metadata),
+                    &Self::target_probe(&route, match_metadata),
                 );
                 Some(self.materialize_rule_match(&route, result))
             }
         }
     }
 
-    /// Registry-membership predicate for the match engines (issue #513
-    /// `continue` semantics). Mirrors mihomo's `match()` loop exactly: the
-    /// scan skips a matched rule whose target is absent — and, for UDP
-    /// flows, whose adapter lacks `support_udp` (upstream's second
-    /// `continue` at `!adapter.SupportUDP()`). `DIRECT` is hard-coded as
-    /// always usable: the tunnel owns that adapter unconditionally.
-    fn target_usable<'a>(route: &'a RouteTable, metadata: &Metadata) -> impl Fn(&str) -> bool + 'a {
-        let is_udp = metadata.network == Network::Udp;
-        move |name| {
-            name == "DIRECT"
-                || route
-                    .proxies
-                    .get(name)
-                    .is_some_and(|p| !is_udp || p.support_udp())
-        }
+    /// Registry probe for the match engines — upstream `match()`'s three
+    /// checks between `rule.Match` and returning the adapter:
+    /// `proxies[ada]` membership, the `Unwrap` walk for the `PASS`
+    /// built-in (`continue GetRules`), and the UDP `SupportUDP` continue
+    /// (issue #513). `DIRECT` is hard-coded as always usable: the tunnel
+    /// owns that adapter unconditionally.
+    fn target_probe<'a>(route: &'a RouteTable, metadata: &'a Metadata) -> RouteTargetProbe<'a> {
+        RouteTargetProbe { route, metadata }
     }
 
     /// Map a rule-match result to a [`ResolvedTarget`], recording match
@@ -370,12 +365,15 @@ impl TunnelInner {
         match result {
             Some(m) => {
                 let target = m.adapter_name;
-                let mut action = if target == "DIRECT" {
-                    "DIRECT"
-                } else if target.starts_with("REJECT") {
-                    "REJECT"
-                } else {
-                    "PROXY"
+                // Bucket by adapter type, not name — a `type: direct` leaf
+                // or the COMPATIBLE built-in dial direct, PASS-RULE rejects.
+                let mut action = match route.proxies.get(target).map(|p| p.adapter_type()) {
+                    _ if target == "DIRECT" => "DIRECT",
+                    Some(AdapterType::Direct | AdapterType::Compatible) => "DIRECT",
+                    Some(AdapterType::Reject | AdapterType::RejectDrop | AdapterType::PassRule) => {
+                        "REJECT"
+                    }
+                    _ => "PROXY",
                 };
                 let proxy: Arc<dyn ProxyAdapter> = match route.proxies.get(target).cloned() {
                     Some(p) => p as Arc<dyn ProxyAdapter>,
@@ -453,6 +451,68 @@ pub struct ResolvedTarget {
     /// the dial (`route: _route`) — dropping it early re-opens the reload
     /// race this type exists to close.
     pub route: Arc<RouteTable>,
+}
+
+/// Route-table-backed [`TargetProbe`] for the match engines.
+struct RouteTargetProbe<'a> {
+    route: &'a RouteTable,
+    metadata: &'a Metadata,
+}
+
+impl RouteTargetProbe<'_> {
+    /// Upstream `for adapter := adapter; adapter != nil; adapter =
+    /// adapter.Unwrap(metadata, false)`: peek down the group chain — no
+    /// round-robin advance, no usage stats — and report whether any hop
+    /// carries the `want` type tag. `reject_group_membership_cycles` keeps
+    /// config-declared chains acyclic, so the hop bound only guards
+    /// hand-built registries; upstream's walk is unbounded.
+    fn unwraps_to(&self, start: Arc<dyn Proxy>, want: AdapterType) -> bool {
+        const MAX_UNWRAP_HOPS: usize = 16;
+        let mut cur = start;
+        for _ in 0..MAX_UNWRAP_HOPS {
+            if cur.adapter_type() == want {
+                return true;
+            }
+            match cur.unwrap_proxy(self.metadata, false) {
+                Some(next) => cur = next,
+                None => return false,
+            }
+        }
+        debug!(
+            "{}: unwrap chain exceeded {MAX_UNWRAP_HOPS} hops probing for {want}",
+            cur.name()
+        );
+        false
+    }
+}
+
+impl TargetProbe for RouteTargetProbe<'_> {
+    fn check(&self, name: &str) -> TargetCheck {
+        // `DIRECT` resolves without a registry entry: route snapshots may
+        // lack it (hand-built tables), and user entries cannot shadow it
+        // (build rejects builtin names) — short-circuit is always safe.
+        if name == "DIRECT" {
+            return TargetCheck::Usable;
+        }
+        let Some(p) = self.route.proxies.get(name) else {
+            return TargetCheck::Missing;
+        };
+        // upstream order: membership, then the Unwrap walk, then UDP.
+        if self.unwraps_to(Arc::clone(p), AdapterType::Pass) {
+            return TargetCheck::Pass;
+        }
+        if self.metadata.network == Network::Udp && !p.support_udp() {
+            return TargetCheck::Missing;
+        }
+        TargetCheck::Usable
+    }
+
+    fn is_pass_rule(&self, name: &str) -> bool {
+        self.route
+            .proxies
+            .get(name)
+            .is_some_and(|p| self.unwraps_to(Arc::clone(p), AdapterType::PassRule))
+    }
 }
 
 pub struct Tunnel {
@@ -1101,5 +1161,159 @@ mod tests {
             "the API traffic feed owns sampling; an idle tunnel has no 1 Hz sampler"
         );
         assert_eq!(tunnel.statistics().snapshot(), (123, 456));
+    }
+
+    /// Issue #533: the built-in proxies map registers PASS / PASS-RULE /
+    /// COMPATIBLE, and a rule targeting PASS skips silently to the next
+    /// rule — upstream `continue GetRules` in `match()`.
+    #[test]
+    fn pass_builtin_skips_matched_rule() {
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+
+        let tunnel = test_tunnel();
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        for name in ["PASS", "PASS-RULE", "COMPATIBLE"] {
+            assert!(
+                proxies.contains_key(name),
+                "built-in {name} must be registered"
+            );
+        }
+        assert_eq!(proxies["PASS"].adapter_type(), AdapterType::Pass);
+        assert_eq!(
+            proxies["COMPATIBLE"].adapter_type(),
+            AdapterType::Compatible
+        );
+
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("example.com", "PASS")),
+                Box::new(FinalRule::new("REJECT")),
+            ],
+            Default::default(),
+        );
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        assert_eq!(
+            adapter.name(),
+            "REJECT",
+            "PASS-targeted rule must be skipped"
+        );
+    }
+
+    /// A rule targeting a group whose selected member is PASS also skips —
+    /// the match loop walks `unwrap_proxy(metadata, false)` for the type
+    /// tag without committing selection side effects.
+    #[test]
+    fn pass_inside_group_unwrap_skips_rule() {
+        use meow_proxy::SelectorGroup;
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+
+        let tunnel = test_tunnel();
+        let mut proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        let pass_member: Arc<dyn Proxy> = Arc::new(meow_config::proxy_parser::WrappedProxy::new(
+            Box::new(meow_proxy::RejectAdapter::pass()),
+        ));
+        proxies.insert(
+            "SEL".into(),
+            Arc::new(SelectorGroup::new("SEL", vec![pass_member])),
+        );
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("example.com", "SEL")),
+                Box::new(FinalRule::new("DIRECT")),
+            ],
+            Default::default(),
+        );
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        assert_eq!(
+            adapter.name(),
+            "DIRECT",
+            "rule matching a PASS-bearing group must fall through"
+        );
+    }
+
+    /// PASS-RULE targeted at the top level behaves like REJECT — the match
+    /// returns it and dialing yields immediate EOF, same as upstream's
+    /// nop adapter.
+    #[test]
+    fn pass_rule_at_top_level_rejects() {
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+
+        let tunnel = test_tunnel();
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("example.com", "PASS-RULE")),
+                Box::new(FinalRule::new("DIRECT")),
+            ],
+            Default::default(),
+        );
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        assert_eq!(
+            adapter.adapter_type(),
+            AdapterType::PassRule,
+            "top-level PASS-RULE must materialize as its own adapter"
+        );
+    }
+
+    /// COMPATIBLE resolves like any real target and buckets its stats as
+    /// `"DIRECT"` — it is a direct dialer, not a signal adapter.
+    #[test]
+    fn compatible_resolves_and_buckets_direct() {
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+
+        let tunnel = test_tunnel();
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("example.com", "COMPATIBLE")),
+                Box::new(FinalRule::new("REJECT")),
+            ],
+            Default::default(),
+        );
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        assert_eq!(
+            adapter.adapter_type(),
+            AdapterType::Compatible,
+            "COMPATIBLE must materialize, not be skipped"
+        );
+        let stats = tunnel.inner().stats.rule_match.snapshot();
+        assert!(
+            stats
+                .iter()
+                .any(|((_, action), n)| *action == "DIRECT" && *n == 1),
+            "COMPATIBLE match must bucket as DIRECT, got: {stats:?}"
+        );
     }
 }

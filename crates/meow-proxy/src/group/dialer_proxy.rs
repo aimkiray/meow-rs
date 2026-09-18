@@ -120,8 +120,8 @@ impl ProxyAdapter for DialerProxyAdapter {
         self.inner.connect_over(stream, metadata).await
     }
 
-    fn unwrap_proxy(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
-        self.inner.unwrap_proxy(metadata)
+    fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
+        self.inner.unwrap_proxy(metadata, touch)
     }
 
     fn health(&self) -> &ProxyHealth {

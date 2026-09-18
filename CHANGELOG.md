@@ -205,6 +205,25 @@ the canonical, in-repo source a release is cut from.
   keeps up to two skips inline, so a dead-target match stays
   allocation-free in the common case. (#533)
 
+- **`PASS`, `PASS-RULE` and `COMPATIBLE` now exist as real built-ins and
+  the match loop honours their upstream semantics.** Rules targeting
+  `PASS` — or a group whose `unwrap_proxy` chain contains it — are skipped
+  silently (mihomo's `continue GetRules`), and inner rules inside a
+  `sub-rules:` block resolving to `PASS-RULE` (by name or by adapter type,
+  upstream's `CheckPassRule`) skip to the next inner rule. Top-level
+  `PASS-RULE` behaves like `REJECT`, and `COMPATIBLE` dials direct while
+  carrying its own adapter type, matching upstream. `PASS`, `PASS-RULE`,
+  `COMPATIBLE`, and `REJECT-DROP` are filtered out of the auto-created
+  `GLOBAL` member list (only DIRECT, REJECT, and user entries seed it);
+  `COMPATIBLE` remains usable as a rule target and group member. To support
+  side-effect-free chain probing, `ProxyAdapter::unwrap_proxy` gained a
+  `touch` flag (upstream `Unwrap(metadata, touch)` parity): `false` peeks
+  without advancing round-robin counters or recording usage stats.
+  `Rule::match_and_resolve` now takes a `&dyn TargetProbe` — a plain
+  `Fn(&str) -> bool` closure still satisfies it (`true` → usable, `false`
+  → missing-and-warned). Both are breaking trait changes for external
+  implementers. (#533)
+
 - **TLS handshakes no longer fail on multiplexed transports whose
   `poll_flush` pends.** Every TLS-over-mux handshake — AnyTLS, smux, and any
   stream whose `poll_flush` waits on a writer-task acknowledgement — died at

@@ -118,11 +118,20 @@ impl LoadBalanceGroup {
     }
 
     /// Strategy-specific index into a set of `alive_count` members.
-    /// Callers must ensure `alive_count > 0`.
-    fn pick_index(&self, alive_count: usize, metadata: &Metadata) -> usize {
+    /// Callers must ensure `alive_count > 0`. `advance=false` is the
+    /// match-time peek (`Unwrap(metadata, false)` upstream): round-robin
+    /// reads the counter without committing it.
+    fn pick_index(&self, alive_count: usize, metadata: &Metadata, advance: bool) -> usize {
         debug_assert!(alive_count > 0, "modulo over an empty pick space");
         match self.strategy {
-            LbStrategy::RoundRobin => self.counter.fetch_add(1, Ordering::Relaxed) % alive_count,
+            LbStrategy::RoundRobin => {
+                let c = if advance {
+                    self.counter.fetch_add(1, Ordering::Relaxed)
+                } else {
+                    self.counter.load(Ordering::Relaxed)
+                };
+                c % alive_count
+            }
             LbStrategy::ConsistentHashing => {
                 let (bytes, len) = src_ip_bytes(metadata);
                 (fnv1a(&bytes[..len]) as usize) % alive_count
@@ -136,11 +145,11 @@ impl LoadBalanceGroup {
     ///
     /// TODO(perf M2): cache alive-set or use a pre-filtered index if profiling shows this hot
     pub fn select(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
-        self.pick(metadata, false)
+        self.pick(metadata, false, true)
     }
 
     fn select_udp(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
-        self.pick(metadata, true)
+        self.pick(metadata, true, true)
     }
 
     /// Two passes over the member set — count eligible members, pick an index,
@@ -148,7 +157,7 @@ impl LoadBalanceGroup {
     /// provider slots (the same walk url-test's `pick_for_dial` does). A
     /// member dying between the passes can shift the pick or yield `None`
     /// for this one dial — benign, self-correcting on the next call.
-    fn pick(&self, metadata: &Metadata, udp_only: bool) -> Option<Arc<dyn Proxy>> {
+    fn pick(&self, metadata: &Metadata, udp_only: bool, advance: bool) -> Option<Arc<dyn Proxy>> {
         let eligible = |p: &Arc<dyn Proxy>| p.alive() && (!udp_only || p.support_udp());
         let mut alive_count = 0usize;
         self.for_each_member(|p| {
@@ -158,7 +167,7 @@ impl LoadBalanceGroup {
         if alive_count == 0 {
             return None;
         }
-        let idx = self.pick_index(alive_count, metadata);
+        let idx = self.pick_index(alive_count, metadata, advance);
         let mut picked = None;
         let mut i = 0usize;
         self.for_each_member(|p| {
@@ -249,9 +258,18 @@ impl ProxyAdapter for LoadBalanceGroup {
         attempt.finish(proxy.dial_udp(metadata).await)
     }
 
-    fn unwrap_proxy(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
-        self.usage.touch_user_traffic(metadata);
-        self.select(metadata)
+    fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
+        if touch {
+            self.usage.touch_user_traffic(metadata);
+        }
+        // Peek the same member space the upcoming dial uses: UDP flows pick
+        // from UDP-capable members only (upstream LB does not filter by UDP,
+        // so this asymmetry is local — keep probe and dial consistent).
+        self.pick(
+            metadata,
+            metadata.network == meow_common::Network::Udp,
+            touch,
+        )
     }
 
     fn health(&self) -> &ProxyHealth {
@@ -1051,5 +1069,41 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(group.select(&meta).unwrap().name(), "P2");
         }
+    }
+
+    /// Issue #533: match-time probing calls `unwrap_proxy(meta, false)` —
+    /// upstream's `Unwrap(metadata, touch=false)` peek. Round-robin must
+    /// not advance the counter, and the peeked member must equal the next
+    /// real pick while the alive set is stable.
+    #[test]
+    fn unwrap_peek_does_not_advance_round_robin() {
+        let group = LoadBalanceGroup::new(
+            "lb",
+            vec![
+                MockProxy::new("A"),
+                MockProxy::new("B"),
+                MockProxy::new("C"),
+            ],
+            LbStrategy::RoundRobin,
+        );
+        let meta = Metadata::default();
+        let peeked = group.unwrap_proxy(&meta, false).unwrap();
+        let peeked_again = group.unwrap_proxy(&meta, false).unwrap();
+        assert!(
+            Arc::ptr_eq(&peeked, &peeked_again),
+            "repeated peeks must not rotate"
+        );
+        let picked = group.select(&meta).unwrap();
+        assert!(
+            Arc::ptr_eq(&peeked, &picked),
+            "peek must show the member the next pick would take"
+        );
+        // The real pick committed the counter — the next peek sees the
+        // following member.
+        let next_peek = group.unwrap_proxy(&meta, false).unwrap();
+        assert!(
+            !Arc::ptr_eq(&peeked, &next_peek),
+            "after a committed pick the peek must move on"
+        );
     }
 }

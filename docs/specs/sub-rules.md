@@ -95,6 +95,12 @@ target is always the target of whichever rule *inside* the block matched.
 `MATCH` inside a sub-rule block still works: `MATCH,Fallback` always matches, so
 the sub-rule block always produces a result when MATCH is present.
 
+An inner rule whose target is the literal name `PASS-RULE`, or an adapter
+(group) whose `unwrap_proxy` chain contains a `PASS-RULE`-typed adapter
+(upstream's `CheckPassRule`), is skipped and the inner scan continues —
+upstream `matchSubRules`' `continue`. At top level a rule targeting
+`PASS-RULE` materializes the nop adapter and rejects like `REJECT`.
+
 **⚠️ YAML syntax note**: upstream SUB-RULE is implemented as a logic rule
 (`rules/logic/logic.go`). The exact comma-separated field layout should be
 verified from `rules/parser.go` SUB-RULE case before engineer writes the

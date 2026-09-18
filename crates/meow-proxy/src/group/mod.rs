@@ -143,7 +143,12 @@ pub(super) fn record_dial_failure(
 ) {
     if matches!(
         member.adapter_type(),
-        AdapterType::Direct | AdapterType::Reject | AdapterType::RejectDrop
+        AdapterType::Direct
+            | AdapterType::Compatible
+            | AdapterType::Reject
+            | AdapterType::RejectDrop
+            | AdapterType::Pass
+            | AdapterType::PassRule
     ) {
         return;
     }
