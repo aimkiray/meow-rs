@@ -4426,6 +4426,61 @@ mod dialer_proxy_tests {
              target — otherwise the injected dialer was dropped"
         );
     }
+
+    /// Issue #554 — a `dialer-proxy` member must share ONE health handle
+    /// with its registry adapter. `apply_dialer_proxies` runs before group
+    /// construction (issue #513), so the adapter a group captured is the
+    /// same object `route.proxies` and `group.member_handles()` serve the
+    /// sweep and API probes. Marking the registry adapter dead must move
+    /// the group's selection — a second `ProxyHealth` minted after group
+    /// capture would leave the group reading a default-alive private
+    /// handle while probes recorded results on the other.
+    #[test]
+    fn dialer_proxy_member_shares_health_with_group_selection() {
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            r#"
+proxies:
+  - name: member
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+    dialer-proxy: front
+  - name: front
+    type: socks5
+    server: 127.0.0.1
+    port: 1081
+  - name: spare
+    type: socks5
+    server: 127.0.0.1
+    port: 1082
+proxy-groups:
+  - name: fb
+    type: fallback
+    proxies: [member, spare]
+    url: "http://www.gstatic.com/generate_204"
+rules:
+  - MATCH,fb
+"#,
+        )
+        .unwrap();
+        let result = rebuild_from_raw(&raw).expect("dialer-proxy config must rebuild");
+        let proxies = &result.proxies;
+        let group = &proxies["fb"];
+        let member = &proxies["member"];
+
+        assert_eq!(group.current().as_deref(), Some("member"));
+        // The API's delay endpoints probe `route.proxies["member"]` and
+        // the periodic sweep resolves `group.member_handles()` — both
+        // must land on the same `ProxyHealth`, so marking the registry
+        // adapter dead must move the group's selection either way.
+        member.health().set_alive(false);
+        assert_eq!(
+            group.current().as_deref(),
+            Some("spare"),
+            "a dead registry adapter must stop being selected — a second \
+             ProxyHealth minted after group capture would stay default-alive"
+        );
+    }
 }
 
 #[cfg(test)]
