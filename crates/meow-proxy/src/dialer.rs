@@ -41,7 +41,13 @@ use smol_str::SmolStr;
 #[async_trait]
 pub trait TcpDialer: Send + Sync {
     /// Dial `host:port` and return a duplex stream.
-    async fn dial(&self, host: &str, port: u16) -> io::Result<Box<dyn Stream>>;
+    ///
+    /// `internal` is [`Metadata::is_internal`] from the caller's metadata —
+    /// `true` for housekeeping traffic (health probes, provider fetches).
+    /// [`ProxyDialer`] copies it onto the reconstructed metadata so a lazy
+    /// front-hop group does not count internal chained dials as user
+    /// traffic; dialers with no metadata to construct ignore it.
+    async fn dial(&self, host: &str, port: u16, internal: bool) -> io::Result<Box<dyn Stream>>;
 
     /// Dial an already-resolved [`SocketAddr`].
     ///
@@ -50,8 +56,9 @@ pub trait TcpDialer: Send + Sync {
     /// only for the callee to parse it straight back into an `IpAddr`.
     /// The default implementation does exactly that round-trip, so
     /// implementors that can dial an address directly should override it.
-    async fn dial_addr(&self, addr: SocketAddr) -> io::Result<Box<dyn Stream>> {
-        self.dial(&addr.ip().to_string(), addr.port()).await
+    async fn dial_addr(&self, addr: SocketAddr, internal: bool) -> io::Result<Box<dyn Stream>> {
+        self.dial(&addr.ip().to_string(), addr.port(), internal)
+            .await
     }
 
     /// Whether this dialer tunnels through another proxy (vs. direct).
@@ -91,7 +98,7 @@ pub struct DirectDialer;
 
 #[async_trait]
 impl TcpDialer for DirectDialer {
-    async fn dial(&self, host: &str, port: u16) -> io::Result<Box<dyn Stream>> {
+    async fn dial(&self, host: &str, port: u16, _internal: bool) -> io::Result<Box<dyn Stream>> {
         let tcp = meow_common::connect_tcp_host(host, port).await?;
         // Preserve TCP_NODELAY (disable Nagle) — all call sites that
         // previously called `tcp.set_nodelay(true)` on the raw
@@ -100,7 +107,7 @@ impl TcpDialer for DirectDialer {
         Ok(Box::new(tcp))
     }
 
-    async fn dial_addr(&self, addr: SocketAddr) -> io::Result<Box<dyn Stream>> {
+    async fn dial_addr(&self, addr: SocketAddr, _internal: bool) -> io::Result<Box<dyn Stream>> {
         // Skip the default's `to_string()` + re-parse: `connect_tcp` takes the
         // `SocketAddr` as-is and keeps the SocketProtector hook.
         let tcp = meow_common::connect_tcp(addr).await?;
@@ -278,7 +285,7 @@ use packet_conn_socket::PacketConnSocket;
 
 #[async_trait]
 impl TcpDialer for ProxyDialer {
-    async fn dial(&self, host: &str, port: u16) -> io::Result<Box<dyn Stream>> {
+    async fn dial(&self, host: &str, port: u16, internal: bool) -> io::Result<Box<dyn Stream>> {
         // An IP-literal `host` becomes a typed `dst_ip` so the front proxy
         // encodes an IP address rather than a domain name that happens to look
         // like one.
@@ -288,12 +295,18 @@ impl TcpDialer for ProxyDialer {
         // chained-relay dial — the front proxy's rules, /connections list,
         // and stats must classify it as `Inner`, not as an HTTP inbound
         // (review B2).
+        // `internal` carries the caller's usage-accounting marker through
+        // the reconstruction — otherwise a probe or fetch chained through
+        // `dialer-proxy` would reach a lazy front-hop group as ordinary
+        // `Inner` traffic and be counted as use, keeping the group's probe
+        // loop awake forever.
         let meta = match host.parse::<std::net::IpAddr>() {
             Ok(ip) => Metadata {
                 network: Network::Tcp,
                 conn_type: ConnType::Inner,
                 dst_ip: Some(ip),
                 dst_port: port,
+                internal,
                 ..Default::default()
             },
             Err(_) => Metadata {
@@ -301,13 +314,14 @@ impl TcpDialer for ProxyDialer {
                 conn_type: ConnType::Inner,
                 host: host.into(),
                 dst_port: port,
+                internal,
                 ..Default::default()
             },
         };
         self.dial_metadata(meta).await
     }
 
-    async fn dial_addr(&self, addr: SocketAddr) -> io::Result<Box<dyn Stream>> {
+    async fn dial_addr(&self, addr: SocketAddr, internal: bool) -> io::Result<Box<dyn Stream>> {
         // Carry the literal address in `dst_ip` instead of rendering it into
         // `host`: adapters that encode the target for the front proxy then emit
         // an IP-typed address rather than a domain-typed one holding a
@@ -319,6 +333,7 @@ impl TcpDialer for ProxyDialer {
             conn_type: ConnType::Inner,
             dst_ip: Some(addr.ip()),
             dst_port: addr.port(),
+            internal,
             ..Default::default()
         };
         self.dial_metadata(meta).await
@@ -336,6 +351,12 @@ impl TcpDialer for ProxyDialer {
         // `proxyDialer.ListenPacket` upstream: the datagram endpoint is the
         // front proxy's UDP relay association to `remote`. `ConnType::Inner`
         // like `dial()` — this is infrastructure traffic, not user inbound.
+        // `internal` stays false by the same rule as mux session
+        // establishment: the pooled kcptun session is the ONLY dial signal
+        // a lazy front hop sees for this chain — per-stream `open_stream`
+        // calls never re-dial while a session lives — so marking it
+        // internal would leave the front hop permanently "unused" while
+        // user traffic flows (issue #555 boundary).
         let meta = Metadata {
             network: Network::Udp,
             conn_type: ConnType::Inner,
@@ -476,20 +497,20 @@ impl NamedProxyDialer {
 
 #[async_trait]
 impl TcpDialer for NamedProxyDialer {
-    async fn dial(&self, host: &str, port: u16) -> io::Result<Box<dyn Stream>> {
+    async fn dial(&self, host: &str, port: u16, internal: bool) -> io::Result<Box<dyn Stream>> {
         let front = self
             .target
             .resolve()
             .ok_or_else(|| io::Error::other(self.target.missing_error()))?;
-        ProxyDialer::new(front).dial(host, port).await
+        ProxyDialer::new(front).dial(host, port, internal).await
     }
 
-    async fn dial_addr(&self, addr: SocketAddr) -> io::Result<Box<dyn Stream>> {
+    async fn dial_addr(&self, addr: SocketAddr, internal: bool) -> io::Result<Box<dyn Stream>> {
         let front = self
             .target
             .resolve()
             .ok_or_else(|| io::Error::other(self.target.missing_error()))?;
-        ProxyDialer::new(front).dial_addr(addr).await
+        ProxyDialer::new(front).dial_addr(addr, internal).await
     }
 
     fn is_proxy(&self) -> bool {
@@ -641,31 +662,73 @@ mod tests {
         let dialer = ProxyDialer::new(Arc::clone(&mock) as Arc<dyn Proxy>);
 
         // Hostname target — dial() must produce host + port metadata.
-        let _ = dialer.dial("chain.example", 443).await;
+        let _ = dialer.dial("chain.example", 443, false).await;
         let meta = last_seen(&mock);
         assert_eq!(meta.conn_type, ConnType::Inner);
         assert_eq!(meta.network, Network::Tcp);
         assert_eq!(meta.host.as_str(), "chain.example");
         assert_eq!(meta.dst_port, 443);
+        assert!(!meta.internal);
+
+        // Internal traffic keeps the `Inner` conn_type but carries the
+        // marker through the reconstruction, so a lazy front-hop group
+        // would not count this dial as user traffic.
+        let _ = dialer.dial("chain.example", 443, true).await;
+        let meta = last_seen(&mock);
+        assert_eq!(meta.conn_type, ConnType::Inner);
+        assert!(meta.internal);
 
         // IP-literal target through dial() — typed dst_ip, no host string.
-        let _ = dialer.dial("192.0.2.9", 853).await;
+        let _ = dialer.dial("192.0.2.9", 853, false).await;
         let meta = last_seen(&mock);
         assert_eq!(meta.conn_type, ConnType::Inner);
         assert_eq!(meta.network, Network::Tcp);
         assert_eq!(meta.dst_ip, Some("192.0.2.9".parse().unwrap()));
         assert_eq!(meta.dst_port, 853);
+        assert!(!meta.internal);
 
-        // SocketAddr target through dial_addr() — typed dst_ip.
+        // SocketAddr target through dial_addr() — typed dst_ip + marker.
         let addr: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
-        let _ = dialer.dial_addr(addr).await;
+        let _ = dialer.dial_addr(addr, true).await;
         let meta = last_seen(&mock);
         assert_eq!(meta.conn_type, ConnType::Inner);
         assert_eq!(meta.network, Network::Tcp);
         assert_eq!(meta.dst_ip, Some(addr.ip()));
+        assert!(meta.internal);
         assert_eq!(meta.dst_port, 443);
 
-        assert_eq!(mock.seen.lock().unwrap().len(), 3);
+        assert_eq!(mock.seen.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn internal_marker_survives_reconstruction_for_lazy_groups() {
+        // #555: housekeeping dials chained through `dialer-proxy` reach the
+        // front hop as `ConnType::Inner` — the `internal` flag must carry
+        // the usage-accounting marker across the reconstruction, or a lazy
+        // front-hop group counts every probe/fetch as use and its probe
+        // loop never goes idle.
+        use crate::group::fallback::FallbackGroup;
+        use crate::group::test_support::MockProxy;
+
+        let member = MockProxy::new("member");
+        let group = Arc::new(FallbackGroup::new("lazy-fb", vec![member]));
+        let dialer = ProxyDialer::new(Arc::clone(&group) as Arc<dyn Proxy>);
+
+        // Housekeeping dial (probe/fetch) — the marker reaches the group.
+        let _ = dialer.dial("chain.example", 443, true).await;
+        assert_eq!(
+            group.usage_generation(),
+            0,
+            "internal chained dial must not record group use"
+        );
+
+        // Real user traffic through the same chain still counts.
+        let _ = dialer.dial("chain.example", 443, false).await;
+        assert_eq!(
+            group.usage_generation(),
+            1,
+            "user chained dial records group use"
+        );
     }
 
     /// `DialerTarget` holds the registry cell weakly (issue #533): it resolves
@@ -707,7 +770,7 @@ mod tests {
         drop(registry);
 
         let err = dialer
-            .dial("example.com", 443)
+            .dial("example.com", 443, false)
             .await
             .err()
             .expect("a dead registry must fail the dial");

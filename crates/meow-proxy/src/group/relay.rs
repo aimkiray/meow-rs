@@ -38,7 +38,7 @@ use tracing::debug;
 /// Note: `rfind(':')` is intentional — it correctly handles IPv6 literal
 /// addresses (e.g. `[2001:db8::1]:1080`) by splitting at the *last* colon,
 /// so the port is always the suffix after the rightmost colon.
-fn metadata_for_proxy(proxy: &Arc<dyn Proxy>) -> Metadata {
+fn metadata_for_proxy(proxy: &Arc<dyn Proxy>, internal: bool) -> Metadata {
     let addr = proxy.addr();
     // IP literals land in `dst_ip` so the preceding hop encodes a typed
     // address (ATYP 1/4, SocksAddr::Ip) rather than a domain name that
@@ -46,6 +46,11 @@ fn metadata_for_proxy(proxy: &Arc<dyn Proxy>) -> Metadata {
     // `Metadata::default()` yields `ConnType::Http`, but this is an internal
     // chained dial — rules, /connections, and stats must not classify it as
     // an HTTP inbound.  Same rule `ProxyDialer::dial` applies (review B2).
+    //
+    // `internal` carries the connection's usage-accounting marker through
+    // the rebuild — when hop N is itself `dialer-proxy`-chained to a lazy
+    // front hop, a housekeeping relay (probe/fetch) must not count as use
+    // of that group.
     let (host, port) = if let Some(colon) = addr.rfind(':') {
         (
             &addr[..colon],
@@ -67,6 +72,7 @@ fn metadata_for_proxy(proxy: &Arc<dyn Proxy>) -> Metadata {
             conn_type: meow_common::ConnType::Inner,
             dst_ip: Some(ip),
             dst_port: port,
+            internal,
             ..Default::default()
         },
         Err(_) => Metadata {
@@ -74,6 +80,7 @@ fn metadata_for_proxy(proxy: &Arc<dyn Proxy>) -> Metadata {
             conn_type: meow_common::ConnType::Inner,
             host: host.into(),
             dst_port: port,
+            internal,
             ..Default::default()
         },
     }
@@ -267,7 +274,10 @@ fn metadata_for_next_hop(
                 AdapterType::Direct | AdapterType::Compatible
             ) && !proxy.addr().is_empty()
         })
-        .map_or_else(|| final_target.clone(), metadata_for_proxy)
+        .map_or_else(
+            || final_target.clone(),
+            |proxy| metadata_for_proxy(proxy, final_target.is_internal()),
+        )
 }
 
 // ─── Core relay functions ─────────────────────────────────────────────────────
@@ -927,7 +937,7 @@ mod tests {
     #[test]
     fn metadata_for_proxy_types_ip_literals_as_dst_ip() {
         let p: Arc<dyn Proxy> = MockProxy::new("ip-hop", "203.0.113.7", 8443, 1);
-        let m = metadata_for_proxy(&p);
+        let m = metadata_for_proxy(&p, false);
         assert_eq!(m.dst_ip, Some("203.0.113.7".parse().expect("v4")));
         assert!(m.host.is_empty());
         assert_eq!(m.dst_port, 8443);
@@ -939,7 +949,7 @@ mod tests {
     #[test]
     fn metadata_for_proxy_strips_ipv6_brackets_into_dst_ip() {
         let p: Arc<dyn Proxy> = MockProxy::new("v6-hop", "[2001:db8::1]", 1080, 1);
-        let m = metadata_for_proxy(&p);
+        let m = metadata_for_proxy(&p, false);
         assert_eq!(m.dst_ip, Some("2001:db8::1".parse().expect("v6")));
         assert_eq!(m.dst_port, 1080);
     }
@@ -951,7 +961,7 @@ mod tests {
     #[test]
     fn metadata_for_proxy_unbracketed_ipv6_server() {
         let p: Arc<dyn Proxy> = MockProxy::new("v6-bare", "2001:db8::1", 1080, 1);
-        let m = metadata_for_proxy(&p);
+        let m = metadata_for_proxy(&p, false);
         assert_eq!(m.dst_ip, Some("2001:db8::1".parse().expect("v6")));
         assert_eq!(m.dst_port, 1080);
         assert!(m.host.is_empty());
@@ -960,10 +970,37 @@ mod tests {
     #[test]
     fn metadata_for_proxy_keeps_domains_in_host() {
         let p: Arc<dyn Proxy> = MockProxy::new("dns-hop", "example.com", 443, 1);
-        let m = metadata_for_proxy(&p);
+        let m = metadata_for_proxy(&p, false);
         assert_eq!(m.host.as_str(), "example.com");
         assert!(m.dst_ip.is_none());
         assert_eq!(m.dst_port, 443);
+    }
+
+    /// #555: the next-hop rebuild must carry the connection's `internal`
+    /// marker — a relay hop that is itself `dialer-proxy`-chained to a lazy
+    /// front hop must not count housekeeping relays as use.  Both arms of
+    /// `metadata_for_next_hop` (rebuild and `final_target` clone) must agree.
+    #[test]
+    fn metadata_for_next_hop_carries_internal_marker() {
+        let p: Arc<dyn Proxy> = MockProxy::new("hop", "example.com", 443, 1);
+        let proxies = vec![p];
+        let internal_target = Metadata {
+            internal: true,
+            ..Metadata::default()
+        };
+        let user_target = Metadata::default();
+
+        let m = metadata_for_next_hop(&proxies, 0, &internal_target);
+        assert!(m.is_internal(), "rebuilt next-hop meta keeps the marker");
+        let m = metadata_for_next_hop(&proxies, 0, &user_target);
+        assert!(!m.is_internal(), "user relay stays user-classed");
+
+        // The `final_target.clone()` arm (no dialable next hop) preserves
+        // the whole metadata — internal included — by construction.
+        let undialable: Arc<dyn Proxy> = MockProxy::reject(false);
+        // `find` skips empty addr → falls back to the clone arm.
+        let m = metadata_for_next_hop(&[undialable], 0, &internal_target);
+        assert!(m.is_internal());
     }
 
     /// A nested relay whose members include a selector must resolve that

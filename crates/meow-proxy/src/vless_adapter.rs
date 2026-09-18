@@ -138,7 +138,13 @@ impl VlessAdapter {
             #[cfg(feature = "vless-encryption")]
             let encryption = encryption.clone();
             Box::pin(async move {
-                let stream = dialer.dial(&server, port).await.map_err(MeowError::Io)?;
+                // Mux session dial — `internal: false`: a shared mux conn
+                // exists to serve user streams regardless of which dial
+                // triggered its establishment.
+                let stream = dialer
+                    .dial(&server, port, false)
+                    .await
+                    .map_err(MeowError::Io)?;
                 let stream = transport.connect(stream).await?;
                 #[cfg(feature = "vless-encryption")]
                 let stream = match &encryption {
@@ -217,10 +223,10 @@ impl VlessAdapter {
 
     /// Dial a raw TCP + transport-chain stream to the VLESS server, then run the
     /// VLESS Encryption handshake if one is configured.
-    async fn dial_stream(&self) -> Result<Box<dyn meow_transport::Stream>> {
+    async fn dial_stream(&self, internal: bool) -> Result<Box<dyn meow_transport::Stream>> {
         let stream = self
             .dialer
-            .dial(&self.server, self.port)
+            .dial(&self.server, self.port, internal)
             .await
             .map_err(MeowError::Io)?;
         self.wrap_stream(stream).await
@@ -348,7 +354,7 @@ impl ProxyAdapter for VlessAdapter {
             return Ok(Box::new(conn));
         }
 
-        let stream = self.dial_stream().await?;
+        let stream = self.dial_stream(metadata.is_internal()).await?;
         self.handshake_tcp(stream, metadata).await
     }
 
@@ -393,7 +399,7 @@ impl ProxyAdapter for VlessAdapter {
             self.addr_str
         );
 
-        let stream = self.dial_stream().await?;
+        let stream = self.dial_stream(metadata.is_internal()).await?;
         let addr = addr_from_metadata(metadata);
 
         let conn = VlessPacketConn::new(stream, &self.uuid_bytes, metadata.dst_port, &addr).await?;

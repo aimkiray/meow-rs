@@ -375,7 +375,7 @@ impl ProxyAdapter for VmessAdapter {
     fn support_udp(&self) -> bool { self.udp }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-        let raw = self.dialer.dial(&self.server, self.port).await?;
+        let raw = self.dialer.dial(&self.server, self.port, metadata.is_internal()).await?;
         let wrapped = self.transport.connect(raw).await?;
         let conn = VmessConn::new(
             wrapped,
@@ -389,7 +389,7 @@ impl ProxyAdapter for VmessAdapter {
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         if !self.udp { return Err(Error::UdpNotSupported); }
-        let raw = self.dialer.dial(&self.server, self.port).await?;
+        let raw = self.dialer.dial(&self.server, self.port, metadata.is_internal()).await?;
         let wrapped = self.transport.connect(raw).await?;
         let conn = VmessPacketConn::new(
             wrapped,

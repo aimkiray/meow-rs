@@ -1,5 +1,5 @@
 use meow_common::atomic::AtomicU;
-use meow_common::{AdapterType, ConnType, MeowError, Metadata, Proxy};
+use meow_common::{AdapterType, MeowError, Metadata, Proxy};
 use parking_lot::Mutex;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -22,14 +22,15 @@ impl UsageTracker {
 
     /// Record a use, but only for real user traffic.
     ///
-    /// Health-check probes dial with [`ConnType::Tunnel`] — an internal
+    /// Health-check probes dial with [`meow_common::ConnType::Tunnel`] — an internal
     /// marker set by `health::url_test` (no production dialer uses the
-    /// variant).  Counting probes as uses would defeat lazy mode for
-    /// nested groups: a parent group's periodic probes would mark a lazy
-    /// child as used and keep its own probe loop awake forever without
-    /// any real traffic.
+    /// variant) — and housekeeping traffic (provider/geodata/subscription
+    /// fetches, DNS-via-proxy) carries [`Metadata::internal`].  Counting
+    /// either as uses would defeat lazy mode: a parent group's periodic
+    /// probes or a background refresh would mark a lazy child as used and
+    /// keep its own probe loop awake forever without any real traffic.
     pub(super) fn touch_user_traffic(&self, metadata: &Metadata) {
-        if metadata.conn_type == ConnType::Tunnel {
+        if metadata.is_internal() {
             return;
         }
         self.touch();
@@ -56,13 +57,17 @@ const DIAL_FAILURE_WINDOW: Duration = Duration::from_secs(5);
 /// mihomo's terminal action on escalation is to force a provider health
 /// check. The group layer here cannot trigger probes (the health-check loop
 /// lives in meow-app), so the local equivalent is to mark the failed member
-/// dead: routing stops selecting it immediately. A static member is revived
-/// by the next scheduled group probe — guaranteed to run for a lazy group,
-/// because a dial bumps the usage generation. A *provider* member is not:
-/// the sweep resolves `members()` names through the route map where
-/// provider nodes are unregistered, so only a provider refresh (or a manual
-/// `GET /providers/proxies/{name}/healthcheck` when the provider configures
-/// `health-check:`) revives it.
+/// dead: routing stops selecting it immediately. A member is revived by the
+/// next scheduled group probe — guaranteed to run for a lazy group, because
+/// a dial bumps the usage generation. The sweep resolves members through
+/// `member_proxies()`, so provider-slot members are probed and revived too
+/// (issue #543).
+///
+/// Unlike [`UsageTracker::touch_user_traffic`], failure recording does NOT
+/// skip internal traffic (mihomo's `onDialFailed` ignores the touch flag
+/// the same way): a failed dial is real evidence the member is down,
+/// regardless of who asked.  The asymmetry is deliberate — housekeeping
+/// traffic neither keeps a lazy group awake nor hides a dead member.
 pub(super) struct DialFailureTracker {
     state: Mutex<DialFailureState>,
 }

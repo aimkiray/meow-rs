@@ -202,6 +202,9 @@ async fn fetch_one(
                 conn_type: ConnType::Http,
                 host: SmolStr::from(&host),
                 dst_port: port,
+                // Provider/geodata/subscription fetches are housekeeping —
+                // a `lazy` group serving this dial must not count it as use.
+                internal: true,
                 ..Metadata::default()
             };
             let conn = tokio::time::timeout(CONNECT_TIMEOUT, proxy.dial_tcp(&metadata))

@@ -377,7 +377,7 @@ impl ProxyAdapter for VlessAdapter {
     fn support_udp(&self) -> bool { self.udp }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-        let raw = self.dialer.dial(&self.server, self.port).await?;
+        let raw = self.dialer.dial(&self.server, self.port, metadata.is_internal()).await?;
         let stream = self.transport.connect(raw).await?;
         match self.flow {
             None => Ok(Box::new(VlessConn::new(stream, &self.uuid, Cmd::Tcp, metadata).await?)),

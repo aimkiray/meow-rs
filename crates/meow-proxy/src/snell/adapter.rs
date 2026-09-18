@@ -135,10 +135,10 @@ impl SnellAdapter {
 
     /// Open a fresh underlying byte stream (TCP, optionally wrapped in obfs)
     /// and Snell-wrap it. No CONNECT header is sent yet.
-    async fn dial_fresh(&self) -> Result<PoolStream> {
+    async fn dial_fresh(&self, internal: bool) -> Result<PoolStream> {
         let tcp = self
             .dialer
-            .dial(&self.server, self.port)
+            .dial(&self.server, self.port, internal)
             .await
             .map_err(MeowError::Io)?;
         let inner: Box<dyn TransportStream> = Box::new(tcp);
@@ -228,7 +228,7 @@ impl ProxyAdapter for SnellAdapter {
             }
         }
 
-        let mut snell = self.dial_fresh().await?;
+        let mut snell = self.dial_fresh(metadata.is_internal()).await?;
         let reuse = self.pool.is_some();
         write_header(&mut snell, &host, port, reuse)
             .await
@@ -259,13 +259,13 @@ impl ProxyAdapter for SnellAdapter {
         Ok(Box::new(PooledConn::new(snell, None, 1)))
     }
 
-    async fn dial_udp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+    async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         if !self.support_udp {
             return Err(MeowError::NotSupported(
                 "snell UDP is disabled for this proxy (set `udp: true`)".into(),
             ));
         }
-        let mut snell = self.dial_fresh().await?;
+        let mut snell = self.dial_fresh(metadata.is_internal()).await?;
         write_udp_header(&mut snell).await.map_err(MeowError::Io)?;
         if self.version.supports_reuse() {
             snell.read_reply().await.map_err(MeowError::Io)?;

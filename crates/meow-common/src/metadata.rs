@@ -57,6 +57,32 @@ pub struct Metadata {
     pub in_user: Option<SmolStr>,
     #[serde(rename = "specialProxy")]
     pub special_proxy: SmolStr,
+    /// Marks housekeeping traffic that is not a user connection: health
+    /// probes, provider/geodata/subscription fetches, and DNS-via-proxy
+    /// exchanges.
+    ///
+    /// Routing, rules, and the /connections API still classify the conn by
+    /// `conn_type`; the flag exists purely so usage accounting can tell
+    /// internal dials apart from user traffic without abusing `conn_type`
+    /// (an HTTP provider fetch is genuinely `Http`, not `Tunnel`).  Lazy
+    /// proxy groups skip it so background maintenance cannot keep a group
+    /// permanently "in use" — mihomo threads the same distinction via an
+    /// explicit `touch` flag on its group dials.
+    ///
+    /// Internal only: never serialized — it is a routing hint, not a conn
+    /// attribute, and external metadata (API, configs) has no business
+    /// claiming it.
+    #[serde(skip)]
+    pub internal: bool,
+}
+
+impl Metadata {
+    /// Whether this metadata describes internal housekeeping traffic rather
+    /// than a user connection: either flagged `internal` or carrying the
+    /// legacy `ConnType::Tunnel` probe marker.
+    pub fn is_internal(&self) -> bool {
+        self.internal || self.conn_type == ConnType::Tunnel
+    }
 }
 
 impl Default for Metadata {
@@ -81,6 +107,7 @@ impl Default for Metadata {
             in_port: 0,
             in_user: None,
             special_proxy: SmolStr::default(),
+            internal: false,
         }
     }
 }
@@ -206,6 +233,7 @@ impl Metadata {
             in_port: 0,
             in_user: None,
             special_proxy: SmolStr::default(),
+            internal: self.internal,
         }
     }
 }

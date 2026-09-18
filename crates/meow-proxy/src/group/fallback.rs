@@ -414,6 +414,20 @@ mod tests {
             0,
             "probe dials must not mark the group as used"
         );
+        // The `internal` flag (provider fetches, probes chained through
+        // `dialer-proxy`) is the same housekeeping signal — also skipped
+        // (issue #555).
+        let internal_meta = Metadata {
+            conn_type: meow_common::ConnType::Inner,
+            internal: true,
+            ..Default::default()
+        };
+        let _ = g.dial_tcp(&internal_meta).await;
+        assert_eq!(
+            g.usage_generation(),
+            0,
+            "internal dials must not mark the group as used"
+        );
         let _ = g.dial_tcp(&Metadata::default()).await;
         assert_eq!(g.usage_generation(), 1, "real traffic still marks use");
     }

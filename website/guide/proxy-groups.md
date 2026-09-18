@@ -51,7 +51,7 @@ Periodically probes each member with an HTTP GET and auto-selects the fastest.
 | `url` | string | — | Health-check URL, e.g. `https://www.gstatic.com/generate_204` |
 | `interval` | u64 | — | Probe interval in seconds |
 | `tolerance` | u16 | `150` | Only switch if the new node is faster by more than this (ms) |
-| `lazy` | bool | `false` | Probe only when the group is in use |
+| `lazy` | bool | `false` | Probe only when the group is in use — housekeeping traffic (provider/geodata downloads, DNS-via-proxy exchanges, probes chained through `dialer-proxy`) does not count |
 
 ```yaml
 - name: Auto
@@ -71,7 +71,7 @@ moves to the next.
 | --- | --- | --- | --- |
 | `url` | string | — | Health-check URL |
 | `interval` | u64 | — | Probe interval in seconds |
-| `lazy` | bool | `false` | Probe only when in use |
+| `lazy` | bool | `false` | Probe only when in use — housekeeping traffic does not count |
 
 ```yaml
 - name: Fallback

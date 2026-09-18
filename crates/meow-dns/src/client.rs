@@ -836,6 +836,9 @@ async fn proxy_tcp_exchange(
         host: smol_str::SmolStr::from(addr.ip().to_string()),
         dst_ip: Some(addr.ip()),
         dst_port: addr.port(),
+        // DNS-via-proxy exchanges are resolver housekeeping — a `lazy`
+        // group serving this dial must not count it as use.
+        internal: true,
         ..Default::default()
     };
     let mut stream = proxy

@@ -151,7 +151,13 @@ impl TrojanAdapter {
                 pos += 2;
                 let header = &hdr_buf[..pos];
 
-                let tcp = dialer.dial(&server, port).await.map_err(MeowError::Io)?;
+                // Mux session dial — `internal: false`: a shared mux conn
+                // exists to serve user streams regardless of which dial
+                // triggered its establishment.
+                let tcp = dialer
+                    .dial(&server, port, false)
+                    .await
+                    .map_err(MeowError::Io)?;
                 let mut stream = tls_layer
                     .connect(tcp)
                     .await
@@ -192,7 +198,7 @@ impl TrojanAdapter {
     ) -> Result<Box<dyn TransportStream>> {
         let tcp = self
             .dialer
-            .dial(&self.server, self.port)
+            .dial(&self.server, self.port, metadata.is_internal())
             .await
             .map_err(MeowError::Io)?;
         self.tls_header_over(tcp, metadata, cmd).await

@@ -137,10 +137,11 @@ pub async fn dial(
     server_host: &str,
     server_port: u16,
     dialer: &dyn crate::dialer::TcpDialer,
+    internal: bool,
 ) -> Result<Box<dyn meow_transport::Stream>> {
     // 1) Raw TCP.
     let tcp = dialer
-        .dial(server_host, server_port)
+        .dial(server_host, server_port, internal)
         .await
         .map_err(MeowError::Io)?;
 

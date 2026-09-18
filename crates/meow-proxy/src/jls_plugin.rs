@@ -148,13 +148,14 @@ pub async fn dial(
     server_host: &str,
     server_port: u16,
     dialer: &dyn crate::dialer::TcpDialer,
+    internal: bool,
 ) -> Result<Box<dyn Stream>> {
     debug!(
         "{PLUGIN}: dialing {}:{} via host={} username={}",
         server_host, server_port, cfg.host, cfg.username
     );
     let tcp = dialer
-        .dial(server_host, server_port)
+        .dial(server_host, server_port, internal)
         .await
         .map_err(MeowError::Io)?;
     let config = JlsConfig {

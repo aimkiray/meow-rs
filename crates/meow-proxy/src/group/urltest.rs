@@ -534,6 +534,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_dial_does_not_count_as_use() {
+        // Housekeeping traffic (provider fetches, probes chained through
+        // `dialer-proxy`) must not bump the usage generation — otherwise a
+        // `lazy` group is probed every interval forever, degrading lazy to
+        // eager.
+        let a = MockProxy::new("a");
+        a.set_delay(20);
+        let g = UrlTestGroup::new("ut", vec![a], 0);
+
+        let meta = Metadata {
+            conn_type: meow_common::ConnType::Inner,
+            internal: true,
+            ..Metadata::default()
+        };
+        let _ = g.dial_tcp(&meta).await;
+        assert_eq!(
+            g.usage_generation(),
+            0,
+            "internal dial must not record group use"
+        );
+
+        // The legacy `ConnType::Tunnel` probe marker is still skipped.
+        let meta = Metadata {
+            conn_type: meow_common::ConnType::Tunnel,
+            ..Metadata::default()
+        };
+        let _ = g.dial_tcp(&meta).await;
+        assert_eq!(
+            g.usage_generation(),
+            0,
+            "tunnel-typed probe dial must not record group use"
+        );
+
+        // Real user traffic still counts.
+        let _ = g.dial_tcp(&Metadata::default()).await;
+        assert_eq!(g.usage_generation(), 1, "user dial records group use");
+    }
+
+    #[tokio::test]
     async fn user_pin_overrides_fastest_and_can_be_cleared() {
         let a = MockProxy::new("a");
         let b = MockProxy::new("b");

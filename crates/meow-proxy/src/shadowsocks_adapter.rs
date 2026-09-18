@@ -310,7 +310,7 @@ impl ShadowsocksAdapter {
                     MUX_DESTINATION_FQDN.to_string(),
                     MUX_DESTINATION_PORT,
                 );
-                core.dial_tcp_stream(addr).await
+                core.dial_tcp_stream(addr, false).await
             })
         });
         self.mux = Some(MuxClient::new(dial, options));
@@ -321,14 +321,18 @@ impl ShadowsocksAdapter {
 impl SsCore {
     /// Dial a raw (or plugin-transported) TCP stream to the SS server and
     /// wrap it in the SS crypto codec for the given target address.
-    async fn dial_tcp_stream(&self, addr: Address) -> Result<Box<dyn ProxyConn>> {
+    ///
+    /// `internal` is the caller's [`Metadata::is_internal`] marker — mux
+    /// session dials pass `false` because a shared mux conn exists to serve
+    /// user streams regardless of which dial triggered its establishment.
+    async fn dial_tcp_stream(&self, addr: Address, internal: bool) -> Result<Box<dyn ProxyConn>> {
         match &self.plugin {
             PluginKind::Obfs(obfs) => {
                 // Open a raw TCP connection to the SS server, wrap it in the
                 // simple-obfs codec, then layer the SS crypto stream on top.
                 let tcp = self
                     .dialer
-                    .dial(&self.server, self.port)
+                    .dial(&self.server, self.port, internal)
                     .await
                     .map_err(|e| MeowError::Proxy(format!("ss obfs tcp connect: {e}")))?;
 
@@ -356,9 +360,15 @@ impl SsCore {
                 }
             }
             PluginKind::V2ray(cfg, tls) => {
-                let transport =
-                    v2ray_plugin::dial(cfg, tls.as_ref(), &self.server, self.port, &*self.dialer)
-                        .await?;
+                let transport = v2ray_plugin::dial(
+                    cfg,
+                    tls.as_ref(),
+                    &self.server,
+                    self.port,
+                    &*self.dialer,
+                    internal,
+                )
+                .await?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     transport,
@@ -375,6 +385,7 @@ impl SsCore {
                     &self.server,
                     self.port,
                     &*self.dialer,
+                    internal,
                 )
                 .await?;
                 let stream = ProxyClientStream::from_stream(
@@ -386,9 +397,15 @@ impl SsCore {
                 Ok(Box::new(SsConn(stream)))
             }
             PluginKind::ShadowTls(cfg, tls) => {
-                let transport =
-                    shadow_tls_plugin::dial(cfg, tls, &self.server, self.port, &*self.dialer)
-                        .await?;
+                let transport = shadow_tls_plugin::dial(
+                    cfg,
+                    tls,
+                    &self.server,
+                    self.port,
+                    &*self.dialer,
+                    internal,
+                )
+                .await?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     transport,
@@ -399,7 +416,8 @@ impl SsCore {
             }
             PluginKind::Restls(cfg) => {
                 let transport =
-                    restls_plugin::dial(cfg, &self.server, self.port, &*self.dialer).await?;
+                    restls_plugin::dial(cfg, &self.server, self.port, &*self.dialer, internal)
+                        .await?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     transport,
@@ -410,7 +428,7 @@ impl SsCore {
             }
             PluginKind::Jls(cfg) => {
                 let transport =
-                    jls_plugin::dial(cfg, &self.server, self.port, &*self.dialer).await?;
+                    jls_plugin::dial(cfg, &self.server, self.port, &*self.dialer, internal).await?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     transport,
@@ -434,8 +452,15 @@ impl SsCore {
             }
             #[cfg(feature = "ech-tls-tunnel")]
             PluginKind::EchTlsTunnel(cfg, tls) => {
-                let transport =
-                    ech_tls_tunnel::dial(cfg, tls, &self.server, self.port, &*self.dialer).await?;
+                let transport = ech_tls_tunnel::dial(
+                    cfg,
+                    tls,
+                    &self.server,
+                    self.port,
+                    &*self.dialer,
+                    internal,
+                )
+                .await?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     transport,
@@ -451,8 +476,10 @@ impl SsCore {
                 // ``VpnService.protect(fd)``), and ``DirectDialer`` preserves
                 // both of those properties.
                 let tcp = match self.server_config.tcp_external_addr() {
-                    ServerAddr::SocketAddr(sa) => self.dialer.dial_addr(*sa).await,
-                    ServerAddr::DomainName(host, port) => self.dialer.dial(host, *port).await,
+                    ServerAddr::SocketAddr(sa) => self.dialer.dial_addr(*sa, internal).await,
+                    ServerAddr::DomainName(host, port) => {
+                        self.dialer.dial(host, *port, internal).await
+                    }
                 }
                 .map_err(|e| MeowError::Proxy(format!("ss tcp connect: {e}")))?;
                 let stream = ProxyClientStream::from_stream(
@@ -1050,7 +1077,9 @@ impl ProxyAdapter for ShadowsocksAdapter {
             return Ok(Box::new(conn));
         }
 
-        self.core.dial_tcp_stream(addr).await
+        self.core
+            .dial_tcp_stream(addr, metadata.is_internal())
+            .await
     }
 
     /// Run the SS handshake over an existing stream (relay chain).
@@ -1328,6 +1357,7 @@ mod tests {
             &self,
             _host: &str,
             _port: u16,
+            _internal: bool,
         ) -> std::io::Result<Box<dyn meow_transport::Stream>> {
             Err(std::io::Error::other("test dialer never connects"))
         }

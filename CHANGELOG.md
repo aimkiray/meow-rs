@@ -355,6 +355,26 @@ the canonical, in-repo source a release is cut from.
   `geodata_fetch::run_on_startup` / `auto_update_loop` signatures gain a
   `dns_server` handle parameter for this.
 
+- **`lazy` proxy groups no longer count housekeeping traffic as use.** A
+  `lazy` group is only probed after real traffic uses it, but the marker
+  distinguishing probe dials (`ConnType::Tunnel`) did not survive two
+  internal paths: `dialer-proxy` chained dials rebuilt metadata as
+  `ConnType::Inner`, and provider/geodata downloads plus DNS-via-proxy
+  exchanges constructed `Inner`/`Http` metadata directly —
+  so a `lazy` group referenced as a node's `dialer-proxy` or used for
+  downloads was probed every interval forever, silently degrading `lazy`
+  to eager. `Metadata` now carries an `internal` flag for housekeeping
+  traffic; `TcpDialer::dial`/`dial_addr` take it from the caller's
+  metadata and `ProxyDialer` copies it onto the reconstructed metadata
+  (as does the relay chain's next-hop rebuild), the internal HTTP fetcher
+  and the DNS proxy exchange set it at construction, and group usage
+  accounting skips both it and the existing
+  `Tunnel` marker via `Metadata::is_internal()`. Mux session-establishment
+  dials deliberately stay user-classed — a shared mux conn exists to
+  serve user streams regardless of which dial triggered it — and pooled
+  kcptun session establishment follows the same rule: it is the only
+  dial signal a lazy front hop sees for that chain.
+
 - **Relay groups can now terminate on real protocol adapters, not just
   `http`/`socks5`/`snell`.** Every hop after the first runs
   `ProxyAdapter::connect_over`, which previously only `direct`, `reject`,

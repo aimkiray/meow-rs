@@ -564,7 +564,7 @@ mod tests {
     struct SilentDialer;
     #[async_trait]
     impl TcpDialer for SilentDialer {
-        async fn dial(&self, _: &str, _: u16) -> io::Result<Box<dyn Stream>> {
+        async fn dial(&self, _: &str, _: u16, _: bool) -> io::Result<Box<dyn Stream>> {
             Err(io::Error::other("unused in pool tests"))
         }
         async fn dial_udp_endpoint(&self, _: SocketAddr) -> io::Result<Box<dyn SocketIo>> {
@@ -577,7 +577,7 @@ mod tests {
     struct FailOnceDialer(AtomicUsize);
     #[async_trait]
     impl TcpDialer for FailOnceDialer {
-        async fn dial(&self, _: &str, _: u16) -> io::Result<Box<dyn Stream>> {
+        async fn dial(&self, _: &str, _: u16, _: bool) -> io::Result<Box<dyn Stream>> {
             Err(io::Error::other("unused in pool tests"))
         }
         async fn dial_udp_endpoint(&self, _: SocketAddr) -> io::Result<Box<dyn SocketIo>> {

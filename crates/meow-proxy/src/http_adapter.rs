@@ -100,10 +100,10 @@ impl HttpAdapter {
     }
 
     /// Dial TCP to the proxy server, optionally wrapping in TLS.
-    async fn dial_stream(&self) -> Result<Box<dyn meow_transport::Stream>> {
+    async fn dial_stream(&self, internal: bool) -> Result<Box<dyn meow_transport::Stream>> {
         let tcp = self
             .dialer
-            .dial(&self.server, self.port)
+            .dial(&self.server, self.port, internal)
             .await
             .map_err(MeowError::Io)?;
         self.wrap_tls(tcp).await
@@ -244,7 +244,7 @@ impl ProxyAdapter for HttpAdapter {
             target, self.server, self.port
         );
 
-        let mut stream = self.dial_stream().await?;
+        let mut stream = self.dial_stream(metadata.is_internal()).await?;
         self.run_connect(&mut stream, &target).await?;
         Ok(Box::new(StreamConn(stream)))
     }

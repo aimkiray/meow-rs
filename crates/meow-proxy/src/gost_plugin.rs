@@ -335,6 +335,7 @@ pub async fn dial(
     server_host: &str,
     server_port: u16,
     dialer: &dyn crate::dialer::TcpDialer,
+    internal: bool,
 ) -> Result<Box<dyn meow_transport::Stream>> {
     debug!(
         "{PLUGIN}: dialing {}:{} tls={} host={} path={} mux={}",
@@ -343,7 +344,7 @@ pub async fn dial(
 
     // 1) Raw TCP.
     let tcp = dialer
-        .dial(server_host, server_port)
+        .dial(server_host, server_port, internal)
         .await
         .map_err(MeowError::Io)?;
 
@@ -659,7 +660,7 @@ mod tests {
         let cfg = parse_opts("mode=websocket;host=test.example;mux=true").unwrap();
         let ws = build_ws_layer(&cfg).unwrap();
         let dialer = crate::dialer::DirectDialer;
-        let mut stream = dial(&cfg, None, &ws, "127.0.0.1", port, &dialer)
+        let mut stream = dial(&cfg, None, &ws, "127.0.0.1", port, &dialer, false)
             .await
             .unwrap();
         stream.write_all(b"ping").await.unwrap();
@@ -695,7 +696,7 @@ mod tests {
         let cfg = parse_opts("mode=websocket;host=test.example;mux=false").unwrap();
         let ws = build_ws_layer(&cfg).unwrap();
         let dialer = crate::dialer::DirectDialer;
-        let mut stream = dial(&cfg, None, &ws, "127.0.0.1", port, &dialer)
+        let mut stream = dial(&cfg, None, &ws, "127.0.0.1", port, &dialer, false)
             .await
             .unwrap();
         stream.write_all(b"ping").await.unwrap();
@@ -760,7 +761,7 @@ mod tests {
         let tls = build_tls_layer(&cfg).unwrap();
         let ws = build_ws_layer(&cfg).unwrap();
         let dialer = crate::dialer::DirectDialer;
-        let mut stream = dial(&cfg, tls.as_ref(), &ws, "127.0.0.1", port, &dialer)
+        let mut stream = dial(&cfg, tls.as_ref(), &ws, "127.0.0.1", port, &dialer, false)
             .await
             .unwrap();
         stream.write_all(b"ping").await.unwrap();
@@ -785,7 +786,7 @@ mod tests {
         let tls = build_tls_layer(&cfg).unwrap();
         let ws = build_ws_layer(&cfg).unwrap();
         let dialer = crate::dialer::DirectDialer;
-        match dial(&cfg, tls.as_ref(), &ws, "127.0.0.1", port, &dialer).await {
+        match dial(&cfg, tls.as_ref(), &ws, "127.0.0.1", port, &dialer, false).await {
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
@@ -852,7 +853,7 @@ mod tests {
             let cfg = parse_opts(opts).unwrap();
             let ws = build_ws_layer(&cfg).unwrap();
             let dialer = crate::dialer::DirectDialer;
-            let mut stream = dial(&cfg, None, &ws, "127.0.0.1", port, &dialer)
+            let mut stream = dial(&cfg, None, &ws, "127.0.0.1", port, &dialer, false)
                 .await
                 .unwrap();
             stream.write_all(b"ping").await.unwrap();

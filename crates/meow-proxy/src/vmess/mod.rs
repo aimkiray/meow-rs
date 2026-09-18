@@ -104,7 +104,19 @@ impl VmessAdapter {
                     }
                 }
                 .map_err(MeowError::Proxy)?;
-                dial_vmess(&transport, &server, port, dialer.as_ref(), sealed, security).await
+                // Mux session dial — `internal: false`: a shared mux conn
+                // exists to serve user streams regardless of which dial
+                // triggered its establishment.
+                dial_vmess(
+                    &transport,
+                    &server,
+                    port,
+                    dialer.as_ref(),
+                    sealed,
+                    security,
+                    false,
+                )
+                .await
             })
         });
         self.mux = Some(MuxClient::new(dial, options));
@@ -124,6 +136,7 @@ impl VmessAdapter {
             self.dialer.as_ref(),
             sealed,
             self.security,
+            metadata.is_internal(),
         )
         .await
     }
@@ -140,8 +153,12 @@ async fn dial_vmess(
     dialer: &dyn crate::dialer::TcpDialer,
     sealed: header::SealedHeader,
     security: Security,
+    internal: bool,
 ) -> Result<Box<dyn ProxyConn>> {
-    let stream = dialer.dial(server, port).await.map_err(MeowError::Io)?;
+    let stream = dialer
+        .dial(server, port, internal)
+        .await
+        .map_err(MeowError::Io)?;
     vmess_over(transport, stream, sealed, security).await
 }
 

@@ -113,10 +113,10 @@ impl Socks5Adapter {
     }
 
     /// Dial TCP to the proxy server, optionally wrapping in TLS.
-    async fn dial_stream(&self) -> Result<Box<dyn meow_transport::Stream>> {
+    async fn dial_stream(&self, internal: bool) -> Result<Box<dyn meow_transport::Stream>> {
         let tcp = self
             .dialer
-            .dial(&self.server, self.port)
+            .dial(&self.server, self.port, internal)
             .await
             .map_err(MeowError::Io)?;
         self.wrap_tls(tcp).await
@@ -557,7 +557,7 @@ impl ProxyAdapter for Socks5Adapter {
             metadata.host, metadata.dst_port, self.server, self.port
         );
 
-        let mut stream = self.dial_stream().await?;
+        let mut stream = self.dial_stream(metadata.is_internal()).await?;
         self.run_handshake(
             &mut stream,
             &metadata.host,
@@ -568,7 +568,7 @@ impl ProxyAdapter for Socks5Adapter {
         Ok(Box::new(StreamConn(stream)))
     }
 
-    async fn dial_udp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+    async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         if !self.udp {
             return Err(MeowError::NotSupported(
                 "socks5: UDP ASSOCIATE not enabled (set `udp: true`)".into(),
@@ -593,7 +593,7 @@ impl ProxyAdapter for Socks5Adapter {
         // The UDP association is bound to the lifetime of this TCP control
         // connection (RFC 1928 §7): the server tears the association down when
         // the control conn closes. We keep it open via `ControlGuard`.
-        let mut control = self.dial_stream().await?;
+        let mut control = self.dial_stream(metadata.is_internal()).await?;
         let relay = self.run_udp_associate(&mut control).await?;
         debug!(
             "socks5: UDP ASSOCIATE via {}:{} → relay {}",
@@ -899,6 +899,7 @@ mod tests {
             &self,
             _host: &str,
             _port: u16,
+            _internal: bool,
         ) -> std::io::Result<Box<dyn meow_transport::Stream>> {
             Err(std::io::Error::other("test dialer never connects"))
         }
@@ -949,6 +950,66 @@ mod tests {
         assert!(make_adapter("127.0.0.1", 1080, None)
             .with_udp(true)
             .support_udp());
+    }
+
+    /// Captures the `internal` flag the adapter hands to its dialer —
+    /// proves `dial_tcp` maps `Metadata::is_internal()` through, which is
+    /// what keeps probes/housekeeping chained via `dialer-proxy` from
+    /// counting as use of a lazy front-hop group (#555).
+    struct CaptureFlagDialer {
+        seen: std::sync::Mutex<Option<bool>>,
+    }
+
+    #[async_trait]
+    impl crate::dialer::TcpDialer for CaptureFlagDialer {
+        async fn dial(
+            &self,
+            _host: &str,
+            _port: u16,
+            internal: bool,
+        ) -> std::io::Result<Box<dyn meow_transport::Stream>> {
+            *self.seen.lock().unwrap() = Some(internal);
+            Err(std::io::Error::other("test dialer never connects"))
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_tcp_forwards_internal_marker_to_dialer() {
+        let dialer = Arc::new(CaptureFlagDialer {
+            seen: std::sync::Mutex::new(None),
+        });
+        let adapter = Socks5Adapter::new(
+            "front",
+            "127.0.0.1",
+            1080,
+            None,
+            false,
+            false,
+            Arc::clone(&dialer) as Arc<dyn crate::dialer::TcpDialer>,
+        );
+
+        // Probe-shaped metadata (the `ConnType::Tunnel` marker) must reach
+        // the dialer as `internal: true`.
+        let probe = Metadata {
+            conn_type: meow_common::ConnType::Tunnel,
+            host: "example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let _ = adapter.dial_tcp(&probe).await;
+        assert_eq!(
+            *dialer.seen.lock().unwrap(),
+            Some(true),
+            "probe dial must propagate internal=true"
+        );
+
+        // User-shaped metadata keeps `internal: false`.
+        let _ = adapter.dial_tcp(&meta_with_host("example.com", 443)).await;
+        assert_eq!(
+            *dialer.seen.lock().unwrap(),
+            Some(false),
+            "user dial must propagate internal=false"
+        );
     }
 
     fn meta_with_host(host: &str, port: u16) -> Metadata {
