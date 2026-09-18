@@ -1147,6 +1147,107 @@ fn apply_dialer_proxies(
     Ok(edges)
 }
 
+/// Reject cycles in the declared group-membership graph (issue #562).
+///
+/// Groups may name other groups as members, and the multi-pass build defers
+/// a group until its declared group dependencies have built. A cyclic set
+/// can never satisfy that: every member waits on another, and without this
+/// check the lenient fallback silently drops the unresolved edges — the
+/// built graph loses the declared cycle and the outcome depends on
+/// declaration order. Detect the cycle on the *declared* graph and report
+/// its path (`A -> B -> A`) before any construction, matching mihomo's
+/// `proxyGroupsDagSort` rejection (which reports only the involved names).
+///
+/// Edges come only from explicit `proxies:` members that name a declared
+/// group. Provider slots (`use:`/`include-all`) resolve to leaf nodes and
+/// `include-all-proxies` expands to leaf proxies only, so neither can close
+/// a cycle here. Callers must run the duplicate-name check first — this
+/// function assumes each group name is declared at most once.
+///
+/// Stricter than mihomo in one corner: upstream's DAG check skips
+/// `exclude-filter`-matched members; meow-rs never applies `exclude-filter`
+/// to static `proxies:` members, so a declared self-reference is rejected
+/// even when a filter would have excluded it.
+fn reject_declared_group_cycles(raw_groups: &[raw::RawProxyGroup]) -> Result<(), anyhow::Error> {
+    debug_assert!(
+        raw_groups
+            .iter()
+            .map(|g| g.name.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == raw_groups.len(),
+        "caller must run the duplicate-name check first"
+    );
+    let declared: std::collections::HashSet<&str> =
+        raw_groups.iter().map(|g| g.name.as_str()).collect();
+    let edges: HashMap<&str, Vec<&str>> = raw_groups
+        .iter()
+        .map(|g| {
+            (
+                g.name.as_str(),
+                g.proxies
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|m| declared.contains(m))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+
+    // Iterative three-colour DFS — `stack`/`progress` track the live DFS
+    // path in lockstep so a back-edge reports the actual cycle.
+    #[derive(Clone, Copy)]
+    enum Mark {
+        Visiting,
+        Done,
+    }
+    let mut marks: HashMap<&str, Mark> = HashMap::with_capacity(raw_groups.len());
+    for group in raw_groups {
+        let start = group.name.as_str();
+        if marks.contains_key(start) {
+            continue;
+        }
+        marks.insert(start, Mark::Visiting);
+        let mut stack: Vec<&str> = vec![start];
+        let mut progress: Vec<usize> = vec![0];
+        while let Some(&node) = stack.last() {
+            let idx = progress.last_mut().expect("progress tracks stack");
+            let children = &edges[node];
+            if *idx < children.len() {
+                let child = children[*idx];
+                *idx += 1;
+                match marks.get(child) {
+                    Some(Mark::Visiting) => {
+                        let pos = stack
+                            .iter()
+                            .position(|&n| n == child)
+                            .expect("visiting node is on the DFS stack");
+                        let cycle: Vec<&str> = stack[pos..]
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(child))
+                            .collect();
+                        anyhow::bail!("proxy-group cycle detected: {}", cycle.join(" -> "));
+                    }
+                    Some(Mark::Done) => {}
+                    None => {
+                        marks.insert(child, Mark::Visiting);
+                        stack.push(child);
+                        progress.push(0);
+                    }
+                }
+            } else {
+                marks.insert(node, Mark::Done);
+                stack.pop();
+                progress.pop();
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reject any `dialer-proxy` edge whose target can route the front-hop dial
 /// back to the chained proxy through group membership — a loop that never
 /// reaches I/O: it is synchronous nested polls and exhausts the native stack
@@ -1324,6 +1425,9 @@ fn primary_global_target<'a>(
         .find(|name| is_usable_global_target(name, proxies))
 }
 
+/// Post-#562 a declared group dep that stays unbuilt can only mean it
+/// *failed* to build — cycles are rejected before the build loop, so
+/// stalling here is never "still waiting on a cyclic dep".
 fn has_unresolved_group_dependency(
     group: &raw::RawProxyGroup,
     declared_group_names: &std::collections::HashSet<&str>,
@@ -1574,6 +1678,8 @@ fn build_proxy_layer(
             group.name
         );
     }
+
+    reject_declared_group_cycles(raw_groups)?;
 
     // Apply per-outbound `dialer-proxy` chains (issue #210) *before* groups are
     // built: groups clone their members eagerly, so a chain applied afterwards
@@ -1898,10 +2004,10 @@ fn prefetch_proxy_map(
         return Ok(None);
     }
     let registry = meow_proxy::dialer::ProxyRegistry::default();
-    // A rejected layer (bad chain, group-membership cycle) hard-fails the
-    // real build with the same error; surface it now instead of letting
-    // default-proxy provider/geodata fetches egress direct on a config that
-    // intends chained egress.
+    // A rejected layer (bad chain, group-declaration or membership
+    // cycle) hard-fails the real build with the same error; surface it
+    // now instead of letting default-proxy provider/geodata fetches
+    // egress direct on a config that intends chained egress.
     let map = build_proxy_layer(
         raw,
         None,

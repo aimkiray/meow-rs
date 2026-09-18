@@ -94,6 +94,9 @@ proxies:
     # dialer-proxy: "Proxy"
 
 # Proxy groups
+# Group names must be unique (no collision with a built-in, a proxies:
+# entry, or another group) and the group-membership graph must be
+# acyclic — both are hard config errors, checked before construction.
 proxy-groups:
   - name: "Proxy"
     type: select

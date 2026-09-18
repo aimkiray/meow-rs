@@ -277,6 +277,184 @@ proxy-groups:
         .expect("names are matched byte-exactly — 'direct' is not 'DIRECT'");
 }
 
+/// Issue #562: a declared group cycle must be rejected with its path —
+/// previously the lenient pass silently truncated the unresolvable edge
+/// and the result depended on declaration order.
+#[tokio::test]
+async fn test_group_cycle_is_rejected_both_declaration_orders() {
+    for groups in [
+        "  - {name: A, type: select, proxies: [B, DIRECT]}\n  - {name: B, type: select, proxies: [A]}",
+        "  - {name: B, type: select, proxies: [A]}\n  - {name: A, type: select, proxies: [B, DIRECT]}",
+    ] {
+        let yaml = format!("proxy-groups:\n{groups}\n");
+        let err = load_config_from_str(&yaml)
+            .await
+            .err()
+            .expect("a declared group cycle must be rejected");
+        assert!(
+            err.to_string().contains("proxy-group cycle detected"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+/// Self-reference is a degenerate cycle.
+#[tokio::test]
+async fn test_group_self_reference_is_rejected() {
+    let yaml = r#"
+proxy-groups:
+  - {name: A, type: select, proxies: [A, DIRECT]}
+"#;
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("a self-referencing group must be rejected");
+    assert!(
+        err.to_string()
+            .contains("proxy-group cycle detected: A -> A"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A cycle with no usable leaf members is still a declared cycle — the
+/// rejection is declaration-level, not "we happened to have a fallback".
+#[tokio::test]
+async fn test_group_cycle_without_leaf_members_is_rejected() {
+    let yaml = r#"
+proxy-groups:
+  - {name: A, type: select, proxies: [B]}
+  - {name: B, type: select, proxies: [A]}
+"#;
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("a leafless group cycle must be rejected");
+    assert!(
+        err.to_string().contains("proxy-group cycle detected"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A diamond (A→B, A→C, B→D, C→D) is NOT a cycle — `Done` marks must not
+/// be misread as back-edges. And a tail feeding a cycle reports the
+/// cycle path, not the tail.
+#[tokio::test]
+async fn test_group_diamond_builds_and_tail_cycle_reports_cycle_only() {
+    let yaml = r#"
+proxies:
+  - {name: node-a, type: socks5, server: 127.0.0.1, port: 10001}
+
+proxy-groups:
+  - {name: A, type: select, proxies: [B, C]}
+  - {name: B, type: select, proxies: [D]}
+  - {name: C, type: select, proxies: [D]}
+  - {name: D, type: select, proxies: [node-a]}
+"#;
+    load_config_from_str(yaml)
+        .await
+        .expect("a diamond is acyclic and must build");
+
+    let yaml = r#"
+proxy-groups:
+  - {name: tail, type: select, proxies: [A]}
+  - {name: A, type: select, proxies: [B, DIRECT]}
+  - {name: B, type: select, proxies: [A]}
+"#;
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("a tail feeding a cycle must be rejected");
+    // The reported path is the cycle, excluding the `tail` prefix.
+    assert!(
+        err.to_string().contains("A -> B -> A"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !err.to_string().contains("tail"),
+        "tail must not appear in the cycle path: {err}"
+    );
+}
+
+/// Edges only come from `proxies:` members naming a declared group —
+/// a member that names no declared group (missing leaf, leaf proxy,
+/// provider slot) never participates, so an acyclic forward reference
+/// with a missing leaf keeps the lenient #536 behavior.
+#[tokio::test]
+async fn test_acyclic_group_chain_with_missing_leaf_still_builds() {
+    let yaml = r#"
+proxies:
+  - {name: node-a, type: socks5, server: 127.0.0.1, port: 10001}
+
+proxy-groups:
+  - {name: outer, type: select, proxies: [inner, ghost-leaf]}
+  - {name: inner, type: select, proxies: [node-a]}
+"#;
+    let config = load_config_from_str(yaml)
+        .await
+        .expect("forward reference with a missing leaf must still build");
+    let outer = config.proxies.get("outer").expect("outer must be built");
+    assert_eq!(outer.members().unwrap(), ["inner"]);
+}
+
+/// A deeper cycle (A→B→C→A) reports the full path through every hop.
+#[tokio::test]
+async fn test_group_three_node_cycle_reports_full_path() {
+    let yaml = r#"
+proxy-groups:
+  - {name: A, type: select, proxies: [B]}
+  - {name: B, type: select, proxies: [C]}
+  - {name: C, type: select, proxies: [A]}
+"#;
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("a three-node group cycle must be rejected");
+    assert!(
+        err.to_string()
+            .contains("proxy-group cycle detected: A -> B -> C -> A"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A declared `GLOBAL` group is legal (it suppresses the auto-created
+/// one), but a `GLOBAL -> GLOBAL` member edge is still a declared cycle.
+#[tokio::test]
+async fn test_global_group_self_reference_is_rejected() {
+    let yaml = r#"
+proxy-groups:
+  - {name: GLOBAL, type: select, proxies: [GLOBAL, DIRECT]}
+"#;
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("a self-referencing GLOBAL group must be rejected");
+    assert!(
+        err.to_string()
+            .contains("proxy-group cycle detected: GLOBAL -> GLOBAL"),
+        "unexpected error: {err}"
+    );
+}
+
+/// The check is unconditional — `strict: true` rejects the same cycle
+/// (the registry split it prevents is structural, not a parse defect).
+#[tokio::test]
+async fn test_group_cycle_is_rejected_under_strict() {
+    let yaml = r#"
+strict: true
+proxy-groups:
+  - {name: A, type: select, proxies: [B, DIRECT]}
+  - {name: B, type: select, proxies: [A]}
+"#;
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("strict mode must reject a declared group cycle too");
+    assert!(
+        err.to_string().contains("proxy-group cycle detected"),
+        "unexpected error: {err}"
+    );
+}
+
 #[tokio::test]
 async fn test_missing_member_does_not_expand_include_all_to_proxy_groups() {
     let yaml = r#"

@@ -2,9 +2,9 @@
 
 A proxy group bundles several proxies behind one name and a selection strategy. Groups
 can themselves reference other groups, and rules target a group exactly like a single
-proxy. Group names must be unique and may not collide with a `proxies:` entry or a
-built-in (`DIRECT`/`REJECT`/`REJECT-DROP`/`COMPATIBLE`/`PASS`/`PASS-RULE`) — a
-duplicate is a load-time error.
+proxy. Group names must be unique across groups, `proxies:` entries, and built-ins
+(`DIRECT`, `REJECT`, `REJECT-DROP`, `COMPATIBLE`, `PASS`, `PASS-RULE`), and the
+group-membership graph must be acyclic — both are hard config errors.
 
 ```yaml
 proxy-groups:

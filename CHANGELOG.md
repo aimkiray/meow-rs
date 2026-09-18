@@ -428,6 +428,19 @@ the canonical, in-repo source a release is cut from.
   `proxies["child"]` and `parent`'s member could be two different groups
   (#561).
 
+- **Cyclic `proxy-groups` declarations are now a hard error, matching
+  mihomo's `proxyGroupsDagSort` rejection.** The group-membership graph
+  is validated on the declared config before construction and reports
+  the actual cycle path (`proxy-group cycle detected: A -> B -> A`).
+  Previously a cyclic set never satisfied the dependency-aware build
+  passes, so the lenient fallback silently dropped the unresolvable
+  edges and accepted an order-dependent, truncated graph — e.g.
+  `A: [B, DIRECT]` / `B: [A]` could build `A` as `[DIRECT]` only.
+  Self-references are rejected the same way. Provider slots
+  (`use:`/`include-all`) and `include-all-proxies` resolve to leaf
+  nodes only and cannot close a cycle; acyclic forward references with
+  missing leaf members keep the lenient #536 behavior (#562).
+
 - **Relay groups can now terminate on real protocol adapters, not just
   `http`/`socks5`/`snell`.** Every hop after the first runs
   `ProxyAdapter::connect_over`, which previously only `direct`, `reject`,
