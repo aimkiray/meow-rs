@@ -47,6 +47,9 @@ ech-tls-tunnel = [
 ]
 # sing-mux multiplexing (in `full`; excluded from `minimal` per ADR-0007).
 mux = ["meow-config/mux", "meow-proxy/mux"]
+# In-process kcptun SS-plugin client (issue #533) — in `full`; excluded
+# from `minimal` alongside `mux` (ADR-0007 binary-size caps).
+kcptun = ["meow-config/kcptun", "meow-proxy/kcptun"]
 
 # DNS
 dns-server = ["meow-dns/dns-server"]
@@ -68,7 +71,7 @@ listener-shadowsocks = ["meow-listener/listener-shadowsocks"]
 # Convenience bundles
 minimal = ["ss", "trojan", "dns-server", "listener-mixed"]
 full = [
-    "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel", "mux",
+    "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel", "mux", "kcptun",
     "dns-server", "dns-encrypted",
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
 ]

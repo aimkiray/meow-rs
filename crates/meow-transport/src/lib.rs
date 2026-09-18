@@ -84,6 +84,13 @@ pub mod jls;
 #[cfg(feature = "simple-obfs")]
 pub mod simple_obfs;
 
+/// kcptun SS-plugin transport (issue #533): a kcp-go wire-compatible
+/// KCP-over-UDP stream plus the crypt/FEC/snappy packet layers.
+/// Gated by the `kcptun` feature; the smux session and client pool live
+/// in `meow-proxy`.
+#[cfg(feature = "kcptun")]
+pub mod kcptun;
+
 /// A duplex byte stream — the currency passed between transport layers.
 ///
 /// Blanket-implemented for every `T: AsyncRead + AsyncWrite + Unpin + Send + Sync`,

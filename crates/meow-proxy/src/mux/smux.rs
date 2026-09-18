@@ -1,14 +1,13 @@
-//! smux protocol (sagernet/smux fork wire format — protocol version 1),
-//! client side.
+//! smux protocol version 1, client side.
 //!
-//! This is NOT the upstream xtaci layout: sing-mux/sing-box use the
-//! sagernet fork whose frames are: ver=1, cmd, len u16 LE, stream_id u32 LE, data
-//! (8-byte header, little-endian) and whose version 1 has no window-update
-//! (UPD) flow control — a v1 write just splits into MaxFrameSize frames.
-//! Commands: SYN=0, FIN=1, PSH=2, NOP=3; client stream IDs are odd
-//! (1, 3, 5, ...).  Matches sing-mux's smux usage (DefaultConfig +
-//! KeepAliveDisabled): Version=1, MaxFrameSize=32768, MaxStreamBuffer=64 KiB,
-//! MaxReceiveBuffer=4 MiB.
+//! The v1 frame layout is identical across the xtaci and sagernet forks:
+//! `ver=1, cmd, len u16 LE, stream_id u32 LE, data` (8-byte header,
+//! little-endian), no window-update (UPD) flow control — a v1 write just
+//! splits into MaxFrameSize frames. Commands: SYN=0, FIN=1, PSH=2, NOP=3;
+//! client stream IDs are odd (1, 3, 5, ...). Session defaults match
+//! sing-mux's usage (DefaultConfig + KeepAliveDisabled): Version=1,
+//! MaxFrameSize=32768, MaxStreamBuffer=64 KiB, MaxReceiveBuffer=4 MiB —
+//! the kcptun path overrides frame size, buffers, and keepalive.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
@@ -16,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -260,6 +259,19 @@ struct SessionState {
     /// Streams keyed by stream ID; dropping the sender EOFs the stream.
     streams: Mutex<HashMap<u32, StreamEntry>>,
     dead: AtomicBool,
+    /// Millis-since-epoch of the last inbound frame — the smux
+    /// `KeepAliveTimeout` input. Only written when a session is built
+    /// with keepalive; the epoch in [`now_ms`] is process-wide.
+    last_recv_ms: AtomicU64,
+}
+
+/// Milliseconds on a process-wide monotonic epoch for keepalive timestamps.
+fn now_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// smux session over one physical connection (client role).
@@ -273,6 +285,9 @@ pub struct Session {
     /// the stream — [`MAX_STREAM_BUFFER`] by default; single-stream
     /// sessions (gost-plugin) may grant the whole budget.
     stream_buffer: usize,
+    /// Outbound frame payload cap — [`MAX_FRAME_SIZE`] (32768) for sing-mux,
+    /// `frameSize` (8192) for kcptun whose peers reject larger frames.
+    max_frame_size: usize,
 }
 
 impl Session {
@@ -299,14 +314,85 @@ impl Session {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        Ok(Self::client_inner_with_budget(
+            io,
+            stream_buffer,
+            None,
+            MAX_FRAME_SIZE,
+            MAX_RECEIVE_BUFFER,
+        ))
+    }
+
+    /// [`client_with_stream_buffer`](Self::client_with_stream_buffer) with
+    /// smux keepalive (`KeepAliveInterval`/`KeepAliveTimeout` upstream): a
+    /// NOP frame goes out every `interval`, and the session is declared
+    /// dead once no inbound frame has arrived for `timeout`. A zero
+    /// `interval` or `timeout` disables the task rather than panicking on
+    /// `tokio::time::interval(Duration::ZERO)`.
+    pub fn client_with_keepalive<S>(
+        io: S,
+        stream_buffer: usize,
+        interval: Duration,
+        timeout: Duration,
+    ) -> io::Result<Self>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Ok(Self::client_inner_with_budget(
+            io,
+            stream_buffer,
+            Some((interval, timeout)),
+            MAX_FRAME_SIZE,
+            MAX_RECEIVE_BUFFER,
+        ))
+    }
+
+    /// [`client_with_keepalive`](Self::client_with_keepalive) plus the
+    /// remaining upstream smux knobs kcptun exposes: `max_frame_size` caps
+    /// outbound frame payloads (`frameSize`, 8192 upstream) and
+    /// `receive_budget` sizes the session-wide inbound window (`smuxbuf`,
+    /// [`MAX_RECEIVE_BUFFER`] by default).
+    pub fn client_kcptun<S>(
+        io: S,
+        stream_buffer: usize,
+        keepalive: Duration,
+        keepalive_timeout: Duration,
+        max_frame_size: usize,
+        receive_budget: usize,
+    ) -> io::Result<Self>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Ok(Self::client_inner_with_budget(
+            io,
+            stream_buffer,
+            Some((keepalive, keepalive_timeout)),
+            max_frame_size,
+            receive_budget,
+        ))
+    }
+
+    fn client_inner_with_budget<S>(
+        io: S,
+        stream_buffer: usize,
+        keepalive: Option<(Duration, Duration)>,
+        max_frame_size: usize,
+        receive_budget_size: usize,
+    ) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (mut reader, mut writer) = tokio::io::split(io);
         let (writer_tx, mut writer_rx) = mpsc::channel::<OutMsg>(OUTBOUND_QUEUE);
         let (deferred_fin_tx, mut deferred_fin_rx) = mpsc::channel(DEFERRED_FIN_QUEUE);
         let state = Arc::new(SessionState {
             streams: Mutex::new(HashMap::new()),
             dead: AtomicBool::new(false),
+            // Seed at session start: a peer that sends nothing yet still
+            // gets the full first timeout window before being declared dead.
+            last_recv_ms: AtomicU64::new(now_ms()),
         });
-        let receive_budget = Arc::new(Semaphore::new(MAX_RECEIVE_BUFFER));
+        let receive_budget = Arc::new(Semaphore::new(receive_budget_size.max(1)));
         let cancel = CancellationToken::new();
 
         // A single forwarder waits for writer capacity, preserving the
@@ -349,6 +435,22 @@ impl Session {
                         };
                         if result.is_err() {
                             break;
+                        }
+                        // Buffered transports (snappy over kcptun) emit only
+                        // on flush — a frame stranded in the encoder's input
+                        // accumulator never reaches the wire, which would
+                        // silently drop keepalive NOPs and stream FINs.
+                        // Flush once the write queue drains: upstream's
+                        // compStream flushes per write, and queued frames
+                        // will each flush the backlog behind them anyway.
+                        if writer_rx.is_empty() {
+                            let result = tokio::select! {
+                                _ = writer_cancel.cancelled() => break,
+                                result = writer.flush() => result,
+                            };
+                            if result.is_err() {
+                                break;
+                            }
                         }
                     }
                     OutMsg::Flush(ack) => {
@@ -402,6 +504,9 @@ impl Session {
                 let Ok((cmd, length, stream_id)) = Frame::decode_header(&header) else {
                     break;
                 };
+                // Any decodable frame — data or a bare NOP — proves the
+                // peer's side of the session is still forwarding.
+                reader_state.last_recv_ms.store(now_ms(), Ordering::Relaxed);
                 match cmd {
                     CMD_PSH if length == 0 => continue,
                     CMD_PSH => {
@@ -473,7 +578,7 @@ impl Session {
                                     _ = tokio::time::sleep(remaining) => {
                                         warn!(
                                             "smux: session receive budget \
-                                             ({MAX_RECEIVE_BUFFER} bytes) saturated for \
+                                             ({receive_budget_size} bytes) saturated for \
                                              {BUDGET_STALL_TIMEOUT:?}; abandoning session"
                                         );
                                         break 'reader;
@@ -596,19 +701,66 @@ impl Session {
             reader_cancel.cancel();
         });
 
-        Ok(Self {
+        // Keepalive task (xtaci/smux `keepalive`): emit a NOP every
+        // `interval`; declare the session dead once `timeout` (upstream's
+        // `KeepAliveTimeout`, independent of the interval) passes with no
+        // inbound frame. Both failure modes funnel through `mark_dead` +
+        // `cancel`, so a dead writer or a silent peer ends the session the
+        // same way the reader's exit does. Zero disables the task.
+        if let Some((interval, timeout)) = keepalive.filter(|(i, t)| !i.is_zero() && !t.is_zero()) {
+            let ka_state = Arc::clone(&state);
+            let ka_cancel = cancel.clone();
+            let ka_writer_tx = writer_tx.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    tokio::select! {
+                        _ = ka_cancel.cancelled() => break,
+                        _ = ticker.tick() => {}
+                    }
+                    let silence = Duration::from_millis(
+                        now_ms().saturating_sub(ka_state.last_recv_ms.load(Ordering::Relaxed)),
+                    );
+                    if silence > timeout {
+                        debug!("smux: no inbound frame for {silence:?}; declaring session dead");
+                        break;
+                    }
+                    // sid 0 — NOPs are session-scoped, not stream-scoped.
+                    let sent = ka_writer_tx
+                        .send(OutMsg::Frame(encode_frame(CMD_NOP, 0, &[])))
+                        .await
+                        .is_ok();
+                    if !sent {
+                        break;
+                    }
+                }
+                ka_state.mark_dead();
+                ka_cancel.cancel();
+            });
+        }
+
+        Self {
             state,
             writer_tx,
             deferred_fin_tx,
             cancel,
             next_stream_id: AtomicU32::new(1),
             stream_buffer,
-        })
+            // Never above the u16 length field; zero means the wire cap.
+            max_frame_size: max_frame_size.clamp(1, u16::MAX as usize),
+        }
     }
 
     /// Open a new stream.  Client IDs count up by 2 from 1.
     pub async fn open_stream(self: &Arc<Self>) -> io::Result<SmuxStream> {
-        let id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
+        // The u32 counter wraps after ~2^31 opens on one session; a
+        // colliding id must not silently replace a live stream entry.
+        let id = loop {
+            let id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
+            if !self.state.streams.lock().contains_key(&id) {
+                break id;
+            }
+        };
         let (tx, rx) = mpsc::channel(STREAM_QUEUE);
         let aborted = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(StreamStats {
@@ -1015,7 +1167,7 @@ impl AsyncWrite for SmuxStream {
                 "smux session closed",
             )));
         }
-        let written = buf.len().min(MAX_FRAME_SIZE);
+        let written = buf.len().min(this.session.max_frame_size);
         match this.poll_sender.poll_reserve(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(error)) => Poll::Ready(Err(io::Error::other(error.to_string()))),
@@ -2358,5 +2510,138 @@ mod tests {
         })
         .await
         .expect("dropping an idle session must stop its tasks and release the fd");
+    }
+
+    /// `client_with_keepalive` must emit a NOP (cmd=3, sid=0) every
+    /// interval so a kcptun session keeps its NAT mapping warm. Real time,
+    /// not `start_paused` — the silence check compares `std::time`
+    /// timestamps, which mocked time does not advance.
+    #[tokio::test]
+    async fn keepalive_emits_nop_frames() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let _session = Session::client_with_keepalive(
+            client_io,
+            MAX_STREAM_BUFFER,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(60),
+        )
+        .unwrap();
+
+        // Two NOPs prove the ticker repeats; anything else on the wire is
+        // a regression (no streams were ever opened).
+        let mut header = [0u8; 8];
+        for _ in 0..2 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                server_io.read_exact(&mut header),
+            )
+            .await
+            .expect("a NOP must arrive within the keepalive interval")
+            .unwrap();
+            assert_eq!(header[0], 1, "smux v1 version byte");
+            assert_eq!(header[1], CMD_NOP, "keepalive frame must be a NOP");
+            assert_eq!(&header[4..8], &0u32.to_le_bytes(), "NOPs are sid 0");
+        }
+    }
+
+    /// A write side that buffers everything until `poll_flush` — models
+    /// `tokio_snappy::SnappyIO`'s frame accumulator so this test proves the
+    /// writer task flushes queued frames (keepalives, FINs) out without
+    /// waiting for an unrelated write to trigger it.
+    struct BufferedIo {
+        inner: tokio::io::DuplexStream,
+        pending: Vec<u8>,
+    }
+
+    impl AsyncRead for BufferedIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for BufferedIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.pending.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.as_mut().get_mut();
+            while !this.pending.is_empty() {
+                let n = match Pin::new(&mut this.inner).poll_write(cx, &this.pending) {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                    }
+                    Poll::Ready(Ok(n)) => n,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                };
+                this.pending.drain(..n);
+            }
+            Pin::new(&mut this.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Regression for the kcptun keepalive stall: NOPs queued while the
+    /// write queue is idle must flush through a buffering transport —
+    /// upstream's compStream flushes per write for exactly this reason.
+    #[tokio::test]
+    async fn keepalive_nops_flush_through_buffered_transport() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let buffered = BufferedIo {
+            inner: client_io,
+            pending: Vec::new(),
+        };
+        let _session = Session::client_with_keepalive(
+            buffered,
+            MAX_STREAM_BUFFER,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(5000),
+        )
+        .unwrap();
+
+        let mut header = [0u8; 8];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server_io.read_exact(&mut header),
+        )
+        .await
+        .expect("a NOP must flush out of a buffered transport")
+        .unwrap();
+        assert_eq!(header[1], CMD_NOP, "keepalive frame must be a NOP");
+    }
+
+    /// The kcptun dead-link detector: with no inbound frame for
+    /// `timeout` the keepalive task must mark the session dead and
+    /// release the physical io.
+    #[tokio::test]
+    async fn silent_peer_declares_session_dead() {
+        let (client_io, _server_io) = tokio::io::duplex(64 * 1024);
+        let session = Session::client_with_keepalive(
+            client_io,
+            MAX_STREAM_BUFFER,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(60),
+        )
+        .unwrap();
+        assert!(!session.is_dead());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !session.is_dead() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a silent peer past the keepalive timeout must kill the session");
     }
 }

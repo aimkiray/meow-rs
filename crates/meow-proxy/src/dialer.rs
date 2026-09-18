@@ -63,6 +63,24 @@ pub trait TcpDialer: Send + Sync {
     fn is_proxy(&self) -> bool {
         false
     }
+
+    /// Connected UDP datagram endpoint for transports layered over UDP
+    /// (kcptun). Equivalent to mihomo's `dialer.ListenPacket`: the direct
+    /// dialer binds a real socket; a proxy dialer tunnels datagrams through
+    /// the front proxy's UDP relay instead of leaking the real source path.
+    ///
+    /// The default errors — implementations without UDP simply cannot carry
+    /// a UDP transport.
+    #[cfg(feature = "kcptun")]
+    async fn dial_udp_endpoint(
+        &self,
+        _remote: SocketAddr,
+    ) -> io::Result<Box<dyn meow_transport::kcptun::SocketIo>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "dialer cannot provide a UDP endpoint",
+        ))
+    }
 }
 
 /// Direct TCP dialer — the default, equivalent to mihomo's `dialer.NewDialer()`.
@@ -88,6 +106,24 @@ impl TcpDialer for DirectDialer {
         let tcp = meow_common::connect_tcp(addr).await?;
         let _ = tcp.set_nodelay(true);
         Ok(Box::new(tcp))
+    }
+
+    #[cfg(feature = "kcptun")]
+    async fn dial_udp_endpoint(
+        &self,
+        remote: SocketAddr,
+    ) -> io::Result<Box<dyn meow_transport::kcptun::SocketIo>> {
+        // Same bind-family + protect-hook dance as the SS UDP relay path:
+        // `bind_udp` routes the fd through the installed SocketProtector
+        // (Android VpnService.protect) before `connect`.
+        let bind_addr: SocketAddr = if remote.is_ipv4() {
+            "0.0.0.0:0".parse().expect("static")
+        } else {
+            "[::]:0".parse().expect("static")
+        };
+        let udp = meow_common::bind_udp(bind_addr).await?;
+        udp.connect(remote).await?;
+        Ok(Box::new(udp))
     }
 }
 
@@ -119,6 +155,121 @@ impl ProxyDialer {
         Ok(Box::new(ConnStream(conn)))
     }
 }
+
+#[cfg(feature = "kcptun")]
+mod packet_conn_socket {
+    //! `SocketIo` over a front proxy's UDP relay — the `dialer-proxy`
+    //! counterpart of `DirectDialer`'s raw `UdpSocket`. `ProxyPacketConn`
+    //! is async rather than poll-based, so two pump tasks bridge it to
+    //! bounded channels; the poll side then carries ordinary channel
+    //! backpressure semantics. Both tasks exit — and the association
+    //! closes — when the socket drops.
+
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    use meow_transport::kcptun::SocketIo;
+    use tokio::io::ReadBuf;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::PollSender;
+
+    /// Datagram queue depth either way — sized like a socket buffer, not a
+    /// stream queue: a full queue drops a datagram and KCP retransmits.
+    const QUEUE: usize = 256;
+
+    pub struct PacketConnSocket {
+        /// `Mutex` only because `Receiver`/`PollSender` are `!Sync`;
+        /// `&mut` poll methods go through `get_mut`, never the lock.
+        inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
+        outbound: Mutex<PollSender<Vec<u8>>>,
+        /// Aborted on drop: the task parks inside `read_packet` and would
+        /// otherwise outlive the socket, pinning the front-proxy UDP
+        /// association open across KCP session churn. The write pump needs
+        /// no handle — it exits when the `PollSender` side closes.
+        read_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for PacketConnSocket {
+        fn drop(&mut self) {
+            self.read_task.abort();
+        }
+    }
+
+    impl PacketConnSocket {
+        pub fn new(conn: Arc<dyn meow_common::ProxyPacketConn>, remote: SocketAddr) -> Self {
+            let (in_tx, inbound) = mpsc::channel(QUEUE);
+            let (outbound, mut out_rx) = mpsc::channel::<Vec<u8>>(QUEUE);
+
+            let reader = Arc::clone(&conn);
+            let read_task = tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                // try_send drops on a full queue: KCP retransmits, same as
+                // a full kernel socket buffer upstream.
+                while let Ok((n, _src)) = reader.read_packet(&mut buf).await {
+                    let _ = in_tx.try_send(buf[..n].to_vec());
+                }
+                let _ = reader.close();
+            });
+            tokio::spawn(async move {
+                while let Some(pkt) = out_rx.recv().await {
+                    if conn.write_packet(&pkt, &remote).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = conn.close();
+            });
+
+            Self {
+                inbound: Mutex::new(inbound),
+                outbound: Mutex::new(PollSender::new(outbound)),
+                read_task,
+            }
+        }
+    }
+
+    impl SocketIo for PacketConnSocket {
+        fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            let sender = self.outbound.get_mut().unwrap();
+            match sender.poll_reserve(cx) {
+                // `send_item` after a successful reserve cannot fail to
+                // enqueue — the permit is already held.
+                Poll::Ready(Ok(())) => match sender.send_item(buf.to_vec()) {
+                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Err(_) => Poll::Ready(Err(closed())),
+                },
+                Poll::Ready(Err(_)) => Poll::Ready(Err(closed())),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_recv(
+            &mut self,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.inbound.get_mut().unwrap().poll_recv(cx) {
+                // Datagram semantics: an oversized packet truncates.
+                Poll::Ready(Some(pkt)) => {
+                    let n = pkt.len().min(buf.remaining());
+                    buf.put_slice(&pkt[..n]);
+                    Poll::Ready(Ok(()))
+                }
+                // The read pump exited — the association is gone.
+                Poll::Ready(None) => Poll::Ready(Err(closed())),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    fn closed() -> io::Error {
+        io::Error::new(io::ErrorKind::BrokenPipe, "udp endpoint closed")
+    }
+}
+
+#[cfg(feature = "kcptun")]
+use packet_conn_socket::PacketConnSocket;
 
 #[async_trait]
 impl TcpDialer for ProxyDialer {
@@ -170,6 +321,29 @@ impl TcpDialer for ProxyDialer {
 
     fn is_proxy(&self) -> bool {
         true
+    }
+
+    #[cfg(feature = "kcptun")]
+    async fn dial_udp_endpoint(
+        &self,
+        remote: SocketAddr,
+    ) -> io::Result<Box<dyn meow_transport::kcptun::SocketIo>> {
+        // `proxyDialer.ListenPacket` upstream: the datagram endpoint is the
+        // front proxy's UDP relay association to `remote`. `ConnType::Inner`
+        // like `dial()` — this is infrastructure traffic, not user inbound.
+        let meta = Metadata {
+            network: Network::Udp,
+            conn_type: ConnType::Inner,
+            dst_ip: Some(remote.ip()),
+            dst_port: remote.port(),
+            ..Default::default()
+        };
+        let conn = self
+            .proxy
+            .dial_udp(&meta)
+            .await
+            .map_err(|e| io::Error::other(format!("dialer-proxy udp: {e}")))?;
+        Ok(Box::new(PacketConnSocket::new(Arc::from(conn), remote)))
     }
 }
 
@@ -315,6 +489,18 @@ impl TcpDialer for NamedProxyDialer {
 
     fn is_proxy(&self) -> bool {
         true
+    }
+
+    #[cfg(feature = "kcptun")]
+    async fn dial_udp_endpoint(
+        &self,
+        remote: SocketAddr,
+    ) -> io::Result<Box<dyn meow_transport::kcptun::SocketIo>> {
+        let front = self
+            .target
+            .resolve()
+            .ok_or_else(|| io::Error::other(self.target.missing_error()))?;
+        ProxyDialer::new(front).dial_udp_endpoint(remote).await
     }
 }
 

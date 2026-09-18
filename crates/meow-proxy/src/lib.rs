@@ -24,6 +24,8 @@ pub mod ech_tls_tunnel;
 pub mod gost_plugin;
 #[cfg(feature = "ss")]
 pub mod jls_plugin;
+#[cfg(feature = "kcptun")]
+pub mod kcptun_plugin;
 #[cfg(feature = "ss")]
 mod plugin_util;
 #[cfg(feature = "ss")]
@@ -34,6 +36,11 @@ pub mod shadow_tls_plugin;
 pub mod shadowsocks_adapter;
 #[cfg(feature = "ss")]
 pub mod v2ray_plugin;
+
+/// `uot.AddrParser` per-packet address headers — shared by the anytls and
+/// kcptun UDP-over-TCP relays.
+#[cfg(any(feature = "anytls", feature = "kcptun"))]
+mod uot;
 
 #[cfg(feature = "trojan")]
 pub mod trojan;
@@ -91,20 +98,31 @@ pub use vmess::VmessAdapter;
 
 // ─── Stream-desync poison ────────────────────────────────────────────────────
 
-/// Drop guard shared by stream-framed UDP packet conns (trojan, vless).
+/// Drop guard shared by stream-framed UDP packet conns (trojan, vless,
+/// anytls-uot, kcptun-uot).
 /// Unless `complete` is set, dropping the guard — via an early `?` return
 /// OR the future being cancelled mid-frame — marks the conn desynced:
 /// consumed read bytes cannot be un-read and a partially written frame
 /// leaves the peer parsing garbage, so either way the only safe recovery
 /// is to fail fast and let the tunnel tear the session down and re-dial
 /// (issue #514).
-#[cfg(any(feature = "trojan", feature = "vless"))]
+#[cfg(any(
+    feature = "trojan",
+    feature = "vless",
+    feature = "anytls",
+    feature = "kcptun"
+))]
 pub(crate) struct PoisonOnIncomplete<'a> {
     flag: &'a std::sync::atomic::AtomicBool,
     pub(crate) complete: bool,
 }
 
-#[cfg(any(feature = "trojan", feature = "vless"))]
+#[cfg(any(
+    feature = "trojan",
+    feature = "vless",
+    feature = "anytls",
+    feature = "kcptun"
+))]
 impl<'a> PoisonOnIncomplete<'a> {
     pub(crate) fn new(flag: &'a std::sync::atomic::AtomicBool) -> Self {
         Self {
@@ -114,7 +132,12 @@ impl<'a> PoisonOnIncomplete<'a> {
     }
 }
 
-#[cfg(any(feature = "trojan", feature = "vless"))]
+#[cfg(any(
+    feature = "trojan",
+    feature = "vless",
+    feature = "anytls",
+    feature = "kcptun"
+))]
 impl Drop for PoisonOnIncomplete<'_> {
     fn drop(&mut self) {
         if !self.complete {
@@ -127,7 +150,12 @@ impl Drop for PoisonOnIncomplete<'_> {
 /// every `read_packet`/`write_packet` entry AND again after acquiring the
 /// direction lock — an operation parked behind one that was cancelled
 /// mid-frame passed the outer check before the poison store landed.
-#[cfg(any(feature = "trojan", feature = "vless"))]
+#[cfg(any(
+    feature = "trojan",
+    feature = "vless",
+    feature = "anytls",
+    feature = "kcptun"
+))]
 pub(crate) fn check_not_desynced(
     flag: &std::sync::atomic::AtomicBool,
 ) -> Result<(), meow_common::MeowError> {

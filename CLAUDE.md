@@ -151,7 +151,7 @@ cargo test --lib --bin meow \
   --test config_persistence_test --test systemd_config_test \
   --test trojan_integration --test vless_config_test --test vless_integration \
   --test v2ray_plugin_integration --test gost_plugin_integration \
-  --test shadow_tls_test --test restls_e2e --test jls_e2e --test pre_resolve_test \
+  --test shadow_tls_test --test restls_e2e --test jls_e2e --test kcptun_e2e --test pre_resolve_test \
   --test tls_test --test ws_test --test crate_invariants_test \
   --test crate_publish_metadata_test \
   --test smux_singbox_integration
@@ -181,6 +181,14 @@ handshake and data path against a real upstream peer
 jls-server .`); `MEOW_JLS_E2E_ALLOW_SKIP=1` prints a loud explicit
 skip for local runs only — CI builds the harness via `actions/setup-go`
 and never sets it.
+
+`kcptun_e2e` drives the full SS → smux → snappy → KCP → crypt/FEC stack
+against a real upstream Go peer (kcp-go + xtaci/smux + go-shadowsocks2).
+Every leg is real-peer, so the suite **fails** when `KCPTUN_SERVER_BIN`
+is unset — build the harness from
+`crates/meow-proxy/tests/support/kcptun-server` (`go build -o kcptun-server .`);
+`MEOW_KCPTUN_E2E_ALLOW_SKIP=1` prints a loud explicit skip for local runs
+only — CI builds the harness via `actions/setup-go` and never sets it.
 
 Keep the target list in sync with `.github/workflows/test.yml`; a new `tests/`
 file that CI runs but this list omits is invisible to the local bar.

@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux"]
+default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun"]
 ss = ["dep:shadowsocks", "meow-transport/simple-obfs", "meow-transport/shadow-tls", "meow-transport/restls", "meow-transport/jls"]
 trojan = []
 vless = []
@@ -47,6 +47,13 @@ mux = ["dep:h2", "dep:yamux", "dep:tokio-util", "meow-transport/h2"]
 # (https://github.com/shadowsocks/ech-tls-tunnel). ECH is native to the
 # BoringSSL TlsLayer, so no extra TLS deps.
 ech-tls-tunnel = ["ss"]
+# In-process kcptun SIP003 plugin client (issue #533): the KCP-over-UDP
+# stream with crypt/FEC/snappy lives in `meow-transport`; this crate adds
+# the smux session pool (lazy expiry, round-robin) and UDP-over-TCP
+# relay on top. In the
+# `full` bundle; excluded from `minimal` (ADR-0007 — the cipher suite,
+# reed-solomon and snappy deps are only reachable via `plugin: kcptun`).
+kcptun = ["ss", "mux", "dep:tokio-util", "meow-transport/kcptun"]
 
 [dependencies]
 meow-common = { workspace = true }

@@ -93,6 +93,33 @@ the canonical, in-repo source a release is cut from.
   authentication *is* the certificate check. UDP relay is unsupported,
   matching upstream. (#533)
 
+- **In-process `kcptun` for Shadowsocks** — `plugin: kcptun` now runs
+  natively (kcptun/kcp-go wire parity). The transport lives in
+  `meow-transport` as a poll-driven `KcpStream` (ARQ over UDP on the
+  zonyitoo `kcp` core) plus the kcp-go-compatible crypt envelope
+  (`none`/`xor`/`salsa20`/CFB ciphers/`aes-128-gcm`, PBKDF2-HMAC-SHA1
+  KDF), Reed-Solomon FEC with peer auto-tuning, and optional snappy
+  stream compression. `meow-proxy` adds the SIP003 option parser, a
+  pooled session layer (round-robin `conn` KCP sessions with lazy
+  `autoexpire` reuse expiry; `scavengettl` is parsed but is a no-op —
+  client-side linger does not apply) over in-tree smux v1 with
+  keepalive NOPs and `frameSize`/`smuxbuf`/`streambuf` sizing, and
+  upstream-compatible UDP relay: UDP datagrams travel as
+  UDP-over-TCP records (`sp.udp-over-tcp.arpa:0`, length-prefixed)
+  through a pooled smux stream. The KCP socket goes through
+  `dial_udp_endpoint`, so `dialer-proxy` chains tunnel the datagrams
+  instead of leaking raw UDP. Options mirror upstream kcptun
+  (`key`/`crypt`/`mode`/`conn`/`autoexpire`/`scavengettl`/`mtu`/
+  `ratelimit`/`sndwnd`/`rcvwnd`/`datashard`/`parityshard`/`dscp`/
+  `nocomp`/`nodelay`/`interval`/`resend`/`nc`/`sockbuf`/`smuxver`/
+  `smuxbuf`/`streambuf`/`framesize`/`keepalive`); `acknodelay` is
+  accepted but ignored (no such knob on the `kcp` core), and only
+  `smuxver=1` is supported, matching our smux layer. The feature is in the `full` bundle and excluded from
+  `minimal` (cipher/FEC/snappy dependency weight). One operational
+  note: `KcpStream` progress is poll-driven — retransmits and
+  dead-link detection advance while the stream is polled, which the
+  smux session reader guarantees for pooled sessions. (#533)
+
 ### Changed
 
 - **BoringSSL is now the only crypto library; rustls is gone from the runtime.**

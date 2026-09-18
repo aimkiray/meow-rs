@@ -11,7 +11,7 @@
 //! in-process `anytls_rs::server::Server`; no external anytls server needed.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -19,7 +19,7 @@ use std::task::{Context, Poll};
 use anytls_rs::client::Client as AnytlsClient;
 use anytls_rs::client::UDP_OVER_TCP_MAGIC_ADDR;
 use anytls_rs::padding::PaddingFactory;
-use anytls_rs::session::{Session, Stream as AnytlsStream, StreamReader};
+use anytls_rs::session::{Session, Stream as AnytlsStream};
 use anytls_rs::{AsyncStream, TlsConnect, TlsConnectFuture};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -32,6 +32,8 @@ use tokio::net::TcpStream;
 use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
+
+use crate::uot::{encode_uot_addr, read_uot_addr};
 
 /// AnyTLS outbound adapter.
 pub struct AnytlsAdapter {
@@ -394,11 +396,6 @@ const SOCKS5_ATYP_IPV4: u8 = 0x01;
 const SOCKS5_ATYP_DOMAIN: u8 = 0x03;
 const SOCKS5_ATYP_IPV6: u8 = 0x04;
 
-/// `uot.AddrParser` address-family bytes — every **per-packet** header.
-const UOT_ATYP_IPV4: u8 = 0x00;
-const UOT_ATYP_IPV6: u8 = 0x01;
-const UOT_ATYP_DOMAIN: u8 = 0x02;
-
 /// One anytls data frame carries a `u16` length, so a datagram plus its uot
 /// header must fit in 64 KiB. The largest possible IPv6 header is
 /// ATYP(1) + addr(16) + port(2) + length(2) = 21 bytes, which still leaves
@@ -448,79 +445,6 @@ fn encode_uot_request(metadata: &Metadata) -> Vec<u8> {
     buf
 }
 
-/// Append a per-packet uot address header (`uot.AddrParser` bytes).
-fn encode_uot_addr(buf: &mut Vec<u8>, addr: &SocketAddr) {
-    match addr.ip() {
-        IpAddr::V4(v4) => {
-            buf.push(UOT_ATYP_IPV4);
-            buf.extend_from_slice(&v4.octets());
-        }
-        // Upstream unmaps before serializing, so a `::ffff:a.b.c.d` peer goes
-        // out as plain IPv4 rather than as an IPv6 address the server would
-        // then have to unmap itself.
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => {
-                buf.push(UOT_ATYP_IPV4);
-                buf.extend_from_slice(&v4.octets());
-            }
-            None => {
-                buf.push(UOT_ATYP_IPV6);
-                buf.extend_from_slice(&v6.octets());
-            }
-        },
-    }
-    buf.extend_from_slice(&addr.port().to_be_bytes());
-}
-
-/// Read a per-packet uot address header.
-///
-/// Domain-form replies are best-effort, matching `trojan.rs`: an IP literal is
-/// parsed, anything else degrades to `0.0.0.0:<port>`. Servers echo the IP
-/// form here — the FQDN branch exists because the serializer allows it.
-async fn read_uot_addr(reader: &mut StreamReader) -> Result<SocketAddr> {
-    let mut atyp = [0u8; 1];
-    reader.read_exact(&mut atyp).await.map_err(MeowError::Io)?;
-    let ip = match atyp[0] {
-        UOT_ATYP_IPV4 => {
-            let mut octets = [0u8; 4];
-            reader
-                .read_exact(&mut octets)
-                .await
-                .map_err(MeowError::Io)?;
-            IpAddr::V4(Ipv4Addr::from(octets))
-        }
-        UOT_ATYP_IPV6 => {
-            let mut octets = [0u8; 16];
-            reader
-                .read_exact(&mut octets)
-                .await
-                .map_err(MeowError::Io)?;
-            IpAddr::V6(Ipv6Addr::from(octets))
-        }
-        UOT_ATYP_DOMAIN => {
-            let mut len = [0u8; 1];
-            reader.read_exact(&mut len).await.map_err(MeowError::Io)?;
-            let mut domain = vec![0u8; len[0] as usize];
-            reader
-                .read_exact(&mut domain)
-                .await
-                .map_err(MeowError::Io)?;
-            std::str::from_utf8(&domain)
-                .ok()
-                .and_then(|d| d.parse::<IpAddr>().ok())
-                .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-        }
-        other => {
-            return Err(MeowError::Proxy(format!(
-                "anytls udp: unknown uot address type {other:#x}"
-            )))
-        }
-    };
-    let mut port = [0u8; 2];
-    reader.read_exact(&mut port).await.map_err(MeowError::Io)?;
-    Ok(SocketAddr::new(ip, u16::from_be_bytes(port)))
-}
-
 /// UDP-over-AnyTLS packet connection.
 ///
 /// Each datagram becomes exactly one anytls data frame, so the framing the
@@ -532,6 +456,10 @@ struct AnytlsPacketConn {
     stream: Arc<AnytlsStream>,
     // See `AnytlsConn::_session`.
     _session: Arc<Session>,
+    /// Set once a frame read is torn by cancellation — the stream's
+    /// framing is then unrecoverable, so every later packet op must fail
+    /// fast rather than misdeliver (issue #514).
+    poisoned: std::sync::atomic::AtomicBool,
 }
 
 impl AnytlsPacketConn {
@@ -539,6 +467,7 @@ impl AnytlsPacketConn {
         Self {
             stream,
             _session: session,
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -553,9 +482,14 @@ impl AnytlsPacketConn {
 #[async_trait]
 impl ProxyPacketConn for AnytlsPacketConn {
     async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        crate::check_not_desynced(&self.poisoned)?;
         let mut reader = self.stream.reader().lock().await;
+        // Re-check post-lock: a read parked behind a cancelled mid-frame
+        // read must not consume the torn remainder.
+        crate::check_not_desynced(&self.poisoned)?;
+        let mut guard = crate::PoisonOnIncomplete::new(&self.poisoned);
 
-        let addr = read_uot_addr(&mut reader).await?;
+        let addr = read_uot_addr(&mut *reader).await?;
 
         let mut len_bytes = [0u8; 2];
         reader
@@ -577,10 +511,15 @@ impl ProxyPacketConn for AnytlsPacketConn {
             let mut sink = vec![0u8; length - to_copy];
             reader.read_exact(&mut sink).await.map_err(MeowError::Io)?;
         }
+        guard.complete = true;
         Ok((to_copy, addr))
     }
 
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
+        // `send_data` queues the frame atomically, so a cancelled write
+        // cannot tear framing — but a conn poisoned on the read side is
+        // dead regardless; fail fast rather than feed it.
+        crate::check_not_desynced(&self.poisoned)?;
         let mut frame = Vec::with_capacity(21 + buf.len());
         encode_uot_addr(&mut frame, addr);
         let Ok(length) = u16::try_from(buf.len()) else {
@@ -718,16 +657,11 @@ fn install_anytls_bridges() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::uot::UOT_ATYP_IPV4;
     use anytls_rs::protocol::Command;
     use meow_common::Network;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-
-    fn reader_over(bytes: &[u8]) -> StreamReader {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(Bytes::copy_from_slice(bytes)).unwrap();
-        StreamReader::new(0, rx)
-    }
 
     async fn test_session() -> (Arc<Session>, DuplexStream) {
         let (io, peer) = tokio::io::duplex(64);
@@ -939,70 +873,5 @@ mod tests {
     fn request_falls_back_to_unspecified_without_address() {
         let empty = encode_uot_request(&metadata_for("", None, 1234));
         assert_eq!(empty, vec![0, SOCKS5_ATYP_IPV4, 0, 0, 0, 0, 0x04, 0xd2]);
-    }
-
-    /// Per-packet headers use the uot family bytes — 0x00/0x01, not SOCKS5's
-    /// 0x01/0x04. Getting this wrong is silent on the wire.
-    #[test]
-    fn packet_header_encodes_uot_family_bytes() {
-        let mut buf = Vec::new();
-        encode_uot_addr(&mut buf, &"1.2.3.4:80".parse().unwrap());
-        assert_eq!(buf, vec![UOT_ATYP_IPV4, 1, 2, 3, 4, 0, 80]);
-
-        let mut buf = Vec::new();
-        encode_uot_addr(&mut buf, &"[::1]:80".parse().unwrap());
-        assert_eq!(buf[0], UOT_ATYP_IPV6);
-        assert_eq!(buf.len(), 1 + 16 + 2);
-
-        // v4-mapped peers are unmapped, as upstream does before serializing.
-        let mut buf = Vec::new();
-        encode_uot_addr(&mut buf, &"[::ffff:1.2.3.4]:80".parse().unwrap());
-        assert_eq!(buf, vec![UOT_ATYP_IPV4, 1, 2, 3, 4, 0, 80]);
-    }
-
-    #[tokio::test]
-    async fn read_uot_addr_round_trips_encode() {
-        for addr in ["1.2.3.4:53", "[2001:db8::1]:443"] {
-            let addr: SocketAddr = addr.parse().unwrap();
-            let mut buf = Vec::new();
-            encode_uot_addr(&mut buf, &addr);
-            let mut reader = reader_over(&buf);
-            assert_eq!(read_uot_addr(&mut reader).await.unwrap(), addr);
-        }
-    }
-
-    /// Domain-form replies degrade to `0.0.0.0:<port>` unless the "domain" is
-    /// an IP literal — same best-effort rule as `trojan.rs`.
-    #[tokio::test]
-    async fn read_uot_addr_handles_domain_form() {
-        let mut wire = vec![UOT_ATYP_DOMAIN, 11];
-        wire.extend_from_slice(b"example.com");
-        wire.extend_from_slice(&443u16.to_be_bytes());
-        let mut reader = reader_over(&wire);
-        assert_eq!(
-            read_uot_addr(&mut reader).await.unwrap(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 443)
-        );
-
-        let mut wire = vec![UOT_ATYP_DOMAIN, 7];
-        wire.extend_from_slice(b"1.2.3.4");
-        wire.extend_from_slice(&53u16.to_be_bytes());
-        let mut reader = reader_over(&wire);
-        assert_eq!(
-            read_uot_addr(&mut reader).await.unwrap(),
-            "1.2.3.4:53".parse::<SocketAddr>().unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn read_uot_addr_rejects_unknown_family() {
-        let mut reader = reader_over(&[0x09, 0, 0, 0, 0, 0, 0]);
-        let Err(err) = read_uot_addr(&mut reader).await else {
-            panic!("unknown address family must error");
-        };
-        assert!(
-            err.to_string().contains("unknown uot address type"),
-            "{err}"
-        );
     }
 }

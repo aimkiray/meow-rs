@@ -169,6 +169,20 @@ jobs:
       - name: Build jls-server harness
         run: go build -C crates/meow-transport/tests/support/jls-server -o "$RUNNER_TEMP/jls-server" .
 
+      # The kcptun e2e suite drives the full SS→smux→snappy→KCP→crypt/FEC
+      # stack against a real upstream Go peer (kcp-go + xtaci/smux +
+      # go-shadowsocks2), so build the in-tree harness. Without
+      # KCPTUN_SERVER_BIN every leg loud-skips — a green run here always
+      # means real wire interop was exercised.
+      - name: Set up Go (kcptun harness)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/meow-proxy/tests/support/kcptun-server/go.mod
+
+      - name: Build kcptun interop harness
+        working-directory: crates/meow-proxy/tests/support/kcptun-server
+        run: go build -o "$RUNNER_TEMP/kcptun-server" .
+
       - name: Build
         run: cargo build --tests
 
@@ -185,6 +199,8 @@ jobs:
           RESTLS_SERVER_BIN: ${{ runner.temp }}/restls-server
           # Same contract for jls_e2e's upstream-interop leg.
           JLS_SERVER_BIN: ${{ runner.temp }}/jls-server
+          # And for kcptun_e2e's all-real-peer suite.
+          KCPTUN_SERVER_BIN: ${{ runner.temp }}/kcptun-server
         run: |
           cargo nextest run --lib --bin meow \
             --test common_test \
@@ -206,6 +222,7 @@ jobs:
             --test shadow_tls_test \
             --test restls_e2e \
             --test jls_e2e \
+            --test kcptun_e2e \
             --test pre_resolve_test \
             --test tls_test \
             --test ws_test \

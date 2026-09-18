@@ -62,6 +62,7 @@ Rust port currently supports:
 - `shadow-tls` (cover-TLS record transport, v1/v2/v3) — `crates/meow-proxy/src/shadow_tls_plugin.rs`
 - `restls` (record-level TLS client + tagged records, tls12/tls13) — `crates/meow-proxy/src/restls_plugin.rs`
 - `jls` (record-level TLS 1.3 client with hello-random auth) — `crates/meow-proxy/src/jls_plugin.rs`
+- `kcptun` (KCP ARQ + crypt/FEC/snappy over UDP, smux v1 pool, UDP-over-TCP relay) — `crates/meow-proxy/src/kcptun_plugin.rs`
 - `simple-obfs` — `crates/meow-proxy/src/shadowsocks_adapter.rs` (`BuiltinObfs`)
 
 | Transport        | Upstream | Rust | Status |
@@ -74,9 +75,10 @@ Rust port currently supports:
 | ShadowTLS        | Yes      | Yes (SS plugin, v1–v3) | OK |
 | restls           | Yes      | Yes (SS plugin, tls12/tls13) | OK |
 | jls              | Yes      | Yes (SS plugin) | OK |
+| kcptun           | Yes      | Yes (SS plugin, smux v1 only) | OK |
 | Reality          | Yes      | No   | **Gap** |
 | simple-obfs      | Yes      | Yes  | OK |
-| SMUX / mux       | Yes      | Yes | OK — `smux:`/`mux:` node option (trojan/vless/ss/vmess) + gost-plugin single-stream |
+| SMUX / mux       | Yes      | Yes (`mux` feature: smux/yamux/h2mux/muxcool; `smux:`/`mux:` node option + gost-plugin single-stream; smux v1 also underlays kcptun) | OK |
 
 ### Proxy groups
 

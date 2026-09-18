@@ -154,10 +154,12 @@ is called out explicitly.
 Fully supported including AEAD-2022 ciphers. The built-in `v2ray-plugin`
 and `gost-plugin` WebSocket transports are included, along with
 `shadow-tls` (all three protocol versions), `restls` (both
-`version-hint` modes; `force-tls12` maps to the `tls12` path) and `jls`
-(hello-random authentication over a real TLS 1.3 handshake). External
-SIP003 plugin binaries are supported via `plugin:` on `ss` nodes and
-`allow-external-plugin` on providers.
+`version-hint` modes; `force-tls12` maps to the `tls12` path), `jls`
+(hello-random authentication over a real TLS 1.3 handshake) and
+`kcptun` (KCP ARQ with crypt/FEC/snappy over a smux v1 session pool;
+UDP relay via UDP-over-TCP). External SIP003 plugin binaries are
+supported via `plugin:` on `ss` nodes and `allow-external-plugin` on
+providers.
 
 ### Trojan
 

@@ -2,6 +2,8 @@
 use crate::ech_tls_tunnel::{self, EchTlsTunnelConfig};
 use crate::gost_plugin;
 use crate::jls_plugin;
+#[cfg(feature = "kcptun")]
+use crate::kcptun_plugin;
 use crate::restls_plugin;
 use crate::shadow_tls_plugin;
 use crate::v2ray_plugin::{self, V2rayPluginConfig};
@@ -51,6 +53,7 @@ pub enum BuiltinObfs {
 /// * `EchTlsTunnel` — `ech-tls-tunnel` plugin (TLS-in-TLS with ECH).
 /// * `Restls` — native restls (record-level TLS handshake + tagged records).
 /// * `Jls` — native jls (record-level TLS 1.3 with random-field auth).
+/// * `Kcptun` — native kcptun (KCP-over-UDP + smux pool; UDP via UoT).
 #[allow(
     clippy::large_enum_variant,
     reason = "external-plugin boxing would add an indirection to the overwhelmingly-common no-plugin arm; the variant spread is bounded by in-tree plugins"
@@ -79,6 +82,10 @@ enum PluginKind {
     /// Native jls transport — record-level TLS 1.3 with hello-random
     /// authentication; `JlsConfig` is validated at construction.
     Jls(jls_plugin::JlsPluginConfig),
+    /// Native kcptun transport — KCP-over-UDP + smux session pool.
+    /// `Arc` because the pooled client outlives a single dial.
+    #[cfg(feature = "kcptun")]
+    Kcptun(Arc<kcptun_plugin::KcptunClient>),
     #[cfg(feature = "ech-tls-tunnel")]
     EchTlsTunnel(EchTlsTunnelConfig, TlsLayer),
 }
@@ -211,6 +218,20 @@ impl ShadowsocksAdapter {
                     warn!("SS '{name}': client-fingerprint has no effect on jls");
                 }
                 PluginKind::Jls(cfg)
+            }
+            #[cfg(feature = "kcptun")]
+            Some("kcptun") => {
+                let cfg = kcptun_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
+                debug!(
+                    "SS '{}' using built-in kcptun: crypt={} mode={} conn={} nocomp={}",
+                    name, cfg.crypt, cfg.mode, cfg.conn, cfg.no_comp
+                );
+                PluginKind::Kcptun(Arc::new(kcptun_plugin::KcptunClient::new(
+                    cfg,
+                    server,
+                    port,
+                    Arc::clone(&dialer),
+                )))
             }
             #[cfg(feature = "ech-tls-tunnel")]
             Some("ech-tls-tunnel") => {
@@ -398,6 +419,19 @@ impl SsCore {
                 );
                 Ok(Box::new(SsConn(stream)))
             }
+            #[cfg(feature = "kcptun")]
+            PluginKind::Kcptun(client) => {
+                // A pooled smux stream over the KCP/UDP transport — the SS
+                // crypto layer sits on top exactly like a TCP dial.
+                let transport = client.open_stream().await?;
+                let stream = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    transport,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(stream)))
+            }
             #[cfg(feature = "ech-tls-tunnel")]
             PluginKind::EchTlsTunnel(cfg, tls) => {
                 let transport =
@@ -560,6 +594,15 @@ impl SsCore {
                         .into(),
                 ))
             }
+            #[cfg(feature = "kcptun")]
+            PluginKind::Kcptun(_) => {
+                // KCP is UDP-only — it can never ride a relay TCP stream.
+                Err(MeowError::NotSupported(
+                    "ss: kcptun is a UDP transport; it cannot terminate on \
+                     a relay-supplied stream"
+                        .into(),
+                ))
+            }
             PluginKind::External(_) => {
                 // A SIP003 subprocess owns its outbound leg (it dials the
                 // real server itself and we only reach its local listener).
@@ -633,7 +676,7 @@ pub fn is_builtin_obfs_plugin(name: &str) -> bool {
 /// spawned as an external SIP003 subprocess.  Must stay in sync with the
 /// dispatch match in `ShadowsocksAdapter::new` (single source of truth
 /// for `meow-config`'s dialer-injection gate, which cannot see the
-/// feature-gated `ech-tls-tunnel` arm directly).
+/// feature-gated `ech-tls-tunnel`/`kcptun` arms directly).
 pub fn is_builtin_sip003_plugin(name: &str) -> bool {
     is_builtin_obfs_plugin(name)
         || matches!(
@@ -641,6 +684,7 @@ pub fn is_builtin_sip003_plugin(name: &str) -> bool {
             "v2ray-plugin" | "gost-plugin" | "shadow-tls" | "restls" | "jls"
         )
         || (cfg!(feature = "ech-tls-tunnel") && name == "ech-tls-tunnel")
+        || (cfg!(feature = "kcptun") && name == "kcptun")
 }
 
 /// Parses `plugin-opts` (already serialized to SIP003 `key=value;...` form) for
@@ -977,7 +1021,14 @@ impl ProxyAdapter for ShadowsocksAdapter {
         let plain_udp_ok = self.support_udp
             && !self.core.dialer.is_proxy()
             && self.core.plugin.udp_block_reason().is_none();
-        plain_udp_ok || {
+        // kcptun's UDP path is UDP-over-TCP over a pooled smux stream — its
+        // datagrams go through `dial_udp_endpoint`, which tunnels them under
+        // `dialer-proxy`, so the chain-safety check does not apply.
+        #[cfg(feature = "kcptun")]
+        let kcptun_udp_ok = self.support_udp && matches!(self.core.plugin, PluginKind::Kcptun(_));
+        #[cfg(not(feature = "kcptun"))]
+        let kcptun_udp_ok = false;
+        plain_udp_ok || kcptun_udp_ok || {
             #[cfg(feature = "mux")]
             {
                 self.mux.as_ref().is_some_and(|mux| mux.supports_udp())
@@ -1039,6 +1090,36 @@ impl ProxyAdapter for ShadowsocksAdapter {
             if let Some(conn) = mux.open_packet_stream_for(metadata, "ss").await? {
                 return Ok(conn);
             }
+        }
+
+        // kcptun has no UDP relay on the wire — upstream forces
+        // `UDPOverTCP`: one pooled smux stream carries an SS request to the
+        // magic UoT target, then legacy `addr ‖ len ‖ payload` framing.
+        // Safe before the `is_proxy` refusal below: the underlying KCP
+        // datagrams went through `dial_udp_endpoint`, which tunnels them
+        // through the front proxy's UDP relay rather than binding a raw
+        // socket.
+        #[cfg(feature = "kcptun")]
+        if let PluginKind::Kcptun(client) = &self.core.plugin {
+            debug!(
+                "SS UDP over kcptun UoT connecting to {} via {}",
+                metadata.remote_address(),
+                self.addr_str
+            );
+            let stream = client.open_stream().await?;
+            let target = Address::DomainNameAddress(
+                kcptun_plugin::UOT_MAGIC_HOST.to_string(),
+                kcptun_plugin::UOT_MAGIC_PORT,
+            );
+            let ss_stream = ProxyClientStream::from_stream(
+                Arc::clone(&self.core.context),
+                stream,
+                &self.core.server_config,
+                target,
+            );
+            return Ok(Box::new(kcptun_plugin::UotPacketConn::new(Box::new(
+                ss_stream,
+            ))));
         }
 
         // Enforcement point for the dialer-proxy UDP leak (not `support_udp`,

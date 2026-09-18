@@ -133,7 +133,7 @@ pub fn node_selects_external_plugin(config: &HashMap<String, serde_yaml::Value>)
 /// during adapter construction, so provider content would select a local
 /// binary (issue #513). Built-in/in-process plugins (`obfs`,
 /// `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`,
-/// `ech-tls-tunnel`) stay allowed — mihomo
+/// `kcptun`, `ech-tls-tunnel`) stay allowed — mihomo
 /// implements those in-process too, so gating them would diverge.
 pub fn parse_proxy_provider_node(
     config: &HashMap<String, serde_yaml::Value>,
@@ -3102,6 +3102,37 @@ tls: true
             panic!("missing username must reach the jls parser and fail");
         };
         assert!(err.contains("username"), "msg: {err}");
+    }
+
+    /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
+    /// the in-process kcptun parser → adapter construction.
+    #[cfg(feature = "kcptun")]
+    #[test]
+    fn test_kcptun_node_parse_e2e() {
+        let cfg = proxy_config(
+            "name: kcptun\ntype: ss\nserver: 1.2.3.4\nport: 8388\n\
+             cipher: aes-256-gcm\npassword: pw\n\
+             plugin: kcptun\nplugin-opts:\n  crypt: salsa20\n  mode: fast3\n  \
+             conn: 2\n  nocomp: true\n  datashard: 6\n  parityshard: 3\n",
+        );
+        let adapter = parse_proxy(&cfg).expect("kcptun node must parse");
+        assert_eq!(adapter.name(), "kcptun");
+        assert!(
+            !is_external_sip003_plugin(Some("kcptun")),
+            "provider/subscription path must treat kcptun as built-in"
+        );
+
+        // A rejected opt proves the serialized string reached the kcptun
+        // parser — a misrouted plugin would parse as a no-op.
+        let cfg = proxy_config(
+            "name: kcptun\ntype: ss\nserver: 1.2.3.4\nport: 8388\n\
+             cipher: aes-256-gcm\npassword: pw\n\
+             plugin: kcptun\nplugin-opts:\n  smuxver: 2\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("smuxver=2 must reach the kcptun parser and fail");
+        };
+        assert!(err.contains("smuxver"), "msg: {err}");
     }
 
     // ─── direct proxy with per-proxy DNS (issue #67) ─────────────────────────

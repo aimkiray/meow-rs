@@ -95,6 +95,33 @@ restls = [
 # `tls13` driver (hello-random credential auth, plain appdata records).
 jls = ["restls"]
 
+# kcptun: the kcptun SS-plugin transport (issue #533) — a kcp-go wire-compatible
+# KCP-over-UDP stream: `kcp` gives the ARQ core (same crate shadowsocks-rust /
+# kcptun-rust build on, maintained by zonyitoo), the crypt/FEC/snappy layers
+# are in-tree against the exact upstream packet formats. aes stays on the
+# cipher-0.5 line (0.9.x) to share the RustCrypto traits with the exotic
+# crypts (blowfish/cast5/twofish/des); vmess's `aes` 0.8 in meow-proxy is
+# unaffected — the two majors coexist in the lockfile.
+kcptun = [
+    "dep:kcp",
+    "dep:reed-solomon-erasure",
+    "dep:crc32fast",
+    "dep:pbkdf2",
+    "dep:sha1",
+    "dep:rand",
+    "dep:aes",
+    "dep:aes-gcm11",
+    "dep:salsa20",
+    "dep:blowfish",
+    "dep:byteorder",
+    "dep:cast5",
+    "dep:des",
+    "dep:cipher",
+    "dep:twofish",
+    "dep:tokio-snappy",
+    "dep:socket2",
+]
+
 [dependencies]
 async-trait = { workspace = true }
 thiserror = { workspace = true }
@@ -126,6 +153,31 @@ httparse = { version = "1", optional = true }
 
 # reality feature — pure-Rust X25519 for the REALITY handshake.
 x25519-dalek = { workspace = true, optional = true }
+
+# kcptun feature — see the `kcptun` feature comment above for why aes is pinned
+# to the cipher-0.5 line while vmess's aes stays on 0.8.
+kcp = { version = "0.6", optional = true }
+reed-solomon-erasure = { version = "6", optional = true }
+crc32fast = { workspace = true, optional = true }
+# pbkdf2 0.12 pairs with the digest-0.10 sha1 the workspace already pins
+# (0.13 moved to digest 0.11 and would pull a second sha1).
+pbkdf2 = { version = "0.12", optional = true }
+aes = { version = "0.9", optional = true }
+aes-gcm11 = { package = "aes-gcm", version = "0.11", optional = true }
+salsa20 = { version = "0.11", optional = true }
+blowfish = { version = "0.10", optional = true }
+# blowfish is generic over byte order; Go's blowfish is big-endian.
+byteorder = { version = "1", optional = true }
+cast5 = { version = "0.12", optional = true }
+des = { version = "0.9", optional = true }
+cipher = { version = "0.5", optional = true }
+twofish = { version = "0.8", optional = true }
+# Snappy framed-stream codec for kcptun's `nocomp=false` data path —
+# `tokio-snappy` wraps `snap`'s frame format (wire-identical to golang/snappy's
+# Writer/Reader) over a bidirectional tokio stream. 185 lines, MIT.
+tokio-snappy = { version = "0.2", optional = true }
+# `SO_RCVBUF`/`SO_SNDBUF`/`TOS` on the kcptun UDP socket (`sockbuf`/`dscp`).
+socket2 = { workspace = true, optional = true }
 
 # tls feature (BoringSSL)
 boring             = { workspace = true, optional = true }
