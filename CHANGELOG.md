@@ -270,6 +270,19 @@ the canonical, in-repo source a release is cut from.
   independently; changing the API secret refreshes authentication. Add
   dashboard browser and lifecycle regression tests to CI.
 
+- **A bare `Fin` before `SynAck` no longer hangs the anytls dial**
+  (feature `anytls`). `Session::handle_frame`'s Fin arm evicted the
+  stream from `streams`/`stream_receive_tx` but never notified the
+  pending synack-waiter — the client keeps `Arc<Stream>` so `synack_tx`
+  stayed alive and `synack_rx` pended with no wake of its own (internal
+  bound 30 s; the 5 s dial deadline surfaced first). A server that FINs
+  instead of SynAck-erroring a refused stream now marks it closed
+  locally and wakes the waiter immediately with `StreamClosed`,
+  producing a clean dial error (issue #543). The outbound-Fin eviction
+  in `process_stream_data` now notifies symmetrically — `open_stream`
+  is pub, so an out-of-tree caller can hold a live waiter across a
+  local close.
+
 - **Scheduled subscription refreshes no longer reset `select` group
   choices or drop provider-backed group members.** The refresh loop
   rebuilt each fetched candidate with `rebuild_from_raw_with_resolver`,

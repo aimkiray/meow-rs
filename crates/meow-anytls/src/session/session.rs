@@ -633,10 +633,27 @@ impl Session {
                     "[Session] FIN received for stream {}, closing",
                     frame.stream_id
                 );
-                let mut streams = self.streams.write().await;
-                streams.remove(&frame.stream_id);
-                let mut receive_map = self.stream_receive_tx.write().await;
-                receive_map.remove(&frame.stream_id);
+                let removed = {
+                    let mut streams = self.streams.write().await;
+                    let removed = streams.remove(&frame.stream_id);
+                    let mut receive_map = self.stream_receive_tx.write().await;
+                    receive_map.remove(&frame.stream_id);
+                    removed
+                };
+                // A FIN can arrive before the SynAck — the peer refusing
+                // the stream instead of SynAck-erroring it. Mark the
+                // stream closed locally (no Fin reply — upstream
+                // `closeLocally`) so a retained `Arc<Stream>` cannot
+                // `send_data` for a dead stream, and wake the pending
+                // synack-waiter: without it the client keeps `Arc<Stream>`
+                // so `synack_tx` stays alive and `synack_rx` pends until
+                // the internal bound instead of failing the dial
+                // immediately (issue #543). `notify_synack` no-ops once
+                // the SynAck landed.
+                if let Some(stream) = removed {
+                    stream.close_with_error(AnyTlsError::StreamClosed).await;
+                    stream.notify_synack(Err(AnyTlsError::StreamClosed)).await;
+                }
             }
             Command::Settings => {
                 // Client settings (server side)
@@ -1286,8 +1303,23 @@ impl Session {
                             }
                             let result = self.write_frame_inner(frame).await;
                             if fin {
-                                self.streams.write().await.remove(&stream_id);
+                                let removed =
+                                    self.streams.write().await.remove(&stream_id);
                                 self.stream_receive_tx.write().await.remove(&stream_id);
+                                // `open_stream` is pub: an out-of-tree
+                                // caller can hold a live synack-waiter
+                                // across a local close — wake it like the
+                                // inbound Fin arm does, and mark the stream
+                                // closed so a retained Arc<Stream> can't
+                                // still queue PSH (issue #543).
+                                if let Some(stream) = removed {
+                                    stream
+                                        .close_with_error(AnyTlsError::StreamClosed)
+                                        .await;
+                                    stream
+                                        .notify_synack(Err(AnyTlsError::StreamClosed))
+                                        .await;
+                                }
                             }
                             // Hold capacity through the physical write/flush.
                             drop(_permit);
@@ -1823,6 +1855,188 @@ mod tests {
             .unwrap();
 
         assert_eq!(session.padding.read().await.md5(), before);
+    }
+
+    /// Issue #543 — a bare `Fin` arriving before the `SynAck` must wake
+    /// the pending synack-waiter. The client keeps `Arc<Stream>`, so
+    /// without `notify_synack` the receiver pended until the internal
+    /// bound and surfaced as a dial timeout instead of a clean error.
+    #[tokio::test]
+    async fn fin_before_synack_wakes_pending_waiter() {
+        // Client session; the peer end plays the server.
+        let (io, mut peer) = duplex(8192);
+        let (reader, writer) = tokio::io::split(io);
+        let session = Arc::new(Session::new_client(
+            reader,
+            writer,
+            create_test_padding().into_shared(),
+            None,
+        ));
+        let s = Arc::clone(&session);
+        tokio::spawn(async move {
+            let _ = s.recv_loop().await;
+        });
+        let s = Arc::clone(&session);
+        tokio::spawn(async move {
+            let _ = s.process_stream_data().await;
+        });
+
+        let (stream, synack_rx) = session.open_stream().await.unwrap();
+        // The server sees the Syn and refuses the stream by FINing it
+        // instead of SynAck-erroring it.
+        let syn = read_frame(&mut peer).await;
+        assert_eq!(syn.cmd, Command::Syn);
+        let mut fin = Vec::with_capacity(7);
+        fin.push(Command::Fin as u8);
+        fin.extend_from_slice(&syn.stream_id.to_be_bytes());
+        fin.extend_from_slice(&0u16.to_be_bytes());
+        peer.write_all(&fin).await.unwrap();
+
+        let result = time::timeout(Duration::from_secs(2), synack_rx)
+            .await
+            .expect("synack-waiter must wake on Fin, not hit the timeout");
+        assert!(
+            matches!(result, Ok(Err(AnyTlsError::StreamClosed))),
+            "expected StreamClosed for the pending waiter, got {result:?}"
+        );
+        assert!(
+            stream.is_closed(),
+            "an inbound Fin must mark the stream closed locally — a retained \
+             Arc<Stream> must not send_data for a dead stream"
+        );
+        assert!(
+            !session.has_active_streams().await,
+            "the Fin must also evict the stream from the session maps"
+        );
+    }
+
+    /// Issue #543 — a Fin arriving AFTER the SynAck must still evict and
+    /// close the established stream, while `notify_synack` no-ops on the
+    /// already-landed acknowledgement (first notify wins).
+    #[tokio::test]
+    async fn fin_after_synack_evicts_without_renotifying() {
+        // Client session; the peer end plays the server.
+        let (io, mut peer) = duplex(8192);
+        let (reader, writer) = tokio::io::split(io);
+        let session = Arc::new(Session::new_client(
+            reader,
+            writer,
+            create_test_padding().into_shared(),
+            None,
+        ));
+        let s = Arc::clone(&session);
+        tokio::spawn(async move {
+            let _ = s.recv_loop().await;
+        });
+        let s = Arc::clone(&session);
+        tokio::spawn(async move {
+            let _ = s.process_stream_data().await;
+        });
+
+        let (stream, synack_rx) = session.open_stream().await.unwrap();
+        let syn = read_frame(&mut peer).await;
+        assert_eq!(syn.cmd, Command::Syn);
+        let write_frame = |cmd: Command, stream_id: u32| -> Vec<u8> {
+            let mut f = Vec::with_capacity(7);
+            f.push(cmd as u8);
+            f.extend_from_slice(&stream_id.to_be_bytes());
+            f.extend_from_slice(&0u16.to_be_bytes());
+            f
+        };
+
+        // Acknowledge the stream, then FIN it — the first notify wins.
+        peer.write_all(&write_frame(Command::SynAck, syn.stream_id))
+            .await
+            .unwrap();
+        let result = time::timeout(Duration::from_secs(2), synack_rx)
+            .await
+            .expect("synack-waiter must wake on SynAck");
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "the SynAck must land first, got {result:?}"
+        );
+
+        peer.write_all(&write_frame(Command::Fin, syn.stream_id))
+            .await
+            .unwrap();
+
+        // recv_loop handles frames in order: once a second stream's SynAck
+        // resolves, the earlier Fin has already been processed.
+        let (_stream2, synack2) = session.open_stream().await.unwrap();
+        // Padding may append Waste frames after the first Syn; skip them.
+        let syn2 = loop {
+            let frame = read_frame(&mut peer).await;
+            if frame.cmd == Command::Syn {
+                break frame;
+            }
+        };
+        peer.write_all(&write_frame(Command::SynAck, syn2.stream_id))
+            .await
+            .unwrap();
+        time::timeout(Duration::from_secs(2), synack2)
+            .await
+            .expect("the second stream's synack-waiter must resolve")
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            stream.is_closed(),
+            "the Fin must mark the established stream closed"
+        );
+    }
+
+    /// Issue #543 — the symmetric outbound direction: a locally initiated
+    /// close writes a Fin through `process_stream_data`, whose eviction
+    /// must wake a pending synack-waiter too. `open_stream` is pub, so an
+    /// out-of-tree caller can hold `synack_rx` across the local close.
+    #[tokio::test]
+    async fn local_fin_eviction_wakes_pending_waiter() {
+        let (io, mut peer) = duplex(8192);
+        let (reader, writer) = tokio::io::split(io);
+        let session = Arc::new(Session::new_client(
+            reader,
+            writer,
+            create_test_padding().into_shared(),
+            None,
+        ));
+        let s = Arc::clone(&session);
+        tokio::spawn(async move {
+            let _ = s.recv_loop().await;
+        });
+        let s = Arc::clone(&session);
+        tokio::spawn(async move {
+            let _ = s.process_stream_data().await;
+        });
+
+        let (stream, synack_rx) = session.open_stream().await.unwrap();
+        let syn = read_frame(&mut peer).await;
+        assert_eq!(syn.cmd, Command::Syn);
+
+        // Close locally before any SynAck — the Fin the writer emits
+        // must evict the stream and wake the waiter.
+        stream.close();
+        let result = time::timeout(Duration::from_secs(2), synack_rx)
+            .await
+            .expect("synack-waiter must wake on local Fin eviction");
+        assert!(
+            matches!(result, Ok(Err(AnyTlsError::StreamClosed))),
+            "expected StreamClosed for the pending waiter, got {result:?}"
+        );
+
+        // The peer observes the Fin on the wire (padding may append
+        // Waste frames after the Syn — skip them), and the stream is
+        // gone from the session maps.
+        let fin = loop {
+            let frame = read_frame(&mut peer).await;
+            if frame.cmd == Command::Fin {
+                break frame;
+            }
+        };
+        assert_eq!(fin.stream_id, syn.stream_id);
+        assert!(
+            !session.has_active_streams().await,
+            "the local Fin must evict the stream from the session maps"
+        );
     }
 }
 #[cfg(test)]
