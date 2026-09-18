@@ -91,6 +91,9 @@ restls = [
     "dep:rand",
     "dep:chacha20poly1305",
 ]
+# jls client transport — record-level TLS 1.3 built on restls's shared
+# `tls13` driver (hello-random credential auth, plain appdata records).
+jls = ["restls"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -161,6 +164,10 @@ blake3 = { workspace = true }
 [[test]]
 name = "boring_tls_test"
 required-features = ["tls"]
+
+[[test]]
+name = "jls_e2e"
+required-features = ["jls"]
 
 [[test]]
 name = "grpc_test"

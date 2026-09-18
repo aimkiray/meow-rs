@@ -61,6 +61,7 @@ Rust port currently supports:
 - `gost-plugin` (websocket + TLS + smux) — `crates/meow-proxy/src/gost_plugin.rs`
 - `shadow-tls` (cover-TLS record transport, v1/v2/v3) — `crates/meow-proxy/src/shadow_tls_plugin.rs`
 - `restls` (record-level TLS client + tagged records, tls12/tls13) — `crates/meow-proxy/src/restls_plugin.rs`
+- `jls` (record-level TLS 1.3 client with hello-random auth) — `crates/meow-proxy/src/jls_plugin.rs`
 - `simple-obfs` — `crates/meow-proxy/src/shadowsocks_adapter.rs` (`BuiltinObfs`)
 
 | Transport        | Upstream | Rust | Status |
@@ -72,6 +73,7 @@ Rust port currently supports:
 | HTTP upgrade     | Yes      | No   | **Gap** |
 | ShadowTLS        | Yes      | Yes (SS plugin, v1–v3) | OK |
 | restls           | Yes      | Yes (SS plugin, tls12/tls13) | OK |
+| jls              | Yes      | Yes (SS plugin) | OK |
 | Reality          | Yes      | No   | **Gap** |
 | simple-obfs      | Yes      | Yes  | OK |
 | SMUX / mux       | Yes      | Yes | OK — `smux:`/`mux:` node option (trojan/vless/ss/vmess) + gost-plugin single-stream |

@@ -71,6 +71,28 @@ the canonical, in-repo source a release is cut from.
   supported; the upstream `force-tls12` test knob maps to the `tls12`
   path. UDP relay is unsupported, matching upstream. (#533)
 
+- **In-process `jls` for Shadowsocks** — `plugin: jls` now runs natively
+  (mihomo `transport/jls` / `metacubex/jls-tls` parity). jls authenticates
+  inside a genuine TLS 1.3 handshake: `ClientHello.random` is replaced by
+  a 16-byte seed sealed with AES-256-GCM under
+  `SHA-256(password ‖ authData)` / nonce `SHA-256(username ‖ authData)`,
+  where `authData` is the serialized hello with `random` zeroed, and the
+  server answers with the same construction in `ServerHello.random`. No
+  generic TLS stack can control those fields, so the client is driven at
+  the record level on the shared TLS 1.3 machinery introduced for restls.
+  When the server's random authenticates, certificate-chain and
+  CertificateVerify checks are skipped exactly as upstream (the
+  camouflage certificate is a throwaway); when it does not, the full
+  checks run against `host` — an unauthenticated jls server relays to a
+  real cover, so the handshake completes and is then rejected
+  (`ErrJLSAuthFailed` parity). Post-handshake traffic is plain TLS
+  application records — no tagging, masking, or script — with KeyUpdate
+  rotation and `close_notify` handled. Options mirror upstream: `host`,
+  `username` and `password` are required, `alpn` defaults to
+  `h2,http/1.1`; there is no `skip-cert-verify` because jls's
+  authentication *is* the certificate check. UDP relay is unsupported,
+  matching upstream. (#533)
+
 ### Changed
 
 - **BoringSSL is now the only crypto library; rustls is gone from the runtime.**

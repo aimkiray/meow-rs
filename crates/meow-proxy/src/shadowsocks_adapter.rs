@@ -1,6 +1,7 @@
 #[cfg(feature = "ech-tls-tunnel")]
 use crate::ech_tls_tunnel::{self, EchTlsTunnelConfig};
 use crate::gost_plugin;
+use crate::jls_plugin;
 use crate::restls_plugin;
 use crate::shadow_tls_plugin;
 use crate::v2ray_plugin::{self, V2rayPluginConfig};
@@ -49,6 +50,7 @@ pub enum BuiltinObfs {
 /// * `ShadowTls` — native shadow-tls v1/v2/v3 (cover-TLS record transport).
 /// * `EchTlsTunnel` — `ech-tls-tunnel` plugin (TLS-in-TLS with ECH).
 /// * `Restls` — native restls (record-level TLS handshake + tagged records).
+/// * `Jls` — native jls (record-level TLS 1.3 with random-field auth).
 #[allow(
     clippy::large_enum_variant,
     reason = "external-plugin boxing would add an indirection to the overwhelmingly-common no-plugin arm; the variant spread is bounded by in-tree plugins"
@@ -74,6 +76,9 @@ enum PluginKind {
     /// Native restls transport — the record-level TLS client needs no
     /// `TlsLayer`; `RestlsPluginConfig` is validated at construction.
     Restls(restls_plugin::RestlsPluginConfig),
+    /// Native jls transport — record-level TLS 1.3 with hello-random
+    /// authentication; `JlsConfig` is validated at construction.
+    Jls(jls_plugin::JlsPluginConfig),
     #[cfg(feature = "ech-tls-tunnel")]
     EchTlsTunnel(EchTlsTunnelConfig, TlsLayer),
 }
@@ -87,6 +92,7 @@ impl PluginKind {
             PluginKind::Gost(..) => Some("gost-plugin does not support UDP relay"),
             PluginKind::ShadowTls(..) => Some("shadow-tls does not support UDP relay"),
             PluginKind::Restls(..) => Some("restls does not support UDP relay"),
+            PluginKind::Jls(..) => Some("jls does not support UDP relay"),
             #[cfg(feature = "ech-tls-tunnel")]
             PluginKind::EchTlsTunnel(..) => Some("ech-tls-tunnel does not support UDP relay"),
             _ => None,
@@ -192,6 +198,19 @@ impl ShadowsocksAdapter {
                     warn!("SS '{name}': client-fingerprint has no effect on restls");
                 }
                 PluginKind::Restls(cfg)
+            }
+            Some("jls") => {
+                let cfg = jls_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
+                debug!(
+                    "SS '{}' using built-in jls: host={} username={}",
+                    name, cfg.host, cfg.username
+                );
+                // `client-fingerprint` selects a uTLS profile upstream; our
+                // record-level client crafts a fixed-shape ClientHello.
+                if client_fingerprint.is_some() {
+                    debug!("SS '{name}': client-fingerprint has no effect on jls");
+                }
+                PluginKind::Jls(cfg)
             }
             #[cfg(feature = "ech-tls-tunnel")]
             Some("ech-tls-tunnel") => {
@@ -368,6 +387,17 @@ impl SsCore {
                 );
                 Ok(Box::new(SsConn(stream)))
             }
+            PluginKind::Jls(cfg) => {
+                let transport =
+                    jls_plugin::dial(cfg, &self.server, self.port, &*self.dialer).await?;
+                let stream = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    transport,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(stream)))
+            }
             #[cfg(feature = "ech-tls-tunnel")]
             PluginKind::EchTlsTunnel(cfg, tls) => {
                 let transport =
@@ -519,6 +549,17 @@ impl SsCore {
                         .into(),
                 ))
             }
+            PluginKind::Jls(..) => {
+                // jls could terminate on a relay-supplied stream once it
+                // grows a `handshake_over` split — its `dial` currently owns
+                // the TCP dial itself. Until then, fail loudly rather than
+                // send unwrapped traffic.
+                Err(MeowError::NotSupported(
+                    "ss: jls transport does not yet support terminating on \
+                     a relay-supplied stream"
+                        .into(),
+                ))
+            }
             PluginKind::External(_) => {
                 // A SIP003 subprocess owns its outbound leg (it dials the
                 // real server itself and we only reach its local listener).
@@ -597,7 +638,7 @@ pub fn is_builtin_sip003_plugin(name: &str) -> bool {
     is_builtin_obfs_plugin(name)
         || matches!(
             name,
-            "v2ray-plugin" | "gost-plugin" | "shadow-tls" | "restls"
+            "v2ray-plugin" | "gost-plugin" | "shadow-tls" | "restls" | "jls"
         )
         || (cfg!(feature = "ech-tls-tunnel") && name == "ech-tls-tunnel")
 }
@@ -1285,6 +1326,7 @@ mod tests {
                 "host=cover.example.com;password=p;version-hint=tls13",
                 "restls",
             ),
+            ("jls", "host=cover.example.com;username=u;password=p", "jls"),
         ] {
             let adapter = ShadowsocksAdapter::new(
                 "ss-test",

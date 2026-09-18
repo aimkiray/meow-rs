@@ -1,5 +1,5 @@
 //! TLS-record I/O machinery shared by the record-framed SIP003
-//! transports (`shadow_tls`, `restls`) — incremental record assembly,
+//! transports (`shadow_tls`, `restls`, `jls`) — incremental record assembly,
 //! outbox draining, and VecDeque→ReadBuf serving. One copy keeps the
 //! framing rules (header-then-payload reads, reads capped at the record
 //! boundary, EOF-at-boundary vs mid-record, write-zero) identical across

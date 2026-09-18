@@ -1282,4 +1282,35 @@ mod tests {
         assert_eq!(rekeys.load(std::sync::atomic::Ordering::Relaxed), 3);
         assert!(s.cover_hs_buf.is_empty());
     }
+
+    /// A KeyUpdate coalesced into the server Finished record arrives via
+    /// `cover_hs_pending` — `RestlsStream::new` consumes it eagerly or
+    /// the cover epoch desyncs.
+    #[test]
+    fn pending_leftover_keyupdate_rekeys() {
+        // KU(update_requested): typ 24, len 1, body [1].
+        let (read, read_rekeys) = MockCover::new([]);
+        let (write, write_rekeys) = MockCover::new([]);
+        let (inner, _peer) = tokio::io::duplex(64);
+        let s = RestlsStream::new(
+            RestlsUpgraded {
+                inner,
+                server_random: [7u8; 32],
+                client_finished: None,
+                authed: true,
+                cover_read: Some(Box::new(read)),
+                cover_write: Some(Box::new(write)),
+                tls12_gcm: false,
+                gcm_ctr_disabled: false,
+                gcm_next_seq: 0,
+                cover_hs_pending: vec![0x18, 0x00, 0x00, 0x01, 0x01],
+            },
+            wire::derive_secret(b"pw"),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(read_rekeys.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(write_rekeys.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(!s.outbox.is_empty(), "KU response must be staged");
+    }
 }

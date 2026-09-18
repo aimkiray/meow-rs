@@ -1,6 +1,6 @@
 //! Helpers shared by the in-process SIP003 plugin parsers:
 //! `v2ray_plugin`, `gost_plugin`, `shadow_tls_plugin`, `restls_plugin`,
-//! `ech_tls_tunnel`.
+//! `jls_plugin`, `ech_tls_tunnel`.
 
 use meow_common::error::{MeowError, Result};
 use tracing::warn;

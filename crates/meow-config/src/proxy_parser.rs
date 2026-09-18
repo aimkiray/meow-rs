@@ -132,7 +132,7 @@ pub fn node_selects_external_plugin(config: &HashMap<String, serde_yaml::Value>)
 /// external SIP003 executable is rejected: that name reaches `Command::new`
 /// during adapter construction, so provider content would select a local
 /// binary (issue #513). Built-in/in-process plugins (`obfs`,
-/// `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`,
+/// `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`,
 /// `ech-tls-tunnel`) stay allowed — mihomo
 /// implements those in-process too, so gating them would diverge.
 pub fn parse_proxy_provider_node(
@@ -3071,6 +3071,37 @@ tls: true
             panic!("missing version-hint must reach the restls parser and fail");
         };
         assert!(err.contains("version-hint"), "msg: {err}");
+    }
+
+    /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
+    /// the in-process jls parser → adapter construction.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn test_jls_node_parse_e2e() {
+        let cfg = proxy_config(
+            "name: jls\ntype: ss\nserver: 1.2.3.4\nport: 8388\n\
+             cipher: aes-256-gcm\npassword: pw\n\
+             plugin: jls\nplugin-opts:\n  host: cover.example.com\n  \
+             username: alice\n  password: psk\n  alpn: [h2, http/1.1]\n",
+        );
+        let adapter = parse_proxy(&cfg).expect("jls node must parse");
+        assert_eq!(adapter.name(), "jls");
+        assert!(
+            !is_external_sip003_plugin(Some("jls")),
+            "provider/subscription path must treat jls as built-in"
+        );
+
+        // A missing required opt proves the serialized string reached the
+        // jls parser — a misrouted plugin would parse as a no-op.
+        let cfg = proxy_config(
+            "name: jls\ntype: ss\nserver: 1.2.3.4\nport: 8388\n\
+             cipher: aes-256-gcm\npassword: pw\n\
+             plugin: jls\nplugin-opts:\n  host: cover.example.com\n  password: psk\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("missing username must reach the jls parser and fail");
+        };
+        assert!(err.contains("username"), "msg: {err}");
     }
 
     // ─── direct proxy with per-proxy DNS (issue #67) ─────────────────────────

@@ -153,8 +153,9 @@ is called out explicitly.
 
 Fully supported including AEAD-2022 ciphers. The built-in `v2ray-plugin`
 and `gost-plugin` WebSocket transports are included, along with
-`shadow-tls` (all three protocol versions) and `restls` (both
-`version-hint` modes; `force-tls12` maps to the `tls12` path). External
+`shadow-tls` (all three protocol versions), `restls` (both
+`version-hint` modes; `force-tls12` maps to the `tls12` path) and `jls`
+(hello-random authentication over a real TLS 1.3 handshake). External
 SIP003 plugin binaries are supported via `plugin:` on `ss` nodes and
 `allow-external-plugin` on providers.
 

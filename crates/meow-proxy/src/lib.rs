@@ -23,6 +23,8 @@ pub mod ech_tls_tunnel;
 #[cfg(feature = "ss")]
 pub mod gost_plugin;
 #[cfg(feature = "ss")]
+pub mod jls_plugin;
+#[cfg(feature = "ss")]
 mod plugin_util;
 #[cfg(feature = "ss")]
 pub mod restls_plugin;
