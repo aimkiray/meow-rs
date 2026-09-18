@@ -454,7 +454,7 @@ fn encode_uot_request(metadata: &Metadata) -> Vec<u8> {
 /// plain per-datagram frames.
 struct AnytlsPacketConn {
     stream: Arc<AnytlsStream>,
-    // See `AnytlsConn::_session`.
+    // See `AnytlsConn::session`.
     _session: Arc<Session>,
     /// Set once a frame read is torn by cancellation — the stream's
     /// framing is then unrecoverable, so every later packet op must fail
@@ -676,6 +676,13 @@ mod tests {
         tokio::spawn(async move {
             writer_session.process_stream_data().await.unwrap();
         });
+        // `new_server` does not start the inbound frame reader — the
+        // real server spawns `recv_loop` per session (server.rs). Tests
+        // that feed peer→session frames need it running.
+        let reader_session = Arc::clone(&session);
+        tokio::spawn(async move {
+            let _ = reader_session.recv_loop().await;
+        });
         (session, peer)
     }
 
@@ -799,6 +806,201 @@ mod tests {
             [UOT_ATYP_IPV4, 192, 0, 2, 2, 0, 53, 0, 3, b'u', b'd', b'p']
         );
         assert_eq!(wire_frame(&mut peer).await, (Command::Fin, id, vec![]));
+        session.close().await.unwrap();
+    }
+
+    /// Push one data frame into the session from the peer end.
+    async fn push_frame(peer: &mut DuplexStream, stream_id: u32, data: &[u8]) {
+        let mut frame = Vec::with_capacity(7 + data.len());
+        frame.push(Command::Push as u8);
+        frame.extend_from_slice(&stream_id.to_be_bytes());
+        frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        frame.extend_from_slice(data);
+        peer.write_all(&frame).await.unwrap();
+    }
+
+    /// Issue #543: same class as the trojan poison — a `read_packet`
+    /// cancelled mid-frame releases the reader lock with the stream
+    /// mid-datagram and every later read silently parses garbage. The
+    /// conn must poison itself so the tunnel re-dials instead.
+    #[tokio::test]
+    async fn udp_cancelled_read_poisons_packet_conn() {
+        let (session, mut peer) = test_session().await;
+        let (stream, _) = session.open_stream().await.unwrap();
+        let id = stream.id();
+        assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
+        let mut buf = [0u8; 2048];
+
+        // A lone ATYP byte: the address read stalls mid-frame.
+        push_frame(&mut peer, id, &[UOT_ATYP_IPV4]).await;
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(50), conn.read_packet(&mut buf)).await;
+        assert!(cancelled.is_err(), "read must have timed out mid-addr");
+
+        // The peer then completes the datagram — the conn must not
+        // resume mid-stream.
+        push_frame(&mut peer, id, &[9, 9, 9, 9, 0, 53, 0, 1, b'x']).await;
+        let err = conn.read_packet(&mut buf).await.unwrap_err();
+        assert!(
+            err.to_string().contains("desynced"),
+            "expected desync error after cancelled read, got {err:?}"
+        );
+
+        // Writes fail fast on the desynced conn too — the tunnel
+        // re-dials rather than emitting datagrams whose replies can
+        // never be parsed.
+        let destination: SocketAddr = "192.0.2.2:53".parse().unwrap();
+        let err = conn.write_packet(b"x", &destination).await.unwrap_err();
+        assert!(
+            err.to_string().contains("desynced"),
+            "write on a desynced conn must fail fast, got {err:?}"
+        );
+        session.close().await.unwrap();
+    }
+
+    /// A read parked on the reader mutex while another is cancelled
+    /// mid-frame must fail fast at the post-lock re-check instead of
+    /// resuming the torn frame.
+    #[tokio::test]
+    async fn udp_parked_read_after_cancelled_read_fails_fast() {
+        let (session, mut peer) = test_session().await;
+        let (stream, _) = session.open_stream().await.unwrap();
+        let id = stream.id();
+        assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
+        let conn = Arc::new(AnytlsPacketConn::new(stream, Arc::clone(&session)));
+
+        // read1 stalls mid-addr while holding the reader lock.
+        push_frame(&mut peer, id, &[UOT_ATYP_IPV4]).await;
+        let conn1 = Arc::clone(&conn);
+        let first = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            conn1.read_packet(&mut buf).await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // read2 parks on the mutex behind it.
+        let conn2 = Arc::clone(&conn);
+        let queued = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            conn2.read_packet(&mut buf).await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        first.abort();
+        // A trailing datagram keeps a regressed implementation honest:
+        // without the post-lock re-check, read2 would parse these bytes
+        // as the start of a fresh frame and *succeed* — the assert below
+        // fails — rather than parking forever on an empty stream.
+        push_frame(
+            &mut peer,
+            id,
+            &[UOT_ATYP_IPV4, 9, 9, 9, 9, 0, 53, 0, 1, b'x'],
+        )
+        .await;
+        let err = queued.await.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("desynced"),
+            "queued read must fail fast after the poisoned first read, got {err:?}"
+        );
+        session.close().await.unwrap();
+    }
+
+    /// A read cancelled while parked on the reader mutex consumed no
+    /// bytes — it must NOT poison the conn. Pins the invariant that the
+    /// guard arms only after the lock is held.
+    #[tokio::test]
+    async fn udp_parked_read_cancellation_does_not_poison() {
+        let (session, mut peer) = test_session().await;
+        let (stream, _) = session.open_stream().await.unwrap();
+        let id = stream.id();
+        assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
+        let conn = Arc::new(AnytlsPacketConn::new(stream, Arc::clone(&session)));
+
+        // read1 stalls mid-addr holding the lock; read2 parks behind it.
+        push_frame(&mut peer, id, &[UOT_ATYP_IPV4]).await;
+        let conn1 = Arc::clone(&conn);
+        let first = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            conn1.read_packet(&mut buf).await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let conn2 = Arc::clone(&conn);
+        let parked = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            conn2.read_packet(&mut buf).await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        parked.abort();
+        let _ = parked.await;
+
+        // read1's datagram completes cleanly once the rest lands, and the
+        // conn still serves the following datagram — no poison.
+        push_frame(&mut peer, id, &[9, 9, 9, 9, 0, 53, 0, 1, b'a']).await;
+        first.await.unwrap().unwrap();
+        push_frame(
+            &mut peer,
+            id,
+            &[UOT_ATYP_IPV4, 8, 8, 8, 8, 0, 53, 0, 1, b'b'],
+        )
+        .await;
+        let mut buf = [0u8; 2048];
+        conn.read_packet(&mut buf).await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    /// The same poison fires on a parse error after bytes were consumed
+    /// (unknown atyp) — not only on future cancellation.
+    #[tokio::test]
+    async fn udp_errored_read_poisons_packet_conn() {
+        let (session, mut peer) = test_session().await;
+        let (stream, _) = session.open_stream().await.unwrap();
+        let id = stream.id();
+        assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
+        let mut buf = [0u8; 2048];
+
+        push_frame(&mut peer, id, &[0x7f]).await;
+        let err = conn.read_packet(&mut buf).await.unwrap_err();
+        assert!(err.to_string().contains("address type"), "got {err:?}");
+
+        // The peer then sends a valid datagram — the conn must not
+        // resume mid-stream.
+        push_frame(
+            &mut peer,
+            id,
+            &[UOT_ATYP_IPV4, 9, 9, 9, 9, 0, 53, 0, 1, b'x'],
+        )
+        .await;
+        let err = conn.read_packet(&mut buf).await.unwrap_err();
+        assert!(
+            err.to_string().contains("desynced"),
+            "second read must fail fast on poisoned conn, got {err:?}"
+        );
+        session.close().await.unwrap();
+    }
+
+    /// Happy-path guard: a completed datagram read must not poison.
+    #[tokio::test]
+    async fn udp_completed_read_leaves_conn_usable() {
+        let (session, mut peer) = test_session().await;
+        let (stream, _) = session.open_stream().await.unwrap();
+        let id = stream.id();
+        assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
+        let mut buf = [0u8; 2048];
+        let src: SocketAddr = "192.0.2.9:53".parse().unwrap();
+
+        for i in 0u8..2 {
+            // uot addr + u16 len + payload, exactly what the server sends.
+            let mut datagram = Vec::new();
+            encode_uot_addr(&mut datagram, &src);
+            datagram.extend_from_slice(&3u16.to_be_bytes());
+            datagram.extend_from_slice(&[i, i, i]);
+            push_frame(&mut peer, id, &datagram).await;
+
+            let (n, addr) = conn.read_packet(&mut buf).await.unwrap();
+            assert_eq!(addr, src);
+            assert_eq!(&buf[..n], &[i, i, i]);
+        }
         session.close().await.unwrap();
     }
 

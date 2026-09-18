@@ -270,6 +270,17 @@ the canonical, in-repo source a release is cut from.
   independently; changing the API secret refreshes authentication. Add
   dashboard browser and lifecycle regression tests to CI.
 
+- **AnyTLS UDP-over-TCP reads poison the conn on an incomplete frame**
+  (feature `anytls`). `AnytlsPacketConn::read_packet` consumed the uot
+  address + length + payload incrementally under the stream's reader
+  mutex — a dropped/cancelled read released the lock mid-datagram and
+  every later read silently parsed payload bytes as frame headers, the
+  same desync class the trojan/vless poison fixed in #545. The shared
+  `PoisonOnIncomplete`/`check_not_desynced` pair now covers `read_packet`
+  (with the write side fail-fasting on an already-desynced conn, since
+  each anytls write is one atomic frame enqueue and cannot itself tear
+  framing) (issue #543).
+
 - **A bare `Fin` before `SynAck` no longer hangs the anytls dial**
   (feature `anytls`). `Session::handle_frame`'s Fin arm evicted the
   stream from `streams`/`stream_receive_tx` but never notified the
