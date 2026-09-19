@@ -16,7 +16,17 @@ exists, no group impl".
 > `interval` seconds (default 300, `0` disables); `lazy: true` defers probing
 > until the group next carries traffic. The `url`, `interval`, and `lazy`
 > fields are therefore effective. `use:` / `include-all` provider members are
-> still not supported on load-balance and emit a parse-time warning (#555).
+> supported (issue #533 item 3): they join the same pick space as static
+> `proxies:` members — statics first, then each provider slot in order — and
+> a provider refresh is visible to the next selection without rebuilding the
+> group. Note on liveness: the periodic sweep resolves member **names**
+> through the route map, so provider members are never probed by it — their
+> `alive()` changes via provider refresh, the on-demand
+> `/providers/proxies/{name}/healthcheck` endpoint, or the group's
+> dial-failure escalation (repeated member dial errors mark the member dead,
+> same as url-test/fallback). Escalation is one-way for provider members:
+> nothing scheduled revives them, so a marked-dead provider member stays out
+> of the pick space until its provider refreshes or is manually probed.
 
 ## Motivation
 
@@ -85,7 +95,7 @@ Field reference:
 
 | Field | Type | Required | Default | Meaning |
 |-------|------|:-------:|---------|---------|
-| `proxies` | `[]string` | yes | — | Named proxies or groups to balance across. Same resolution as Selector for static names; `use:` / `include-all` provider members are not supported yet (warned at parse time, see divergence 6). |
+| `proxies` | `[]string` | no* | — | Named proxies or groups to balance across. Same resolution as Selector for static names; `use:` / `include-all` provider members balance alongside them (statics first in rotation order). *Required only when neither `use:` nor `include-all` supplies members. |
 | `url` | string | no | `https://www.gstatic.com/generate_204` | Health-check probe URL. Members are probed against it by the periodic sweep. |
 | `interval` | integer | no | `300` | Health-check sweep interval in seconds. Each member is probed every `interval` seconds; a member whose probe fails is skipped by both strategies until it recovers. `0` disables the periodic sweep (upstream `HealthCheck.auto()`). |
 | `strategy` | enum | no | `round-robin` | Selection strategy. |
@@ -101,7 +111,10 @@ Field reference:
 | 3 | All proxies dead — upstream returns the round-robin slot (dead proxy) | B | We return `NoProxyAvailable` error immediately instead of dialing a known-dead proxy. Same reachability outcome (connection fails), but our failure is fast and named. |
 | 4 | `strategy: consistent-hashing` uses modulo-hash, not ring-hash | B | Despite the name, upstream Go mihomo's implementation (`adapter/outbound/loadbalance.go`) uses the same `hash % alive.len()` modulo approach, not a ring. Rebalancing a proxy list reshuffles most assignments — users expecting minimal-disruption ring-consistent-hash should be aware. We match upstream; the label "consistent-hashing" means "stable for a given src IP given a fixed proxy list", not ring-consistent. |
 | 5 | `lazy` defaults to `false` — upstream defaults to `true` (`GroupCommonOption{Lazy: true}`, `adapter/outboundgroup/parser.go`) | B | Pre-existing default shared with `url-test`/`fallback`; an unset `lazy` probes eagerly instead of only while the group carries traffic. Subscription-compatible either way; only background probe volume differs. Tracked in #555. |
-| 6 | `use:` / `include-all` on load-balance — upstream resolves provider members | B | `LoadBalanceGroup` has no provider slots yet, so provider members are dropped when the group is built. We warn and balance only the static `proxies:` members. The non-empty guard counts provider slots, so a `use:`-only group whose provider exists still parses and builds with zero members (every dial returns `NoProxyAvailable`, the sweep logs `0/0 alive`); the warning is the only signal. Only a group with neither static members nor a resolvable provider is rejected. Tracked in #555. |
+| 6 | `expected-status:` on load-balance parses but is ignored — upstream honors it (`HealthCheckOption`) | B | `LoadBalanceGroup` does not store `expected_status`/`test_url` (unlike url-test/fallback's `with_runtime_options`), so the sweep probes with the default 2xx acceptance set. Pre-existing gap, amplified now that provider members balance here. Tracked in #555. |
+| 7 | Duplicate `use:` entries are deduped — upstream appends per entry, so `use: [A, A]` double-weights provider A | B | A duplicated provider name can only ever produce an identical member view (group `filter:`/`exclude-*` are group scalars), so double-wiring it is always a weighting accident, never intent. Static `proxies:` duplicates still double-weight, matching upstream. |
+| 8 | `include-all` pulls providers only; upstream's `include-all` also pulls statics (`include-all-providers` is the providers-only alias upstream) | B | Pre-existing shared group semantics — `include-all-proxies` already covers the all-statics case, so `include-all` here equals upstream's `include-all-providers`. Combined with `use:`, `include-all` wins and `use:` is ignored — same as upstream. |
+| 9 | `use:` on a `relay` group warns and is ignored — upstream relay ignores it silently | B | A relay is a fixed static chain; provider members have no place in it. |
 
 ## Internal design
 
@@ -116,11 +129,14 @@ pub enum LbStrategy {
 }
 
 pub struct LoadBalanceGroup {
-    name: String,
-    proxies: Vec<Arc<dyn Proxy>>,
+    name: SmolStr,
+    static_proxies: Vec<Arc<dyn Proxy>>,
+    provider_slots: Vec<ProviderSlot>,  // live `use:`/`include-all` members
     strategy: LbStrategy,
     counter: AtomicUsize,   // only used for round-robin
     health: ProxyHealth,
+    usage: UsageTracker,
+    dial_failures: DialFailureTracker,  // onDialFailed escalation
 }
 ```
 
@@ -136,30 +152,33 @@ load-balancer where exact fairness is not guaranteed anyway.
 
 ```rust
 impl LoadBalanceGroup {
-    fn select(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
-        let alive: Vec<_> = self.proxies.iter()
-            .filter(|p| p.alive())
-            .collect();
-        if alive.is_empty() {
+    // Two passes over statics + provider-slot members: count the eligible
+    // set, take the strategy index, clone the nth eligible member. No Vec
+    // is materialized on the dial path even with providers attached.
+    fn pick(&self, metadata: &Metadata, udp_only: bool) -> Option<Arc<dyn Proxy>> {
+        // Pass 1: count members where `alive() && (!udp_only || support_udp())`.
+        let alive_count = ...;
+        if alive_count == 0 {
             return None;
         }
         let idx = match self.strategy {
             LbStrategy::RoundRobin => {
-                self.counter.fetch_add(1, Ordering::Relaxed) % alive.len()
+                self.counter.fetch_add(1, Ordering::Relaxed) % alive_count
             }
             LbStrategy::ConsistentHashing => {
-                let hash = fnv1a(metadata.src_ip_bytes());
-                (hash as usize) % alive.len()
+                let (bytes, len) = src_ip_bytes(metadata); // -> ([u8; 16], usize)
+                (fnv1a(&bytes[..len]) as usize) % alive_count
             }
         };
-        Some(alive[idx].clone())
+        // Pass 2: clone the nth eligible member of the same walk.
+        ...
     }
 
-    fn src_ip_bytes(metadata: &Metadata) -> &[u8] {
+    fn src_ip_bytes(metadata: &Metadata) -> ([u8; 16], usize) {
         // Extract the raw bytes of src_addr's IP.
         // IPv4: 4 bytes. IPv6: 16 bytes. Both are valid hash inputs.
         // If src_addr is absent (local loopback test / API probe), hash 0.0.0.0
-        // (4 zero bytes). Every connectionwithout a src_addr hashes to the same
+        // (4 zero bytes). Every connection without a src_addr hashes to the same
         // proxy — deterministic, not random, not an error.
     }
 }
@@ -179,10 +198,12 @@ identical to the Go output.
 not add `fnv` crate for a 1-function use. Implement inline with a
 comment `// FNV-1a 32-bit, matching upstream adapter/outbound/loadbalance.go::jumpHash logic shape`.
 
-**Alive-set Vec allocation** — `alive: Vec<_>` is rebuilt on every
-`select()` call. Fine at realistic proxy counts (N < 50). Add a
-`// TODO(perf M2): cache alive-set or use a pre-filtered index if profiling shows this hot`
-comment; do not optimize now.
+**Alive-set walk, no allocation** — `select()` walks statics then provider
+slot contents twice (count, then nth) instead of materializing a `Vec`,
+keeping the dial path allocation-free whether or not providers are
+attached (same shape as url-test's `pick_for_dial`). A member dying
+between the two passes can shift the pick or yield `None` for one dial —
+benign and self-correcting.
 
 ### Health-check integration
 
@@ -198,10 +219,14 @@ comment; do not optimize now.
   set on every config commit, so groups added or removed at runtime are
   picked up.
 - The per-group task ticks every `interval` seconds. Each tick resolves the
-  group's `members()` to their `Arc<dyn Proxy>` and probes them via
+  group's `members()` **names** through the route proxy map to their
+  `Arc<dyn Proxy>` and probes them via
   `meow_proxy::health::probe_many_bounded(members, &spec.url, …)`, which
   records each result into that member's shared `ProxyHealth`
-  (`record_delay`; `alive = delay > 0`).
+  (`record_delay`; `alive = delay > 0`). Provider-sourced members are not
+  registered in the route map, so the sweep skips them — their liveness
+  comes from the group's dial-failure escalation and provider refreshes
+  (see the status note above).
 - `select()` reads `p.alive()` on each member — no extra locking; the sweep
   and the group hold the same `Arc<dyn Proxy>`, so a recorded probe result is
   immediately visible to selection.
@@ -222,17 +247,14 @@ impl ProxyAdapter for LoadBalanceGroup {
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-        // Filter alive proxies that also support UDP
-        let alive_udp: Vec<_> = self.proxies.iter()
-            .filter(|p| p.alive() && p.support_udp())
-            .collect();
-        // Then apply strategy on this filtered set
+        // `pick(metadata, udp_only = true)` — same two-pass member walk with
+        // the eligibility predicate narrowed to `alive() && support_udp()`.
         // ... same hash/counter logic as dial_tcp
     }
 
     fn support_udp(&self) -> bool {
-        // true if any proxy in the group supports UDP
-        self.proxies.iter().any(|p| p.support_udp())
+        // true if any static or provider-slot member supports UDP
+        self.any_member(|p| p.support_udp())
     }
 }
 ```

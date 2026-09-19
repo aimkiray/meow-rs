@@ -428,6 +428,9 @@ pub struct RawProxyGroup {
     pub exclude_type: Option<Vec<String>>,
     pub include_all: Option<bool>,
     pub include_all_proxies: Option<bool>,
+    /// Upstream's providers-only alias — identical to `include-all` here
+    /// (our `include-all` never pulls statics; `include-all-proxies` does).
+    pub include_all_providers: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

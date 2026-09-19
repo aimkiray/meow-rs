@@ -168,8 +168,9 @@ pub trait ProxyAdapter: Send + Sync {
 }
 
 /// Shared live proxy list owned by a `ProxyProvider`.
-/// Groups hold `Vec<ProviderSlot>` and call `effective_proxies()` at dial time
-/// to merge static members with provider-supplied proxies without caching.
+/// Groups hold `Vec<ProviderSlot>` and walk statics then slot contents under
+/// a read guard at pick time — the provider swaps the `Vec` on refresh and
+/// the group sees the new membership on its next dial without caching.
 pub type ProviderSlot = std::sync::Arc<parking_lot::RwLock<Vec<std::sync::Arc<dyn Proxy>>>>;
 
 /// Runtime selection capability implemented by mihomo-compatible outbound

@@ -2529,28 +2529,46 @@ fn parse_proxy_group_inner(
         None => Arc::clone(&p.slot),
     };
 
-    // Collect provider slots: include_all wires every provider; use: wires specific ones.
-    let slots: Vec<meow_common::ProviderSlot> = if config.include_all.unwrap_or(false) {
-        providers.values().map(&provider_slot).collect()
+    // Collect provider slots: include_all wires every provider; use: wires
+    // specific ones. include-all iterates the map sorted by provider name so
+    // the slot order — which defines a load-balance pick space and a
+    // selector's default member — is stable across restarts/rebuilds
+    // instead of following HashMap iteration order.
+    let include_all_providers =
+        config.include_all.unwrap_or(false) || config.include_all_providers.unwrap_or(false);
+    let slots: Vec<meow_common::ProviderSlot> = if include_all_providers {
+        let mut sorted: Vec<_> = providers.iter().collect();
+        sorted.sort_by_key(|(name, _)| name.as_str());
+        sorted.into_iter().map(|(_, p)| provider_slot(p)).collect()
     } else {
-        config
-            .use_providers
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|pname| {
-                if let Some(p) = providers.get(pname.as_str()) {
-                    Some(provider_slot(p))
-                } else {
+        // Dedupe `use:` entries: listing the same provider twice would
+        // double-count its members in a load-balance pick space (and show
+        // them twice in `members()` for every group type). Static `proxies:`
+        // duplicates keep their double weight — matching upstream.
+        let mut seen = std::collections::HashSet::new();
+        let mut slots = Vec::new();
+        for pname in config.use_providers.as_deref().unwrap_or(&[]) {
+            if !seen.insert(pname.as_str()) {
+                continue;
+            }
+            match providers.get(pname.as_str()) {
+                Some(p) => slots.push(provider_slot(p)),
+                None if strict => {
+                    return Err(format!(
+                        "group '{}' references unknown provider '{}'",
+                        config.name, pname
+                    ));
+                }
+                None => {
                     tracing::warn!(
                         "proxy-provider '{}' not found for group '{}', skipping",
                         pname,
                         config.name
                     );
-                    None
                 }
-            })
-            .collect()
+            }
+        }
+        slots
     };
 
     if proxies.is_empty() && slots.is_empty() {
@@ -2594,30 +2612,27 @@ fn parse_proxy_group_inner(
             Ok(Arc::new(group))
         }
         "load-balance" => {
-            // Class B (ADR-0002): LoadBalanceGroup has no provider slots yet,
-            // so `use:` / `include-all` members are dropped here. Warn rather
-            // than build a silently-empty group; full support tracked in #555.
-            let has_use = config
-                .use_providers
-                .as_deref()
-                .is_some_and(|u| !u.is_empty());
-            if has_use || config.include_all.unwrap_or(false) {
-                tracing::warn!(
-                    group = %config.name,
-                    "load-balance: 'use'/'include-all' provider members are not \
-                     supported yet and will be ignored; only static 'proxies' \
-                     members are balanced. (upstream: supported; we warn — \
-                     Class B ADR-0002)"
-                );
-            }
             let strategy = parse_lb_strategy(config.strategy.as_deref())?;
-            Ok(Arc::new(LoadBalanceGroup::new(
+            Ok(Arc::new(LoadBalanceGroup::new_with_providers(
                 &config.name,
                 proxies,
                 strategy,
+                slots,
             )))
         }
-        "relay" => parse_relay_group(&config.name, proxies, config),
+        "relay" => {
+            // Relay is a fixed static chain — `use:`/`include-all` provider
+            // members are silently dropped here (upstream's relay likewise
+            // ignores them). Warn so the config author sees the loss.
+            if !slots.is_empty() {
+                tracing::warn!(
+                    "relay group '{}': 'use'/'include-all' provider members are \
+                     ignored — relay chains only static 'proxies' members",
+                    config.name
+                );
+            }
+            parse_relay_group(&config.name, proxies, config)
+        }
         _ => Err(format!("unsupported group type: {}", config.group_type)),
     }
 }
@@ -3361,9 +3376,9 @@ tls: true
             .expect("relay with url+interval must not hard-error");
     }
 
-    // ─── load-balance ignores provider members (issue #485 / #555) ──────────
+    // ─── load-balance provider members (issue #533 item 3) ──────────────────
 
-    const LB_PROVIDER_WARN: &str = "'use'/'include-all' provider members are not supported yet";
+    const LB_UNKNOWN_PROVIDER_WARN: &str = "proxy-provider 'airport' not found";
 
     /// Scoped WARN capture — `with_default` is thread-local, so parallel tests
     /// in this binary don't see each other's lines.
@@ -3417,42 +3432,206 @@ tls: true
         m
     }
 
-    // `use:` on load-balance → warn, static members still balanced (Class B).
+    // `use:` naming an unknown provider → strict parse hard-errors (upstream
+    // `getProviders` does the same); the lenient fallback pass warns and
+    // skips the slot, keeping static members (same shape as every other
+    // group type).
     #[test]
-    fn load_balance_use_providers_warns_not_errors() {
+    fn load_balance_use_providers_unknown_provider_warns() {
         let config = lb_config_with_providers(Some(vec!["airport".to_string()]), None);
+        assert!(
+            parse_proxy_group(&config, &direct_reject(), &[], &Default::default()).is_err(),
+            "strict parse must reject an unknown provider"
+        );
         let (group, logs) = capture_warns(|| {
-            parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+            parse_proxy_group_lenient(&config, &direct_reject(), &[], &Default::default())
         });
-        let group = group.expect("load-balance with use: must not hard-error");
+        let group = group.expect("lenient load-balance with use: must not hard-error");
         assert_eq!(
             group.members().unwrap_or_default().len(),
             2,
             "static members are kept"
         );
         assert!(
-            logs.contains(LB_PROVIDER_WARN),
-            "expected provider warning, got: {logs}"
+            logs.contains(LB_UNKNOWN_PROVIDER_WARN),
+            "expected unknown-provider warning, got: {logs}"
         );
     }
 
-    // `include-all` on load-balance → warn, static members still balanced.
+    // `include-all` with no providers loaded → empty slot set; the group
+    // still builds from statics alone.
     #[test]
-    fn load_balance_include_all_warns_not_errors() {
+    fn load_balance_include_all_with_no_providers_keeps_statics() {
         let config = lb_config_with_providers(None, Some(true));
-        let (group, logs) = capture_warns(|| {
-            parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
-        });
-        let group = group.expect("load-balance with include-all must not hard-error");
+        let group = parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+            .expect("load-balance with include-all must not hard-error");
         assert_eq!(
             group.members().unwrap_or_default().len(),
             2,
             "static members are kept"
         );
-        assert!(
-            logs.contains(LB_PROVIDER_WARN),
-            "expected provider warning, got: {logs}"
+    }
+
+    // `use:` provider members join the pick space — round-robin distributes
+    // across statics AND slot members (issue #533 item 3).
+    #[cfg(feature = "ss")]
+    #[tokio::test]
+    async fn load_balance_use_providers_wires_slot_members() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let providers = file_provider_with(tmp.path(), PROVIDER_YAML).await;
+
+        let config = crate::raw::RawProxyGroup {
+            name: "lb".to_string(),
+            group_type: "load-balance".to_string(),
+            use_providers: Some(vec!["airport".to_string()]),
+            ..Default::default()
+        };
+        let group = parse_proxy_group(&config, &HashMap::new(), &[], &providers)
+            .expect("load-balance with use: must build");
+        assert_eq!(
+            group.members().unwrap_or_default(),
+            ["US 1", "US 2 expat", "HK 1"],
+            "provider members appear in the member list"
         );
+        // Round-robin over three provider members must reach each in turn.
+        let meta = meow_common::Metadata::default();
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        for _ in 0..6 {
+            seen.insert(group.unwrap_proxy(&meta).unwrap().name().to_string());
+        }
+        assert_eq!(seen.len(), 3, "every provider member gets picked");
+    }
+
+    // `use: [p, p]` must not double-weight the provider: the slot is wired
+    // once, so its members appear once in `members()` and get one share of
+    // the pick space.
+    #[cfg(feature = "ss")]
+    #[tokio::test]
+    async fn load_balance_use_providers_duplicate_entry_deduped() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let providers = file_provider_with(tmp.path(), PROVIDER_YAML).await;
+
+        let config = crate::raw::RawProxyGroup {
+            name: "lb".to_string(),
+            group_type: "load-balance".to_string(),
+            use_providers: Some(vec!["airport".to_string(), "airport".to_string()]),
+            ..Default::default()
+        };
+        let group = parse_proxy_group(&config, &HashMap::new(), &[], &providers)
+            .expect("load-balance with duplicated use: must build");
+        assert_eq!(
+            group.members().unwrap_or_default(),
+            ["US 1", "US 2 expat", "HK 1"],
+            "a duplicated use: entry wires the provider's slot once"
+        );
+    }
+
+    // `use: [unknown, unknown]` warns once — dedupe happens before lookup.
+    #[test]
+    fn load_balance_use_providers_duplicate_unknown_warns_once() {
+        let config = lb_config_with_providers(
+            Some(vec!["airport".to_string(), "airport".to_string()]),
+            None,
+        );
+        let (group, logs) = capture_warns(|| {
+            parse_proxy_group_lenient(&config, &direct_reject(), &[], &Default::default())
+        });
+        group.expect("lenient load-balance with use: must not hard-error");
+        assert_eq!(
+            logs.matches(LB_UNKNOWN_PROVIDER_WARN).count(),
+            1,
+            "the repeated unknown provider warns once, got: {logs}"
+        );
+    }
+
+    // `include-all` wires every loaded provider's slot — same coverage as
+    // `use:` but through the include-all collection path.
+    #[cfg(feature = "ss")]
+    #[tokio::test]
+    async fn load_balance_include_all_wires_slot_members() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let providers = file_provider_with(tmp.path(), PROVIDER_YAML).await;
+
+        let config = crate::raw::RawProxyGroup {
+            name: "lb".to_string(),
+            group_type: "load-balance".to_string(),
+            include_all: Some(true),
+            ..Default::default()
+        };
+        let group = parse_proxy_group(&config, &HashMap::new(), &[], &providers)
+            .expect("load-balance with include-all must build");
+        assert_eq!(
+            group.members().unwrap_or_default(),
+            ["US 1", "US 2 expat", "HK 1"],
+            "include-all provider members join the pick space"
+        );
+    }
+
+    // `include-all-providers` is the upstream providers-only alias — wired
+    // identically to `include-all` (ours never pulls statics).
+    #[cfg(feature = "ss")]
+    #[tokio::test]
+    async fn load_balance_include_all_providers_alias_wires_slots() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let providers = file_provider_with(tmp.path(), PROVIDER_YAML).await;
+
+        let config = crate::raw::RawProxyGroup {
+            name: "lb".to_string(),
+            group_type: "load-balance".to_string(),
+            include_all_providers: Some(true),
+            ..Default::default()
+        };
+        let group = parse_proxy_group(&config, &HashMap::new(), &[], &providers)
+            .expect("load-balance with include-all-providers must build");
+        assert_eq!(
+            group.members().unwrap_or_default(),
+            ["US 1", "US 2 expat", "HK 1"],
+            "the upstream alias wires provider members identically"
+        );
+    }
+
+    // `include-all` beats `use:` — upstream `Use = AllProviders`.
+    #[cfg(feature = "ss")]
+    #[tokio::test]
+    async fn load_balance_include_all_overrides_use() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let providers = file_provider_with(tmp.path(), PROVIDER_YAML).await;
+
+        let config = crate::raw::RawProxyGroup {
+            name: "lb".to_string(),
+            group_type: "load-balance".to_string(),
+            use_providers: Some(vec!["nonexistent".to_string()]),
+            include_all: Some(true),
+            ..Default::default()
+        };
+        let group = parse_proxy_group(&config, &HashMap::new(), &[], &providers)
+            .expect("load-balance with include-all + use: must build");
+        assert_eq!(
+            group.members().unwrap_or_default(),
+            ["US 1", "US 2 expat", "HK 1"],
+            "include-all supplies the membership; use: is ignored"
+        );
+    }
+
+    // Group-level `filter:`/`exclude-filter:` apply to LB provider members
+    // through the same `derived_slot` view the siblings use (issue #358).
+    #[cfg(feature = "ss")]
+    #[tokio::test]
+    async fn load_balance_filter_applies_to_slot_members() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let providers = file_provider_with(tmp.path(), PROVIDER_YAML).await;
+
+        let config = crate::raw::RawProxyGroup {
+            name: "lb".to_string(),
+            group_type: "load-balance".to_string(),
+            use_providers: Some(vec!["airport".to_string()]),
+            filter: Some("(?i)^us".to_string()),
+            exclude_filter: Some("expat".to_string()),
+            ..Default::default()
+        };
+        let group = parse_proxy_group(&config, &HashMap::new(), &[], &providers)
+            .expect("filtered load-balance must build");
+        assert_eq!(group.members().unwrap_or_default(), ["US 1"]);
     }
 
     // No provider fields → no warning (the warning is keyed on the raw config).
@@ -3464,17 +3643,17 @@ tls: true
         });
         group.expect("plain load-balance must parse");
         assert!(
-            !logs.contains(LB_PROVIDER_WARN),
+            !logs.contains("provider"),
             "no provider fields must not warn, got: {logs}"
         );
     }
 
-    // A `use:`-only group whose provider exists passes the non-empty guard on
-    // the provider slot, then builds with no members — the warning is the only
-    // signal (#555 item 3).
+    // A `use:`-only group wires the provider slot as its whole membership —
+    // previously the members were dropped at build time and only a warn
+    // remained (#533 item 3).
     #[cfg(feature = "ss")]
     #[tokio::test]
-    async fn load_balance_provider_only_builds_empty_with_warning() {
+    async fn load_balance_provider_only_balances_slot_members() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let providers = file_provider_with(tmp.path(), PROVIDER_YAML).await;
         let config = crate::raw::RawProxyGroup {
@@ -3483,16 +3662,12 @@ tls: true
             use_providers: Some(vec!["airport".to_string()]),
             ..Default::default()
         };
-        let (group, logs) =
-            capture_warns(|| parse_proxy_group(&config, &HashMap::new(), &[], &providers));
-        let group = group.expect("provider-only load-balance passes the non-empty guard");
-        assert!(
-            group.members().unwrap_or_default().is_empty(),
-            "provider members are dropped at build time"
-        );
-        assert!(
-            logs.contains(LB_PROVIDER_WARN),
-            "expected provider warning, got: {logs}"
+        let group = parse_proxy_group(&config, &HashMap::new(), &[], &providers)
+            .expect("provider-only load-balance must build");
+        assert_eq!(
+            group.members().unwrap_or_default(),
+            ["US 1", "US 2 expat", "HK 1"],
+            "provider members join the pick space"
         );
     }
 

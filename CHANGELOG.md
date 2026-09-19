@@ -180,6 +180,21 @@ the canonical, in-repo source a release is cut from.
   layer cannot resolve is skipped and retried against the full registry
   rather than egressing unchained. (#533)
 
+- **`load-balance` groups now balance provider members.** `use:` /
+  `include-all` on a `load-balance` group were parsed but dropped with a
+  warning — only static `proxies:` entries were balanced, and a
+  provider-only group built empty so every dial failed. The group now
+  carries the same live `ProviderSlot` set as selector/url-test/fallback:
+  provider members join the pick space (statics first, then slot order)
+  for both round-robin and consistent-hashing, a provider refresh is
+  visible to the next selection without a config reload, and `members()`,
+  `alive`, `support_udp`, and delay reporting all see the combined set.
+  Load-balance also gains the dial-failure escalation its siblings already
+  had: a member that keeps failing dials is marked dead between sweeps —
+  the only liveness signal provider members get, since the group sweep
+  resolves member names through the route map where provider nodes are
+  never registered. (#533)
+
 - **TLS handshakes no longer fail on multiplexed transports whose
   `poll_flush` pends.** Every TLS-over-mux handshake — AnyTLS, smux, and any
   stream whose `poll_flush` waits on a writer-task acknowledgement — died at
@@ -233,10 +248,9 @@ the canonical, in-repo source a release is cut from.
   probing until the group next carries traffic. Two known divergences from
   mihomo remain and are tracked in #555: `lazy` still defaults to `false`
   (upstream `true`, shared with `url-test`/`fallback`), and `select`/`relay`
-  members are still not swept. A `load-balance` group with `use:` or
-  `include-all` now logs a warning that provider members are ignored; a
-  provider-only group still parses but ends up with no members, so the
-  warning is the signal to look for. See #485.
+  members are still not swept. (`use:` / `include-all` provider members were
+  ignored with a warning when this landed; they now balance — see the
+  provider-members entry above.) See #485.
 
 - Proxy groups declared before their nested groups now retain those forward
   references even when either group also names a missing proxy.

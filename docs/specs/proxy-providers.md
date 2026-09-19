@@ -71,8 +71,9 @@ Out of scope:
   (same pattern, can be shared).
 - **`mrs` binary format** — proxy providers only use YAML/text; MRS is
   a rule-provider-only format. Not applicable here.
-- **`include-all-providers:`** — upstream alias for `include-all:`.
-  Accepted with a warn-once "use include-all:" and treated identically.
+- **`include-all-providers:`** — upstream providers-only alias for
+  `include-all:`; wired identically (our `include-all` never pulls
+  statics — `include-all-proxies:` covers that).
 - **Signed/authenticated subscriptions** — M3 operational maturity.
 - **`proxy-providers` as the source for `RULE-SET` rules** — not a
   thing; they are separate concepts.
@@ -156,7 +157,7 @@ proxy-groups:
 | `health-check.enable` | bool | no | `false` | Enable periodic health-check probes. |
 | `health-check.url` | string | if `enable` | — | URL used for reachability probes. |
 | `health-check.interval` | integer | no | `300` | Health-check sweep interval in seconds. |
-| `health-check.lazy` | bool | no | `true` | If true, defer first probe until the proxy is first used by a connection. |
+| `health-check.lazy` | bool | no | `false` | If true, defer first probe until the proxy is first used by a connection. (Note: provider health checks run only via the manual `/providers/proxies/{name}/healthcheck` endpoint today — nothing schedules them.) |
 | `health-check.expected-status` | integer or string | no | any 2xx | HTTP status that counts as healthy: a bare code (`204`) or a range string (`"200-299"`, `"200,204"`). |
 | `override` | map | no | `{}` | Key-value overrides applied to every proxy. See §Override. |
 | `filter` | string | no | `""` | Regex. Include only proxies whose `name` matches. Empty = include all. |
@@ -168,8 +169,8 @@ proxy-groups:
 | Field | Type | Required | Default | Meaning |
 |-------|------|:-------:|---------|---------|
 | `use` | `[]string` | no | `[]` | Provider names to merge into this group's proxy list. Unknown provider name = warn-once at load (not a hard error — the provider may not be defined in all config variants). |
-| `include-all` | bool | no | `false` | If true, merge proxies from all defined providers. Equivalent to listing every provider name in `use:`. |
-| `include-all-proxies` | bool | no | `false` | Upstream alias for `include-all`; accepted, warn-once "use include-all:", treated identically. |
+| `include-all` | bool | no | `false` | If true, merge proxies from all defined providers — providers only (upstream's `include-all` also pulls statics; use `include-all-proxies` for that). Wins over `use:` when both are set. |
+| `include-all-proxies` | bool | no | `false` | Merge every static `proxies:` entry into the group — NOT a provider alias. Upstream parity. |
 | `filter` | string | no | `""` | Applied to provider-sourced members only (`use:` / `include-all`), matching upstream mihomo — explicit `proxies:` entries are never filtered (otherwise `proxies: [DIRECT]` + `filter: "^HK"` would drop DIRECT). |
 | `exclude-filter` | string | no | `""` | Applied after `filter`. Provider-sourced members only. |
 | `exclude-type` | string | no | `""` | Applied after `filter`/`exclude-filter`. Provider-sourced members only. |

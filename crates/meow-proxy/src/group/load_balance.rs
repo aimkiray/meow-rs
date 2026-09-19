@@ -1,14 +1,14 @@
 use async_trait::async_trait;
 use meow_common::{
-    AdapterType, DelayHistory, MeowError, Metadata, Proxy, ProxyAdapter, ProxyConn, ProxyHealth,
-    ProxyPacketConn, Result,
+    AdapterType, DelayHistory, MeowError, Metadata, ProviderSlot, Proxy, ProxyAdapter, ProxyConn,
+    ProxyHealth, ProxyPacketConn, Result,
 };
 use smol_str::SmolStr;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use super::UsageTracker;
+use super::{DialFailureTracker, UsageTracker};
 
 #[derive(Debug)]
 pub enum LbStrategy {
@@ -18,22 +18,115 @@ pub enum LbStrategy {
 
 pub struct LoadBalanceGroup {
     name: SmolStr,
-    proxies: Vec<Arc<dyn Proxy>>,
+    static_proxies: Vec<Arc<dyn Proxy>>,
+    /// Provider-sourced members (`use:` / `include-all`), each a live
+    /// slot whose contents the owning provider swaps on refresh — the
+    /// same `ProviderSlot` shape url-test/fallback/selector carry.
+    /// Invariant: slots only ever hold leaf adapters (provider payloads
+    /// cannot declare groups), so member walks never recurse into another
+    /// group's slot guards.
+    provider_slots: Vec<ProviderSlot>,
     strategy: LbStrategy,
     counter: AtomicUsize,
     health: ProxyHealth,
     usage: UsageTracker,
+    /// mihomo `GroupBase.onDialFailed` escalation: repeated member dial
+    /// failures mark the member dead between sweeps — the only liveness
+    /// signal provider members get, since the sweep resolves group members
+    /// by name through the route map (provider names are not registered).
+    dial_failures: DialFailureTracker,
 }
 
 impl LoadBalanceGroup {
     pub fn new(name: &str, proxies: Vec<Arc<dyn Proxy>>, strategy: LbStrategy) -> Self {
+        Self::new_with_providers(name, proxies, strategy, Vec::new())
+    }
+
+    pub fn new_with_providers(
+        name: &str,
+        proxies: Vec<Arc<dyn Proxy>>,
+        strategy: LbStrategy,
+        slots: Vec<ProviderSlot>,
+    ) -> Self {
         Self {
             name: SmolStr::from(name),
-            proxies,
+            static_proxies: proxies,
+            provider_slots: slots,
             strategy,
             counter: AtomicUsize::new(0),
             health: ProxyHealth::new(),
             usage: UsageTracker::new(),
+            dial_failures: DialFailureTracker::new(),
+        }
+    }
+
+    /// Visit every member in canonical order — static `proxies:` entries
+    /// first, then each provider slot under its read guard (the same order
+    /// url-test/selector enumerate). `f` returning `false` stops the walk.
+    fn for_each_member(&self, mut f: impl FnMut(&Arc<dyn Proxy>) -> bool) {
+        for p in &self.static_proxies {
+            if !f(p) {
+                return;
+            }
+        }
+        for slot in &self.provider_slots {
+            let guard = slot.read();
+            for p in guard.iter() {
+                if !f(p) {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn any_member(&self, mut pred: impl FnMut(&Arc<dyn Proxy>) -> bool) -> bool {
+        let mut hit = false;
+        self.for_each_member(|p| {
+            hit = pred(p);
+            !hit
+        });
+        hit
+    }
+
+    /// First alive member in canonical order (for `current()`/`delay_history`).
+    fn first_alive_member(&self) -> Option<Arc<dyn Proxy>> {
+        let mut out = None;
+        self.for_each_member(|p| {
+            if p.alive() {
+                out = Some(Arc::clone(p));
+                false
+            } else {
+                true
+            }
+        });
+        out
+    }
+
+    /// Smallest positive delay across alive members (0 = none measured).
+    fn min_alive_delay(&self, mut delay: impl FnMut(&Arc<dyn Proxy>) -> u16) -> u16 {
+        let mut best = 0u16;
+        self.for_each_member(|p| {
+            if p.alive() {
+                let d = delay(p);
+                if d > 0 && (best == 0 || d < best) {
+                    best = d;
+                }
+            }
+            true
+        });
+        best
+    }
+
+    /// Strategy-specific index into a set of `alive_count` members.
+    /// Callers must ensure `alive_count > 0`.
+    fn pick_index(&self, alive_count: usize, metadata: &Metadata) -> usize {
+        debug_assert!(alive_count > 0, "modulo over an empty pick space");
+        match self.strategy {
+            LbStrategy::RoundRobin => self.counter.fetch_add(1, Ordering::Relaxed) % alive_count,
+            LbStrategy::ConsistentHashing => {
+                let (bytes, len) = src_ip_bytes(metadata);
+                (fnv1a(&bytes[..len]) as usize) % alive_count
+            }
         }
     }
 
@@ -43,73 +136,42 @@ impl LoadBalanceGroup {
     ///
     /// TODO(perf M2): cache alive-set or use a pre-filtered index if profiling shows this hot
     pub fn select(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
-        match self.strategy {
-            LbStrategy::RoundRobin => {
-                let alive_count = self.proxies.iter().filter(|p| p.alive()).count();
-                if alive_count == 0 {
-                    return None;
-                }
-                let target_idx = self.counter.fetch_add(1, Ordering::Relaxed) % alive_count;
-                self.proxies
-                    .iter()
-                    .filter(|p| p.alive())
-                    .nth(target_idx)
-                    .cloned()
-            }
-            LbStrategy::ConsistentHashing => {
-                let alive_count = self.proxies.iter().filter(|p| p.alive()).count();
-                if alive_count == 0 {
-                    return None;
-                }
-                let (bytes, len) = src_ip_bytes(metadata);
-                let hash = fnv1a(&bytes[..len]);
-                let target_idx = (hash as usize) % alive_count;
-                self.proxies
-                    .iter()
-                    .filter(|p| p.alive())
-                    .nth(target_idx)
-                    .cloned()
-            }
-        }
+        self.pick(metadata, false)
     }
 
     fn select_udp(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
-        match self.strategy {
-            LbStrategy::RoundRobin => {
-                let alive_count = self
-                    .proxies
-                    .iter()
-                    .filter(|p| p.alive() && p.support_udp())
-                    .count();
-                if alive_count == 0 {
-                    return None;
-                }
-                let target_idx = self.counter.fetch_add(1, Ordering::Relaxed) % alive_count;
-                self.proxies
-                    .iter()
-                    .filter(|p| p.alive() && p.support_udp())
-                    .nth(target_idx)
-                    .cloned()
-            }
-            LbStrategy::ConsistentHashing => {
-                let alive_count = self
-                    .proxies
-                    .iter()
-                    .filter(|p| p.alive() && p.support_udp())
-                    .count();
-                if alive_count == 0 {
-                    return None;
-                }
-                let (bytes, len) = src_ip_bytes(metadata);
-                let hash = fnv1a(&bytes[..len]);
-                let target_idx = (hash as usize) % alive_count;
-                self.proxies
-                    .iter()
-                    .filter(|p| p.alive() && p.support_udp())
-                    .nth(target_idx)
-                    .cloned()
-            }
+        self.pick(metadata, true)
+    }
+
+    /// Two passes over the member set — count eligible members, pick an index,
+    /// then clone the nth eligible member. No materialized Vec even with
+    /// provider slots (the same walk url-test's `pick_for_dial` does). A
+    /// member dying between the passes can shift the pick or yield `None`
+    /// for this one dial — benign, self-correcting on the next call.
+    fn pick(&self, metadata: &Metadata, udp_only: bool) -> Option<Arc<dyn Proxy>> {
+        let eligible = |p: &Arc<dyn Proxy>| p.alive() && (!udp_only || p.support_udp());
+        let mut alive_count = 0usize;
+        self.for_each_member(|p| {
+            alive_count += usize::from(eligible(p));
+            true
+        });
+        if alive_count == 0 {
+            return None;
         }
+        let idx = self.pick_index(alive_count, metadata);
+        let mut picked = None;
+        let mut i = 0usize;
+        self.for_each_member(|p| {
+            if eligible(p) {
+                if i == idx {
+                    picked = Some(Arc::clone(p));
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        });
+        picked
     }
 }
 
@@ -167,13 +229,14 @@ impl ProxyAdapter for LoadBalanceGroup {
     }
 
     fn support_udp(&self) -> bool {
-        self.proxies.iter().any(|p| p.support_udp())
+        self.any_member(|p| p.support_udp())
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         self.usage.touch_user_traffic(metadata);
         let proxy = self.select(metadata).ok_or(MeowError::NoProxyAvailable)?;
-        proxy.dial_tcp(metadata).await
+        let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
+        attempt.finish(proxy.dial_tcp(metadata).await)
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
@@ -181,7 +244,8 @@ impl ProxyAdapter for LoadBalanceGroup {
         let proxy = self
             .select_udp(metadata)
             .ok_or(MeowError::NoProxyAvailable)?;
-        proxy.dial_udp(metadata).await
+        let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
+        attempt.finish(proxy.dial_udp(metadata).await)
     }
 
     fn unwrap_proxy(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
@@ -196,55 +260,48 @@ impl ProxyAdapter for LoadBalanceGroup {
 
 impl Proxy for LoadBalanceGroup {
     fn alive(&self) -> bool {
-        self.proxies.iter().any(|p| p.alive())
+        self.any_member(|p| p.alive())
     }
 
     fn alive_for_url(&self, url: &str) -> bool {
-        self.proxies.iter().any(|p| p.alive_for_url(url))
+        self.any_member(|p| p.alive_for_url(url))
     }
 
     fn last_delay(&self) -> u16 {
-        self.proxies
-            .iter()
-            .filter(|p| p.alive())
-            .map(|p| p.last_delay())
-            .filter(|&d| d > 0)
-            .min()
-            .unwrap_or(0)
+        self.min_alive_delay(|p| p.last_delay())
     }
 
     fn last_delay_for_url(&self, url: &str) -> u16 {
-        self.proxies
-            .iter()
-            .filter(|p| p.alive())
-            .map(|p| p.last_delay_for_url(url))
-            .filter(|&d| d > 0)
-            .min()
-            .unwrap_or(0)
+        self.min_alive_delay(|p| p.last_delay_for_url(url))
     }
 
     fn delay_history(&self) -> Vec<DelayHistory> {
-        self.proxies
-            .iter()
-            .find(|p| p.alive())
+        self.first_alive_member()
             .map(|p| p.delay_history())
             .unwrap_or_default()
     }
 
     fn members(&self) -> Option<Vec<String>> {
-        Some(self.proxies.iter().map(|p| p.name().to_string()).collect())
+        let mut out = Vec::new();
+        self.for_each_member(|p| {
+            out.push(p.name().to_string());
+            true
+        });
+        Some(out)
     }
 
     fn member_proxies(&self) -> Option<Vec<Arc<dyn Proxy>>> {
-        Some(self.proxies.clone())
+        let mut out = Vec::new();
+        self.for_each_member(|p| {
+            out.push(Arc::clone(p));
+            true
+        });
+        Some(out)
     }
 
     fn current(&self) -> Option<String> {
         // For load-balance, no single "current" proxy; return first alive for API compat.
-        self.proxies
-            .iter()
-            .find(|p| p.alive())
-            .map(|p| p.name().to_string())
+        self.first_alive_member().map(|p| p.name().to_string())
     }
 
     fn usage_generation(&self) -> u64 {
@@ -255,87 +312,9 @@ impl Proxy for LoadBalanceGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meow_common::{ConnType, DnsMode, Network, ProxyHealth};
+    use crate::group::test_support::MockProxy;
+    use meow_common::{ConnType, DnsMode, Network};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    // ─── MockProxy ────────────────────────────────────────────────────────────
-
-    struct MockProxy {
-        name: String,
-        health: ProxyHealth,
-        udp: bool,
-        dial_count: Arc<AtomicUsize>,
-    }
-
-    impl MockProxy {
-        fn new(name: &str) -> Arc<Self> {
-            Arc::new(Self {
-                name: name.to_string(),
-                health: ProxyHealth::new(),
-                udp: false,
-                dial_count: Arc::new(AtomicUsize::new(0)),
-            })
-        }
-
-        fn new_udp(name: &str) -> Arc<Self> {
-            Arc::new(Self {
-                name: name.to_string(),
-                health: ProxyHealth::new(),
-                udp: true,
-                dial_count: Arc::new(AtomicUsize::new(0)),
-            })
-        }
-
-        fn mark_dead(&self) {
-            self.health.set_alive(false);
-        }
-    }
-
-    #[async_trait]
-    impl ProxyAdapter for MockProxy {
-        fn name(&self) -> &str {
-            &self.name
-        }
-        fn adapter_type(&self) -> AdapterType {
-            AdapterType::Direct
-        }
-        fn addr(&self) -> &str {
-            ""
-        }
-        fn support_udp(&self) -> bool {
-            self.udp
-        }
-        async fn dial_tcp(&self, _m: &Metadata) -> Result<Box<dyn ProxyConn>> {
-            self.dial_count.fetch_add(1, Ordering::Relaxed);
-            Err(MeowError::NotSupported("mock".into()))
-        }
-        async fn dial_udp(&self, _m: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-            self.dial_count.fetch_add(1, Ordering::Relaxed);
-            Err(MeowError::NotSupported("mock udp".into()))
-        }
-        fn health(&self) -> &ProxyHealth {
-            &self.health
-        }
-    }
-
-    impl Proxy for MockProxy {
-        fn alive(&self) -> bool {
-            self.health.alive()
-        }
-        fn alive_for_url(&self, _url: &str) -> bool {
-            self.health.alive()
-        }
-        fn last_delay(&self) -> u16 {
-            self.health.last_delay()
-        }
-        fn last_delay_for_url(&self, _url: &str) -> u16 {
-            self.health.last_delay()
-        }
-        fn delay_history(&self) -> Vec<DelayHistory> {
-            self.health.delay_history()
-        }
-    }
 
     fn meta_no_src() -> Metadata {
         Metadata {
@@ -422,7 +401,7 @@ mod tests {
         let a = MockProxy::new("A");
         let b = MockProxy::new("B");
         let c = MockProxy::new("C");
-        b.mark_dead();
+        b.set_alive(false);
         let proxies: Vec<Arc<dyn Proxy>> = vec![a, b, c];
         let group = make_rr(proxies);
         let meta = meta_no_src();
@@ -440,8 +419,8 @@ mod tests {
         let a = MockProxy::new("A");
         let b = MockProxy::new("B");
         let c = MockProxy::new("C");
-        b.mark_dead();
-        c.mark_dead();
+        b.set_alive(false);
+        c.set_alive(false);
         let proxies: Vec<Arc<dyn Proxy>> = vec![a, b, c];
         let group = make_rr(proxies);
         let meta = meta_no_src();
@@ -459,11 +438,13 @@ mod tests {
             .collect();
         let group = LoadBalanceGroup {
             name: "wrap-test".into(),
-            proxies,
+            static_proxies: proxies,
+            provider_slots: Vec::new(),
             strategy: LbStrategy::RoundRobin,
             counter: AtomicUsize::new(usize::MAX - 1),
             health: ProxyHealth::new(),
             usage: super::UsageTracker::new(),
+            dial_failures: DialFailureTracker::new(),
         };
         let meta = meta_no_src();
         // Should not panic; indices are (usize::MAX-1)%4 and (usize::MAX)%4
@@ -487,7 +468,7 @@ mod tests {
         let r1 = group.select(&meta);
         assert!(r1.is_some());
 
-        b.mark_dead();
+        b.set_alive(false);
 
         let r2 = group.select(&meta);
         assert!(
@@ -548,7 +529,7 @@ mod tests {
         // Verify A is the normal selection
         assert_eq!(group.select(&meta).unwrap().name(), "A");
         // Mark A dead
-        a.mark_dead();
+        a.set_alive(false);
         // Must still return an alive proxy
         let selected = group
             .select(&meta)
@@ -604,7 +585,7 @@ mod tests {
         let meta = meta_src(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
 
         assert_eq!(group.select(&meta).unwrap().name(), "A");
-        b.mark_dead();
+        b.set_alive(false);
         // fnv1a([1,1,1,1]) % 2 = 1, alive=[A,C], so idx 1 = C
         assert_eq!(group.select(&meta).unwrap().name(), "C");
     }
@@ -617,8 +598,8 @@ mod tests {
         // ADR-0002 Class A.
         let a = MockProxy::new("A");
         let b = MockProxy::new("B");
-        a.mark_dead();
-        b.mark_dead();
+        a.set_alive(false);
+        b.set_alive(false);
         let proxies: Vec<Arc<dyn Proxy>> = vec![a, b];
         let group = make_rr(proxies);
         assert!(group.select(&meta_no_src()).is_none());
@@ -629,8 +610,8 @@ mod tests {
         // upstream Go panics with index out of bounds. NOT here — ADR-0002 Class A.
         let a = MockProxy::new("A");
         let b = MockProxy::new("B");
-        a.mark_dead();
-        b.mark_dead();
+        a.set_alive(false);
+        b.set_alive(false);
         let proxies: Vec<Arc<dyn Proxy>> = vec![a, b];
         let group = make_ch(proxies);
         assert!(group
@@ -688,29 +669,17 @@ mod tests {
         let a = MockProxy::new_udp("A");
         let b = MockProxy::new("B"); // no UDP
         let c = MockProxy::new_udp("C");
-        c.mark_dead();
-        let a_count = Arc::clone(&a.dial_count);
-        let b_count = Arc::clone(&b.dial_count);
-        let c_count = Arc::clone(&c.dial_count);
+        c.set_alive(false);
+        let a_ref = Arc::clone(&a);
+        let b_ref = Arc::clone(&b);
+        let c_ref = Arc::clone(&c);
         let proxies: Vec<Arc<dyn Proxy>> = vec![a, b, c];
         let group = make_rr(proxies);
         // dial_udp returns error from MockProxy but that's OK — we care about which was tried
         let _ = group.dial_udp(&meta_no_src()).await;
-        assert_eq!(
-            a_count.load(Ordering::Relaxed),
-            1,
-            "A (UDP+alive) must be tried"
-        );
-        assert_eq!(
-            b_count.load(Ordering::Relaxed),
-            0,
-            "B (no UDP) must not be tried"
-        );
-        assert_eq!(
-            c_count.load(Ordering::Relaxed),
-            0,
-            "C (dead) must not be tried"
-        );
+        assert_eq!(a_ref.dials(), 1, "A (UDP+alive) must be tried");
+        assert_eq!(b_ref.dials(), 0, "B (no UDP) must not be tried");
+        assert_eq!(c_ref.dials(), 0, "C (dead) must not be tried");
     }
 
     #[tokio::test]
@@ -718,7 +687,7 @@ mod tests {
         // All UDP-capable proxies dead → NoProxyAvailable. NOT a dial to non-UDP proxy.
         let a = MockProxy::new_udp("A");
         let b = MockProxy::new("B"); // no UDP, alive
-        a.mark_dead();
+        a.set_alive(false);
         let proxies: Vec<Arc<dyn Proxy>> = vec![a, b];
         let group = make_rr(proxies);
         let result = group.dial_udp(&meta_no_src()).await;
@@ -786,5 +755,235 @@ mod tests {
         );
         let _ = group.dial_tcp(&meta_no_src()).await;
         assert_eq!(group.usage_generation(), 1, "real traffic still marks use");
+    }
+
+    // ─── I. Provider slots (issue #533 item 3) ──────────────────────────────
+
+    fn slot_of(proxies: Vec<Arc<dyn Proxy>>) -> ProviderSlot {
+        Arc::new(parking_lot::RwLock::new(proxies))
+    }
+
+    #[test]
+    fn round_robin_cycles_statics_then_slot_members() {
+        // One static + a two-member provider slot: the pick space is the
+        // concatenation in canonical order (statics first, slot members after).
+        let slot = slot_of(vec![MockProxy::new("P1"), MockProxy::new("P2")]);
+        let group = LoadBalanceGroup::new_with_providers(
+            "lb",
+            vec![MockProxy::new("A")],
+            LbStrategy::RoundRobin,
+            vec![slot],
+        );
+        let meta = meta_no_src();
+        let got: Vec<String> = (0..6)
+            .map(|_| group.select(&meta).unwrap().name().to_string())
+            .collect();
+        assert_eq!(got, ["A", "P1", "P2", "A", "P1", "P2"]);
+    }
+
+    #[test]
+    fn provider_slot_refresh_is_seen_on_next_select() {
+        // The slot is a live RwLock<Vec>: swapping its contents must change
+        // both `members()` and the pick space without rebuilding the group.
+        let slot = slot_of(vec![MockProxy::new("P1")]);
+        let group = LoadBalanceGroup::new_with_providers(
+            "lb",
+            vec![],
+            LbStrategy::RoundRobin,
+            vec![Arc::clone(&slot)],
+        );
+        let meta = meta_no_src();
+        assert_eq!(group.members().unwrap(), ["P1"]);
+        assert_eq!(group.select(&meta).unwrap().name(), "P1");
+
+        *slot.write() = vec![MockProxy::new("P9")];
+        assert_eq!(group.members().unwrap(), ["P9"]);
+        assert_eq!(group.select(&meta).unwrap().name(), "P9");
+    }
+
+    #[test]
+    fn dead_slot_member_is_skipped() {
+        let dead = MockProxy::new("PD");
+        dead.set_alive(false);
+        let slot = slot_of(vec![dead, MockProxy::new("P1")]);
+        let group = LoadBalanceGroup::new_with_providers(
+            "lb",
+            vec![MockProxy::new("A")],
+            LbStrategy::RoundRobin,
+            vec![slot],
+        );
+        let meta = meta_no_src();
+        for _ in 0..4 {
+            assert_ne!(group.select(&meta).unwrap().name(), "PD");
+        }
+    }
+
+    #[test]
+    fn consistent_hashing_stable_across_slots() {
+        // Same src IP must keep landing on the same member whether the alive
+        // set is static or slot-sourced.
+        let slot = slot_of(vec![MockProxy::new("P1"), MockProxy::new("P2")]);
+        let group = LoadBalanceGroup::new_with_providers(
+            "lb",
+            vec![MockProxy::new("A")],
+            LbStrategy::ConsistentHashing,
+            vec![slot],
+        );
+        let meta = meta_src(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+        let first = group.select(&meta).unwrap().name().to_string();
+        for _ in 0..9 {
+            assert_eq!(group.select(&meta).unwrap().name(), first);
+        }
+    }
+
+    #[test]
+    fn members_and_support_udp_include_slots() {
+        let slot = slot_of(vec![MockProxy::new_udp("PU")]);
+        let group = LoadBalanceGroup::new_with_providers(
+            "lb",
+            vec![MockProxy::new("A")],
+            LbStrategy::RoundRobin,
+            vec![slot],
+        );
+        assert_eq!(group.members().unwrap(), ["A", "PU"]);
+        assert!(group.support_udp(), "slot member's UDP support counts");
+    }
+
+    #[test]
+    fn select_udp_picks_udp_capable_slot_member() {
+        let slot = slot_of(vec![MockProxy::new_udp("PU"), MockProxy::new("PN")]);
+        let group =
+            LoadBalanceGroup::new_with_providers("lb", vec![], LbStrategy::RoundRobin, vec![slot]);
+        let meta = meta_no_src();
+        for _ in 0..4 {
+            assert_eq!(group.select_udp(&meta).unwrap().name(), "PU");
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_udp_reaches_udp_capable_slot_member() {
+        // End-to-end through `ProxyAdapter::dial_udp` — not just `select_udp`.
+        let pu = MockProxy::new_udp("PU");
+        let pn = MockProxy::new("PN");
+        let pu_ref = Arc::clone(&pu);
+        let pn_ref = Arc::clone(&pn);
+        let slot = slot_of(vec![pu, pn]);
+        let group =
+            LoadBalanceGroup::new_with_providers("lb", vec![], LbStrategy::RoundRobin, vec![slot]);
+        for _ in 0..3 {
+            let _ = group.dial_udp(&meta_no_src()).await;
+        }
+        assert_eq!(
+            pu_ref.dials(),
+            3,
+            "every UDP dial reaches the capable member"
+        );
+        assert_eq!(pn_ref.dials(), 0, "non-UDP member is never tried");
+    }
+
+    #[tokio::test]
+    async fn repeated_dial_failures_mark_slot_member_dead() {
+        // Provider members are never probed by the group sweep (their names
+        // don't resolve through the route map), so mihomo's onDialFailed
+        // escalation — DialAttempt/DialFailureTracker — is their only
+        // liveness signal between refreshes. Mirrors urltest's
+        // `repeated_dial_failures_mark_member_dead`.
+        let failing = MockProxy::new_failing("P1", AdapterType::Shadowsocks, "dial timed out");
+        let slot = slot_of(vec![Arc::clone(&failing) as Arc<dyn Proxy>]);
+        let group = LoadBalanceGroup::new_with_providers(
+            "lb",
+            vec![MockProxy::new("A")],
+            LbStrategy::RoundRobin,
+            vec![slot],
+        );
+        // Round-robin alternates A,P1,A,P1… — only P1's failures count (A is
+        // a Direct adapter, exempt). The 5th P1 failure (dial #10) kills it.
+        for i in 1..10 {
+            let _ = group.dial_tcp(&meta_no_src()).await;
+            assert!(
+                failing.alive(),
+                "failure {i} below the escalation threshold"
+            );
+        }
+        let _ = group.dial_tcp(&meta_no_src()).await;
+        assert!(!failing.alive(), "five failures mark the slot member dead");
+        let _ = group.dial_tcp(&meta_no_src()).await;
+        assert_eq!(
+            failing.dials(),
+            5,
+            "the dead member no longer receives dials"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_refused_marks_slot_member_dead_immediately() {
+        // mihomo escalates "connection refused" without a streak.
+        let failing = MockProxy::new_failing("P1", AdapterType::Shadowsocks, "connection refused");
+        let slot = slot_of(vec![Arc::clone(&failing) as Arc<dyn Proxy>]);
+        let group = LoadBalanceGroup::new_with_providers(
+            "lb",
+            vec![MockProxy::new("A")],
+            LbStrategy::RoundRobin,
+            vec![slot],
+        );
+        let _ = group.dial_tcp(&meta_no_src()).await; // A
+        let _ = group.dial_tcp(&meta_no_src()).await; // P1 — refused
+        assert!(!failing.alive(), "refused escalates on the first failure");
+    }
+
+    #[test]
+    fn slot_members_feed_alive_for_url_current_and_delay() {
+        // All statics dead, one alive slot member: group liveness, current
+        // pick, and delay reporting must see the provider member.
+        let member = MockProxy::new("P1");
+        member.set_delay(50);
+        let slot = slot_of(vec![member]);
+        let dead = MockProxy::new("A");
+        dead.set_alive(false);
+        let group = LoadBalanceGroup::new_with_providers(
+            "lb",
+            vec![dead],
+            LbStrategy::RoundRobin,
+            vec![slot],
+        );
+        assert!(group.alive());
+        assert!(group.alive_for_url("https://x"));
+        assert_eq!(group.current().as_deref(), Some("P1"));
+        assert_eq!(group.last_delay(), 50);
+        assert_eq!(group.last_delay_for_url("https://x"), 50);
+        assert_eq!(
+            group.delay_history().len(),
+            1,
+            "delay history comes from the alive slot member"
+        );
+    }
+
+    #[test]
+    fn consistent_hashing_picks_alive_after_slot_member_death() {
+        // A slot member dying mid-run must not strand the hash: the pick
+        // space shrinks and the same src IP lands on an *alive* member.
+        let a = MockProxy::new("P1");
+        let b = MockProxy::new("P2");
+        let a_ref = Arc::clone(&a);
+        let b_ref = Arc::clone(&b);
+        let slot = slot_of(vec![a, b]);
+        let group = LoadBalanceGroup::new_with_providers(
+            "lb",
+            vec![],
+            LbStrategy::ConsistentHashing,
+            vec![slot],
+        );
+        let meta = meta_src(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)));
+        let _ = group.select(&meta);
+        a_ref.set_alive(false);
+        b_ref.set_alive(false);
+        assert!(
+            group.select(&meta).is_none(),
+            "all dead → None, not a dead pick"
+        );
+        b_ref.set_alive(true);
+        for _ in 0..3 {
+            assert_eq!(group.select(&meta).unwrap().name(), "P2");
+        }
     }
 }

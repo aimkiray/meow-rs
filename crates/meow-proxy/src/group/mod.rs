@@ -56,9 +56,13 @@ const DIAL_FAILURE_WINDOW: Duration = Duration::from_secs(5);
 /// mihomo's terminal action on escalation is to force a provider health
 /// check. The group layer here cannot trigger probes (the health-check loop
 /// lives in meow-app), so the local equivalent is to mark the failed member
-/// dead: routing stops selecting it immediately, and the next scheduled
-/// group probe — guaranteed to run for a lazy group, because a dial bumps
-/// the usage generation — revives members that failed only transiently.
+/// dead: routing stops selecting it immediately. A static member is revived
+/// by the next scheduled group probe — guaranteed to run for a lazy group,
+/// because a dial bumps the usage generation. A *provider* member is not:
+/// the sweep resolves `members()` names through the route map where
+/// provider nodes are unregistered, so only a provider refresh (or a manual
+/// `GET /providers/proxies/{name}/healthcheck` when the provider configures
+/// `health-check:`) revives it.
 pub(super) struct DialFailureTracker {
     state: Mutex<DialFailureState>,
 }
