@@ -30,6 +30,29 @@ the canonical, in-repo source a release is cut from.
   → `key.sub=value`). `mux` requires the `mux` cargo feature; builds
   without it reject `mux=true` at parse time. (#533)
 
+- **In-process `shadow-tls` for Shadowsocks** — `plugin: shadow-tls` now
+  runs natively (mihomo `transport/sing-shadowtls` parity) instead of
+  spawning a SIP003 subprocess. All three protocol versions are
+  supported: v1 (TLS 1.2 cover handshake then plaintext), v2 (8-byte
+  HMAC-SHA1 transcript tag on the first framed record), and v3
+  (ClientHello `legacy_session_id` authentication + XOR-swizzled cover
+  records with embedded rolling HMACs). Options mirror upstream:
+  `host` (required cover SNI), `password`, `version` (required — 1, 2
+  or 3; upstream has no default),
+  `alpn` (default `h2,http/1.1` — YAML list values flatten),
+  `skip-cert-verify`, `name-cert-verify` (`TlsConfig::verify_name`),
+  `fingerprint` (SHA-256 certificate pin), `certificate`/`private-key`
+  (mTLS, PEM or path), and the node-level `client-fingerprint` uTLS
+  shaping. Two deliberate divergences from upstream, both forced by
+  BoringSSL lacking uTLS's `SessionIDGenerator` hook: the v3 cover
+  handshake always ends in an expected transcript-mismatch failure that
+  is recovered from after the shim has verified a swizzled cover record
+  (TLS 1.2 covers still run real certificate verification before the
+  failure; TLS 1.3 covers cannot be cert-verified at all — the post-
+  ServerHello flight is undecryptable under the diverged transcript, so
+  `skip-cert-verify`/`fingerprint` have no effect there), and the cover
+  session is torn down quietly rather than completed. (#533)
+
 ### Changed
 
 - **BoringSSL is now the only crypto library; rustls is gone from the runtime.**

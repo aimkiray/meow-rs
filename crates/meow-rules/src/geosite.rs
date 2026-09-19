@@ -306,21 +306,11 @@ fn split_category_attrs(category: &str) -> (&str, Vec<String>) {
     (base, attrs)
 }
 
-/// Meow home directory for geosite discovery.
-///
-/// Delegates to the process-wide override set by `meow_common::set_home_dir`
-/// (from `-d`), falling back to `$XDG_CONFIG_HOME/meow` or
-/// `$HOME/.config/meow`.  This mirrors the logic in `meow_config::meow_config_dir`
-/// without introducing a circular crate dependency.
+/// Meow home directory for geosite discovery — the same chain as
+/// `meow_config::meow_config_dir` (which cannot be depended on here
+/// without a crate cycle).
 fn geosite_config_dir() -> PathBuf {
-    if let Some(d) = meow_common::meow_home_dir() {
-        return d;
-    }
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("meow")
+    meow_common::resolved_home_dir()
 }
 
 /// Candidate paths for the geosite DB, in priority order. Returned

@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! TcpStream
-//!   → rustls TLS (with ECH + inner SNI override, ALPN=http/1.1)
+//!   → BoringSSL TLS (with ECH + inner SNI override, ALPN=http/1.1)
 //!   → HTTP/1.1 WebSocket upgrade (Host = inner SNI, path = cfg.path)
 //!   → caller wraps with Shadowsocks ProxyClientStream
 //! ```
@@ -22,6 +22,8 @@
 
 use base64::Engine;
 use meow_common::{MeowError, Result};
+
+use crate::plugin_util::{parse_bool, sip003_opts};
 use meow_transport::{
     tls::{EchOpts, TlsConfig, TlsLayer},
     ws::{WsConfig, WsLayer},
@@ -45,10 +47,6 @@ pub struct EchTlsTunnelConfig {
     pub fingerprint: Option<String>,
 }
 
-fn parse_bool(s: &str) -> bool {
-    matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-}
-
 /// Parse a SIP003 opts string for `ech-tls-tunnel`.
 ///
 /// Recognised keys:
@@ -70,12 +68,8 @@ pub fn parse_opts(s: &str) -> Result<EchTlsTunnelConfig> {
     let mut ech_b64: Option<String> = None;
     let mut fingerprint: Option<String> = Some("chrome".to_string());
 
-    for token in s.split(';').map(str::trim).filter(|t| !t.is_empty()) {
-        let (key, value) = match token.split_once('=') {
-            Some((k, v)) => (k.trim(), v.trim().to_string()),
-            None => (token, "true".to_string()),
-        };
-        match key {
+    for (key, value) in sip003_opts(s) {
+        match key.as_str() {
             "mode" => mode = Some(value),
             "sni" => sni = Some(value),
             "path" => path = Some(value),
@@ -87,7 +81,9 @@ pub fn parse_opts(s: &str) -> Result<EchTlsTunnelConfig> {
                 };
             }
             "fast_open" | "fast-open" => {
-                let _ = parse_bool(&value);
+                // Accepted-but-ignored compat knob; shared parse_bool
+                // still warns on garbage values.
+                let _ = parse_bool(&value, "ech-tls-tunnel", "fast-open");
             }
             other => warn!("ech-tls-tunnel: ignoring unknown opt '{}'", other),
         }

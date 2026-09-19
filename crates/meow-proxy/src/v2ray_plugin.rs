@@ -24,6 +24,7 @@ use meow_transport::{
 };
 use tracing::{debug, warn};
 
+use crate::plugin_util::{parse_bool, sip003_opts};
 use crate::transport_to_proxy_err;
 
 /// Transport mode.  Only WebSocket is supported.
@@ -65,11 +66,6 @@ impl Default for V2rayPluginConfig {
         }
     }
 }
-
-fn parse_bool(s: &str) -> bool {
-    matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-}
-
 /// Parse a SIP003 opts string (`mode=websocket;tls;host=...;path=/ws;mux=1`).
 ///
 /// - Bare keys (e.g. `tls`) are treated as `key=true`.
@@ -78,13 +74,8 @@ fn parse_bool(s: &str) -> bool {
 pub fn parse_opts(s: &str) -> Result<V2rayPluginConfig> {
     let mut cfg = V2rayPluginConfig::default();
 
-    for token in s.split(';').map(str::trim).filter(|t| !t.is_empty()) {
-        let (key, value) = match token.split_once('=') {
-            Some((k, v)) => (k.trim(), v.trim().to_string()),
-            None => (token, "true".to_string()),
-        };
-
-        match key {
+    for (key, value) in sip003_opts(s) {
+        match key.as_str() {
             "mode" => {
                 if value.eq_ignore_ascii_case("websocket") || value.eq_ignore_ascii_case("ws") {
                     cfg.mode = Mode::Websocket;
@@ -94,11 +85,13 @@ pub fn parse_opts(s: &str) -> Result<V2rayPluginConfig> {
                     )));
                 }
             }
-            "tls" => cfg.tls = parse_bool(&value),
+            "tls" => cfg.tls = parse_bool(&value, "v2ray-plugin", "tls"),
             "host" => cfg.host = value,
             "path" => cfg.path = value,
-            "mux" => cfg.mux = parse_bool(&value),
-            "skip-cert-verify" => cfg.skip_cert_verify = parse_bool(&value),
+            "mux" => cfg.mux = parse_bool(&value, "v2ray-plugin", "mux"),
+            "skip-cert-verify" => {
+                cfg.skip_cert_verify = parse_bool(&value, "v2ray-plugin", "skip-cert-verify");
+            }
             "header" => {
                 // Form: header=Key:Value
                 if let Some((k, v)) = value.split_once(':') {

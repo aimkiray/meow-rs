@@ -73,6 +73,12 @@ xhttp = [
 # keeping them in one module lets a single round-trip test guard both halves
 # against framing drift.
 simple-obfs = ["dep:base64", "dep:rand"]
+# shadow-tls client transport (v1/v2/v3) — a real cover TLS handshake over
+# a sniffer/patcher shim, then record-framed data. Dedicated feature so
+# `tls`-only consumers (meow-dns et al.) don't compile ~1.7k lines they
+# can't use; sha1/subtle are its deps alone (hmac/sha2 stay unconditional
+# for the REALITY backend).
+shadow-tls = ["tls", "dep:sha1", "dep:subtle"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -83,6 +89,8 @@ bytes = { workspace = true }
 aes-gcm = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
+sha1 = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
 
 # ws feature
 tokio-tungstenite = { workspace = true, optional = true }
@@ -152,6 +160,10 @@ required-features = ["h2"]
 [[test]]
 name = "httpupgrade_test"
 required-features = ["httpupgrade"]
+
+[[test]]
+name = "shadow_tls_test"
+required-features = ["shadow-tls"]
 
 [[test]]
 name = "xhttp_test"

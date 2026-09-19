@@ -132,8 +132,8 @@ pub fn node_selects_external_plugin(config: &HashMap<String, serde_yaml::Value>)
 /// external SIP003 executable is rejected: that name reaches `Command::new`
 /// during adapter construction, so provider content would select a local
 /// binary (issue #513). Built-in/in-process plugins (`obfs`,
-/// `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `ech-tls-tunnel`) stay
-/// allowed — mihomo
+/// `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`,
+/// `ech-tls-tunnel`) stay allowed — mihomo
 /// implements those in-process too, so gating them would diverge.
 pub fn parse_proxy_provider_node(
     config: &HashMap<String, serde_yaml::Value>,
@@ -194,6 +194,7 @@ pub fn parse_proxy_with_dialer(
                 .unwrap_or(false);
             let plugin = config.get("plugin").and_then(|v| v.as_str());
             let plugin_opts_str = config.get("plugin-opts").and_then(serialize_plugin_opts);
+            let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
 
             // A SIP003 *external* plugin is a local subprocess spawned by
             // `ShadowsocksAdapter::new`, and the adapter deliberately dials it
@@ -221,6 +222,7 @@ pub fn parse_proxy_with_dialer(
                 udp,
                 plugin,
                 plugin_opts_str.as_deref(),
+                client_fingerprint,
                 Arc::clone(dialer),
             )
             .map_err(|e| format!("ss: {e}"))?;
@@ -355,24 +357,9 @@ pub fn parse_proxy_with_dialer(
 /// as built-in is handed to `Plugin::start`, which spawns a child process.
 #[cfg(feature = "ss")]
 fn is_external_sip003_plugin(plugin: Option<&str>) -> bool {
-    let Some(plugin) = plugin.filter(|p| !p.is_empty()) else {
-        return false;
-    };
-    if meow_proxy::shadowsocks_adapter::is_builtin_obfs_plugin(plugin) {
-        return false;
-    }
-    if matches!(plugin, "v2ray-plugin" | "gost-plugin") {
-        return false;
-    }
-    // Mirror `ShadowsocksAdapter::new` exactly: its `ech-tls-tunnel` arm is
-    // feature-gated, so without the feature the plugin falls through to the
-    // external-subprocess branch and must be classified external here too —
-    // otherwise an injected dialer would be accepted and silently ignored.
-    #[cfg(feature = "ech-tls-tunnel")]
-    if plugin == "ech-tls-tunnel" {
-        return false;
-    }
-    true
+    plugin
+        .filter(|p| !p.is_empty())
+        .is_some_and(|p| !meow_proxy::shadowsocks_adapter::is_builtin_sip003_plugin(p))
 }
 
 /// Reject a `ProxyDialer` for adapter types that do not thread it through.
@@ -2231,7 +2218,38 @@ fn serialize_plugin_opts(opts: &serde_yaml::Value) -> Option<String> {
             serde_yaml::Value::String(s) => s.clone(),
             serde_yaml::Value::Bool(b) => b.to_string(),
             serde_yaml::Value::Number(n) => n.to_string(),
-            _ => return,
+            // Sequences join on `,` — not a SIP003 separator, and the list
+            // opts that exist (shadow-tls `alpn`) are comma-split downstream.
+            // An element containing `,` or `;` would splice extra items or
+            // a whole extra token into the serialized value, so drop it.
+            serde_yaml::Value::Sequence(seq) => seq
+                .iter()
+                .filter_map(|i| {
+                    let s = match i {
+                        serde_yaml::Value::String(s) => s.clone(),
+                        serde_yaml::Value::Bool(b) => b.to_string(),
+                        serde_yaml::Value::Number(n) => n.to_string(),
+                        other => {
+                            tracing::warn!(
+                                "plugin-opts: dropping non-scalar sequence element under '{key}': {other:?}"
+                            );
+                            return None;
+                        }
+                    };
+                    if s.contains([',', ';']) {
+                        tracing::warn!(
+                            "plugin-opts: dropping sequence element under '{key}' containing a separator: {s:?}"
+                        );
+                        return None;
+                    }
+                    Some(s)
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            other => {
+                tracing::warn!("plugin-opts: dropping non-scalar value for '{key}': {other:?}");
+                return;
+            }
         };
         if key.contains([';', '=']) || val.contains(';') {
             tracing::warn!(
@@ -2246,16 +2264,29 @@ fn serialize_plugin_opts(opts: &serde_yaml::Value) -> Option<String> {
         serde_yaml::Value::Mapping(map) => {
             let mut parts: Vec<String> = Vec::new();
             for (k, v) in map {
-                let Some(key) = k.as_str() else { continue };
+                let Some(key) = k.as_str() else {
+                    tracing::warn!("plugin-opts: dropping non-string key {k:?}");
+                    continue;
+                };
                 match v {
                     serde_yaml::Value::Mapping(inner) if key.eq_ignore_ascii_case("headers") => {
                         for (hk, hv) in inner {
-                            let Some(hk) = hk.as_str() else { continue };
+                            let Some(hk) = hk.as_str() else {
+                                tracing::warn!(
+                                    "plugin-opts: dropping non-string header name {hk:?}"
+                                );
+                                continue;
+                            };
                             let hv = match hv {
                                 serde_yaml::Value::String(s) => s.clone(),
                                 serde_yaml::Value::Bool(b) => b.to_string(),
                                 serde_yaml::Value::Number(n) => n.to_string(),
-                                _ => continue,
+                                other => {
+                                    tracing::warn!(
+                                        "plugin-opts: dropping non-scalar value for header '{hk}': {other:?}"
+                                    );
+                                    continue;
+                                }
                             };
                             if hk.contains([';', '=', ':']) || hv.contains(';') {
                                 tracing::warn!(
@@ -2268,8 +2299,11 @@ fn serialize_plugin_opts(opts: &serde_yaml::Value) -> Option<String> {
                     }
                     serde_yaml::Value::Mapping(inner) => {
                         for (sk, sv) in inner {
-                            if let Some(sk) = sk.as_str() {
-                                push_scalar(&mut parts, &format!("{key}.{sk}"), sv);
+                            match sk.as_str() {
+                                Some(sk) => push_scalar(&mut parts, &format!("{key}.{sk}"), sv),
+                                None => tracing::warn!(
+                                    "plugin-opts: dropping non-string key {sk:?} under '{key}'"
+                                ),
                             }
                         }
                     }
@@ -2960,6 +2994,51 @@ tls: true
             serialize_plugin_opts(&yaml).unwrap(),
             "mode=websocket;header=X-A:b"
         );
+    }
+
+    #[cfg(feature = "ss")]
+    #[test]
+    fn test_serialize_plugin_opts_sequence_join() {
+        // `alpn` arrives as a YAML sequence (upstream `alpn []string`) —
+        // joined with `,`, which the shadow-tls parser splits back out.
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str("alpn:\n  - h2\n  - http/1.1\nversion: 3\n").unwrap();
+        assert_eq!(
+            serialize_plugin_opts(&yaml).unwrap(),
+            "alpn=h2,http/1.1;version=3"
+        );
+    }
+
+    /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
+    /// the in-process shadow-tls parser → adapter construction, incl.
+    /// the `alpn` sequence and node-level `client-fingerprint` plumbing.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn test_shadow_tls_node_parse_e2e() {
+        let cfg = proxy_config(
+            "name: stls\ntype: ss\nserver: 1.2.3.4\nport: 8388\n\
+             cipher: aes-256-gcm\npassword: pw\nclient-fingerprint: chrome\n\
+             plugin: shadow-tls\nplugin-opts:\n  host: cover.example.com\n  \
+             password: psk\n  version: 3\n  alpn:\n    - h2\n    - http/1.1\n",
+        );
+        let adapter = parse_proxy(&cfg).expect("shadow-tls node must parse");
+        assert_eq!(adapter.name(), "stls");
+        assert!(
+            !is_external_sip003_plugin(Some("shadow-tls")),
+            "provider/subscription path must treat shadow-tls as built-in"
+        );
+
+        // An invalid opt proves the serialized string reached the
+        // shadow-tls parser — a misrouted plugin would parse as a no-op.
+        let cfg = proxy_config(
+            "name: stls\ntype: ss\nserver: 1.2.3.4\nport: 8388\n\
+             cipher: aes-256-gcm\npassword: pw\n\
+             plugin: shadow-tls\nplugin-opts:\n  host: cover.example.com\n  version: 9\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("version=9 must reach the shadow-tls parser and fail");
+        };
+        assert!(err.contains("version"), "msg: {err}");
     }
 
     // ─── direct proxy with per-proxy DNS (issue #67) ─────────────────────────

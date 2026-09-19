@@ -247,6 +247,7 @@ async fn test_ss_tcp_relay() {
         false,
         None,
         None,
+        None,
         Arc::new(DirectDialer),
     )
     .unwrap();
@@ -308,6 +309,7 @@ async fn test_ss_udp_relay() {
         SS_PASSWORD,
         SS_CIPHER,
         true,
+        None,
         None,
         None,
         Arc::new(DirectDialer),
@@ -388,6 +390,7 @@ async fn test_ss_udp_relay_2022() {
         true,
         None,
         None,
+        None,
         Arc::new(DirectDialer),
     )
     .unwrap();
@@ -444,6 +447,7 @@ async fn test_ss_tcp_relay_with_obfs_plugin() {
         false,
         Some("obfs-local"),
         Some("obfs=http"),
+        None,
         Arc::new(DirectDialer),
     )
     .expect("failed to create adapter with obfs-local plugin");
@@ -520,6 +524,7 @@ async fn test_ss_tcp_relay_with_builtin_obfs_http() {
         false,
         Some("obfs"),
         Some("mode=http;host=bing.com"),
+        None,
         Arc::new(DirectDialer),
     )
     .expect("failed to create adapter with built-in obfs http");
@@ -585,6 +590,7 @@ async fn test_ss_tcp_relay_with_builtin_obfs_tls() {
         false,
         Some("obfs"),
         Some("mode=tls;host=cloudflare.com"),
+        None,
         Arc::new(DirectDialer),
     )
     .expect("failed to create adapter with built-in obfs tls");
@@ -651,6 +657,7 @@ async fn test_ss_connect_over_runs_ss_handshake() {
         false,
         None,
         None,
+        None,
         Arc::new(DirectDialer),
     )
     .unwrap();
@@ -703,6 +710,7 @@ async fn test_ss_connect_over_external_plugin_not_supported() {
         false,
         Some("obfs-local"),
         Some("obfs=http"),
+        None,
         Arc::new(DirectDialer),
     )
     .expect("adapter with external plugin must construct");
@@ -753,6 +761,7 @@ async fn test_ss_connect_over_builtin_obfs_http() {
         false,
         Some("obfs"),
         Some("obfs=http"),
+        None,
         Arc::new(DirectDialer),
     )
     .expect("failed to create adapter with built-in obfs");
@@ -808,6 +817,7 @@ async fn test_ss_connect_over_builtin_obfs_tls() {
         false,
         Some("obfs"),
         Some("mode=tls;host=cloudflare.com"),
+        None,
         Arc::new(DirectDialer),
     )
     .expect("failed to create adapter with built-in obfs tls");

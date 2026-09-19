@@ -159,6 +159,7 @@ async fn fetch_via_proxy_through_ssserver_returns_body() {
         false,
         None,
         None,
+        None,
         Arc::new(DirectDialer),
     )
     .expect("ShadowsocksAdapter::new");
@@ -223,6 +224,7 @@ async fn fetch_via_proxy_follows_redirect() {
         SS_PASSWORD,
         SS_CIPHER,
         false,
+        None,
         None,
         None,
         Arc::new(DirectDialer),

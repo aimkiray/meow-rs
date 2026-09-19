@@ -1,0 +1,320 @@
+//! In-process `shadow-tls` SIP003 plugin for Shadowsocks (mihomo
+//! `transport/sing-shadowtls` parity — the record layer lives in
+//! [`meow_transport::shadow_tls`]).
+//!
+//! `plugin: shadow-tls` with `plugin-opts` keys:
+//!
+//! | opt | meaning | default |
+//! |-----|---------|---------|
+//! | `host` | cover server name — TLS SNI of the relayed handshake | *(required)* |
+//! | `password` | per-user PSK (v2 handshake HMAC / v3 session-id tag) | `""` |
+//! | `version` | protocol version 1, 2 or 3 | *(required)* |
+//! | `alpn` | comma-separated ALPN list for the cover handshake | `h2,http/1.1` |
+//! | `skip-cert-verify` | disable cover cert verification | `false` |
+//! | `name-cert-verify` | cert-verify hostname when it differs from SNI — meow extension, upstream ignores this key | `host` |
+//! | `fingerprint` | SHA-256 **certificate pin** (upstream
+//!   `FingerprintVerifier`), *not* a uTLS profile | — |
+//! | `certificate` / `private-key` | mTLS pair — inline PEM or file path | — |
+//!
+//! The node-level `client-fingerprint` option shapes the cover
+//! ClientHello (uTLS profile → `TlsConfig::fingerprint`), matching
+//! upstream's `ShadowTLSOption.ClientFingerprint`.
+//!
+//! Version bounds on the cover handshake mirror upstream
+//! (`MinVersion = TLS 1.2`, `v1` caps at TLS 1.2).  v3 keeps the 1.2
+//! floor: the ClientHello still offers TLS 1.3 (so the compat session id
+//! the HMAC patch needs is emitted), and a TLS 1.2 cover authorizes at
+//! its ServerHello exactly as upstream (`authorized = !isTLS13`).
+
+use meow_common::error::{MeowError, Result};
+use meow_transport::{
+    shadow_tls,
+    tls::{ClientCert, TlsConfig, TlsLayer, TlsVersion},
+    Stream,
+};
+use tracing::{debug, warn};
+
+use crate::plugin_util::{load_pem_or_path, parse_bool_strict, parse_cert_pin, sip003_opts};
+use crate::transport_to_proxy_err;
+
+const PLUGIN: &str = "shadow-tls";
+
+/// Parsed `shadow-tls` client options.
+#[derive(Debug, Clone)]
+pub struct ShadowTlsConfig {
+    /// Cover server name — the TLS handshake's SNI; the shadow-tls server
+    /// relays the handshake to this host.
+    pub host: String,
+    /// Per-user PSK (ignored by v1, matching upstream).
+    pub password: String,
+    /// Protocol version 1, 2 or 3 — required; upstream `obfs:"version"`
+    /// has no default (absent → 0 → `NewClient` errors).
+    pub version: u8,
+    /// ALPN for the cover handshake (upstream default `h2,http/1.1`).
+    pub alpn: Vec<String>,
+    pub skip_cert_verify: bool,
+    /// Cert-verify hostname when it differs from `host`/SNI
+    /// (`name-cert-verify` — a meow extension; mihomo's
+    /// `shadowTLSOption` has no such field and warn-ignores it).
+    pub verify_name: Option<String>,
+    /// SHA-256 certificate pin (`fingerprint` — SSL pinning per upstream
+    /// `ca.NewFingerprintVerifier`, *not* a uTLS ClientHello profile).
+    pub cert_pin: Option<[u8; 32]>,
+    /// mTLS client certificate (`certificate` + `private-key`, PEM or path).
+    pub client_cert: Option<ClientCert>,
+}
+
+/// Parse a flattened SIP003 opts string for `shadow-tls`
+/// (`host=cover.example.com;password=…;version=3;alpn=h2,http/1.1`).
+///
+/// - `host` is required (upstream `obfs:"host"` has no `omitempty`).
+/// - `version` accepts `1`/`2`/`3`; anything else is a config error.
+/// - Unknown keys are logged at `warn` level and ignored.
+pub fn parse_opts(s: &str) -> Result<ShadowTlsConfig> {
+    let mut cfg = ShadowTlsConfig {
+        host: String::new(),
+        password: String::new(),
+        version: 0,
+        alpn: Vec::new(),
+        skip_cert_verify: false,
+        verify_name: None,
+        cert_pin: None,
+        client_cert: None,
+    };
+    let mut version_seen = false;
+    let mut alpn_seen = false;
+    let mut cert_pem: Option<Vec<u8>> = None;
+    let mut key_pem: Option<Vec<u8>> = None;
+
+    for (key, value) in sip003_opts(s) {
+        match key.as_str() {
+            "host" => cfg.host = value,
+            "password" => cfg.password = value,
+            "version" => {
+                version_seen = true;
+                cfg.version = value
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|v| (1..=3).contains(v))
+                    .ok_or_else(|| {
+                        MeowError::Config(format!(
+                            "{PLUGIN}: 'version' must be 1, 2 or 3, got '{value}'"
+                        ))
+                    })?;
+            }
+            "alpn" => {
+                alpn_seen = true;
+                cfg.alpn = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            "skip-cert-verify" => {
+                cfg.skip_cert_verify = parse_bool_strict(&value, PLUGIN, "skip-cert-verify")?;
+            }
+            "name-cert-verify" if !value.is_empty() => cfg.verify_name = Some(value),
+            "fingerprint" if !value.is_empty() => {
+                cfg.cert_pin = Some(parse_cert_pin(&value, PLUGIN)?);
+            }
+            // Explicit-empty value clears the opt — same as absent.
+            "name-cert-verify" | "fingerprint" => {}
+            "certificate" => cert_pem = Some(load_pem_or_path(&value, "certificate", PLUGIN)?),
+            "private-key" => key_pem = Some(load_pem_or_path(&value, "private-key", PLUGIN)?),
+            other => warn!("{PLUGIN}: ignoring unknown opt '{other}'"),
+        }
+    }
+
+    if cfg.host.is_empty() {
+        return Err(MeowError::Config(format!(
+            "{PLUGIN}: missing required 'host' opt (cover server name)"
+        )));
+    }
+    // Upstream has no version default — absent maps to 0 and NewClient
+    // rejects it.  Fail loud the same way rather than silently picking
+    // a wire protocol the operator did not ask for.
+    if !version_seen {
+        return Err(MeowError::Config(format!(
+            "{PLUGIN}: missing required 'version' opt (1, 2 or 3)"
+        )));
+    }
+    // Absent `alpn` → upstream DefaultALPN; `alpn=` (explicit empty) is
+    // honored as no-ALPN, matching upstream's `opt.ALPN != nil` check.
+    if !alpn_seen {
+        cfg.alpn = shadow_tls::DEFAULT_ALPN
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+    }
+    // mTLS: both halves or none — a lone cert or key is a config error.
+    match (cert_pem, key_pem) {
+        (Some(cert_pem), Some(key_pem)) => {
+            cfg.client_cert = Some(ClientCert { cert_pem, key_pem });
+        }
+        (None, None) => {}
+        _ => {
+            return Err(MeowError::Config(format!(
+                "{PLUGIN}: 'certificate' and 'private-key' must both be set"
+            )));
+        }
+    }
+    if cfg.version != 1 && cfg.password.is_empty() {
+        warn!(
+            "{PLUGIN}: empty password — v{} authentication will fail",
+            cfg.version
+        );
+    }
+    Ok(cfg)
+}
+
+/// Build the cover-handshake `TlsLayer`.  `client_fingerprint` is the
+/// node-level `client-fingerprint` option (uTLS profile shaping).
+///
+/// Version bounds mirror upstream: TLS 1.2 floor for every version, TLS
+/// 1.2 cap for v1.  v3 needs no 1.3 floor — the compat session id is
+/// emitted whenever 1.3 is *offered* (the floor does not remove it), and
+/// a TLS 1.2 cover still authorizes the session at its ServerHello.
+/// Upstream also drops `client-fingerprint` when the cap is 1.2
+/// (`uTLSHandshakeFunc` forces `""`) — a 1.2-only ClientHello should not
+/// carry a 1.3-shaped profile.
+pub fn build_tls_layer(
+    cfg: &ShadowTlsConfig,
+    client_fingerprint: Option<&str>,
+) -> Result<TlsLayer> {
+    if cfg.version == 3
+        && (cfg.cert_pin.is_some() || cfg.verify_name.is_some() || cfg.skip_cert_verify)
+    {
+        warn!(
+            "{PLUGIN}: 'fingerprint'/'name-cert-verify'/'skip-cert-verify' only \
+             take effect on a TLS 1.2 cover — on a 1.3 cover the post-ServerHello \
+             flight is undecryptable, so the embedded record tags are the only \
+             authenticator"
+        );
+    }
+    let tls_config = TlsConfig {
+        alpn: cfg.alpn.clone(),
+        skip_cert_verify: cfg.skip_cert_verify,
+        verify_name: cfg.verify_name.clone(),
+        cert_pin: cfg.cert_pin,
+        client_cert: cfg.client_cert.clone(),
+        fingerprint: client_fingerprint
+            .filter(|_| cfg.version != 1)
+            .map(str::to_string),
+        min_version: Some(TlsVersion::Tls12),
+        max_version: (cfg.version == 1).then_some(TlsVersion::Tls12),
+        ..TlsConfig::new(&cfg.host)
+    };
+    TlsLayer::new(&tls_config).map_err(transport_to_proxy_err)
+}
+
+/// Dial a TCP + shadow-tls connection to `server_host:server_port` and
+/// return the framed stream ready to be wrapped by the SS layer.
+pub async fn dial(
+    cfg: &ShadowTlsConfig,
+    tls: &TlsLayer,
+    server_host: &str,
+    server_port: u16,
+    dialer: &dyn crate::dialer::TcpDialer,
+) -> Result<Box<dyn Stream>> {
+    debug!(
+        "{PLUGIN}: dialing {server_host}:{server_port} via cover={} version={}",
+        cfg.host, cfg.version
+    );
+    let tcp = dialer
+        .dial(server_host, server_port)
+        .await
+        .map_err(MeowError::Io)?;
+    shadow_tls::dial(Box::new(tcp), tls, cfg.version, cfg.password.as_bytes())
+        .await
+        .map_err(transport_to_proxy_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_opts_cases() {
+        let cases: &[(&str, bool)] = &[
+            ("host=cover.example.com", false), // version required (upstream parity)
+            ("host=cover.example.com;password=psk", false), // ditto
+            // every version accepted
+            ("host=h;version=1;password=p", true),
+            ("host=h;version=2;password=p", true),
+            ("host=h;version=3;password=p", true),
+            // upstream option surface
+            ("host=h;version=2;password=p;alpn=h2,http/1.1", true),
+            ("host=h;version=2;alpn=", true), // explicit empty = no ALPN
+            ("host=h;version=2;skip-cert-verify=true", true),
+            ("host=h;version=2;name-cert-verify=real.example.com", true),
+            (
+                "host=h;version=2;fingerprint=aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:\
+                 88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99",
+                true,
+            ),
+            ("host=h;version=0", false),
+            ("host=h;version=4", false),
+            ("host=h;version=three", false),
+            ("version=2;password=psk", false), // host required
+            ("", false),                       // empty → no host
+            ("host=h;version=2;fingerprint=chrome", false), // uTLS name rejected
+            ("host=h;version=2;fingerprint=zz", false), // bad hex
+            ("host=h;version=2;certificate=nonexistent.pem", false), // path missing
+            ("host=h;version=2;certificate=-----BEGIN X-----\nPEM", false), // key missing
+        ];
+        for (opts, ok) in cases {
+            assert_eq!(
+                parse_opts(opts).is_ok(),
+                *ok,
+                "opts {opts:?} expected ok={ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_opts_defaults() {
+        let cfg = parse_opts("host=cover.example.com;version=2").unwrap();
+        assert_eq!(cfg.alpn, ["h2", "http/1.1"], "upstream DefaultALPN");
+        assert!(cfg.password.is_empty());
+        assert!(cfg.verify_name.is_none());
+        assert!(cfg.cert_pin.is_none());
+
+        // `alpn=` explicit-empty suppresses the extension entirely —
+        // upstream `opt.ALPN != nil` distinguishes it from "absent".
+        let cfg = parse_opts("host=cover.example.com;version=2;alpn=").unwrap();
+        assert!(cfg.alpn.is_empty(), "explicit alpn= must not re-default");
+    }
+
+    #[test]
+    fn parse_opts_full() {
+        let cfg = parse_opts(
+            "host=cover.example.com;password=psk;version=3;alpn=h3,h2;\
+             skip-cert-verify=true;name-cert-verify=real.example.com;\
+             fingerprint=AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899",
+        )
+        .unwrap();
+        assert_eq!(cfg.version, 3);
+        assert_eq!(cfg.alpn, ["h3", "h2"]);
+        assert!(cfg.skip_cert_verify);
+        assert_eq!(cfg.verify_name.as_deref(), Some("real.example.com"));
+        assert!(cfg.cert_pin.is_some());
+    }
+
+    #[test]
+    fn build_tls_layer_bounds() {
+        // Construction succeeds for every version with a valid host —
+        // bounds (v1 → max 1.2, all → min 1.2) are enforced inside
+        // TlsConfig; invalid combos would error here.
+        for v in 1..=3u8 {
+            let cfg = parse_opts(&format!("host=cover.example.com;version={v}")).unwrap();
+            build_tls_layer(&cfg, None).unwrap_or_else(|e| panic!("v{v}: {e}"));
+        }
+        // client-fingerprint is forwarded into the cover handshake —
+        // except under v1, whose TLS 1.2 cap drops it (upstream parity).
+        let cfg = parse_opts("host=cover.example.com;version=3").unwrap();
+        build_tls_layer(&cfg, Some("chrome")).unwrap();
+        let cfg = parse_opts("host=cover.example.com;version=1").unwrap();
+        build_tls_layer(&cfg, Some("chrome")).unwrap();
+    }
+}

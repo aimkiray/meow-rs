@@ -152,7 +152,8 @@ is called out explicitly.
 ### Shadowsocks
 
 Fully supported including AEAD-2022 ciphers. The built-in `v2ray-plugin`
-and `gost-plugin` WebSocket transports are included. External SIP003
+and `gost-plugin` WebSocket transports are included, along with
+`shadow-tls` (all three protocol versions). External SIP003
 plugin binaries are supported via `plugin:` on `ss` nodes and
 `allow-external-plugin` on providers.
 

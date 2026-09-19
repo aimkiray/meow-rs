@@ -32,7 +32,7 @@ pub use conn::{ProxyConn, ProxyPacketConn, UdpPacket};
 pub use dial::{with_dial_timeout, DIAL_TIMEOUT};
 pub use dns_mode::DnsMode;
 pub use error::{MeowError, Result};
-pub use home_dir::{meow_home_dir, set_home_dir};
+pub use home_dir::{meow_home_dir, resolved_home_dir, set_home_dir, xdg_home_dir};
 pub use metadata::{AddrDisplay, Metadata};
 pub use network::Network;
 #[cfg(target_os = "linux")]

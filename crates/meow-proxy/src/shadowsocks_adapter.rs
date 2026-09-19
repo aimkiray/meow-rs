@@ -1,6 +1,7 @@
 #[cfg(feature = "ech-tls-tunnel")]
 use crate::ech_tls_tunnel::{self, EchTlsTunnelConfig};
 use crate::gost_plugin;
+use crate::shadow_tls_plugin;
 use crate::v2ray_plugin::{self, V2rayPluginConfig};
 use async_trait::async_trait;
 use meow_common::atomic::{checked_increment, AtomicU};
@@ -44,8 +45,12 @@ pub enum BuiltinObfs {
 ///   the TCP stream before SS encryption.
 /// * `Gost` — native gost-plugin websocket (+ optional TLS and single-stream
 ///   smux) transport wraps the TCP stream before SS encryption.
+/// * `ShadowTls` — native shadow-tls v1/v2/v3 (cover-TLS record transport).
 /// * `EchTlsTunnel` — `ech-tls-tunnel` plugin (TLS-in-TLS with ECH).
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "external-plugin boxing would add an indirection to the overwhelmingly-common no-plugin arm; the variant spread is bounded by in-tree plugins"
+)]
 enum PluginKind {
     None,
     /// External SIP003 plugin subprocess. The `Plugin` handle keeps the
@@ -61,8 +66,26 @@ enum PluginKind {
         Option<TlsLayer>,
         meow_transport::ws::WsLayer,
     ),
+    /// Native shadow-tls transport (v1/v2/v3). `TlsLayer` is built at
+    /// construction so a malformed TLS config fails once at startup.
+    ShadowTls(shadow_tls_plugin::ShadowTlsConfig, TlsLayer),
     #[cfg(feature = "ech-tls-tunnel")]
     EchTlsTunnel(EchTlsTunnelConfig, TlsLayer),
+}
+
+impl PluginKind {
+    /// Why this plugin refuses UDP relay, if it does — one place so the
+    /// `dial_udp` gate can't drift as variants accrete.
+    fn udp_block_reason(&self) -> Option<&'static str> {
+        match self {
+            PluginKind::V2ray(..) => Some("v2ray-plugin does not support UDP relay"),
+            PluginKind::Gost(..) => Some("gost-plugin does not support UDP relay"),
+            PluginKind::ShadowTls(..) => Some("shadow-tls does not support UDP relay"),
+            #[cfg(feature = "ech-tls-tunnel")]
+            PluginKind::EchTlsTunnel(..) => Some("ech-tls-tunnel does not support UDP relay"),
+            _ => None,
+        }
+    }
 }
 
 /// Dial-relevant SS state, shared (Arc) between the adapter and any mux
@@ -88,7 +111,10 @@ pub struct ShadowsocksAdapter {
 }
 
 impl ShadowsocksAdapter {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "SS node params are flat config fields; a builder adds indirection without fewer call-site args"
+    )]
     pub fn new(
         name: &str,
         server: &str,
@@ -98,6 +124,9 @@ impl ShadowsocksAdapter {
         udp: bool,
         plugin_name: Option<&str>,
         plugin_opts: Option<&str>,
+        // Node-level `client-fingerprint` (uTLS profile) — consumed by the
+        // `shadow-tls` plugin's cover handshake; ignored by other plugins.
+        client_fingerprint: Option<&str>,
         dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Result<Self> {
         let cipher_kind = cipher
@@ -135,6 +164,15 @@ impl ShadowsocksAdapter {
                 let tls = gost_plugin::build_tls_layer(&cfg)?;
                 let ws = gost_plugin::build_ws_layer(&cfg)?;
                 PluginKind::Gost(cfg, tls, ws)
+            }
+            Some("shadow-tls") => {
+                let cfg = shadow_tls_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
+                debug!(
+                    "SS '{}' using built-in shadow-tls: host={} version={} alpn={:?}",
+                    name, cfg.host, cfg.version, cfg.alpn
+                );
+                let tls = shadow_tls_plugin::build_tls_layer(&cfg, client_fingerprint)?;
+                PluginKind::ShadowTls(cfg, tls)
             }
             #[cfg(feature = "ech-tls-tunnel")]
             Some("ech-tls-tunnel") => {
@@ -219,26 +257,6 @@ impl ShadowsocksAdapter {
         self.mux = Some(MuxClient::new(dial, options));
         self
     }
-
-    /// Whether the configured plugin transport can carry UDP. The ws-based
-    /// plugins are TCP-only (`dial_udp` refuses them); keep the advertised
-    /// `support_udp()` capability in sync so load-balance member filtering
-    /// and `GET /proxies` don't claim UDP for a node that cannot serve it.
-    fn plugin_supports_udp(&self) -> bool {
-        !matches!(
-            self.core.plugin,
-            PluginKind::V2ray(..) | PluginKind::Gost(..)
-        ) && {
-            #[cfg(feature = "ech-tls-tunnel")]
-            {
-                !matches!(self.core.plugin, PluginKind::EchTlsTunnel(..))
-            }
-            #[cfg(not(feature = "ech-tls-tunnel"))]
-            {
-                true
-            }
-        }
-    }
 }
 
 impl SsCore {
@@ -300,6 +318,18 @@ impl SsCore {
                     &*self.dialer,
                 )
                 .await?;
+                let stream = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    transport,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(stream)))
+            }
+            PluginKind::ShadowTls(cfg, tls) => {
+                let transport =
+                    shadow_tls_plugin::dial(cfg, tls, &self.server, self.port, &*self.dialer)
+                        .await?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     transport,
@@ -437,6 +467,17 @@ impl SsCore {
                         .into(),
                 ))
             }
+            PluginKind::ShadowTls(..) => {
+                // shadow-tls could terminate on a relay-supplied stream once
+                // it grows a `handshake_over` split — its `dial` currently
+                // owns the TCP dial itself. Until then, fail loudly rather
+                // than send unwrapped traffic.
+                Err(MeowError::NotSupported(
+                    "ss: shadow-tls transport does not yet support \
+                     terminating on a relay-supplied stream"
+                        .into(),
+                ))
+            }
             PluginKind::External(_) => {
                 // A SIP003 subprocess owns its outbound leg (it dials the
                 // real server itself and we only reach its local listener).
@@ -504,6 +545,17 @@ fn extract_sip003_plugin_mode(opts: Option<&str>) -> (Mode, Option<String>) {
 /// original SIP003 binary name some users still write).
 pub fn is_builtin_obfs_plugin(name: &str) -> bool {
     matches!(name, "obfs" | "simple-obfs")
+}
+
+/// Whether `name` resolves to an in-process plugin — anything else is
+/// spawned as an external SIP003 subprocess.  Must stay in sync with the
+/// dispatch match in `ShadowsocksAdapter::new` (single source of truth
+/// for `meow-config`'s dialer-injection gate, which cannot see the
+/// feature-gated `ech-tls-tunnel` arm directly).
+pub fn is_builtin_sip003_plugin(name: &str) -> bool {
+    is_builtin_obfs_plugin(name)
+        || matches!(name, "v2ray-plugin" | "gost-plugin" | "shadow-tls")
+        || (cfg!(feature = "ech-tls-tunnel") && name == "ech-tls-tunnel")
 }
 
 /// Parses `plugin-opts` (already serialized to SIP003 `key=value;...` form) for
@@ -837,8 +889,9 @@ impl ProxyAdapter for ShadowsocksAdapter {
         // enforcement point: `meow-tunnel`'s UDP path calls `dial_udp`
         // directly without consulting `support_udp`, so the refusal is
         // re-checked there.  Keep the two in sync.
-        let plain_udp_ok =
-            self.support_udp && !self.core.dialer.is_proxy() && self.plugin_supports_udp();
+        let plain_udp_ok = self.support_udp
+            && !self.core.dialer.is_proxy()
+            && self.core.plugin.udp_block_reason().is_none();
         plain_udp_ok || {
             #[cfg(feature = "mux")]
             {
@@ -920,21 +973,8 @@ impl ProxyAdapter for ShadowsocksAdapter {
             ));
         }
 
-        if matches!(self.core.plugin, PluginKind::V2ray(..)) {
-            return Err(MeowError::NotSupported(
-                "v2ray-plugin does not support UDP relay".into(),
-            ));
-        }
-        if matches!(self.core.plugin, PluginKind::Gost(..)) {
-            return Err(MeowError::NotSupported(
-                "gost-plugin does not support UDP relay".into(),
-            ));
-        }
-        #[cfg(feature = "ech-tls-tunnel")]
-        if matches!(self.core.plugin, PluginKind::EchTlsTunnel(..)) {
-            return Err(MeowError::NotSupported(
-                "ech-tls-tunnel does not support UDP relay".into(),
-            ));
+        if let Some(reason) = self.core.plugin.udp_block_reason() {
+            return Err(MeowError::NotSupported(reason.into()));
         }
 
         // Hand-roll the UDP bind+connect so the installed
@@ -1141,6 +1181,7 @@ mod tests {
             udp,
             None,
             None,
+            None,
             dialer,
         )
         .expect("adapter builds")
@@ -1174,36 +1215,54 @@ mod tests {
         );
     }
 
-    /// gost-plugin is a TCP-only ws transport — `dial_udp` must refuse
-    /// loudly (`NotSupported` naming the plugin) and `support_udp()` must
-    /// agree, regardless of the `udp: true` config flag.
+    /// Every built-in TCP-only plugin must refuse `dial_udp` and name
+    /// itself in the refusal — the tunnel's UDP dispatch never consults
+    /// `support_udp`, so this is the enforcement seam.
+    ///
+    /// `mux=false` on the gost fixture keeps it valid under a
+    /// `ss`-without-`mux` build (the upstream mux default is a parse
+    /// error there).
     #[tokio::test]
-    async fn gost_plugin_refuses_udp() {
-        let adapter = ShadowsocksAdapter::new(
-            "ss-gost",
-            "127.0.0.1",
-            8388,
-            "password",
-            "aes-256-gcm",
-            true,
-            Some("gost-plugin"),
-            Some("mode=websocket;mux=false"),
-            Arc::new(crate::dialer::DirectDialer),
-        )
-        .expect("adapter builds");
-
-        match adapter.dial_udp(&Metadata::default()).await {
-            Err(MeowError::NotSupported(m)) => assert!(
-                m.contains("gost-plugin"),
-                "refusal should name the plugin, got: {m}"
+    async fn builtin_tcp_plugins_refuse_udp() {
+        for (plugin, opts, tag) in [
+            ("v2ray-plugin", "host=cdn.example.com", "v2ray-plugin"),
+            (
+                "gost-plugin",
+                "mode=websocket;mux=false;host=cdn.example.com",
+                "gost-plugin",
             ),
-            Err(other) => panic!("expected NotSupported, got: {other:?}"),
-            Ok(_) => panic!("gost-plugin must refuse UDP"),
+            (
+                "shadow-tls",
+                "host=cover.example.com;password=p;version=2",
+                "shadow-tls",
+            ),
+        ] {
+            let adapter = ShadowsocksAdapter::new(
+                "ss-test",
+                "127.0.0.1",
+                8388,
+                "password",
+                "aes-256-gcm",
+                true,
+                Some(plugin),
+                Some(opts),
+                None,
+                Arc::new(crate::dialer::DirectDialer),
+            )
+            .unwrap_or_else(|e| panic!("{plugin} adapter builds: {e}"));
+            assert!(
+                !adapter.support_udp(),
+                "{plugin} must not advertise UDP it will refuse"
+            );
+            match adapter.dial_udp(&Metadata::default()).await {
+                Err(MeowError::NotSupported(m)) => assert!(
+                    m.contains(tag),
+                    "{plugin} refusal should name itself, got: {m}"
+                ),
+                Err(e) => panic!("{plugin} must refuse UDP with NotSupported, got: {e}"),
+                Ok(_) => panic!("{plugin} must refuse UDP, got Ok"),
+            }
         }
-        assert!(
-            !adapter.support_udp(),
-            "advertised capability must agree with the refusal"
-        );
     }
 
     /// SIP022 §3.2.2/§3.2.4: a client session mints a non-zero ID, counts

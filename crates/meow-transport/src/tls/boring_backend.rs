@@ -7,10 +7,21 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use tokio::io::{AsyncRead, AsyncWrite};
+
 use tracing::warn;
 
-use super::{EchOpts, TlsConfig};
+use super::{ConnectTypedError, EchOpts, TlsConfig, TlsVersion};
 use crate::{Result, Stream, TransportError};
+
+impl TlsVersion {
+    fn to_ssl(self) -> boring::ssl::SslVersion {
+        match self {
+            Self::Tls12 => boring::ssl::SslVersion::TLS1_2,
+            Self::Tls13 => boring::ssl::SslVersion::TLS1_3,
+        }
+    }
+}
 
 struct FingerprintParams {
     /// OpenSSL cipher-list string controlling TLS 1.2 cipher order.
@@ -361,6 +372,10 @@ pub(super) struct BoringInner {
     /// `SSL_set_custom_verify` state — like `verify_name`, it stays out
     /// of the connector cache key.
     cert_pin: Option<[u8; 32]>,
+    /// Per-connection version bounds (`ConnectConfiguration` carries
+    /// them, not the `SSL_CTX`, so they stay out of the connector key).
+    min_version: Option<boring::ssl::SslVersion>,
+    max_version: Option<boring::ssl::SslVersion>,
     /// Per-connection ECH config (task #9). Wrapped in a `Mutex` so the
     /// connect path can transparently rotate to server-supplied
     /// `retry_configs` after an ECH-rejection (task: ECH self-healing).
@@ -418,6 +433,18 @@ impl BoringInner {
                 )));
             }
         }
+        if config.min_version == Some(TlsVersion::Tls13)
+            && config.max_version == Some(TlsVersion::Tls12)
+        {
+            return Err(TransportError::Config(
+                "min_version TLS 1.3 conflicts with max_version TLS 1.2".into(),
+            ));
+        }
+        if config.ech.is_some() && config.max_version == Some(TlsVersion::Tls12) {
+            return Err(TransportError::Config(
+                "ech requires TLS 1.3 but max_version caps at TLS 1.2".into(),
+            ));
+        }
         if !config.additional_roots.is_empty() || config.client_cert.is_some() {
             Self::build_connector(config)?;
         }
@@ -436,6 +463,8 @@ impl BoringInner {
             server_name,
             verify_name: config.verify_name.clone(),
             cert_pin: config.cert_pin,
+            min_version: config.min_version.map(TlsVersion::to_ssl),
+            max_version: config.max_version.map(TlsVersion::to_ssl),
             ech: std::sync::Mutex::new(config.ech.clone()),
         })
     }
@@ -545,10 +574,33 @@ impl BoringInner {
         // `TolerantFlushStream` workaround from #571 is gone;
         // `d1_tls_handshake_over_pending_flush_stream` guards the upstream
         // behaviour.
+        self.connect_typed(inner)
+            .await
+            .map(|s| Box::new(s) as Box<dyn Stream>)
+            .map_err(ConnectTypedError::into_transport)
+    }
+
+    /// [`connect`](Self::connect) over a caller-provided stream type,
+    /// returning the concrete `SslStream<S>` so the inner stream can be
+    /// recovered after the handshake.  shadow-tls needs this: the cover
+    /// handshake runs over a sniffer/patcher shim, then the TLS session
+    /// is discarded and the recovered inner stream carries the framed
+    /// data path.  Handshake failures keep the source stream recoverable
+    /// via [`ConnectTypedError::Handshake`] (shadow-tls v3 expects the
+    /// cover handshake to fail at Finished — the wire-patched ClientHello
+    /// diverges the transcript — and proceeds off the recovered shim).
+    ///
+    /// Pending flushes retry natively under boring 5.x (see `connect`) —
+    /// no caller-side workaround is needed for mux transports.
+    async fn connect_typed<S>(&self, inner: S) -> super::TypedConnectResult<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let mut cfg = self
             .connector
             .configure()
-            .map_err(|e| TransportError::Tls(format!("boring: configure: {e}")))?;
+            .map_err(|e| TransportError::Tls(format!("boring: configure: {e}")))
+            .map_err(ConnectTypedError::Transport)?;
 
         // SNI — omitted for IP literals (RFC 6066 §3), matching Go's
         // crypto/tls.  Hostname
@@ -556,6 +608,20 @@ impl BoringInner {
         // literal to `X509_VERIFY_PARAM_set1_ip`, so a SAN `iPAddress`
         // match is required unless `skip_cert_verify` is set.
         cfg.set_use_server_name_indication(self.server_name.parse::<std::net::IpAddr>().is_err());
+
+        // Version bounds — per-connection `ConnectConfiguration` state,
+        // so they stay out of the connector cache key.  ECH's own
+        // TLS 1.3 floor below intentionally overrides a lower `min`.
+        if let Some(min) = self.min_version {
+            cfg.set_min_proto_version(Some(min))
+                .map_err(|e| TransportError::Config(format!("boring: set_min_proto_version: {e}")))
+                .map_err(ConnectTypedError::Transport)?;
+        }
+        if let Some(max) = self.max_version {
+            cfg.set_max_proto_version(Some(max))
+                .map_err(|e| TransportError::Config(format!("boring: set_max_proto_version: {e}")))
+                .map_err(ConnectTypedError::Transport)?;
+        }
 
         // Snapshot the current ECH config before consuming `inner`. The lock
         // is held only across this snapshot — never across the await.
@@ -565,14 +631,16 @@ impl BoringInner {
         // ECH inline path — per-connection setup on ConnectConfiguration.
         if let Some(EchOpts::Config(ech_bytes)) = &ech_snapshot {
             cfg.set_ech_config_list(ech_bytes)
-                .map_err(|e| TransportError::Config(format!("boring: set_ech_config_list: {e}")))?;
+                .map_err(|e| TransportError::Config(format!("boring: set_ech_config_list: {e}")))
+                .map_err(ConnectTypedError::Transport)?;
             // RFC 9180 §6: ECH requires TLS 1.3.  BoringSSL enforces this
             // automatically when an ECH config list is set, but we set it
             // explicitly here so the requirement is visible at the call site.
             cfg.set_min_proto_version(Some(boring::ssl::SslVersion::TLS1_3))
                 .map_err(|e| {
                     TransportError::Config(format!("boring: set_min_proto_version TLS1.3: {e}"))
-                })?;
+                })
+                .map_err(ConnectTypedError::Transport)?;
         }
 
         // `name-cert-verify` (mihomo `NameCertVerify`): the certificate is
@@ -600,7 +668,8 @@ impl BoringInner {
             }
             let mut ssl = cfg
                 .into_ssl(&self.server_name)
-                .map_err(|e| TransportError::Tls(format!("boring: into_ssl: {e}")))?;
+                .map_err(|e| TransportError::Tls(format!("boring: into_ssl: {e}")))
+                .map_err(ConnectTypedError::Transport)?;
             if let Some(pin) = self.cert_pin {
                 // Upstream: `serverName = state.ServerName`, overridden by
                 // `NameCertVerify` — the pin's chain-verify DNS name.
@@ -622,7 +691,8 @@ impl BoringInner {
                     Ok(ip) => param.set_ip(ip),
                     Err(_) => param.set_host(verify_name),
                 }
-                .map_err(|e| TransportError::Tls(format!("boring: set verify name: {e}")))?;
+                .map_err(|e| TransportError::Tls(format!("boring: set verify name: {e}")))
+                .map_err(ConnectTypedError::Transport)?;
             }
             tokio_boring::SslStreamBuilder::new(ssl, inner)
                 .connect()
@@ -642,7 +712,7 @@ impl BoringInner {
                     tls_version = %version,
                     "boring TLS handshake complete"
                 );
-                Ok(Box::new(tls_stream))
+                Ok(tls_stream)
             }
             Err(e) => {
                 // If ECH was active and the server rejected with `ech_required`,
@@ -668,13 +738,15 @@ impl BoringInner {
                                 "ECH rejected by server; rotated to retry_configs — \
                                  next connect will use the new key"
                             );
-                            return Err(TransportError::Tls(format!(
-                                "boring TLS handshake (ECH rejected; retry_configs={hex}): {e}"
+                            return Err(ConnectTypedError::Transport(TransportError::Tls(
+                                format!(
+                                    "boring TLS handshake (ECH rejected; retry_configs={hex}): {e}"
+                                ),
                             )));
                         }
                     }
                 }
-                Err(TransportError::Tls(format!("boring TLS handshake: {e}")))
+                Err(ConnectTypedError::Handshake(e))
             }
         }
     }
@@ -712,6 +784,16 @@ impl LazyBoringInner {
 
     pub(super) async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
         self.get_or_init()?.connect(inner).await
+    }
+
+    pub(super) async fn connect_typed<S>(&self, inner: S) -> super::TypedConnectResult<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.get_or_init()
+            .map_err(ConnectTypedError::Transport)?
+            .connect_typed(inner)
+            .await
     }
 }
 

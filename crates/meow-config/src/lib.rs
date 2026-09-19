@@ -2339,18 +2339,7 @@ pub fn default_geosite_path() -> PathBuf {
 /// 3. `$HOME/.config/meow` if `HOME` is set.
 /// 4. `.` (current working directory) as last resort.
 pub fn meow_config_dir() -> PathBuf {
-    if let Some(d) = meow_common::meow_home_dir() {
-        return d;
-    }
-    default_config_dir_without_home_override()
-}
-
-fn default_config_dir_without_home_override() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("meow")
+    meow_common::resolved_home_dir()
 }
 
 /// Resolve the provider-cache directory for a config file path — the same
@@ -2373,10 +2362,7 @@ fn resource_cache_dir_for_config_path_with_home(path: &str, home_dir: Option<Pat
     std::path::Path::new(path)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .map_or_else(
-            default_config_dir_without_home_override,
-            std::path::Path::to_path_buf,
-        )
+        .map_or_else(meow_common::xdg_home_dir, std::path::Path::to_path_buf)
 }
 
 /// Resolve a listener `listen` field plus optional `port`.
@@ -4276,7 +4262,7 @@ rule-providers:
     #[test]
     fn provider_cache_dir_does_not_fall_back_to_cwd_for_bare_config_name() {
         let got = super::resource_cache_dir_for_config_path_with_home("config.yaml", None);
-        assert_eq!(got, super::default_config_dir_without_home_override());
+        assert_eq!(got, meow_common::xdg_home_dir());
         assert_ne!(got, PathBuf::from("."));
     }
 

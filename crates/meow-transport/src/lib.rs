@@ -52,6 +52,12 @@ pub mod httpupgrade;
 #[cfg(feature = "xhttp")]
 pub mod xhttp;
 
+/// shadow-tls client transport (v1/v2/v3) — real cover TLS handshake over
+/// a sniffer/patcher shim, then record-framed data.  Used by the
+/// `shadow-tls` Shadowsocks plugin in `meow-proxy`.
+#[cfg(feature = "shadow-tls")]
+pub mod shadow_tls;
+
 /// SIP004 simple-obfs HTTP/TLS obfuscation codec (client +, later, server).
 /// Gated by the `simple-obfs` feature; see [`simple_obfs::client`] for the
 /// outbound (proxy-client) wrappers used by the SS / Snell adapters.

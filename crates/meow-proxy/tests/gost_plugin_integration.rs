@@ -125,6 +125,7 @@ async fn test_ss_gost_plugin_ws_mux_real_server() {
         false,
         Some("gost-plugin"),
         Some("mode=websocket;mux=true;host=bing.com;path=/ws"),
+        None,
         Arc::new(DirectDialer),
     )
     .expect("failed to create adapter with built-in gost-plugin");

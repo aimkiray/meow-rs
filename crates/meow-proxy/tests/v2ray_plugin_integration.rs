@@ -211,6 +211,7 @@ async fn test_ss_v2ray_plugin_websocket_mux() {
         false,
         Some("v2ray-plugin"),
         Some("mode=websocket;mux=1;host=example.com;path=/ws"),
+        None,
         Arc::new(DirectDialer),
     )
     .expect("failed to create adapter with built-in v2ray-plugin");
@@ -252,6 +253,7 @@ async fn test_ss_v2ray_plugin_tls_websocket_mux() {
         false,
         Some("v2ray-plugin"),
         Some("mode=websocket;tls;mux=1;host=example.com;path=/ws;skip-cert-verify=true"),
+        None,
         Arc::new(DirectDialer),
     )
     .expect("failed to create adapter with built-in v2ray-plugin (tls)");

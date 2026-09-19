@@ -42,7 +42,10 @@ use meow_transport::{
 };
 use tracing::{debug, warn};
 
+use crate::plugin_util::{load_pem_or_path, parse_bool_strict, parse_cert_pin, sip003_opts};
 use crate::transport_to_proxy_err;
+
+const PLUGIN: &str = "gost-plugin";
 
 /// Parsed `gost-plugin` client options.
 #[derive(Debug, Clone)]
@@ -70,96 +73,6 @@ pub struct GostPluginConfig {
     pub client_cert: Option<ClientCert>,
     /// ECH config (`ech-opts.enable` + base64 `ech-opts.config`).
     pub ech: Option<EchOpts>,
-}
-
-/// Strict bool for all gost boolean knobs (`tls`, `mux`,
-/// `skip-cert-verify`, `ech-opts.enable`): an unrecognized
-/// value is a config error — silently coercing `tls=bogus` to `false`
-/// would produce a plaintext websocket the operator believes is TLS.
-fn parse_bool_strict(s: &str, opt: &str) -> Result<bool> {
-    match s.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => Err(MeowError::Config(format!(
-            "gost-plugin: '{opt}' expects a boolean, got '{s}'"
-        ))),
-    }
-}
-
-/// Parse a `fingerprint` option value: `:`-separated hex of the 32-byte
-/// SHA-256 of the pinned certificate (upstream
-/// `ca.NewFingerprintVerifier`).  uTLS profile names are rejected with a
-/// pointer at `client-fingerprint`, mirroring upstream's explicit check.
-fn parse_cert_pin(s: &str) -> Result<[u8; 32]> {
-    // Upstream guards against the easy confusion between this pin and a
-    // uTLS ClientHello profile name.
-    const UTLS_NAMES: &[&str] = &[
-        "chrome",
-        "firefox",
-        "safari",
-        "ios",
-        "android",
-        "edge",
-        "360",
-        "qq",
-        "random",
-        "randomized",
-    ];
-    if UTLS_NAMES.contains(&s.to_ascii_lowercase().as_str()) {
-        return Err(MeowError::Config(
-            "gost-plugin: 'fingerprint' is a TLS certificate pin (SHA-256 hex), \
-             not a uTLS profile — ClientHello shaping is not supported on ss nodes"
-                .to_string(),
-        ));
-    }
-    let stripped: String = s.trim().replace(':', "");
-    let bytes = hex::decode(&stripped).map_err(|e| {
-        MeowError::Config(format!("gost-plugin: fingerprint hex decode failed: {e}"))
-    })?;
-    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-        MeowError::Config(format!(
-            "gost-plugin: fingerprint must be a SHA-256 hash (32 bytes), got {}",
-            bytes.len()
-        ))
-    })
-}
-
-/// Upstream `NewTLSKeyPairLoader` accepts PEM content or a file path for
-/// `certificate`/`private-key`.  A `-----BEGIN` marker means inline PEM;
-/// anything else is read from the filesystem once at config load.
-/// Relative paths resolve against the meow home dir (upstream `C.Path`),
-/// not the process CWD.  With no explicit `-d` home we fall back to the
-/// same XDG default `meow_config` uses (`$XDG_CONFIG_HOME/meow` or
-/// `~/.config/meow`) rather than silently anchoring on the daemon's CWD —
-/// meow-proxy cannot depend on meow-config (cycle), so the fallback chain
-/// is duplicated here.
-fn load_pem_or_path(value: &str, opt: &str) -> Result<Vec<u8>> {
-    if value.contains("-----BEGIN") {
-        Ok(value.as_bytes().to_vec())
-    } else {
-        let path = std::path::Path::new(value);
-        let resolved = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            let base = meow_common::meow_home_dir().unwrap_or_else(|| {
-                let base = std::env::var_os("XDG_CONFIG_HOME")
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| {
-                        std::env::var_os("HOME")
-                            .map(|h| std::path::PathBuf::from(h).join(".config"))
-                    })
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                base.join("meow")
-            });
-            base.join(path)
-        };
-        std::fs::read(&resolved).map_err(|e| {
-            MeowError::Config(format!(
-                "gost-plugin: '{opt}' is neither inline PEM nor a readable file ({}): {e}",
-                resolved.display()
-            ))
-        })
-    }
 }
 
 /// Parse a flattened SIP003 opts string for `gost-plugin`
@@ -190,29 +103,22 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
     let mut ech_enable = false;
     let mut ech_config: Option<String> = None;
 
-    for token in s.split(';').map(str::trim).filter(|t| !t.is_empty()) {
-        // Upstream decodes plugin-opts through mapstructure — option keys
-        // are case-insensitive (`plugin-opts: {Mode: websocket}` works).
-        let (key, value) = match token.split_once('=') {
-            Some((k, v)) => (k.trim().to_ascii_lowercase(), v.trim().to_string()),
-            None => (token.to_ascii_lowercase(), "true".to_string()),
-        };
-
+    for (key, value) in sip003_opts(s) {
         match key.as_str() {
             "mode" => {
                 if value.eq_ignore_ascii_case("websocket") || value.eq_ignore_ascii_case("ws") {
                     mode_seen = true;
                 } else {
                     return Err(MeowError::Config(format!(
-                        "gost-plugin: unsupported mode '{value}' (only 'websocket'/'ws' is supported)"
+                        "{PLUGIN}: unsupported mode '{value}' (only 'websocket'/'ws' is supported)"
                     )));
                 }
             }
             "host" => {
                 if value.is_empty() {
-                    return Err(MeowError::Config(
-                        "gost-plugin: 'host' must not be empty".into(),
-                    ));
+                    return Err(MeowError::Config(format!(
+                        "{PLUGIN}: 'host' must not be empty"
+                    )));
                 }
                 cfg.host = value;
             }
@@ -224,7 +130,7 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
             "path" => {
                 if value.chars().any(|c| c.is_ascii_control() || c == ' ') {
                     return Err(MeowError::Config(format!(
-                        "gost-plugin: 'path' contains an invalid character: {value:?}"
+                        "{PLUGIN}: 'path' contains an invalid character: {value:?}"
                     )));
                 }
                 cfg.path = if value.is_empty() {
@@ -235,10 +141,10 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
                     format!("/{value}")
                 };
             }
-            "tls" => cfg.tls = parse_bool_strict(&value, "tls")?,
-            "mux" => cfg.mux = parse_bool_strict(&value, "mux")?,
+            "tls" => cfg.tls = parse_bool_strict(&value, PLUGIN, "tls")?,
+            "mux" => cfg.mux = parse_bool_strict(&value, PLUGIN, "mux")?,
             "skip-cert-verify" => {
-                cfg.skip_cert_verify = parse_bool_strict(&value, "skip-cert-verify")?;
+                cfg.skip_cert_verify = parse_bool_strict(&value, PLUGIN, "skip-cert-verify")?;
             }
             // Upstream guards `NameCertVerify != ""` — an empty value is
             // ignored, not an (always-failing) empty verify name.
@@ -249,15 +155,15 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
             // uTLS profile — `NewFingerprintVerifier` rejects the uTLS
             // names explicitly and hex-decodes the rest. Empty = ignored.
             "fingerprint" if !value.is_empty() => {
-                cfg.cert_pin = Some(parse_cert_pin(&value)?);
+                cfg.cert_pin = Some(parse_cert_pin(&value, PLUGIN)?);
             }
             "name-cert-verify" | "fingerprint" => {}
             // Upstream `NewTLSKeyPairLoader` accepts inline PEM or file
             // paths (with fswatch reload — not mirrored here).
-            "certificate" => cert_pem = Some(load_pem_or_path(&value, "certificate")?),
-            "private-key" => key_pem = Some(load_pem_or_path(&value, "private-key")?),
+            "certificate" => cert_pem = Some(load_pem_or_path(&value, "certificate", PLUGIN)?),
+            "private-key" => key_pem = Some(load_pem_or_path(&value, "private-key", PLUGIN)?),
             "ech-opts.enable" | "ech-enable" => {
-                ech_enable = parse_bool_strict(&value, "ech-opts.enable")?;
+                ech_enable = parse_bool_strict(&value, PLUGIN, "ech-opts.enable")?;
             }
             "ech-opts.config" | "ech-config" => ech_config = Some(value),
             "header" => {
@@ -274,27 +180,26 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
                     cfg.headers.insert(k.to_string(), v.trim().to_string());
                 } else {
                     // The value may be a credential — log shape, not content.
-                    warn!("gost-plugin: ignoring malformed header entry (expected 'Key:Value')");
+                    warn!("{PLUGIN}: ignoring malformed header entry (expected 'Key:Value')");
                 }
             }
             other => {
-                warn!("gost-plugin: ignoring unknown opt '{}'", other);
+                warn!("{PLUGIN}: ignoring unknown opt '{}'", other);
             }
         }
     }
 
     if !mode_seen {
-        return Err(MeowError::Config(
-            "gost-plugin: missing required 'mode=websocket' opt".into(),
-        ));
+        return Err(MeowError::Config(format!(
+            "{PLUGIN}: missing required 'mode=websocket' opt"
+        )));
     }
 
     if cfg.mux && !cfg!(feature = "mux") {
-        return Err(MeowError::Config(
-            "gost-plugin: mux=true (the upstream default) needs the `mux` \
+        return Err(MeowError::Config(format!(
+            "{PLUGIN}: mux=true (the upstream default) needs the `mux` \
              cargo feature for smux — rebuild with it or set `mux: false`"
-                .into(),
-        ));
+        )));
     }
 
     // mTLS: both halves or none — a lone cert or key is a config error.
@@ -304,9 +209,9 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
         }
         (None, None) => {}
         _ => {
-            return Err(MeowError::Config(
-                "gost-plugin: 'certificate' and 'private-key' must both be set".into(),
-            ));
+            return Err(MeowError::Config(format!(
+                "{PLUGIN}: 'certificate' and 'private-key' must both be set"
+            )));
         }
     }
 
@@ -318,7 +223,7 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
                     .decode(&b64)
                     .map_err(|e| {
                         MeowError::Config(format!(
-                            "gost-plugin: base64 decode ech-opts.config failed: {e}"
+                            "{PLUGIN}: base64 decode ech-opts.config failed: {e}"
                         ))
                     })?;
                 cfg.ech = Some(EchOpts::Config(list));
@@ -328,39 +233,11 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
                 // resolver path is not implemented — declare it rather than
                 // silently running without ECH.
                 return Err(MeowError::Config(
-                    "gost-plugin: ech-opts.enable without ech-opts.config \
+                    "{PLUGIN}: ech-opts.enable without ech-opts.config \
                      (DNS-queried ECH is not supported)"
                         .into(),
                 ));
             }
-        }
-    }
-
-    // TLS-only knobs parsed but `tls` unset: upstream drops them silently;
-    // warn so a typo doesn't produce a plaintext connection the operator
-    // believes is encrypted.
-    if !cfg.tls {
-        let mut ignored = Vec::new();
-        if cfg.skip_cert_verify {
-            ignored.push("skip-cert-verify");
-        }
-        if cfg.name_cert_verify.is_some() {
-            ignored.push("name-cert-verify");
-        }
-        if cfg.cert_pin.is_some() {
-            ignored.push("fingerprint");
-        }
-        if cfg.client_cert.is_some() {
-            ignored.push("certificate/private-key");
-        }
-        if cfg.ech.is_some() {
-            ignored.push("ech-opts");
-        }
-        if !ignored.is_empty() {
-            warn!(
-                "gost-plugin: {} ignored without `tls` (plaintext websocket)",
-                ignored.join(", ")
-            );
         }
     }
 
@@ -460,11 +337,9 @@ pub async fn dial(
     dialer: &dyn crate::dialer::TcpDialer,
 ) -> Result<Box<dyn meow_transport::Stream>> {
     debug!(
-        "gost-plugin: dialing {}:{} tls={} host={} path={} mux={}",
+        "{PLUGIN}: dialing {}:{} tls={} host={} path={} mux={}",
         server_host, server_port, cfg.tls, cfg.host, cfg.path, cfg.mux
     );
-
-    debug_assert_eq!(cfg.tls, tls_layer.is_some());
 
     // 1) Raw TCP.
     let tcp = dialer
@@ -472,7 +347,9 @@ pub async fn dial(
         .await
         .map_err(MeowError::Io)?;
 
-    // 2) Optional TLS handshake via the pre-built TlsLayer.
+    // 2) Optional TLS handshake via the pre-built TlsLayer.  `dial` already
+    //    returns `Box<dyn Stream>` — no double-boxing.
+    debug_assert_eq!(cfg.tls, tls_layer.is_some());
     let stream: Box<dyn meow_transport::Stream> = if let Some(tls) = tls_layer {
         tls.connect(tcp).await.map_err(transport_to_proxy_err)?
     } else {
@@ -510,9 +387,9 @@ pub async fn dial(
     #[cfg(not(feature = "mux"))]
     {
         // Unreachable — `parse_opts` rejects mux=true without the feature.
-        Err(MeowError::Config(
-            "gost-plugin: mux requires the `mux` cargo feature".into(),
-        ))
+        Err(MeowError::Config(format!(
+            "{PLUGIN}: mux requires the `mux` cargo feature"
+        )))
     }
 }
 

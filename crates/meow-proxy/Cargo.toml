@@ -10,7 +10,7 @@ homepage.workspace = true
 
 [features]
 default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux"]
-ss = ["dep:shadowsocks", "meow-transport/simple-obfs"]
+ss = ["dep:shadowsocks", "meow-transport/simple-obfs", "meow-transport/shadow-tls"]
 trojan = []
 vless = []
 vmess = ["dep:md-5", "dep:hmac", "dep:aes", "dep:aes-gcm", "dep:chacha20poly1305", "dep:crc32fast"]
