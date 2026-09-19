@@ -115,6 +115,16 @@ impl RealityTlsLayer {
                 "skip-cert-verify=true is ignored for Reality TLS; Reality HMAC authentication is still required"
             );
         }
+        if config.verify_name.is_some() {
+            tracing::warn!(
+                "verify_name is ignored for Reality TLS; the server name comes from reality-opts"
+            );
+        }
+        if config.cert_pin.is_some() {
+            tracing::warn!(
+                "cert_pin is ignored for Reality TLS; the Reality handshake owns authentication"
+            );
+        }
 
         Ok(Self {
             server_name,

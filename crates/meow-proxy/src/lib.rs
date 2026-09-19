@@ -21,6 +21,8 @@ pub mod transport_chain;
 #[cfg(feature = "ech-tls-tunnel")]
 pub mod ech_tls_tunnel;
 #[cfg(feature = "ss")]
+pub mod gost_plugin;
+#[cfg(feature = "ss")]
 pub mod shadowsocks_adapter;
 #[cfg(feature = "ss")]
 pub mod v2ray_plugin;

@@ -1,5 +1,6 @@
 #[cfg(feature = "ech-tls-tunnel")]
 use crate::ech_tls_tunnel::{self, EchTlsTunnelConfig};
+use crate::gost_plugin;
 use crate::v2ray_plugin::{self, V2rayPluginConfig};
 use async_trait::async_trait;
 use meow_common::atomic::{checked_increment, AtomicU};
@@ -41,6 +42,9 @@ pub enum BuiltinObfs {
 /// * `Obfs` — native simple-obfs codec wraps the TCP stream before SS encryption.
 /// * `V2ray` — native v2ray-plugin websocket (+ optional TLS) transport wraps
 ///   the TCP stream before SS encryption.
+/// * `Gost` — native gost-plugin websocket (+ optional TLS and single-stream
+///   smux) transport wraps the TCP stream before SS encryption.
+/// * `EchTlsTunnel` — `ech-tls-tunnel` plugin (TLS-in-TLS with ECH).
 #[allow(clippy::large_enum_variant)]
 enum PluginKind {
     None,
@@ -49,6 +53,14 @@ enum PluginKind {
     External(#[allow(dead_code)] Plugin),
     Obfs(BuiltinObfs),
     V2ray(V2rayPluginConfig, Option<TlsLayer>),
+    /// Native gost-plugin websocket (+ optional TLS and smux) transport.
+    /// `WsLayer` is built at construction so a malformed headers/path
+    /// config fails once at startup, not per dial.
+    Gost(
+        gost_plugin::GostPluginConfig,
+        Option<TlsLayer>,
+        meow_transport::ws::WsLayer,
+    ),
     #[cfg(feature = "ech-tls-tunnel")]
     EchTlsTunnel(EchTlsTunnelConfig, TlsLayer),
 }
@@ -113,6 +125,16 @@ impl ShadowsocksAdapter {
                 );
                 let tls = v2ray_plugin::build_tls_layer(&cfg)?;
                 PluginKind::V2ray(cfg, tls)
+            }
+            Some("gost-plugin") => {
+                let cfg = gost_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
+                debug!(
+                    "SS '{}' using built-in gost-plugin: tls={} host={} path={} mux={}",
+                    name, cfg.tls, cfg.host, cfg.path, cfg.mux
+                );
+                let tls = gost_plugin::build_tls_layer(&cfg)?;
+                let ws = gost_plugin::build_ws_layer(&cfg)?;
+                PluginKind::Gost(cfg, tls, ws)
             }
             #[cfg(feature = "ech-tls-tunnel")]
             Some("ech-tls-tunnel") => {
@@ -248,6 +270,24 @@ impl SsCore {
                 );
                 Ok(Box::new(SsConn(stream)))
             }
+            PluginKind::Gost(cfg, tls, ws) => {
+                let transport = gost_plugin::dial(
+                    cfg,
+                    tls.as_ref(),
+                    ws,
+                    &self.server,
+                    self.port,
+                    &*self.dialer,
+                )
+                .await?;
+                let stream = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    transport,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(stream)))
+            }
             #[cfg(feature = "ech-tls-tunnel")]
             PluginKind::EchTlsTunnel(cfg, tls) => {
                 let transport =
@@ -365,6 +405,17 @@ impl SsCore {
                     addr,
                 );
                 Ok(Box::new(SsConn(s)))
+            }
+            PluginKind::Gost(..) => {
+                // gost (ws+tls+smux) could terminate on a relay-supplied
+                // stream once it grows a `handshake_over` split — its `dial`
+                // currently owns the TCP dial itself. Until then, fail
+                // loudly rather than send unwrapped traffic.
+                Err(MeowError::NotSupported(
+                    "ss: gost-plugin transport does not yet support \
+                     terminating on a relay-supplied stream"
+                        .into(),
+                ))
             }
             PluginKind::External(_) => {
                 // A SIP003 subprocess owns its outbound leg (it dials the
@@ -853,6 +904,11 @@ impl ProxyAdapter for ShadowsocksAdapter {
                 "v2ray-plugin does not support UDP relay".into(),
             ));
         }
+        if matches!(self.core.plugin, PluginKind::Gost(..)) {
+            return Err(MeowError::NotSupported(
+                "gost-plugin does not support UDP relay".into(),
+            ));
+        }
         #[cfg(feature = "ech-tls-tunnel")]
         if matches!(self.core.plugin, PluginKind::EchTlsTunnel(..)) {
             return Err(MeowError::NotSupported(
@@ -1241,6 +1297,7 @@ mod tests {
         assert!(is_builtin_obfs_plugin("obfs"));
         assert!(is_builtin_obfs_plugin("simple-obfs"));
         assert!(!is_builtin_obfs_plugin("v2ray-plugin"));
+        assert!(!is_builtin_obfs_plugin("gost-plugin"));
         assert!(!is_builtin_obfs_plugin("OBFS"));
         assert!(!is_builtin_obfs_plugin(""));
     }

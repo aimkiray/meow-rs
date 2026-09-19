@@ -233,6 +233,9 @@ parking_lot = "0.12"
 boring       = { version = "5.2" }
 tokio-boring = { version = "5.2" }
 boring-sys   = { version = "5.2" }
+# `X509VerifyParamRef::as_ptr` for the `set_purpose`/`set1_ip` FFI calls
+# boring's safe bindings omit (cert-pin path). Same version boring uses.
+foreign-types = "0.5"
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }

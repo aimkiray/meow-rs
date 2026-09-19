@@ -47,7 +47,7 @@ const STREAM_QUEUE: usize = 2048;
 /// grace-gated byte cap first. See the last-resort retire in the reader.
 const SPILL_QUEUE: usize = 2048;
 /// Sagernet's default session-wide receive budget.
-const MAX_RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
+pub const MAX_RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
 /// One stream's share of [`MAX_RECEIVE_BUFFER`]. A stream is retired only
 /// once this much of its payload sits undelivered for a whole
 /// [`STREAM_STALL_GRACE`] window — see [`stall_watchdog`] for why the
@@ -200,11 +200,16 @@ impl Drop for InboundChunk {
 /// `Arc<StreamStats>`) and leak the chunk's session-budget permits forever.
 struct StreamStats {
     /// Payload bytes enqueued for this stream and not yet handed to its
-    /// consumer. Retiring is gated on this passing [`MAX_STREAM_BUFFER`]
-    /// for a whole [`STREAM_STALL_GRACE`] window, which keeps one stream
-    /// from monopolising the session budget while transient consumer
-    /// pauses — bursts, scheduler hiccups — ride through untouched.
+    /// consumer. Retiring is gated on this passing the stream's share
+    /// ([`stream_buffer`]) for a whole [`STREAM_STALL_GRACE`] window,
+    /// which keeps one stream from monopolising the session budget while
+    /// transient consumer pauses — bursts, scheduler hiccups — ride
+    /// through untouched.
     unread: Arc<AtomicUsize>,
+    /// This stream's share of the session receive budget: the
+    /// [`MAX_STREAM_BUFFER`] default for multi-stream sessions, or the
+    /// whole budget when the session is single-stream by construction.
+    stream_buffer: usize,
     /// Overflow parking for chunks that arrive while the inbox is full.
     /// FIFO is preserved by the reader (once the spill is non-empty every
     /// later chunk parks there too) and by the consumer (which drains the
@@ -228,7 +233,7 @@ impl StreamStats {
     /// receive budget, or is carrying parked overflow, right now. Arming
     /// uses the same predicate, so the watchdog's re-check is exact.
     fn over_share(&self) -> bool {
-        self.unread.load(Ordering::Acquire) > MAX_STREAM_BUFFER || !self.spill.lock().is_empty()
+        self.unread.load(Ordering::Acquire) > self.stream_buffer || !self.spill.lock().is_empty()
     }
 }
 
@@ -264,6 +269,10 @@ pub struct Session {
     deferred_fin_tx: mpsc::Sender<Bytes>,
     cancel: CancellationToken,
     next_stream_id: AtomicU32,
+    /// Per-stream receive share past which the stall watchdog may retire
+    /// the stream — [`MAX_STREAM_BUFFER`] by default; single-stream
+    /// sessions (gost-plugin) may grant the whole budget.
+    stream_buffer: usize,
 }
 
 impl Session {
@@ -276,6 +285,17 @@ impl Session {
     /// Start an smux client session over the IO.  A reader task owns the
     /// read half; a writer task serialises outbound frames.
     pub fn client<S>(io: S) -> io::Result<Self>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::client_with_stream_buffer(io, MAX_STREAM_BUFFER)
+    }
+
+    /// [`client`](Self::client) with a custom per-stream receive share.
+    /// The `MAX_STREAM_BUFFER` divisor exists to protect sessions
+    /// carrying many streams; a session that is single-stream by
+    /// construction may pass the whole [`MAX_RECEIVE_BUFFER`].
+    pub fn client_with_stream_buffer<S>(io: S, stream_buffer: usize) -> io::Result<Self>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -526,7 +546,7 @@ impl Session {
                         // watchdog per stream; the running one owns the
                         // re-arm until it exits.
                         let over_share = entry.stats.unread.load(Ordering::Acquire)
-                            > MAX_STREAM_BUFFER
+                            > entry.stats.stream_buffer
                             || parked;
                         if over_share && !entry.stats.armed.swap(true, Ordering::AcqRel) {
                             let aborted = Arc::clone(&entry.aborted);
@@ -582,6 +602,7 @@ impl Session {
             deferred_fin_tx,
             cancel,
             next_stream_id: AtomicU32::new(1),
+            stream_buffer,
         })
     }
 
@@ -592,6 +613,7 @@ impl Session {
         let aborted = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(StreamStats {
             unread: Arc::new(AtomicUsize::new(0)),
+            stream_buffer: self.stream_buffer,
             spill: Mutex::new(VecDeque::new()),
             armed: AtomicBool::new(false),
             notify: Notify::new(),

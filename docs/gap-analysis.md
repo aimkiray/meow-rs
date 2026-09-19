@@ -58,6 +58,7 @@ Upstream `adapter/outbound` supports these pluggable transports layered on top o
 Rust port currently supports:
 
 - `v2ray-plugin` (websocket + TLS) — `crates/meow-proxy/src/v2ray_plugin.rs`
+- `gost-plugin` (websocket + TLS + smux) — `crates/meow-proxy/src/gost_plugin.rs`
 - `simple-obfs` — `crates/meow-proxy/src/simple_obfs.rs`
 
 | Transport        | Upstream | Rust | Status |
@@ -70,7 +71,7 @@ Rust port currently supports:
 | ShadowTLS        | Yes      | No   | **Gap** |
 | Reality          | Yes      | No   | **Gap** |
 | simple-obfs      | Yes      | Yes  | OK |
-| SMUX / mux       | Yes      | No   | **Gap** (see memory note: mihomo v2ray-plugin defaults `mux=1` server-side) |
+| SMUX / mux       | Yes      | Yes | OK — `smux:`/`mux:` node option (trojan/vless/ss/vmess) + gost-plugin single-stream |
 
 ### Proxy groups
 

@@ -353,6 +353,14 @@ fn shared_connector(config: &TlsConfig) -> Result<boring::ssl::SslConnector> {
 pub(super) struct BoringInner {
     connector: boring::ssl::SslConnector,
     server_name: String,
+    /// Certificate-verification hostname when it differs from
+    /// `server_name` (gost-plugin `name-cert-verify`). Per-connection
+    /// `X509_VERIFY_PARAM` state, so it stays out of the connector key.
+    verify_name: Option<String>,
+    /// SHA-256 cert-chain pin (mihomo `fingerprint`). Per-connection
+    /// `SSL_set_custom_verify` state — like `verify_name`, it stays out
+    /// of the connector cache key.
+    cert_pin: Option<[u8; 32]>,
     /// Per-connection ECH config (task #9). Wrapped in a `Mutex` so the
     /// connect path can transparently rotate to server-supplied
     /// `retry_configs` after an ECH-rejection (task: ECH self-healing).
@@ -389,6 +397,27 @@ impl BoringInner {
                 "alpn: protocol id {bad:?} must be 1–255 bytes (RFC 7301 §3.1)"
             )));
         }
+        if let Some(EchOpts::Config(bytes)) = &config.ech {
+            // ECHConfigList is u16-length-prefixed on the wire; a larger
+            // blob is malformed — reject once at construction instead of
+            // re-parsing it on every handshake.
+            if bytes.len() > u16::MAX as usize {
+                return Err(TransportError::Config(format!(
+                    "ech: ECHConfigList {} bytes exceeds the u16 wire bound",
+                    bytes.len()
+                )));
+            }
+        }
+        if let Some(verify_name) = &config.verify_name {
+            // `X509_VERIFY_PARAM_set1_host` rejects NUL bytes and names
+            // longer than 255 (DNS name cap) — surface that at startup
+            // instead of failing every dial.
+            if verify_name.is_empty() || verify_name.len() > 255 || verify_name.contains('\0') {
+                return Err(TransportError::Config(format!(
+                    "verify_name {verify_name:?} must be 1–255 bytes without NUL"
+                )));
+            }
+        }
         if !config.additional_roots.is_empty() || config.client_cert.is_some() {
             Self::build_connector(config)?;
         }
@@ -405,6 +434,8 @@ impl BoringInner {
         Ok(Self {
             connector,
             server_name,
+            verify_name: config.verify_name.clone(),
+            cert_pin: config.cert_pin,
             ech: std::sync::Mutex::new(config.ech.clone()),
         })
     }
@@ -544,7 +575,63 @@ impl BoringInner {
                 })?;
         }
 
-        match tokio_boring::connect(cfg, &self.server_name, inner).await {
+        // `name-cert-verify` (mihomo `NameCertVerify`): the certificate is
+        // verified against `verify_name` while SNI keeps `server_name`.
+        // `tokio_boring::connect` couples both to one domain, so this path
+        // builds the `Ssl` by hand and overrides `X509_VERIFY_PARAM`'s host.
+        //
+        // `fingerprint` (mihomo SSL pinning) goes further: upstream sets
+        // `InsecureSkipVerify` and replaces verification with a SHA-256
+        // pin check, so it installs `SSL_set_custom_verify` instead —
+        // the callback then owns the accept/reject decision entirely.
+        let handshake = if self.verify_name.is_some() || self.cert_pin.is_some() {
+            // `verify_name`-only (no pin): `into_ssl` would seed the verify
+            // param with `server_name` (hosts for DNS names, ip for IP
+            // literals), and `check_id` enforces hosts and ip
+            // *independently* — a `host=1.2.3.4; name-cert-verify=example.com`
+            // config would demand a cert matching both, and BoringSSL has no
+            // clear API (`set1_ip(NULL,0)` is rejected, unlike OpenSSL).
+            // Prevent the seed instead: the param stays clean and exactly
+            // one name check is installed below.  The pin arm doesn't need
+            // this — its custom verify callback replaces verification
+            // entirely, so the seeded fields are never consulted.
+            if self.cert_pin.is_none() && self.verify_name.is_some() {
+                cfg.set_verify_hostname(false);
+            }
+            let mut ssl = cfg
+                .into_ssl(&self.server_name)
+                .map_err(|e| TransportError::Tls(format!("boring: into_ssl: {e}")))?;
+            if let Some(pin) = self.cert_pin {
+                // Upstream: `serverName = state.ServerName`, overridden by
+                // `NameCertVerify` — the pin's chain-verify DNS name.
+                let check_name = self
+                    .verify_name
+                    .clone()
+                    .unwrap_or_else(|| self.server_name.clone());
+                ssl.set_custom_verify_callback(boring::ssl::SslVerifyMode::PEER, move |ssl| {
+                    verify_cert_pin(ssl, &pin, &check_name)
+                });
+            } else if let Some(verify_name) = &self.verify_name {
+                let param = ssl.param_mut();
+                // Mirror `setup_verify_hostname`, keyed on `verify_name`
+                // instead of `server_name`: NO_PARTIAL_WILDCARDS plus
+                // `set_ip` for IP literals (`set_host` compares them as
+                // DNS names and never matches an iPAddress SAN).
+                param.set_hostflags(boring::x509::verify::X509CheckFlags::NO_PARTIAL_WILDCARDS);
+                match verify_name.parse::<std::net::IpAddr>() {
+                    Ok(ip) => param.set_ip(ip),
+                    Err(_) => param.set_host(verify_name),
+                }
+                .map_err(|e| TransportError::Tls(format!("boring: set verify name: {e}")))?;
+            }
+            tokio_boring::SslStreamBuilder::new(ssl, inner)
+                .connect()
+                .await
+        } else {
+            tokio_boring::connect(cfg, &self.server_name, inner).await
+        };
+
+        match handshake {
             Ok(tls_stream) => {
                 let ech_accepted = tls_stream.ssl().ech_accepted();
                 let version = tls_stream.ssl().version_str();
@@ -628,6 +715,138 @@ impl LazyBoringInner {
     }
 }
 
+// ── Certificate pinning (mihomo `fingerprint`) ──────────────────────────────
+
+/// Upstream `component/ca.NewFingerprintVerifier`: scan the peer chain
+/// for a cert whose `SHA-256(DER)` equals `pin`.
+///
+/// - **Leaf match (i == 0)** → accept outright; the pin replaces CA
+///   verification entirely (upstream sets `InsecureSkipVerify` before
+///   installing `VerifyConnection`).
+/// - **Non-leaf match (i > 0)** → the pinned cert becomes the trusted
+///   root and the leaf is verified against it plus a `check_name`
+///   hostname check (upstream `x509.VerifyOptions{Roots: {cert[i]},
+///   Intermediates: certs[1..=i], DNSName: serverName}`).
+/// - **No match** → reject with `bad_certificate`.
+fn verify_cert_pin(
+    ssl: &mut boring::ssl::SslRef,
+    pin: &[u8; 32],
+    check_name: &str,
+) -> std::result::Result<(), boring::ssl::SslVerifyError> {
+    use boring::ssl::{SslAlert, SslVerifyError};
+    fn reject() -> SslVerifyError {
+        SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE)
+    }
+    let Some(chain) = ssl.peer_cert_chain() else {
+        return Err(reject());
+    };
+    pinned_chain_decision(chain, pin, check_name).map_err(|_| reject())
+}
+
+/// The pin decision, split out of `verify_cert_pin` so unit tests can
+/// drive it without an `SslRef`: a pin on `certs[0]` accepts the leaf
+/// as-pinned (upstream `FingerprintVerifier`'s `i == 0` arm — no name or
+/// chain check); a deeper pin runs [`verify_leaf_under_pinned_cert`].
+fn pinned_chain_decision(
+    chain: &boring::stack::StackRef<boring::x509::X509>,
+    pin: &[u8; 32],
+    check_name: &str,
+) -> std::result::Result<(), boring::error::ErrorStack> {
+    for (i, cert) in chain.iter().enumerate() {
+        let Ok(digest) = cert.digest(boring::hash::MessageDigest::sha256()) else {
+            continue;
+        };
+        if digest.as_ref() != pin.as_slice() {
+            continue;
+        }
+        if i == 0 {
+            return Ok(());
+        }
+        return verify_leaf_under_pinned_cert(chain, i, check_name);
+    }
+    Err(boring::error::ErrorStack::get())
+}
+
+/// `FingerprintVerifier`'s non-leaf arm: `certs[i]` is treated as the
+/// only trusted root, `certs[1..=i]` as intermediates (the pinned cert
+/// itself included — harmless, mirrors upstream's `certs[1 : i+1]`
+/// slice), and the leaf must chain to the root and match `check_name`.
+fn verify_leaf_under_pinned_cert(
+    chain: &boring::stack::StackRef<boring::x509::X509>,
+    pin_idx: usize,
+    check_name: &str,
+) -> std::result::Result<(), boring::error::ErrorStack> {
+    use boring::{
+        stack::Stack,
+        x509::{
+            store::X509StoreBuilder,
+            verify::{X509CheckFlags, X509VerifyFlags},
+            X509StoreContext,
+        },
+    };
+    use foreign_types::ForeignTypeRef;
+    let mut store_b = X509StoreBuilder::new()?;
+    store_b.add_cert(&chain[pin_idx])?;
+    let store = store_b.build();
+    let mut untrusted = Stack::new()?;
+    for cert in chain.iter().skip(1).take(pin_idx) {
+        untrusted.push(cert.to_owned())?;
+    }
+    let mut ctx = X509StoreContext::new()?;
+    let ok = ctx.init(&store, &chain[0], &untrusted, |ctx| {
+        let param = ctx.verify_param_mut();
+        // A pinned intermediate that is not itself self-signed must still
+        // terminate the chain — Go's `Roots:` semantics. Without
+        // PARTIAL_CHAIN the lookup keeps walking to a root that was never
+        // sent and fails with "unable to get issuer certificate".
+        param.set_flags(X509VerifyFlags::PARTIAL_CHAIN);
+        // A client `SSL_CTX` verifies with purpose `sslserver` by default;
+        // this hand-built context must match that so a cert minted by the
+        // pinned CA but unusable for server auth (e.g. a clientAuth-only
+        // EKU) is rejected. boring's safe bindings omit `set_purpose`, so
+        // call it through boring-sys — the same vendored BoringSSL boring
+        // itself links.
+        // SAFETY: `param` is the live `X509_VERIFY_PARAM` owned by this
+        // context; the call only writes a scalar field on it.
+        if unsafe {
+            boring_sys::X509_VERIFY_PARAM_set_purpose(
+                param.as_ptr(),
+                boring_sys::X509_PURPOSE_SSL_SERVER,
+            )
+        } != 1
+        {
+            return Err(boring::error::ErrorStack::get());
+        }
+        // Exact parity with `X509_STORE_CTX_set_default("ssl_server")`,
+        // which sets purpose AND trust; trust only matters for certs
+        // carrying aux-trust entries (never on the wire), but set it
+        // anyway so the param is identical to the normal client path.
+        // SAFETY: same live `X509_VERIFY_PARAM`, scalar field write.
+        if unsafe {
+            boring_sys::X509_VERIFY_PARAM_set_trust(
+                param.as_ptr(),
+                boring_sys::X509_TRUST_SSL_SERVER,
+            )
+        } != 1
+        {
+            return Err(boring::error::ErrorStack::get());
+        }
+        param.set_hostflags(X509CheckFlags::NO_PARTIAL_WILDCARDS);
+        // IP literals must go through `set_ip`: `set_host` compares them
+        // as DNS names and never matches an iPAddress SAN.
+        match check_name.parse::<std::net::IpAddr>() {
+            Ok(ip) => param.set_ip(ip)?,
+            Err(_) => param.set_host(check_name)?,
+        }
+        ctx.verify_cert()
+    })?;
+    if ok {
+        Ok(())
+    } else {
+        Err(boring::error::ErrorStack::get())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,5 +921,320 @@ mod tests {
         // Re-asking for an existing key hits the cache.
         let a2 = shared_connector(&TlsConfig::new("i.example")).expect("build a2");
         assert!(same_ctx(&a, &a2));
+    }
+
+    /// Knobs for `make_cert` — keep the common leaf case terse.
+    struct CertOpts<'a> {
+        /// CA:TRUE + keyCertSign/crlSign.
+        is_ca: bool,
+        /// dNSName SANs.
+        dns: &'a [&'a str],
+        /// iPAddress SANs ("127.0.0.1", "::1", …).
+        ips: &'a [&'a str],
+        /// ExtendedKeyUsage carrying only clientAuth — a cert the issuer
+        /// minted for client use; the sslserver purpose check must reject
+        /// it on a server handshake.
+        client_auth_eku: bool,
+    }
+
+    /// Generate a throwaway cert for the CA-pin path. `issuer` is the
+    /// issuer's (CN, cert, key) and signs the new cert (None →
+    /// self-signed).
+    fn make_cert(
+        cn: &str,
+        opts: &CertOpts<'_>,
+        issuer: Option<(
+            &str,
+            &boring::x509::X509,
+            &boring::pkey::PKey<boring::pkey::Private>,
+        )>,
+    ) -> (
+        boring::x509::X509,
+        boring::pkey::PKey<boring::pkey::Private>,
+    ) {
+        use boring::{
+            asn1::{Asn1Integer, Asn1Time},
+            bn::BigNum,
+            ec::{EcGroup, EcKey},
+            hash::MessageDigest,
+            nid::Nid,
+            pkey::PKey,
+            x509::{
+                extension::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName},
+                X509Name, X509,
+            },
+        };
+        let key = PKey::from_ec_key(
+            EcKey::generate(&EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut name_b = X509Name::builder().unwrap();
+        name_b.append_entry_by_text("CN", cn).unwrap();
+        let subject = name_b.build();
+        let mut b = X509::builder().unwrap();
+        b.set_version(2).unwrap();
+        let serial = Asn1Integer::from_bn(&BigNum::from_u32(7).unwrap()).unwrap();
+        b.set_serial_number(&serial).unwrap();
+        b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        b.set_not_after(&Asn1Time::days_from_now(30).unwrap())
+            .unwrap();
+        b.set_pubkey(&key).unwrap();
+        b.set_subject_name(&subject).unwrap();
+        let (issuer_cn, issuer_key, issuer_cert) = match issuer {
+            Some((icn, cert, k)) => (icn, k, Some(cert)),
+            None => (cn, &key, None),
+        };
+        let mut issuer_b = X509Name::builder().unwrap();
+        issuer_b.append_entry_by_text("CN", issuer_cn).unwrap();
+        let issuer_name = issuer_b.build();
+        b.set_issuer_name(&issuer_name).unwrap();
+        if opts.is_ca {
+            b.append_extension(&BasicConstraints::new().critical().ca().build().unwrap())
+                .unwrap();
+            b.append_extension(
+                &KeyUsage::new()
+                    .critical()
+                    .key_cert_sign()
+                    .crl_sign()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        } else {
+            let mut san = SubjectAlternativeName::new();
+            for name in opts.dns {
+                san.dns(name);
+            }
+            for ip in opts.ips {
+                san.ip(ip);
+            }
+            let ctx = b.x509v3_context(issuer_cert.map(|c| &**c), None);
+            b.append_extension(&san.build(&ctx).unwrap()).unwrap();
+            if opts.client_auth_eku {
+                b.append_extension(&ExtendedKeyUsage::new().client_auth().build().unwrap())
+                    .unwrap();
+            }
+        }
+        b.sign(issuer_key, MessageDigest::sha256()).unwrap();
+        (b.build(), key)
+    }
+
+    fn chain_of(certs: Vec<boring::x509::X509>) -> boring::stack::Stack<boring::x509::X509> {
+        let mut chain = boring::stack::Stack::new().unwrap();
+        for c in certs {
+            chain.push(c).unwrap();
+        }
+        chain
+    }
+
+    impl CertOpts<'_> {
+        const DEFAULT: Self = CertOpts {
+            is_ca: false,
+            dns: &[],
+            ips: &[],
+            client_auth_eku: false,
+        };
+    }
+
+    const CA: CertOpts<'static> = CertOpts {
+        is_ca: true,
+        ..CertOpts::DEFAULT
+    };
+
+    /// `FingerprintVerifier` i>0 arm: pinning a CA cert accepts a leaf
+    /// that chains to it and matches the check name; a name mismatch or
+    /// unrelated issuer must fail.
+    #[test]
+    fn cert_pin_nonleaf_verifies_leaf_under_pinned_ca() {
+        let (ca, ca_key) = make_cert("Test CA", &CA, None);
+        let (leaf, _leaf_key) = make_cert(
+            "srv.example.com",
+            &CertOpts {
+                dns: &["srv.example.com"],
+                ..CertOpts::DEFAULT
+            },
+            Some(("Test CA", &ca, &ca_key)),
+        );
+        let chain = chain_of(vec![leaf, ca.clone()]);
+
+        verify_leaf_under_pinned_cert(&chain, 1, "srv.example.com")
+            .expect("leaf chaining to the pinned CA must verify");
+        assert!(
+            verify_leaf_under_pinned_cert(&chain, 1, "other.example.com").is_err(),
+            "DNS name mismatch must fail"
+        );
+
+        // A leaf not issued by the pinned CA must fail.
+        let (rogue_ca, rogue_key) = make_cert("Rogue CA", &CA, None);
+        let (rogue_leaf, _) = make_cert(
+            "srv.example.com",
+            &CertOpts {
+                dns: &["srv.example.com"],
+                ..CertOpts::DEFAULT
+            },
+            Some(("Rogue CA", &rogue_ca, &rogue_key)),
+        );
+        let rogue_chain = chain_of(vec![rogue_leaf, ca]);
+        assert!(
+            verify_leaf_under_pinned_cert(&rogue_chain, 1, "srv.example.com").is_err(),
+            "leaf not issued by the pinned CA must fail"
+        );
+    }
+
+    /// A pinned intermediate that is *not* self-signed must still anchor
+    /// the chain (PARTIAL_CHAIN): the server sends leaf + intermediate,
+    /// the real root is never on the wire.
+    #[test]
+    fn cert_pin_nonleaf_verifies_under_unsent_root() {
+        let (root, root_key) = make_cert("Root CA", &CA, None);
+        let (inter, inter_key) =
+            make_cert("Intermediate CA", &CA, Some(("Root CA", &root, &root_key)));
+        let (leaf, _) = make_cert(
+            "srv.example.com",
+            &CertOpts {
+                dns: &["srv.example.com"],
+                ..CertOpts::DEFAULT
+            },
+            Some(("Intermediate CA", &inter, &inter_key)),
+        );
+        let chain = chain_of(vec![leaf, inter]);
+        verify_leaf_under_pinned_cert(&chain, 1, "srv.example.com")
+            .expect("pinning a non-self-signed intermediate must verify via PARTIAL_CHAIN");
+    }
+
+    /// The sslserver purpose: a leaf the pinned CA minted for *client*
+    /// use (clientAuth-only EKU) must not pass as a server certificate.
+    #[test]
+    fn cert_pin_nonleaf_rejects_client_auth_only_eku() {
+        let (ca, ca_key) = make_cert("Test CA", &CA, None);
+        let (leaf, _) = make_cert(
+            "srv.example.com",
+            &CertOpts {
+                dns: &["srv.example.com"],
+                client_auth_eku: true,
+                ..CertOpts::DEFAULT
+            },
+            Some(("Test CA", &ca, &ca_key)),
+        );
+        let chain = chain_of(vec![leaf, ca]);
+        assert!(
+            verify_leaf_under_pinned_cert(&chain, 1, "srv.example.com").is_err(),
+            "clientAuth-only EKU must fail the sslserver purpose check"
+        );
+    }
+
+    /// IP-literal check names verify against iPAddress SANs via `set_ip`,
+    /// for both v4 and v6; a mismatched IP must still fail.
+    #[test]
+    fn cert_pin_nonleaf_verifies_ip_san() {
+        let (ca, ca_key) = make_cert("Test CA", &CA, None);
+        let (leaf4, _) = make_cert(
+            "v4",
+            &CertOpts {
+                ips: &["127.0.0.1"],
+                ..CertOpts::DEFAULT
+            },
+            Some(("Test CA", &ca, &ca_key)),
+        );
+        let (leaf6, _) = make_cert(
+            "v6",
+            &CertOpts {
+                ips: &["::1"],
+                ..CertOpts::DEFAULT
+            },
+            Some(("Test CA", &ca, &ca_key)),
+        );
+        let chain4 = chain_of(vec![leaf4, ca.clone()]);
+        let chain6 = chain_of(vec![leaf6, ca]);
+        verify_leaf_under_pinned_cert(&chain4, 1, "127.0.0.1")
+            .expect("IPv4 SAN must match an IP check_name");
+        verify_leaf_under_pinned_cert(&chain6, 1, "::1")
+            .expect("IPv6 SAN must match an IP check_name");
+        assert!(
+            verify_leaf_under_pinned_cert(&chain4, 1, "127.0.0.2").is_err(),
+            "a different IP must fail"
+        );
+        // An iPAddress SAN does not satisfy a DNS check_name.
+        assert!(
+            verify_leaf_under_pinned_cert(&chain4, 1, "localhost").is_err(),
+            "DNS name against an IP-only SAN must fail"
+        );
+    }
+
+    /// The leaf-pin arm (`i == 0`) accepts the leaf as-pinned — no chain,
+    /// name or purpose check. Keep it distinct from the CA-pin semantics
+    /// above: pinning the leaf is an identity check.
+    #[test]
+    fn cert_pin_leaf_accepts_as_pinned() {
+        let (leaf, _) = make_cert("srv.example.com", &CertOpts::DEFAULT, None);
+        let pin: [u8; 32] = leaf
+            .digest(boring::hash::MessageDigest::sha256())
+            .unwrap()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let chain = chain_of(vec![leaf]);
+        pinned_chain_decision(&chain, &pin, "unrelated.example.com")
+            .expect("pinning the leaf must accept it regardless of check_name");
+        let wrong = [0u8; 32];
+        assert!(
+            pinned_chain_decision(&chain, &wrong, "srv.example.com").is_err(),
+            "a pin matching nothing in the chain must fail"
+        );
+    }
+
+    fn sha256(cert: &boring::x509::X509) -> [u8; 32] {
+        cert.digest(boring::hash::MessageDigest::sha256())
+            .unwrap()
+            .as_ref()
+            .try_into()
+            .unwrap()
+    }
+
+    /// The non-leaf dispatch leg: a pin matching `chain[1]` must route
+    /// through `verify_leaf_under_pinned_cert` — including the name check
+    /// the leaf arm skips.
+    #[test]
+    fn cert_pin_nonleaf_dispatch_runs_full_verify() {
+        let (ca, ca_key) = make_cert("Test CA", &CA, None);
+        let (leaf, _) = make_cert(
+            "srv.example.com",
+            &CertOpts {
+                dns: &["srv.example.com"],
+                ..CertOpts::DEFAULT
+            },
+            Some(("Test CA", &ca, &ca_key)),
+        );
+        let pin = sha256(&ca);
+        let chain = chain_of(vec![leaf, ca]);
+        pinned_chain_decision(&chain, &pin, "srv.example.com")
+            .expect("pinning the CA must verify the leaf under it");
+        assert!(
+            pinned_chain_decision(&chain, &pin, "other.example.com").is_err(),
+            "non-leaf pin must still enforce the name check"
+        );
+    }
+
+    /// Depth-2 pin: `leaf -> inter -> root`, pin the root. The
+    /// `skip(1).take(pin_idx)` slice must hand both intermediates to the
+    /// verifier as untrusted.
+    #[test]
+    fn cert_pin_depth2_verifies_through_intermediate() {
+        let (root, root_key) = make_cert("Test Root", &CA, None);
+        let (inter, inter_key) =
+            make_cert("Test Inter", &CA, Some(("Test Root", &root, &root_key)));
+        let (leaf, _) = make_cert(
+            "srv.example.com",
+            &CertOpts {
+                dns: &["srv.example.com"],
+                ..CertOpts::DEFAULT
+            },
+            Some(("Test Inter", &inter, &inter_key)),
+        );
+        let pin = sha256(&root);
+        let chain = chain_of(vec![leaf, inter, root]);
+        pinned_chain_decision(&chain, &pin, "srv.example.com")
+            .expect("pinning the root at depth 2 must verify leaf via the intermediate");
     }
 }

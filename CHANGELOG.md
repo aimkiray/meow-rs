@@ -8,6 +8,28 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **In-process `gost-plugin` for Shadowsocks** — `plugin: gost-plugin` now
+  runs natively instead of spawning a SIP003 subprocess, matching mihomo's
+  built-in: TCP → optional TLS (ALPN `http/1.1`, SNI from `host` or a `Host`
+  header override) → WebSocket → optional smux v1 session (`mux` defaults
+  to `true` upstream; one session per connection, stream close tears it
+  down). The full option surface is supported — `mode` (required,
+  `websocket`), `host` (default `bing.com`), `path`, `tls`, `mux`,
+  `headers`, `skip-cert-verify`, `name-cert-verify`, `fingerprint`
+  (SHA-256 certificate pin — `TlsConfig::cert_pin` replaces CA
+  verification, matching upstream SSL pinning), `certificate`/`private-key`
+  (mTLS; inline PEM or file path — upstream's file-watch reload is not
+  mirrored), and `ech-opts.enable` + `ech-opts.config` (inline
+  ECHConfigList, bounded to the u16 wire limit; DNS-queried ECH is not
+  supported and errors clearly). `name-cert-verify` is wired through a new
+  `TlsConfig::verify_name` — the certificate is verified against it while
+  the wire SNI stays `host`. Nested `plugin-opts` maps now flatten
+  correctly for all plugins (`headers` → repeated `header=K:V`, other maps
+  → `key.sub=value`). `mux` requires the `mux` cargo feature; builds
+  without it reject `mux=true` at parse time. (#533)
+
 ### Changed
 
 - **BoringSSL is now the only crypto library; rustls is gone from the runtime.**

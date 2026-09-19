@@ -48,7 +48,7 @@ Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vme
 | `password` | string | ✓ | — | |
 | `cipher` | string | ✓ | — | e.g. `aes-256-gcm`, `chacha20-ietf-poly1305` |
 | `udp` | bool | | `false` | Enable UDP relay |
-| `plugin` | string | | — | `obfs` or `v2ray` (built-in `simple-obfs`, no external binary) |
+| `plugin` | string | | — | `obfs`, `v2ray-plugin`, `gost-plugin` (built-in, no external binary) |
 | `plugin-opts` | string \| map | | — | Plugin options |
 
 ```yaml
@@ -63,6 +63,30 @@ Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vme
   plugin-opts:
     mode: http        # or tls
     host: bing.com
+```
+
+`gost-plugin` runs in-process too — a WebSocket transport with optional
+TLS and smux. Upstream defaults apply: `host` defaults to `bing.com` and
+`mux` to `true` (a fresh smux session per connection).
+
+```yaml
+- name: ss-gost
+  type: ss
+  server: 1.2.3.4
+  port: 8388
+  cipher: aes-256-gcm
+  password: "•••"
+  plugin: gost-plugin
+  plugin-opts:
+    mode: websocket      # required
+    host: cdn.example.com
+    path: /ws
+    tls: true
+    mux: true            # default; smux session per connection
+    # headers: {CF-Token: "…"}   # a Host entry also sets the TLS SNI
+    # skip-cert-verify: false
+    # name-cert-verify: real.example.com
+    # fingerprint: "AA:BB:…"   # SHA-256 cert pin (SSL pinning), not uTLS
 ```
 
 ---

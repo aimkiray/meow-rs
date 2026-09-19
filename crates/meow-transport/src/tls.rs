@@ -99,6 +99,25 @@ pub struct TlsConfig {
     /// Disable server certificate verification.  Emits a `warn!` once.
     pub skip_cert_verify: bool,
 
+    /// Hostname the peer certificate is verified against when it differs
+    /// from the connection SNI (mihomo's `name-cert-verify` / Go
+    /// `VerifyPeerCertificate` name override).  `None` → verify against
+    /// `sni`.  Ignored when `skip_cert_verify` is set or on the REALITY
+    /// path.
+    pub verify_name: Option<String>,
+
+    /// Certificate pinning by SHA-256 hash of a cert in the presented
+    /// chain (mihomo `fingerprint` / SSL pinning — *not* a uTLS profile;
+    /// uTLS lives in [`fingerprint`](Self::fingerprint)).
+    ///
+    /// When set, the pin **replaces** CA verification (upstream sets
+    /// `InsecureSkipVerify` and runs the pin check in
+    /// `VerifyPeerCertificate`): a leaf match accepts the cert outright; a
+    /// non-leaf match verifies the leaf under the pinned cert as root
+    /// plus a `check_name` DNS check (`verify_name`, else `sni`).
+    /// Ignored on the REALITY path.
+    pub cert_pin: Option<[u8; 32]>,
+
     /// Optional mutual-TLS client certificate (PEM-encoded).
     pub client_cert: Option<ClientCert>,
 
@@ -138,6 +157,8 @@ impl TlsConfig {
             sni: Some(sni.into()),
             alpn: Vec::new(),
             skip_cert_verify: false,
+            verify_name: None,
+            cert_pin: None,
             client_cert: None,
             fingerprint: None,
             additional_roots: Vec::new(),

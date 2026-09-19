@@ -132,7 +132,8 @@ pub fn node_selects_external_plugin(config: &HashMap<String, serde_yaml::Value>)
 /// external SIP003 executable is rejected: that name reaches `Command::new`
 /// during adapter construction, so provider content would select a local
 /// binary (issue #513). Built-in/in-process plugins (`obfs`,
-/// `simple-obfs`, `v2ray-plugin`, `ech-tls-tunnel`) stay allowed — mihomo
+/// `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `ech-tls-tunnel`) stay
+/// allowed — mihomo
 /// implements those in-process too, so gating them would diverge.
 pub fn parse_proxy_provider_node(
     config: &HashMap<String, serde_yaml::Value>,
@@ -360,7 +361,7 @@ fn is_external_sip003_plugin(plugin: Option<&str>) -> bool {
     if meow_proxy::shadowsocks_adapter::is_builtin_obfs_plugin(plugin) {
         return false;
     }
-    if plugin == "v2ray-plugin" {
+    if matches!(plugin, "v2ray-plugin" | "gost-plugin") {
         return false;
     }
     // Mirror `ShadowsocksAdapter::new` exactly: its `ech-tls-tunnel` arm is
@@ -2214,24 +2215,67 @@ fn parse_uuid(s: &str) -> std::result::Result<[u8; 16], String> {
 
 /// Convert a YAML `plugin-opts` value to the SIP003 semicolon-separated format.
 /// Accepts either a string (passed through) or a YAML map (serialized as `key=value;...`).
+///
+/// Nested maps are flattened: `headers` becomes repeated `header=K:V`
+/// tokens (the SIP003 convention shared by `v2ray-plugin` and
+/// `gost-plugin`), and any other map is dotted into its parent key
+/// (`ech-opts: {enable: true}` → `ech-opts.enable=true`).
 #[cfg(feature = "ss")]
 fn serialize_plugin_opts(opts: &serde_yaml::Value) -> Option<String> {
+    // `;` separates tokens and `=` separates key from value, so neither may
+    // appear inside a serialized name or value — otherwise a nested map
+    // could smuggle a top-level opt token (e.g. `headers: {X: "a;tls"}`
+    // would emit a bare `tls` token).
+    fn push_scalar(parts: &mut Vec<String>, key: &str, v: &serde_yaml::Value) {
+        let val = match v {
+            serde_yaml::Value::String(s) => s.clone(),
+            serde_yaml::Value::Bool(b) => b.to_string(),
+            serde_yaml::Value::Number(n) => n.to_string(),
+            _ => return,
+        };
+        if key.contains([';', '=']) || val.contains(';') {
+            tracing::warn!(
+                "plugin-opts: dropping '{key}' — ';' and '=' cannot appear in serialized opt names, nor ';' in values"
+            );
+            return;
+        }
+        parts.push(format!("{key}={val}"));
+    }
     match opts {
         serde_yaml::Value::String(s) => Some(s.clone()),
         serde_yaml::Value::Mapping(map) => {
-            let parts: Vec<String> = map
-                .iter()
-                .filter_map(|(k, v)| {
-                    let key = k.as_str()?;
-                    let val = match v {
-                        serde_yaml::Value::String(s) => s.clone(),
-                        serde_yaml::Value::Bool(b) => b.to_string(),
-                        serde_yaml::Value::Number(n) => n.to_string(),
-                        _ => return None,
-                    };
-                    Some(format!("{key}={val}"))
-                })
-                .collect();
+            let mut parts: Vec<String> = Vec::new();
+            for (k, v) in map {
+                let Some(key) = k.as_str() else { continue };
+                match v {
+                    serde_yaml::Value::Mapping(inner) if key.eq_ignore_ascii_case("headers") => {
+                        for (hk, hv) in inner {
+                            let Some(hk) = hk.as_str() else { continue };
+                            let hv = match hv {
+                                serde_yaml::Value::String(s) => s.clone(),
+                                serde_yaml::Value::Bool(b) => b.to_string(),
+                                serde_yaml::Value::Number(n) => n.to_string(),
+                                _ => continue,
+                            };
+                            if hk.contains([';', '=', ':']) || hv.contains(';') {
+                                tracing::warn!(
+                                    "plugin-opts: dropping header '{hk}' — ';', '=' and ':' cannot appear in header names, nor ';' in values"
+                                );
+                                continue;
+                            }
+                            parts.push(format!("header={hk}:{hv}"));
+                        }
+                    }
+                    serde_yaml::Value::Mapping(inner) => {
+                        for (sk, sv) in inner {
+                            if let Some(sk) = sk.as_str() {
+                                push_scalar(&mut parts, &format!("{key}.{sk}"), sv);
+                            }
+                        }
+                    }
+                    other => push_scalar(&mut parts, key, other),
+                }
+            }
             if parts.is_empty() {
                 None
             } else {
@@ -2868,6 +2912,54 @@ tls: true
         let yaml: serde_yaml::Value = serde_yaml::from_str("port: 8080").unwrap();
         let result = serialize_plugin_opts(&yaml).unwrap();
         assert_eq!(result, "port=8080");
+    }
+
+    #[cfg(feature = "ss")]
+    #[test]
+    fn test_serialize_plugin_opts_nested_maps() {
+        // gost-plugin takes a `headers` map and an `ech-opts` map
+        // (issue #533).  `headers` flattens to repeated `header=K:V`
+        // tokens (SIP003 convention); any other nested map is dotted.
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            "mode: websocket\nheaders:\n  CF-Token: abc\n  Host: edge.example.com\nech-opts:\n  enable: true\n  config: QUJD\n",
+        )
+        .unwrap();
+        let result = serialize_plugin_opts(&yaml).unwrap();
+        assert_eq!(
+            result,
+            "mode=websocket;header=CF-Token:abc;header=Host:edge.example.com;\
+             ech-opts.enable=true;ech-opts.config=QUJD"
+        );
+    }
+
+    #[cfg(feature = "ss")]
+    #[test]
+    fn test_serialize_plugin_opts_token_smuggling_guard() {
+        // A `;`/`=`/`:` inside a serialized name or value would split into
+        // extra SIP003 tokens — entries containing them are dropped.
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            "mode: websocket\nheaders:\n  \"x;skip-cert-verify\": true\n  Good: ok\n\
+             weird;key: v\nfine: a;b\n",
+        )
+        .unwrap();
+        let result = serialize_plugin_opts(&yaml).unwrap();
+        let mut tokens = result.split(';');
+        assert_eq!(tokens.next(), Some("mode=websocket"));
+        assert_eq!(tokens.next(), Some("header=Good:ok"));
+        assert!(tokens.next().is_none(), "smuggled tokens leaked: {result}");
+    }
+
+    #[cfg(feature = "ss")]
+    #[test]
+    fn test_serialize_plugin_opts_headers_case_insensitive() {
+        // mapstructure decodes `Headers` onto the `headers` field — match
+        // its case-insensitive key handling.
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str("mode: websocket\nHeaders:\n  X-A: b\n").unwrap();
+        assert_eq!(
+            serialize_plugin_opts(&yaml).unwrap(),
+            "mode=websocket;header=X-A:b"
+        );
     }
 
     // ─── direct proxy with per-proxy DNS (issue #67) ─────────────────────────

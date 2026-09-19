@@ -1108,6 +1108,88 @@ async fn test_proxy_parsing_ss_with_builtin_obfs_table() {
 }
 
 #[tokio::test]
+async fn test_proxy_parsing_ss_with_gost_plugin() {
+    // `gost-plugin` is an in-process built-in (issue #533): a ws transport
+    // with upstream defaults host=bing.com / mux=true.  Well-formed nodes
+    // register; a node whose `plugin-opts` is missing the required
+    // `mode: websocket` is skipped (never falls back to the external
+    // SIP003 path).  Nested `headers`/`ech-opts` maps must survive
+    // `plugin-opts` serialization.
+    struct Case {
+        label: &'static str,
+        name: &'static str,
+        plugin_block: &'static str,
+        expect_present: bool,
+    }
+
+    let cases = [
+        Case {
+            label: "yaml map, mode=websocket",
+            name: "ss-gost-basic",
+            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: websocket\n      host: cdn.example.com\n      path: /ws\n      tls: true\n",
+            expect_present: true,
+        },
+        Case {
+            label: "nested headers map",
+            name: "ss-gost-headers",
+            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: websocket\n      headers:\n        CF-Token: abc\n        Host: edge.example.com\n",
+            expect_present: true,
+        },
+        Case {
+            label: "nested ech-opts map",
+            name: "ss-gost-ech",
+            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: websocket\n      tls: true\n      ech-opts:\n        enable: true\n        config: \"QUJD\"\n",
+            expect_present: true,
+        },
+        Case {
+            label: "SIP003 string form",
+            name: "ss-gost-str",
+            plugin_block: "    plugin: gost-plugin\n    plugin-opts: \"mode=websocket;tls;host=cdn.example.com;mux=false\"\n",
+            expect_present: true,
+        },
+        Case {
+            label: "missing mode -> skipped",
+            name: "ss-gost-no-mode",
+            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      host: example.com\n",
+            expect_present: false,
+        },
+        Case {
+            label: "unsupported mode -> skipped",
+            name: "ss-gost-bad-mode",
+            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: quic\n",
+            expect_present: false,
+        },
+        Case {
+            label: "lone certificate -> skipped",
+            name: "ss-gost-bad-cert",
+            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: websocket\n      certificate: PEM\n",
+            expect_present: false,
+        },
+    ];
+
+    let mut failures = Vec::new();
+    for case in &cases {
+        let yaml = format!(
+            "proxies:\n  - name: \"{}\"\n    type: ss\n    server: \"1.2.3.4\"\n    port: 8388\n    cipher: \"aes-256-gcm\"\n    password: \"password123\"\n{}",
+            case.name, case.plugin_block
+        );
+        let config = load_config_from_str(&yaml).await.unwrap();
+        let present = config.proxies.contains_key(case.name);
+        if present != case.expect_present {
+            failures.push(format!(
+                "[{}] proxy `{}`: expected present={}, got present={}",
+                case.label, case.name, case.expect_present, present
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "gost-plugin parsing mismatches:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[tokio::test]
 async fn test_invalid_yaml() {
     let yaml = "{{invalid yaml}}";
     assert!(load_config_from_str(yaml).await.is_err());

@@ -74,8 +74,8 @@ Already shipped (based on README and `crates/`):
 
 - Proxies: Shadowsocks (TCP+UDP, AEAD + stream ciphers), Trojan (rustls
   TLS 1.2/1.3), Direct, Reject.
-- Transports: built-in v2ray-plugin (websocket + TLS) for Shadowsocks
-  (commit b3e3b81).
+- Transports: built-in v2ray-plugin and gost-plugin (websocket + TLS)
+  for Shadowsocks.
 - Proxy groups: Selector, URLTest, Fallback.
 - Rules: DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-REGEX, IP-CIDR,
   SRC-IP-CIDR, DST-PORT, SRC-PORT, NETWORK, PROCESS-NAME, GEOIP, MATCH,
