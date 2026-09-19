@@ -1,5 +1,6 @@
 mod firewall;
 mod orig_dest;
+mod udp;
 
 use crate::sniffer::SnifferRuntime;
 use firewall::FirewallGuard;
@@ -33,6 +34,12 @@ pub struct TProxyListener {
     /// an external system — no `nft`/`pfctl` invocation, no upstream
     /// bypass-IP collection, no rule cleanup on exit (issue #563).
     firewall: bool,
+    /// Opt-in Linux UDP TPROXY datagram path on the same port (issue
+    /// #564). Requires `firewall: false` — the deployer owns the
+    /// PREROUTING TPROXY rules, fwmark, and policy routing.
+    udp: bool,
+    /// Per-flow UDP idle timeout (both directions refresh it).
+    udp_timeout: std::time::Duration,
 }
 
 impl TProxyListener {
@@ -68,6 +75,8 @@ impl TProxyListener {
             name,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             firewall: true,
+            udp: false,
+            udp_timeout: std::time::Duration::from_secs(60),
         }
     }
 
@@ -91,6 +100,16 @@ impl TProxyListener {
     /// rules are installed, probed, or cleaned up. Default `true`.
     pub fn with_firewall(mut self, enabled: bool) -> Self {
         self.firewall = enabled;
+        self
+    }
+
+    /// Enable the Linux UDP TPROXY datagram path on the listener's port
+    /// (issue #564). `udp_timeout` is the per-flow idle timeout. Linux-only
+    /// and external-firewall-only in this release — both are enforced at
+    /// config-parse and again at `run_on`.
+    pub fn with_udp(mut self, enabled: bool, udp_timeout: std::time::Duration) -> Self {
+        self.udp = enabled;
+        self.udp_timeout = udp_timeout;
         self
     }
 
@@ -125,6 +144,16 @@ impl TProxyListener {
             return Err("transparent proxy is not supported on this platform".into());
         }
 
+        // Validate the UDP opt-in BEFORE any firewall work — an invalid
+        // combination must not install-then-remove rules on the way out.
+        if self.udp && self.firewall {
+            return Err(
+                "tproxy `udp: true` requires `firewall: false` — meow does not \
+                 manage UDP TPROXY rules/policy routing"
+                    .into(),
+            );
+        }
+
         let _firewall = if self.firewall {
             let bypass_ips = collect_proxy_server_ips(&self.tunnel);
             Some(
@@ -147,6 +176,55 @@ impl TProxyListener {
         } else {
             None
         };
+
+        // #564: opt-in Linux UDP TPROXY datagram path on the same bound
+        // port. The socket is created BEFORE the "started" log so a UDP
+        // failure (missing CAP_NET_ADMIN, port conflict) never reports a
+        // half-ready TCP+UDP listener. Both invariants are re-enforced here
+        // even though config parsing already rejects `udp` + managed
+        // firewall and non-IPv4 binds — programmatic constructors get the
+        // same contract.
+        if self.udp {
+            #[cfg(target_os = "linux")]
+            {
+                let udp_socket = udp::bind_transparent(bound_addr).map_err(
+                    |e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!(
+                            "tproxy `udp` transparent socket on {bound_addr} failed \
+                                 (needs CAP_NET_ADMIN/CAP_NET_RAW): {e}"
+                        )
+                        .into()
+                    },
+                )?;
+                let udp_tunnel = self.tunnel.clone();
+                let udp_timeout = self.udp_timeout;
+                let udp_max = self.max_connections;
+                let udp_name = self.name.clone();
+                let udp_port = bound_addr.port();
+                tokio::spawn(async move {
+                    let name = udp_name.clone();
+                    if let Err(e) = udp::run_udp(
+                        udp_tunnel,
+                        udp_socket,
+                        udp_timeout,
+                        udp_max,
+                        udp_name,
+                        udp_port,
+                    )
+                    .await
+                    {
+                        error!("tproxy UDP receive loop for '{name}' failed: {e}");
+                    }
+                });
+                info!(
+                    "TProxy listener '{}': UDP TPROXY active on {} (external rules \
+                     must steer LAN datagrams here — see docs/tproxy-gateway.md)",
+                    self.name, bound_addr
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            return Err("tproxy `udp: true` is Linux-only in this release".into());
+        }
 
         if self.max_connections == 0 {
             info!(
@@ -776,6 +854,36 @@ mod tests {
             err.to_string().contains("is not supported"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Issue #564: `udp: true` is Linux-only — on any other platform the
+    /// listener must fail at startup, never silently degrade to TCP-only.
+    /// The positive path (transparent socket + flow dispatch) is exercised
+    /// by the QEMU suite, which requires a Linux guest.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn run_on_udp_rejected_off_linux() {
+        let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let tunnel = meow_tunnel::Tunnel::new(resolver);
+
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+
+        let listener = TProxyListener::new(tunnel, addr, false, None, "udp".to_string())
+            .with_firewall(false)
+            .with_udp(true, std::time::Duration::from_secs(60));
+        let err = listener
+            .run_on(socket)
+            .await
+            .expect_err("udp: true must fail off Linux");
+        assert!(err.to_string().contains("Linux"), "unexpected error: {err}");
     }
 
     #[test]

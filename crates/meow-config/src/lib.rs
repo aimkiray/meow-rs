@@ -145,10 +145,17 @@ pub enum ListenerSpec {
     /// `firewall` (default `true`) selects whether meow installs and owns the
     /// platform firewall rules; `false` delegates rule management to an
     /// external system (issue #563).
+    /// `udp` (default `false`) adds a Linux UDP TPROXY datagram path on the
+    /// same port (issue #564); `udp_timeout` is the per-flow idle timeout in
+    /// seconds (default 60).
     TProxy {
         sni: bool,
         #[serde(default = "default_tproxy_firewall")]
         firewall: bool,
+        #[serde(default)]
+        udp: bool,
+        #[serde(default = "default_udp_timeout_secs")]
+        udp_timeout: u64,
     },
     /// Shadowsocks encrypted-server inbound. The listener terminates SS
     /// encryption (TCP stream cipher / AEAD, UDP relay), reads the SOCKS
@@ -180,6 +187,12 @@ fn default_ss_udp() -> bool {
 /// stay on when a persisted spec predates the field (issue #563).
 fn default_tproxy_firewall() -> bool {
     true
+}
+
+/// `ListenerSpec::TProxy::udp_timeout` serde default, in seconds — matches
+/// `tun.udp-timeout` and upstream's `DefaultUDPTimeout` (issue #564).
+fn default_udp_timeout_secs() -> u64 {
+    60
 }
 
 /// `simple-obfs` sub-config for a shadowsocks listener.
@@ -3008,27 +3021,52 @@ pub(crate) fn resolve_listener_bind(
 /// Parse `type:` string from a `listeners:` entry into a `ListenerSpec`.
 /// Hard errors on unknown types (Class A per ADR-0002).
 ///
-/// `per_listener_sni` / `global_tproxy_sni` / `per_listener_firewall` are
-/// folded into the `TProxy` variant here so the returned spec is always
-/// complete — callers never need to overwrite a placeholder value. All
-/// three are ignored for non-TProxy types; only `firewall` misuse is
-/// diagnosed by the caller (which has the listener name in scope).
-/// `Shadowsocks` returns a placeholder spec; `build_named_listeners`
+/// `per-listener` fields (`tproxy-sni`/`firewall`/`udp`/`udp-timeout` on the
+/// raw entry, plus `global_tproxy_sni`) are folded into the `TProxy` variant
+/// here so the returned spec is always complete — callers never need to
+/// overwrite a placeholder value. Fields that don't apply to the listener's
+/// type are ignored; `firewall`/`udp`/`udp-timeout` misuse is diagnosed by
+/// the caller (which has the listener name in scope). `Shadowsocks` returns
+/// a placeholder spec; `build_named_listeners`
 /// completes it via `build_ss_listener_spec`.
 fn parse_listener_spec(
-    s: &str,
-    per_listener_sni: Option<bool>,
+    raw_l: &raw::RawListener,
     global_tproxy_sni: bool,
-    per_listener_firewall: Option<bool>,
 ) -> Result<ListenerSpec, anyhow::Error> {
-    match s.to_lowercase().as_str() {
+    match raw_l.listener_type.to_lowercase().as_str() {
         "mixed" => Ok(ListenerSpec::Mixed),
         "http" => Ok(ListenerSpec::Http),
         "socks5" => Ok(ListenerSpec::Socks5),
-        "tproxy" => Ok(ListenerSpec::TProxy {
-            sni: per_listener_sni.unwrap_or(global_tproxy_sni),
-            firewall: per_listener_firewall.unwrap_or_else(default_tproxy_firewall),
-        }),
+        "tproxy" => {
+            // #564: `udp` is opt-in and IPv4-only in this release, and the
+            // managed firewall only produces host TCP OUTPUT REDIRECT rules —
+            // it cannot promise LAN UDP TPROXY policy routing, so the
+            // combination is rejected rather than silently TCP-only.
+            let udp = raw_l.udp.unwrap_or(false);
+            let firewall = raw_l.firewall.unwrap_or_else(default_tproxy_firewall);
+            if udp && firewall {
+                anyhow::bail!(
+                    "listeners[{}]: `udp: true` requires `firewall: false` — meow does \
+                     not manage UDP TPROXY rules/policy routing (managed mode only \
+                     installs host TCP REDIRECT); install the UDP rules externally",
+                    raw_l.name
+                );
+            }
+            let udp_timeout = match raw_l.udp_timeout {
+                Some(0) => anyhow::bail!(
+                    "listeners[{}].udp-timeout: must be at least 1 second",
+                    raw_l.name
+                ),
+                Some(s) => s,
+                None => default_udp_timeout_secs(),
+            };
+            Ok(ListenerSpec::TProxy {
+                sni: raw_l.tproxy_sni.unwrap_or(global_tproxy_sni),
+                firewall,
+                udp,
+                udp_timeout,
+            })
+        }
         "shadowsocks" | "ss" => Ok(ListenerSpec::Shadowsocks(SsListenerConfig {
             cipher: String::new(),
             password: String::new(),
@@ -3194,8 +3232,10 @@ fn build_named_listeners(
                 sni: global_tproxy_sni,
                 // The shorthand keeps the managed-firewall default (issue
                 // #563): external management is an explicit `listeners:`
-                // opt-in only.
+                // opt-in only. UDP likewise stays opt-in (issue #564).
                 firewall: true,
+                udp: false,
+                udp_timeout: default_udp_timeout_secs(),
             },
             port,
             "127.0.0.1",
@@ -3205,16 +3245,38 @@ fn build_named_listeners(
 
     // Explicit `listeners:` entries
     for raw_l in raw.listeners.as_deref().unwrap_or(&[]) {
-        let spec = parse_listener_spec(
-            &raw_l.listener_type,
-            raw_l.tproxy_sni,
-            global_tproxy_sni,
-            raw_l.firewall,
-        )?;
+        let spec = parse_listener_spec(raw_l, global_tproxy_sni)?;
         if raw_l.firewall.is_some() && !matches!(spec, ListenerSpec::TProxy { .. }) {
             warn!(
                 "listeners[{}].firewall: only meaningful on `type: tproxy`, ignored; \
                  remove it to suppress this warning",
+                raw_l.name
+            );
+        }
+        match (&spec, raw_l.udp_timeout) {
+            (ListenerSpec::TProxy { udp: true, .. }, _) | (_, None) => {}
+            (ListenerSpec::TProxy { .. }, Some(_)) => warn!(
+                "listeners[{}].udp-timeout: has no effect unless `udp: true` is set; \
+                 remove it to suppress this warning",
+                raw_l.name
+            ),
+            (_, Some(_)) => warn!(
+                "listeners[{}].udp-timeout: only meaningful on `type: tproxy`, ignored; \
+                 remove it to suppress this warning",
+                raw_l.name
+            ),
+        }
+        // `udp` is meaningful on tproxy (issue #564) and shadowsocks; any
+        // other listener type ignoring it is warned about.
+        if raw_l.udp.is_some()
+            && !matches!(
+                spec,
+                ListenerSpec::TProxy { .. } | ListenerSpec::Shadowsocks(_)
+            )
+        {
+            warn!(
+                "listeners[{}].udp: only meaningful on `type: tproxy`/`shadowsocks`, \
+                 ignored; remove it to suppress this warning",
                 raw_l.name
             );
         }
@@ -3235,6 +3297,21 @@ fn build_named_listeners(
             }
             other => other,
         };
+        // UDP TPROXY is IPv4-only in this release (issue #564): `::` is
+        // dual-stack on Linux and would silently accept v6 datagrams, so
+        // reject it rather than claim partial dual-stack support.
+        if let ListenerSpec::TProxy { udp: true, .. } = spec {
+            let v4 = listen
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_ipv4());
+            if !v4 {
+                anyhow::bail!(
+                    "listeners[{}]: `udp: true` is IPv4-only in this release — \
+                     bind an IPv4 address (`{listen}` resolves to IPv6/dual-stack)",
+                    raw_l.name
+                );
+            }
+        }
         let max_connections = raw_l.max_connections.unwrap_or(global_max_conns);
         add(&raw_l.name, spec, port, &listen, max_connections)?;
     }

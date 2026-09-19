@@ -1966,7 +1966,9 @@ tproxy-sni: true
         tproxy.spec,
         ListenerSpec::TProxy {
             sni: true,
-            firewall: true
+            firewall: true,
+            udp: false,
+            udp_timeout: 60,
         },
         "shorthand tproxy-port should inherit the global tproxy-sni default"
     );
@@ -1991,7 +1993,9 @@ tproxy-sni: false
         tproxy.spec,
         ListenerSpec::TProxy {
             sni: false,
-            firewall: true
+            firewall: true,
+            udp: false,
+            udp_timeout: 60,
         },
         "shorthand tproxy-port with global tproxy-sni: false"
     );
@@ -2018,7 +2022,9 @@ listeners:
         tproxy.spec,
         ListenerSpec::TProxy {
             sni: true,
-            firewall: true
+            firewall: true,
+            udp: false,
+            udp_timeout: 60,
         },
         "per-listener tproxy-sni: true must override the global false default"
     );
@@ -2049,7 +2055,9 @@ listeners:
         tproxy.spec,
         ListenerSpec::TProxy {
             sni: true,
-            firewall: true
+            firewall: true,
+            udp: false,
+            udp_timeout: 60,
         },
         "omitted firewall must default to managed"
     );
@@ -2079,7 +2087,9 @@ listeners:
             tproxy.spec,
             ListenerSpec::TProxy {
                 sni: true,
-                firewall: expected
+                firewall: expected,
+                udp: false,
+                udp_timeout: 60,
             },
             "firewall: {value} must round-trip"
         );
@@ -2102,7 +2112,9 @@ async fn test_tproxy_shorthand_keeps_managed_firewall() {
         tproxy.spec,
         ListenerSpec::TProxy {
             sni: true,
-            firewall: true
+            firewall: true,
+            udp: false,
+            udp_timeout: 60,
         },
         "shorthand tproxy-port must keep the managed-firewall default"
     );
@@ -2117,7 +2129,9 @@ fn test_tproxy_spec_deserialization_defaults_firewall_true() {
         spec,
         ListenerSpec::TProxy {
             sni: true,
-            firewall: true
+            firewall: true,
+            udp: false,
+            udp_timeout: 60,
         },
         "legacy spec without `firewall` must default to managed"
     );
@@ -2248,6 +2262,306 @@ tproxy-port: 7893
     }
 }
 
+// ── Issue #564: opt-in `udp`/`udp-timeout` on tproxy ─────────────
+//
+// `udp: true` adds the Linux UDP TPROXY path on the same port. It requires
+// `firewall: false` (meow's managed rules are host TCP REDIRECT only and
+// cannot promise LAN UDP TPROXY policy routing), is IPv4-only in this
+// release, and defaults off — an omitted `udp` creates no socket, needs no
+// extra privileges, and changes nothing about the TCP path.
+
+#[tokio::test]
+async fn test_tproxy_udp_opt_in() {
+    let yaml = r#"
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: 0.0.0.0:5332
+    firewall: false
+    udp: true
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let tproxy = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "my-tproxy")
+        .expect("named tproxy listener must exist");
+    assert_eq!(
+        tproxy.spec,
+        ListenerSpec::TProxy {
+            sni: true,
+            firewall: false,
+            udp: true,
+            udp_timeout: 60,
+        },
+        "udp: true + firewall: false must produce the UDP-enabled spec with the default timeout"
+    );
+}
+
+#[tokio::test]
+async fn test_tproxy_udp_timeout_round_trips() {
+    let yaml = r#"
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: 0.0.0.0:5332
+    firewall: false
+    udp: true
+    udp-timeout: 120
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let ListenerSpec::TProxy { udp_timeout, .. } = config.listeners.named[0].spec else {
+        panic!("expected tproxy spec");
+    };
+    assert_eq!(udp_timeout, 120);
+}
+
+/// `udp: true` without `firewall: false` is a hard error — the managed
+/// firewall only installs host TCP REDIRECT rules and cannot express UDP
+/// TPROXY policy routing, so silently degrading to TCP-only is not an
+/// option.
+#[tokio::test]
+async fn test_tproxy_udp_requires_external_firewall() {
+    for firewall_line in ["", "    firewall: true\n"] {
+        let yaml = format!(
+            r#"
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: 0.0.0.0:5332
+{firewall_line}    udp: true
+"#
+        );
+        let err = load_config_from_str(&yaml)
+            .await
+            .err()
+            .expect("udp: true with managed firewall must fail");
+        assert!(
+            err.to_string().contains("firewall: false"),
+            "error must name the required setting, got: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_tproxy_udp_timeout_zero_rejected() {
+    let yaml = r#"
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: 0.0.0.0:5332
+    firewall: false
+    udp: true
+    udp-timeout: 0
+"#;
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("udp-timeout: 0 must fail");
+    assert!(err.to_string().contains("udp-timeout"), "got: {err}");
+}
+
+/// `udp-timeout: 0` is rejected on a TCP-only tproxy listener too — the
+/// field parse validates positivity before the `udp`/`type` checks, so an
+/// invalid value can never silently ride along inert.
+#[tokio::test]
+async fn test_tproxy_udp_timeout_zero_rejected_without_udp() {
+    let yaml = r#"
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: 0.0.0.0:5332
+    udp-timeout: 0
+"#;
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("udp-timeout: 0 must fail even without udp: true");
+    assert!(err.to_string().contains("udp-timeout"), "got: {err}");
+}
+
+/// IPv6 and dual-stack (`::`) binds are rejected for `udp: true` — the
+/// receive path is IPv4-only (`IP_RECVORIGDSTADDR`) and `::` would
+/// silently accept v6 datagrams it cannot handle.
+#[tokio::test]
+async fn test_tproxy_udp_rejects_ipv6_listen() {
+    for listen in ["[::1]:5332", "[::]:5332"] {
+        let yaml = format!(
+            r#"
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: "{listen}"
+    firewall: false
+    udp: true
+"#
+        );
+        let err = load_config_from_str(&yaml)
+            .await
+            .err()
+            .expect("udp: true on IPv6/dual-stack must fail");
+        assert!(err.to_string().contains("IPv4-only"), "got: {err}");
+    }
+}
+
+/// `firewall: false` alone (no `udp`) stays legal — it is the #563
+/// external-management contract, orthogonal to the UDP opt-in.
+#[tokio::test]
+async fn test_tproxy_external_firewall_without_udp_is_legal() {
+    let yaml = r#"
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: 0.0.0.0:5332
+    firewall: false
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let ListenerSpec::TProxy { firewall, udp, .. } = config.listeners.named[0].spec else {
+        panic!("expected tproxy spec");
+    };
+    assert!(!firewall && !udp);
+}
+
+/// `udp-timeout` on a tproxy listener without `udp: true` is inert —
+/// parsed with a warning rather than silently stored.
+#[test]
+fn test_tproxy_udp_timeout_without_udp_warns() {
+    let yaml = r#"
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: 127.0.0.1:5332
+    udp-timeout: 30
+"#;
+    #[derive(Clone)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+    let sink = Sink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let config = tracing::subscriber::with_default(subscriber, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(load_config_from_str(yaml))
+            .unwrap()
+    });
+    let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+    assert!(
+        logs.contains("has no effect unless `udp: true`"),
+        "expected the inert udp-timeout warning, got: {logs}"
+    );
+
+    let ListenerSpec::TProxy {
+        udp, udp_timeout, ..
+    } = config.listeners.named[0].spec
+    else {
+        panic!("expected tproxy spec");
+    };
+    assert!(!udp && udp_timeout == 30);
+}
+
+/// `udp:` on a non-tproxy/non-shadowsocks listener is inert — parsed with
+/// a warning, never silently changing that listener's behaviour.
+#[test]
+fn test_udp_on_mixed_listener_warns() {
+    let yaml = r#"
+listeners:
+  - name: my-mixed
+    type: mixed
+    listen: 127.0.0.1:7890
+    udp: true
+    udp-timeout: 30
+"#;
+    #[derive(Clone)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+    let sink = Sink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let config = tracing::subscriber::with_default(subscriber, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(load_config_from_str(yaml))
+            .unwrap()
+    });
+    let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+    assert!(
+        logs.contains("only meaningful on `type: tproxy`/`shadowsocks`")
+            && logs.contains("only meaningful on `type: tproxy`, ignored"),
+        "expected both misuse warnings, got: {logs}"
+    );
+
+    let mixed = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "my-mixed")
+        .expect("named mixed listener must exist");
+    assert_eq!(mixed.spec, ListenerSpec::Mixed);
+}
+
+/// The shadowsocks listener keeps its own `udp` semantics (default true)
+/// untouched by the tproxy reuse of the same raw key.
+#[tokio::test]
+async fn test_shadowsocks_udp_semantics_unchanged() {
+    for (udp_line, expected) in [("", true), ("    udp: false\n", false)] {
+        let yaml = format!(
+            r#"
+listeners:
+  - name: my-ss
+    type: shadowsocks
+    listen: 127.0.0.1:8388
+    cipher: aes-256-gcm
+    password: secret
+{udp_line}"#
+        );
+        let config = load_config_from_str(&yaml).await.unwrap();
+        let ListenerSpec::Shadowsocks(ss) = &config.listeners.named[0].spec else {
+            panic!("expected shadowsocks spec");
+        };
+        assert_eq!(ss.udp, expected, "udp_line={udp_line:?}");
+    }
+}
+
 #[tokio::test]
 async fn test_tproxy_named_listener_falls_back_to_global_sni() {
     let yaml = r#"
@@ -2268,7 +2582,9 @@ listeners:
         tproxy.spec,
         ListenerSpec::TProxy {
             sni: true,
-            firewall: true
+            firewall: true,
+            udp: false,
+            udp_timeout: 60,
         },
         "named tproxy without per-listener tproxy-sni should fall back to global true"
     );
@@ -2346,7 +2662,9 @@ async fn test_listener_type_name() {
     assert_eq!(
         ListenerSpec::TProxy {
             sni: true,
-            firewall: true
+            firewall: true,
+            udp: false,
+            udp_timeout: 60,
         }
         .type_name(),
         "tproxy"
@@ -2354,7 +2672,9 @@ async fn test_listener_type_name() {
     assert_eq!(
         ListenerSpec::TProxy {
             sni: false,
-            firewall: true
+            firewall: true,
+            udp: false,
+            udp_timeout: 60,
         }
         .type_name(),
         "tproxy"

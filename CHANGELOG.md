@@ -167,6 +167,24 @@ the canonical, in-repo source a release is cut from.
   listener cap. The superseded `bench.yml` workflow and the unused
   `bench/results/` dir are removed.
 
+- **Opt-in UDP TPROXY for TProxy listeners (#564, Linux/IPv4).** A named
+  `listeners:` tproxy entry with `firewall: false` + `udp: true` serves a
+  UDP TPROXY datagram path on the same port as the TCP REDIRECT path.
+  meow installs no firewall or policy-routing state for UDP — the deployer
+  owns the `prerouting` TPROXY rules and fwmark→local-table routing, and
+  nothing external is removed on exit. Each inbound datagram's original
+  destination is recovered from `IP_ORIGDSTADDR` ancillary data, routed
+  through the normal rule engine (`dial_udp`), and replies leave with the
+  original destination as source via a per-destination `IP_TRANSPARENT`
+  socket. UDP port 53 follows routing rules — no implicit DNS hijack.
+  Resource bounds: `max-connections` caps live flows (`0` = unlimited),
+  `udp-timeout` (default 60s, `0` rejected) is the per-flow idle eviction,
+  and per-flow datagram/byte queues plus a bounded reply-socket cache
+  prevent unbounded FD/memory growth. `udp: true` with managed firewall
+  or a non-IPv4 `listen` is a config error, and on a non-Linux platform
+  the listener fails at startup — no silent TCP-only degrade; an omitted
+  `udp` changes nothing (no extra socket, no extra privileges).
+
 - **External firewall management for TProxy listeners (#563).** A named
   `listeners:` entry accepts `firewall: false`, which makes meow skip every
   nftables/pfctl interaction for that listener: no rules installed, probed,

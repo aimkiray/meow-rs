@@ -186,6 +186,8 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
             spec: ListenerSpec::TProxy {
                 sni: false,
                 firewall: false,
+                udp: false,
+                udp_timeout: 60,
             },
             port: 7894,
             listen: "127.0.0.1".into(),

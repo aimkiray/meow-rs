@@ -51,6 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /src/target/debug/meow /usr/local/bin/meow
 COPY tests/tproxy-qemu/meow-tproxy.yaml /etc/meow-tproxy.yaml
 COPY tests/tproxy-qemu/meow-tproxy-ext.yaml /etc/meow-tproxy-ext.yaml
+COPY tests/tproxy-qemu/meow-tproxy-udp.yaml /etc/meow-tproxy-udp.yaml
 COPY tests/tproxy-qemu/guest-init.sh /run-tests.sh
 RUN chmod +x /run-tests.sh
 DOCKERFILE

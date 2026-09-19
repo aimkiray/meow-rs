@@ -965,7 +965,12 @@ async fn run(
                     nl.spec
                 );
             }
-            ListenerSpec::TProxy { sni, firewall } => {
+            ListenerSpec::TProxy {
+                sni,
+                firewall,
+                udp,
+                udp_timeout,
+            } => {
                 #[cfg(feature = "listener-tproxy")]
                 {
                     let socket = match tokio::net::TcpListener::bind(addr).await {
@@ -986,7 +991,8 @@ async fn run(
                     )
                     .with_sniffer(Arc::clone(&sniffer_runtime))
                     .with_max_connections(nl.max_connections)
-                    .with_firewall(*firewall);
+                    .with_firewall(*firewall)
+                    .with_udp(*udp, std::time::Duration::from_secs(*udp_timeout));
                     tokio::spawn(async move {
                         if let Err(e) = listener.run_on(socket).await {
                             error!("TProxy listener error: {}", e);
@@ -995,10 +1001,11 @@ async fn run(
                 }
                 #[cfg(not(feature = "listener-tproxy"))]
                 {
-                    // `sni`/`firewall` are only consumed by the `listener-tproxy`
-                    // build above; mark them used so the bindings don't trip
-                    // `-D warnings` on tproxy-less feature sets.
-                    let _ = (sni, firewall);
+                    // `sni`/`firewall`/`udp`/`udp_timeout` are only consumed by
+                    // the `listener-tproxy` build above; mark them used so the
+                    // bindings don't trip `-D warnings` on tproxy-less feature
+                    // sets.
+                    let _ = (sni, firewall, udp, udp_timeout);
                     tracing::warn!(
                         "listener '{}': TProxy requires feature 'listener-tproxy'",
                         nl.name

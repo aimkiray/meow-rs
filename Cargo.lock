@@ -2571,6 +2571,7 @@ dependencies = [
  "route_manager",
  "shadowsocks",
  "smallvec",
+ "smol_str",
  "tokio",
  "tracing",
  "tracing-subscriber",

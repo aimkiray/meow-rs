@@ -1,0 +1,36 @@
+# UDP TPROXY variant (issue #564): the tproxy listener is declared via
+# `listeners:` with `firewall: false` + `udp: true` — meow installs no
+# nftables state; the test harness owns the TPROXY rules (`ip meow_udp_tproxy`)
+# and the fwmark/policy routing that steer LAN UDP datagrams to :7895. The
+# same listener port also answers TCP REDIRECT'd connections.
+mixed-port: 7890
+routing-mark: 9527
+mode: rule
+log-level: debug
+
+listeners:
+  - name: udp-tproxy
+    type: tproxy
+    listen: 127.0.0.1
+    port: 7895
+    firewall: false
+    udp: true
+    udp-timeout: 30
+
+dns:
+  enable: true
+  listen: "127.0.0.1:5353"
+  enhanced-mode: normal
+  nameserver:
+    - "8.8.8.8"
+
+proxies:
+  - name: "test-ss"
+    type: ss
+    server: "10.99.0.1"
+    port: 8388
+    cipher: "aes-128-gcm"
+    password: "test-password"
+
+rules:
+  - "MATCH,DIRECT"
