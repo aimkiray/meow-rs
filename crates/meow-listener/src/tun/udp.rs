@@ -17,17 +17,20 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use ipnet::Ipv4Net;
 use lwip::UdpSocket;
 use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
-use meow_dns::server::{hex_prefix, DnsServer};
+use meow_dns::server::{hex_prefix, DnsServer, LocalAnswer};
 use meow_tunnel::{ResolvedTarget, Tunnel};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// One datagram payload cap. UDP over IPv4 tops out below 64 KiB.
 const DATAGRAM_BUF: usize = 65535;
@@ -38,12 +41,46 @@ const FLOW_QUEUE: usize = 64;
 /// a `Sink` and cannot be cloned into per-flow tasks).
 const REPLY_QUEUE: usize = 512;
 
+/// Hard bound on live flow-table entries (issue #515). At cap the
+/// least-recently-active flow is evicted to admit the new tuple —
+/// dropping the evicted sender closes that flow task's queue, which
+/// tears it down through the ordinary shutdown path.
+const MAX_FLOWS: usize = 1024;
+/// Bound on concurrent in-process DNS answers (`dns-hijack`). Beyond it,
+/// queries are dropped and counted — UDP semantics: the client retries.
+/// Without a bound, a query flood could spawn an unbounded number of
+/// tasks here (issue #515).
+const HIJACK_IN_FLIGHT: usize = 64;
+
 /// Sweep dead flow-table entries every this many datagrams.
 const SWEEP_INTERVAL: u32 = 256;
 
 /// `(payload, packet source, packet destination)` — the netstack `UdpMsg`
 /// layout, so a reply to a flow is sent as `(payload, dst, src)`.
 type ReplyMsg = (Vec<u8>, SocketAddr, SocketAddr);
+
+/// `(client source, packet destination)` — the flow-table key.
+type FlowKey = (SocketAddr, SocketAddr);
+
+/// Epoch for flow activity stamps. `Instant` cannot be shared atomically
+/// between the reader loop and flow tasks, so activity is recorded as
+/// elapsed milliseconds since this base — monotonic for the process
+/// lifetime and comparable across entries.
+static ACTIVITY_EPOCH: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+fn activity_ms() -> u64 {
+    ACTIVITY_EPOCH.elapsed().as_millis() as u64
+}
+
+/// Live flow-table entry. `last_activity` is stamped by the reader loop on
+/// every client datagram AND by the flow task on every upstream reply —
+/// a reply-mostly flow (e.g. a QUIC download mid-stream) must not look
+/// idle to the LRU eviction at `MAX_FLOWS`.
+struct FlowEntry {
+    tx: mpsc::Sender<Vec<u8>>,
+    last_activity: Arc<AtomicU64>,
+}
 
 pub(super) async fn run_udp(
     tunnel: Tunnel,
@@ -52,6 +89,7 @@ pub(super) async fn run_udp(
     udp_timeout: Duration,
     in_name: String,
     tun_net: Ipv4Net,
+    live_flows: Arc<AtomicUsize>,
 ) {
     let (write_half, mut read_half) = socket.split();
 
@@ -71,32 +109,66 @@ pub(super) async fn run_udp(
 
     // Flow table, touched only by this loop. A flow task signals its own
     // death by closing its queue; the entry is evicted lazily — on the next
-    // datagram for the tuple or by the periodic sweep below.
-    let mut flows: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Vec<u8>>> = HashMap::new();
+    // datagram for the tuple, by the periodic sweep, or by LRU eviction
+    // when the table reaches MAX_FLOWS (issue #515).
+    let mut flows: HashMap<FlowKey, FlowEntry> = HashMap::new();
     let mut sweep_countdown = SWEEP_INTERVAL;
+    let hijack_permits = Arc::new(tokio::sync::Semaphore::new(HIJACK_IN_FLIGHT));
+    let hijack_dropped = AtomicU64::new(0);
 
     while let Some((data, src, dst)) = read_half.next().await {
         if dns_hijack && dst.port() == 53 {
             let resolver = tunnel.resolver();
-            let reply_tx = reply_tx.clone();
             debug!(
                 "tun dns-hijack: recv {} bytes from {src} to {dst} | {}",
                 data.len(),
                 hex_prefix(&data, 48),
             );
-            tokio::spawn(async move {
-                match DnsServer::handle_query(&data, &resolver).await {
-                    Ok(response) => {
-                        debug!(
-                            "tun dns-hijack: reply {} bytes -> {src} | {}",
-                            response.len(),
-                            hex_prefix(&response, 48),
-                        );
-                        let _ = reply_tx.send((response, dst, src)).await;
+            // Locally-decidable queries (hosts, fake-IP, fresh cache) are
+            // answered inline — they never spend a hijack permit or a task
+            // spawn, so a warm cache can't queue behind slow upstreams.
+            match DnsServer::try_answer_local(&data, &resolver) {
+                LocalAnswer::Answer(response) => {
+                    if reply_tx.try_send((response, dst, src)).is_err() {
+                        note_hijack_drop(&hijack_dropped);
                     }
-                    Err(e) => debug!("tun dns-hijack: unanswerable query from {src}: {e}"),
+                    continue;
                 }
-            });
+                // Malformed — nothing to forward upstream either.
+                LocalAnswer::Drop => continue,
+                LocalAnswer::Upstream => {}
+            }
+            match Arc::clone(&hijack_permits).try_acquire_owned() {
+                Ok(permit) => {
+                    let reply_tx = reply_tx.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        // Panic guard — parity with the serve loop in
+                        // meow-dns: a panicked task would silently drop the
+                        // query otherwise.
+                        let outcome = AssertUnwindSafe(DnsServer::handle_query(&data, &resolver))
+                            .catch_unwind()
+                            .await;
+                        match outcome {
+                            Ok(Ok(response)) => {
+                                debug!(
+                                    "tun dns-hijack: reply {} bytes -> {src} | {}",
+                                    response.len(),
+                                    hex_prefix(&response, 48),
+                                );
+                                let _ = reply_tx.send((response, dst, src)).await;
+                            }
+                            Ok(Err(e)) => {
+                                debug!("tun dns-hijack: unanswerable query from {src}: {e}");
+                            }
+                            Err(_) => {
+                                warn!("tun dns-hijack: query task survived a panic");
+                            }
+                        }
+                    });
+                }
+                Err(_) => note_hijack_drop(&hijack_dropped),
+            }
             continue;
         }
 
@@ -108,65 +180,126 @@ pub(super) async fn run_udp(
         sweep_countdown -= 1;
         if sweep_countdown == 0 {
             sweep_countdown = SWEEP_INTERVAL;
-            flows.retain(|_, tx| !tx.is_closed());
+            flows.retain(|_, e| !e.tx.is_closed());
+            live_flows.store(flows.len(), Ordering::Relaxed);
         }
 
         let key = (src, dst);
-        let data = match flows.get(&key) {
-            Some(tx) => match tx.try_send(data) {
-                // Delivered — or queue full: the flow is alive but slow,
-                // so the datagram is dropped (UDP semantics).
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
-                // Flow task ended (idle timeout or error): evict and fall
-                // through to re-create the flow with this datagram.
-                Err(mpsc::error::TrySendError::Closed(data)) => {
-                    flows.remove(&key);
-                    data
+        let data = match flows.get_mut(&key) {
+            Some(entry) => {
+                entry.last_activity.store(activity_ms(), Ordering::Relaxed);
+                match entry.tx.try_send(data) {
+                    // Delivered — or queue full: the flow is alive but slow,
+                    // so the datagram is dropped (UDP semantics).
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
+                    // Flow task ended (idle timeout or error): evict and fall
+                    // through to re-create the flow with this datagram.
+                    Err(mpsc::error::TrySendError::Closed(data)) => {
+                        flows.remove(&key);
+                        live_flows.store(flows.len(), Ordering::Relaxed);
+                        data
+                    }
                 }
-            },
+            }
             None => data,
         };
 
+        // Admission bound: reclaim dead entries first, then evict the
+        // least-recently-active live flow.
+        if flows.len() >= MAX_FLOWS {
+            evict_for_admission(&mut flows);
+        }
+
         let (tx, rx) = mpsc::channel(FLOW_QUEUE);
         tx.try_send(data).expect("fresh flow queue has capacity");
-        flows.insert(key, tx);
+        let last_activity = Arc::new(AtomicU64::new(activity_ms()));
+        flows.insert(
+            key,
+            FlowEntry {
+                tx,
+                last_activity: Arc::clone(&last_activity),
+            },
+        );
+        live_flows.store(flows.len(), Ordering::Relaxed);
         tokio::spawn(flow_task(
             tunnel.clone(),
-            rx,
-            reply_tx.clone(),
-            src,
-            dst,
-            udp_timeout,
-            in_name.clone(),
+            FlowSpec {
+                rx,
+                reply_tx: reply_tx.clone(),
+                key,
+                udp_timeout,
+                in_name: in_name.clone(),
+                last_activity,
+            },
         ));
+    }
+    live_flows.store(0, Ordering::Relaxed);
+}
+
+/// Per-flow state handed to the spawned flow task.
+struct FlowSpec {
+    rx: mpsc::Receiver<Vec<u8>>,
+    reply_tx: mpsc::Sender<ReplyMsg>,
+    /// `(client source, packet destination)` — same layout as `FlowKey`.
+    key: FlowKey,
+    udp_timeout: Duration,
+    in_name: String,
+    last_activity: Arc<AtomicU64>,
+}
+
+/// Count a dropped hijack response and warn on a power-of-two cadence so
+/// sustained floods stay visible without a log storm (issue #515). Covers
+/// both drop shapes: in-flight cap saturation and a full reply queue.
+fn note_hijack_drop(counter: &AtomicU64) {
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        warn!(
+            "tun dns-hijack saturated: {n} responses dropped \
+             ({HIJACK_IN_FLIGHT} in-flight cap or reply queue full)"
+        );
     }
 }
 
-async fn flow_task(
-    tunnel: Tunnel,
-    rx: mpsc::Receiver<Vec<u8>>,
-    reply_tx: mpsc::Sender<ReplyMsg>,
-    src: SocketAddr,
-    dst: SocketAddr,
-    udp_timeout: Duration,
-    in_name: String,
-) {
-    if let Err(e) = relay_flow(&tunnel, rx, reply_tx, src, dst, udp_timeout, &in_name).await {
+/// Make room for one new flow entry (issue #515): dead entries are
+/// reclaimed first — closing their queue is how a finished flow task
+/// reports itself — then, if the table is still at `MAX_FLOWS`, the
+/// least-recently-active live flow is evicted. Dropping the evicted
+/// sender closes that flow's queue; its task exits through the ordinary
+/// `rx.recv() == None` shutdown path.
+fn evict_for_admission(flows: &mut HashMap<FlowKey, FlowEntry>) {
+    flows.retain(|_, e| !e.tx.is_closed());
+    if flows.len() >= MAX_FLOWS {
+        if let Some(victim) = flows
+            .iter()
+            .min_by_key(|(_, e)| e.last_activity.load(Ordering::Relaxed))
+            .map(|(k, _)| *k)
+        {
+            debug!("tun UDP flow table full: evicting LRU flow {victim:?}");
+            flows.remove(&victim);
+        }
+    }
+}
+
+async fn flow_task(tunnel: Tunnel, spec: FlowSpec) {
+    let (src, dst) = spec.key;
+    if let Err(e) = relay_flow(&tunnel, spec).await {
         debug!("tun UDP {src} -> {dst}: {e}");
     }
 }
 
 /// Route the flow, dial the outbound, then pump datagrams both ways until
-/// `udp_timeout` passes with no traffic in either direction.
-async fn relay_flow(
-    tunnel: &Tunnel,
-    mut rx: mpsc::Receiver<Vec<u8>>,
-    reply_tx: mpsc::Sender<ReplyMsg>,
-    src: SocketAddr,
-    dst: SocketAddr,
-    udp_timeout: Duration,
-    in_name: &str,
-) -> Result<(), String> {
+/// `udp_timeout` passes with no traffic in either direction. `last_activity`
+/// is the table entry's shared stamp — every upstream reply refreshes it so
+/// a reply-mostly flow is not mistaken for idle by LRU eviction.
+async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
+    let FlowSpec {
+        mut rx,
+        reply_tx,
+        key: (src, dst),
+        udp_timeout,
+        in_name,
+        last_activity,
+    } = spec;
     let mut metadata = Metadata {
         network: Network::Udp,
         conn_type: ConnType::Tun,
@@ -201,7 +334,7 @@ async fn relay_flow(
         rule_name,
         rule_payload,
         route: _route,
-    }) = inner.resolve_proxy(&metadata)
+    }) = inner.resolve_proxy(&metadata).await
     else {
         return Err(format!(
             "no matching rule for {}",
@@ -275,6 +408,7 @@ async fn relay_flow(
                     if reply_tx.send((data, dst, src)).await.is_err() {
                         break Ok(()); // stack writer gone — listener shutdown
                     }
+                    last_activity.store(activity_ms(), Ordering::Relaxed);
                     idle.as_mut().reset(Instant::now() + udp_timeout);
                 }
                 // The reader task exited — it owns the only `up_tx`. The
@@ -310,9 +444,91 @@ pub(super) fn is_looping_dst(dst: std::net::IpAddr, tun_net: Ipv4Net) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_looping_dst;
+    use super::{evict_for_admission, is_looping_dst, FlowEntry, MAX_FLOWS};
     use ipnet::Ipv4Net;
-    use std::net::IpAddr;
+    use std::collections::HashMap;
+    use std::net::{IpAddr, SocketAddr};
+
+    /// Build a flow table holding `live` live entries plus `dead` entries
+    /// whose receiver was dropped (channel closed). Live entries are kept
+    /// alive via `keepers`. Activity stamps increase with the loop index —
+    /// index 0 is the least recently active.
+    fn seeded_table(
+        live: usize,
+        dead: usize,
+    ) -> (
+        HashMap<super::FlowKey, FlowEntry>,
+        Vec<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    ) {
+        let mut flows = HashMap::new();
+        let mut keepers = Vec::new();
+        for i in 0..(live + dead) {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            if i < live {
+                keepers.push(rx);
+            } // dead entries: receiver dropped immediately
+            let src: SocketAddr = ([10, 0, 0, 1], 10000 + i as u16).into();
+            let dst: SocketAddr = ([8, 8, 8, 8], 53).into();
+            flows.insert(
+                (src, dst),
+                FlowEntry {
+                    tx,
+                    last_activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(i as u64)),
+                },
+            );
+        }
+        (flows, keepers)
+    }
+
+    #[test]
+    fn evict_for_admission_reclaims_dead_before_touching_live() {
+        let (mut flows, _keepers) = seeded_table(MAX_FLOWS - 1, 3);
+        evict_for_admission(&mut flows);
+        assert_eq!(flows.len(), MAX_FLOWS - 1, "only dead entries removed");
+    }
+
+    #[test]
+    fn evict_for_admission_evicts_least_recently_active() {
+        let (mut flows, _keepers) = seeded_table(MAX_FLOWS, 0);
+        // seeded_table stamps index 0 as least-recently-active.
+        let oldest_key: super::FlowKey = (([10, 0, 0, 1], 10000).into(), ([8, 8, 8, 8], 53).into());
+        evict_for_admission(&mut flows);
+        assert_eq!(flows.len(), MAX_FLOWS - 1);
+        assert!(
+            !flows.contains_key(&oldest_key),
+            "the least-recently-active live flow must be the victim"
+        );
+        // A live flow whose shared stamp is refreshed by an upstream reply
+        // must outrank a stale one (issue #515: reply-side activity counts).
+        let (mut flows, _keepers) = seeded_table(2, 0);
+        flows
+            .values_mut()
+            .next()
+            .unwrap()
+            .last_activity
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        evict_for_admission(&mut flows);
+        assert_eq!(flows.len(), 2, "below cap: refreshed flow untouched");
+    }
+
+    #[test]
+    fn evicted_flow_sender_close_tears_down_task() {
+        // The eviction mechanism contract: removing the entry drops the
+        // Sender, which ends the flow task's `rx.recv()` — the existing
+        // shutdown path; no separate kill signal is needed.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        assert!(tx.try_send(vec![1]).is_ok());
+        drop(tx);
+        assert_eq!(
+            rx.try_recv().unwrap().as_slice(),
+            &[1],
+            "queued datagram drains first"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
 
     #[tokio::test]
     async fn udp_port_53_obeys_reject_rule_without_hijack() {
@@ -322,12 +538,17 @@ mod tests {
             let (reply_tx, _reply_rx) = tokio::sync::mpsc::channel(1);
             let result = super::relay_flow(
                 &tunnel,
-                rx,
-                reply_tx,
-                "127.0.0.1:12345".parse().unwrap(),
-                ([127, 0, 0, 1], port).into(),
-                std::time::Duration::from_millis(100),
-                "tun",
+                super::FlowSpec {
+                    rx,
+                    reply_tx,
+                    key: (
+                        "127.0.0.1:12345".parse().unwrap(),
+                        ([127, 0, 0, 1], port).into(),
+                    ),
+                    udp_timeout: std::time::Duration::from_millis(100),
+                    in_name: "tun".to_string(),
+                    last_activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                },
             )
             .await;
             assert!(result.unwrap_err().contains("rejected"));

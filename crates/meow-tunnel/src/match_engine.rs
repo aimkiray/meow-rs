@@ -1,5 +1,6 @@
 use meow_common::{
-    find_process, Metadata, Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe,
+    find_process, find_process_async, Metadata, Rule, RuleMatchHelper, RuleType, TargetCheck,
+    TargetProbe,
 };
 use meow_trie::DomainTrie;
 use std::net::SocketAddr;
@@ -230,6 +231,26 @@ fn warn_missing_target(adapter_name: &str, rule: &dyn Rule) {
     );
 }
 
+/// Async counterpart of [`maybe_enrich_with_process`]: the platform socket
+/// scan runs on the blocking pool so a large `/proc` table cannot stall the
+/// Tokio worker the match executes on (issue #515).
+pub async fn maybe_enrich_with_process_async(metadata: &Metadata) -> Option<Metadata> {
+    if !metadata.process.is_empty() {
+        return None;
+    }
+    let src_ip = metadata.src_ip?;
+    if metadata.src_port == 0 {
+        return None;
+    }
+    let local = SocketAddr::new(src_ip, metadata.src_port);
+    let info = find_process_async(metadata.network, local).await?;
+    Some(enriched_with_process(metadata, local, info))
+}
+
+/// Synchronous variant retained for non-async callers and tests. Async
+/// callers MUST use [`maybe_enrich_with_process_async`]: the platform
+/// socket scan can walk a large `/proc` tree and would stall the Tokio
+/// worker this runs on (issue #515).
 pub fn maybe_enrich_with_process(metadata: &Metadata) -> Option<Metadata> {
     if !metadata.process.is_empty() {
         return None;
@@ -240,6 +261,14 @@ pub fn maybe_enrich_with_process(metadata: &Metadata) -> Option<Metadata> {
     }
     let local = SocketAddr::new(src_ip, metadata.src_port);
     let info = find_process(metadata.network, local)?;
+    Some(enriched_with_process(metadata, local, info))
+}
+
+fn enriched_with_process(
+    metadata: &Metadata,
+    local: SocketAddr,
+    info: meow_common::ProcessInfo,
+) -> Metadata {
     trace!(
         name = %info.name,
         path = %info.path,
@@ -253,7 +282,7 @@ pub fn maybe_enrich_with_process(metadata: &Metadata) -> Option<Metadata> {
     if enriched.uid.is_none() {
         enriched.uid = info.uid;
     }
-    Some(enriched)
+    enriched
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -307,6 +336,40 @@ mod tests {
             .expect("engine must return a match");
         assert_eq!(result.adapter_name, "Proxy");
         assert_eq!(result.rule_type.as_str(), "PROCESS-NAME");
+    }
+
+    #[tokio::test]
+    async fn async_enrich_matches_sync_result() {
+        // The async variant must produce the same enrichment as the sync
+        // one — it only moves the platform scan to the blocking pool.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap();
+        let meta = base_metadata(local);
+
+        let sync = maybe_enrich_with_process(&meta);
+        let async_ = maybe_enrich_with_process_async(&meta).await;
+        match (sync, async_) {
+            (Some(s), Some(a)) => {
+                assert_eq!(a.process, s.process);
+                assert_eq!(a.process_path, s.process_path);
+                assert_eq!(a.uid, s.uid);
+            }
+            (None, None) => {} // lookup unsupported/missed — still parity
+            (s, a) => panic!("sync/async enrichment diverged: {s:?} vs {a:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn async_enrich_respects_guards() {
+        // Process already set → no lookup; missing src → no lookup.
+        let mut meta = base_metadata("127.0.0.1:1".parse().unwrap());
+        meta.process = "known".into();
+        assert!(maybe_enrich_with_process_async(&meta).await.is_none());
+        let mut meta = base_metadata("127.0.0.1:1".parse().unwrap());
+        meta.src_ip = None;
+        assert!(maybe_enrich_with_process_async(&meta).await.is_none());
+        meta.src_port = 0;
+        assert!(maybe_enrich_with_process_async(&meta).await.is_none());
     }
 
     #[test]

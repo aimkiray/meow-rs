@@ -45,6 +45,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 libc = "0.2"
 smallvec = { workspace = true }
+smol_str = { workspace = true }
 tun-rs = { workspace = true, optional = true }
 lwip = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }

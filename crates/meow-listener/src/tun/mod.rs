@@ -208,11 +208,16 @@ pub enum TunRouteScope {
 /// Allows callers to distinguish immediate setup failure from a timeout
 /// without waiting for the full `TUN_STARTUP_TIMEOUT`.
 pub enum TunReady {
-    /// Device + stack + child tasks are fully initialized. The payload is
-    /// the lwIP core's done signal — it flips `true` once that generation's
-    /// teardown fully completes, which the owner must await before
-    /// permitting a successor stack (issue #514).
-    Ready(tokio::sync::watch::Receiver<bool>),
+    /// Device + stack + child tasks are fully initialized.
+    Ready {
+        /// The lwIP core's done signal — it flips `true` once that
+        /// generation's teardown fully completes, which the owner must
+        /// await before permitting a successor stack (issue #514).
+        core_done: tokio::sync::watch::Receiver<bool>,
+        /// Live UDP flow-table occupancy — written by the UDP read loop,
+        /// readable at any time for observability (issue #515).
+        udp_flows: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    },
     /// Setup failed before reaching the accept loop.  The String carries
     /// the underlying error message so callers can surface it directly.
     Failed(String),
@@ -236,10 +241,17 @@ impl ReadyNotifier {
     }
 
     /// Consume the notifier and send `TunReady::Ready` carrying the lwIP
-    /// core's done signal.
-    fn ready(mut self, core_done: tokio::sync::watch::Receiver<bool>) {
+    /// core's done signal and the UDP flow-table gauge.
+    fn ready(
+        mut self,
+        core_done: tokio::sync::watch::Receiver<bool>,
+        udp_flows: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(TunReady::Ready(core_done));
+            let _ = tx.send(TunReady::Ready {
+                core_done,
+                udp_flows,
+            });
         } else {
             tracing::warn!("ReadyNotifier::ready called but tx was already None");
         }
@@ -688,6 +700,9 @@ impl TunListener {
         let (mut pump_in, mut pump_out) = device::spawn_pumps(device, stack);
         tasks.push(&pump_in);
         tasks.push(&pump_out);
+        // Live UDP flow-table occupancy, readable via `TunReady::Ready` →
+        // `TunHandle` for observability (issue #515).
+        let udp_flows = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tasks.spawn(udp::run_udp(
             self.tunnel.clone(),
             udp_socket,
@@ -695,6 +710,7 @@ impl TunListener {
             cfg.udp_timeout,
             self.name.clone(),
             cfg.inet4_address,
+            std::sync::Arc::clone(&udp_flows),
         ));
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -721,7 +737,7 @@ impl TunListener {
         // return from this function sends `TunReady::Failed` (with the
         // real error) from `run` instead.
         if let Some(notifier) = notifier.take() {
-            notifier.ready(core_done.clone());
+            notifier.ready(core_done.clone(), udp_flows);
             debug!("TUN listener '{}' readiness signalled", self.name);
         }
 

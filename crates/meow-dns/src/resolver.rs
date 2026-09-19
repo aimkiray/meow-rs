@@ -362,6 +362,17 @@ pub(crate) enum AddressLookupResult {
     Failed,
 }
 
+/// Outcome of the synchronous, upstream-free portion of a family lookup
+/// (`lookup_ipv4_local` / `lookup_ipv6_local`).
+pub(crate) enum LocalLookup<'a> {
+    /// Fully answered without an upstream round-trip (hosts, fake-IP, or a
+    /// fresh cache entry).
+    Decided(AddressLookupResult),
+    /// Requires the upstream pipeline, queried under this name — the
+    /// queried host itself, or a hosts-alias target.
+    Upstream(&'a str),
+}
+
 impl FamilySet {
     /// True when at least one queried family has a non-empty answer — the
     /// signal that a pool/tier result is a positive resolution.
@@ -1149,20 +1160,25 @@ impl Resolver {
         }
     }
 
-    pub(crate) async fn lookup_ipv4_result(&self, host: &str) -> AddressLookupResult {
+    /// The synchronously-decidable prefix of [`Self::lookup_ipv4_result`]:
+    /// hosts trie, fake-IP synthesis, and fresh cache entries. The DNS
+    /// serve loop uses this to answer warm queries inline instead of
+    /// queueing them behind slow upstream lookups (issue #515).
+    pub(crate) fn lookup_ipv4_local<'a>(&'a self, host: &'a str) -> LocalLookup<'a> {
         if self.use_hosts {
             match self.lookup_hosts_entry(host) {
                 Some(HostsLookup::Addresses(ips)) => {
-                    return ips
-                        .iter()
-                        .find(|ip| ip.is_ipv4())
-                        .copied()
-                        .map_or(AddressLookupResult::NoData, |ip| {
-                            AddressLookupResult::Answer(ip, HOSTS_ANSWER_TTL)
-                        });
+                    return LocalLookup::Decided(
+                        ips.iter()
+                            .find(|ip| ip.is_ipv4())
+                            .copied()
+                            .map_or(AddressLookupResult::NoData, |ip| {
+                                AddressLookupResult::Answer(ip, HOSTS_ANSWER_TTL)
+                            }),
+                    );
                 }
                 Some(HostsLookup::Alias(alias)) => {
-                    return self.lookup_real_with_ttl(alias, RecordType::A).await;
+                    return LocalLookup::Upstream(alias);
                 }
                 None => {}
             }
@@ -1173,11 +1189,25 @@ impl Resolver {
         if self.mode == DnsMode::FakeIp {
             if let Some(pool) = &self.fakeip_v4 {
                 if !self.skipper_bypasses(host) {
-                    return AddressLookupResult::Answer(pool.lookup(host), self.fakeip_ttl);
+                    return LocalLookup::Decided(AddressLookupResult::Answer(
+                        pool.lookup(host),
+                        self.fakeip_ttl,
+                    ));
                 }
             }
         }
-        self.lookup_real_with_ttl(host, RecordType::A).await
+        if let Some(hit) = self.fresh_family_hit(host, QueryFamilies::IPV4) {
+            return LocalLookup::Decided(hit);
+        }
+        LocalLookup::Upstream(host)
+    }
+
+    pub(crate) async fn lookup_ipv4_result(&self, host: &str) -> AddressLookupResult {
+        let target = match self.lookup_ipv4_local(host) {
+            LocalLookup::Decided(r) => return r,
+            LocalLookup::Upstream(name) => name,
+        };
+        self.lookup_real_with_ttl(target, RecordType::A).await
     }
 
     pub async fn lookup_ipv6(&self, host: &str) -> Option<IpAddr> {
@@ -1194,23 +1224,27 @@ impl Resolver {
         }
     }
 
-    pub(crate) async fn lookup_ipv6_result(&self, host: &str) -> AddressLookupResult {
+    /// The synchronously-decidable prefix of [`Self::lookup_ipv6_result`]:
+    /// IPv6-disable short-circuit, hosts trie, fake-IP synthesis, and fresh
+    /// cache entries (issue #515).
+    pub(crate) fn lookup_ipv6_local<'a>(&'a self, host: &'a str) -> LocalLookup<'a> {
         if !self.ipv6 {
-            return AddressLookupResult::NoData;
+            return LocalLookup::Decided(AddressLookupResult::NoData);
         }
         if self.use_hosts {
             match self.lookup_hosts_entry(host) {
                 Some(HostsLookup::Addresses(ips)) => {
-                    return ips
-                        .iter()
-                        .find(|ip| ip.is_ipv6())
-                        .copied()
-                        .map_or(AddressLookupResult::NoData, |ip| {
-                            AddressLookupResult::Answer(ip, HOSTS_ANSWER_TTL)
-                        });
+                    return LocalLookup::Decided(
+                        ips.iter()
+                            .find(|ip| ip.is_ipv6())
+                            .copied()
+                            .map_or(AddressLookupResult::NoData, |ip| {
+                                AddressLookupResult::Answer(ip, HOSTS_ANSWER_TTL)
+                            }),
+                    );
                 }
                 Some(HostsLookup::Alias(alias)) => {
-                    return self.lookup_real_with_ttl(alias, RecordType::AAAA).await;
+                    return LocalLookup::Upstream(alias);
                 }
                 None => {}
             }
@@ -1222,14 +1256,45 @@ impl Resolver {
         if self.mode == DnsMode::FakeIp {
             if let Some(pool) = &self.fakeip_v6 {
                 if !self.skipper_bypasses(host) {
-                    return AddressLookupResult::Answer(pool.lookup(host), self.fakeip_ttl);
+                    return LocalLookup::Decided(AddressLookupResult::Answer(
+                        pool.lookup(host),
+                        self.fakeip_ttl,
+                    ));
                 }
             } else if self.fakeip_v4.is_some() && !self.skipper_bypasses(host) {
                 // v4-only fake-ip config: suppress AAAA so clients fall back.
-                return AddressLookupResult::NoData;
+                return LocalLookup::Decided(AddressLookupResult::NoData);
             }
         }
-        self.lookup_real_with_ttl(host, RecordType::AAAA).await
+        if let Some(hit) = self.fresh_family_hit(host, QueryFamilies::IPV6) {
+            return LocalLookup::Decided(hit);
+        }
+        LocalLookup::Upstream(host)
+    }
+
+    pub(crate) async fn lookup_ipv6_result(&self, host: &str) -> AddressLookupResult {
+        let target = match self.lookup_ipv6_local(host) {
+            LocalLookup::Decided(r) => return r,
+            LocalLookup::Upstream(name) => name,
+        };
+        self.lookup_real_with_ttl(target, RecordType::AAAA).await
+    }
+
+    /// Fresh cache hit for one family — `None` when the cache cannot answer
+    /// and the caller must run the upstream pipeline.
+    fn fresh_family_hit(&self, host: &str, family: QueryFamilies) -> Option<AddressLookupResult> {
+        let cached = self.cache.get_lookup(host)?;
+        let hit = if family == QueryFamilies::IPV4 {
+            &cached.v4
+        } else {
+            &cached.v6
+        };
+        match hit {
+            FamilyCacheHit::Answer(ips, ttl) => Some(AddressLookupResult::Answer(ips[0], *ttl)),
+            FamilyCacheHit::NoData => Some(AddressLookupResult::NoData),
+            FamilyCacheHit::NxDomain => Some(AddressLookupResult::NxDomain),
+            FamilyCacheHit::Miss => None,
+        }
     }
 
     /// Cache-then-upstream address lookup carrying the answer TTL. A cache hit

@@ -636,6 +636,27 @@ the canonical, in-repo source a release is cut from.
   `Tunnel::set_dialer_registry(config.provider_dialer_registry.clone())`
   once at startup — skipping it leaves every provider-sourced `dialer-proxy`
   chain failing closed at dial time.
+- **Four queueing/capacity hazards closed across the UDP and DNS hot
+  paths.** (a) SOCKS5-UDP session establishment (resolve → route →
+  `dial_udp`) no longer runs inline on the association read loop — each
+  destination gets a task fed by a bounded per-session queue (64
+  datagrams), so one slow destination can no longer stall every other
+  destination; per-destination ordering is preserved and the table is
+  capped at 1024 sessions with least-recently-active eviction. (b) The
+  DNS server replaced its fixed 4-worker pool with answer-inline fast
+  paths — hosts, fake-IP, fresh cache hits, and IPv6-disabled AAAA are
+  served on the receive loop — plus one task per upstream-bound query
+  under a 512-permit semaphore; saturation drops are now counted
+  (`BoundDnsServer::dropped_queries`) and warn-logged on a power-of-two
+  cadence instead of being silently discarded. (c) The TUN UDP flow
+  table is bounded (1024 flows, dead-first then LRU eviction) and
+  `dns-hijack` answers are bounded (64 in flight) with locally-decidable
+  queries answered inline; live flow occupancy is exposed via
+  `TunHandle::udp_flows` / `Tunnel::tun_udp_flow_count`. (d) PROCESS-*
+  rule enrichment no longer runs the synchronous `/proc`/`libproc`
+  socket scan on Tokio workers — it offloads to the blocking pool, and
+  on Linux a 100 ms socket-table cache plus a 1 s inode→process cache
+  (4096-entry cap) turn bursts into map hits. (#515)
 
 - **TLS handshakes no longer fail on multiplexed transports whose
   `poll_flush` pends.** Every TLS-over-mux handshake — AnyTLS, smux, and any

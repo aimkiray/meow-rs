@@ -197,7 +197,7 @@ pub async fn handle_udp(
         rule_name,
         rule_payload,
         route: _route,
-    }) = tunnel.resolve_proxy(&metadata)
+    }) = tunnel.resolve_proxy(&metadata).await
     else {
         warn!("no matching rule for UDP {}", metadata.remote_address());
         return;

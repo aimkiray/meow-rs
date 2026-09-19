@@ -18,37 +18,97 @@ pub struct ProcessInfo {
 /// Look up the process that owns the socket bound to `local_addr`. `local_addr`
 /// is the socket endpoint as seen by meow-rs's inbound — i.e. the client's
 /// source address when it connected to the proxy listener.
+///
+/// This is a synchronous scan of OS tables (`/proc`, `libproc`,
+/// `GetExtended*Table`); callers on an async runtime should prefer
+/// [`find_process_async`], which offloads it to the blocking pool.
 pub fn find_process(network: Network, local_addr: SocketAddr) -> Option<ProcessInfo> {
     platform::find_process(network, local_addr)
+}
+
+/// Async counterpart of [`find_process`]: the platform scan is synchronous
+/// and can cost milliseconds on hosts with large socket tables — running it
+/// on a Tokio worker stalls every task sharing that worker (issue #515).
+/// Offloads to the blocking pool; the Linux impl additionally serves most
+/// lookups from short-TTL caches, so the offload is usually a map hit.
+pub async fn find_process_async(network: Network, local_addr: SocketAddr) -> Option<ProcessInfo> {
+    match tokio::task::spawn_blocking(move || find_process(network, local_addr)).await {
+        Ok(info) => info,
+        Err(e) => {
+            // spawn_blocking tasks are never cancelled, so a JoinError is a
+            // panic in the platform scan — surface it, then report no match
+            // (rules fall through as if the process were unknown).
+            tracing::warn!("process lookup task failed: {e}");
+            None
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{Network, ProcessInfo, SocketAddr};
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
     use std::fs;
     use std::io::Read;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::PathBuf;
+    use std::sync::{Arc, OnceLock};
+    use std::time::{Duration, Instant};
     use tracing::trace;
 
+    /// Short-TTL caches bounding the synchronous /proc work (issue #515).
+    ///
+    /// - `SOCK_TABLES`: one parsed `/proc/net/{tcp,tcp6,udp,udp6}` shared by
+    ///   every lookup within `TABLE_TTL`, so a burst of concurrent
+    ///   connections pays for a single scan instead of one scan each.
+    /// - `INODE_MAP`: the `/proc/<pid>/fd` walk is the expensive half; cached
+    ///   per inode for `INODE_TTL`.
+    ///
+    /// Staleness contract: a hit reports the owner of the endpoint as of at
+    /// most TTL ago. `TABLE_TTL` bounds the window in which a reused
+    /// ephemeral port could misattribute a process; `INODE_TTL` is longer
+    /// because inode→pid only misleads if a socket is closed and its inode
+    /// number recycled into a *different* process's socket within the
+    /// window — rare, and the table revalidates that the inode is still a
+    /// live socket before the cached owner is trusted.
+    const TABLE_TTL: Duration = Duration::from_millis(100);
+    const INODE_TTL: Duration = Duration::from_secs(1);
+    /// Bound on cached inode entries; cleared wholesale past this so a host
+    /// with extreme socket churn cannot grow the map without bound.
+    const INODE_CACHE_CAP: usize = 4096;
+
+    /// port → list of (local addr, inode, uid). Keyed by port because the
+    /// target port filters nearly every row out before address matching.
+    type SockTable = HashMap<u16, Vec<(IpAddr, u64, u32)>>;
+
+    struct CachedTable {
+        at: Instant,
+        map: std::sync::Arc<SockTable>,
+    }
+
+    /// Slots indexed `[network as usize][is_ipv6 as usize]`.
+    static SOCK_TABLES: OnceLock<Mutex<[[Option<CachedTable>; 2]; 2]>> = OnceLock::new();
+    static INODE_MAP: OnceLock<Mutex<HashMap<u64, (Instant, Option<(u32, String, String)>)>>> =
+        OnceLock::new();
+
     pub fn find_process(network: Network, local: SocketAddr) -> Option<ProcessInfo> {
-        let (files, ipv6) = match (network, local.is_ipv4()) {
-            (Network::Tcp, true) => (vec!["/proc/net/tcp"], false),
-            (Network::Tcp, false) => (vec!["/proc/net/tcp6"], true),
-            (Network::Udp, true) => (vec!["/proc/net/udp"], false),
-            (Network::Udp, false) => (vec!["/proc/net/udp6"], true),
+        let (table_idx, path, ipv6) = match (network, local.is_ipv4()) {
+            (Network::Tcp, true) => (0, "/proc/net/tcp", false),
+            (Network::Tcp, false) => (0, "/proc/net/tcp6", true),
+            (Network::Udp, true) => (1, "/proc/net/udp", false),
+            (Network::Udp, false) => (1, "/proc/net/udp6", true),
         };
 
-        let mut inode_uid = None;
-        for path in &files {
-            if let Some(pair) = scan_proc_net(path, local, ipv6) {
-                inode_uid = Some(pair);
-                break;
-            }
-        }
-        let (inode, uid) = inode_uid?;
+        let table = sock_table(table_idx, path, ipv6);
+        let (inode, uid) = table
+            .get(&local.port())
+            .into_iter()
+            .flatten()
+            .find(|(addr, _, _)| addr_matches(*addr, local.ip()))
+            .map(|(_, inode, uid)| (*inode, *uid))?;
         trace!(inode, uid, "process_lookup: matched /proc/net entry");
-        let (_pid, name, exe) = find_pid_by_inode(inode)?;
+        let (_pid, name, exe) = find_pid_by_inode_cached(inode)?;
         Some(ProcessInfo {
             name,
             path: exe,
@@ -56,35 +116,80 @@ mod platform {
         })
     }
 
-    fn scan_proc_net(path: &str, target: SocketAddr, ipv6: bool) -> Option<(u64, u32)> {
+    /// Return the socket table for `(network, family)`, refreshing it from
+    /// /proc when the cached snapshot is older than `TABLE_TTL`. The map is
+    /// `Arc`-shared so a hit clones a pointer, not the table. A failed read
+    /// caches an empty table so the TTL also bounds retry pressure on a
+    /// host where /proc is unreadable (lookups report "no process", same
+    /// observable result as before).
+    fn sock_table(idx: usize, path: &str, ipv6: bool) -> Arc<SockTable> {
+        let tables = SOCK_TABLES.get_or_init(|| Mutex::new(Default::default()));
+        let mut guard = tables.lock();
+        let slot = &mut guard[idx][usize::from(ipv6)];
+        let stale = slot.as_ref().is_none_or(|t| t.at.elapsed() > TABLE_TTL);
+        if stale {
+            *slot = Some(CachedTable {
+                at: Instant::now(),
+                map: Arc::new(parse_proc_net(path, ipv6).unwrap_or_default()),
+            });
+        }
+        Arc::clone(&slot.as_ref().expect("slot just populated").map)
+    }
+
+    /// Parse a `/proc/net/{tcp,udp}{,6}` table into a port-keyed map.
+    /// Returns `None` when the file cannot be read at all (treated as a
+    /// lookup miss, same as before — the caller reports "no process").
+    fn parse_proc_net(path: &str, ipv6: bool) -> Option<SockTable> {
         let mut buf = String::new();
         fs::File::open(path).ok()?.read_to_string(&mut buf).ok()?;
+        let mut map = SockTable::new();
         // Header is the first line; data starts on line 2.
         for line in buf.lines().skip(1) {
+            // local_address is col 1, uid col 7, inode col 9 for the
+            // tcp/udp tables.
             let cols: Vec<&str> = line.split_whitespace().collect();
-            // local_address is col 1, uid col 7, inode col 9 for the tcp/udp tables.
             if cols.len() < 10 {
                 continue;
             }
             let local = cols[1];
-            let (addr_hex, port_hex) = local.split_once(':')?;
-            let port = u16::from_str_radix(port_hex, 16).ok()?;
-            if port != target.port() {
+            let Some((addr_hex, port_hex)) = local.split_once(':') else {
                 continue;
-            }
-            let addr = if ipv6 {
-                parse_hex_ipv6(addr_hex)?
-            } else {
-                parse_hex_ipv4(addr_hex)?
             };
-            if !addr_matches(addr, target.ip()) {
+            let Ok(port) = u16::from_str_radix(port_hex, 16) else {
                 continue;
-            }
-            let uid: u32 = cols[7].parse().ok()?;
-            let inode: u64 = cols[9].parse().ok()?;
-            return Some((inode, uid));
+            };
+            let Some(addr) = (if ipv6 {
+                parse_hex_ipv6(addr_hex)
+            } else {
+                parse_hex_ipv4(addr_hex)
+            }) else {
+                continue;
+            };
+            let (Ok(uid), Ok(inode)) = (cols[7].parse::<u32>(), cols[9].parse::<u64>()) else {
+                continue;
+            };
+            map.entry(port).or_default().push((addr, inode, uid));
         }
-        None
+        Some(map)
+    }
+
+    fn find_pid_by_inode_cached(inode: u64) -> Option<(u32, String, String)> {
+        let cache = INODE_MAP.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some((at, cached)) = cache.lock().get(&inode) {
+            if at.elapsed() <= INODE_TTL {
+                return cached.clone();
+            }
+        }
+        // Walk outside the lock: a concurrent miss may duplicate one scan,
+        // which beats serializing every lookup behind the /proc/*/fd
+        // traversal (the expensive half the cache exists to amortize).
+        let found = find_pid_by_inode(inode);
+        let mut guard = cache.lock();
+        if guard.len() >= INODE_CACHE_CAP {
+            guard.clear();
+        }
+        guard.insert(inode, (Instant::now(), found.clone()));
+        found
     }
 
     fn parse_hex_ipv4(s: &str) -> Option<IpAddr> {
@@ -618,5 +723,21 @@ mod tests {
         // Port 1 is reserved and should not be bound by any test-run process.
         let fake = "127.0.0.1:1".parse().unwrap();
         assert!(find_process(Network::Tcp, fake).is_none());
+    }
+
+    /// The blocking-pool wrapper must return exactly what the synchronous
+    /// scan returns for the same endpoint (issue #515).
+    #[tokio::test]
+    async fn find_process_async_parity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sync = find_process(Network::Tcp, addr);
+        let async_result = find_process_async(Network::Tcp, addr).await;
+        assert_eq!(sync.is_some(), async_result.is_some());
+        if let (Some(s), Some(a)) = (sync, async_result) {
+            assert_eq!(s.name, a.name);
+            assert_eq!(s.path, a.path);
+            assert_eq!(s.uid, a.uid);
+        }
     }
 }

@@ -1150,11 +1150,15 @@ async fn run(
             // notifier sends `TunReady::Failed` immediately — no timeout
             // wait.  Only a genuinely stuck setup hits the timeout.
             match tokio::time::timeout(meow_api::TUN_STARTUP_TIMEOUT, ready_rx).await {
-                Ok(Ok(meow_listener::TunReady::Ready(core_done))) => {
+                Ok(Ok(meow_listener::TunReady::Ready {
+                    core_done,
+                    udp_flows,
+                })) => {
                     tunnel
                         .set_tun_handle(meow_tunnel::TunHandle {
                             task: handle,
                             core_done: Some(core_done),
+                            udp_flows,
                         })
                         .await;
                 }

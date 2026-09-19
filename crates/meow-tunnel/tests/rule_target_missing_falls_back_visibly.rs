@@ -56,8 +56,8 @@ fn tunnel_with_ghost_target() -> Tunnel {
     tunnel
 }
 
-#[test]
-fn a_matched_rule_with_a_missing_target_is_skipped_to_the_tail() {
+#[tokio::test]
+async fn a_matched_rule_with_a_missing_target_is_skipped_to_the_tail() {
     let tunnel = tunnel_with_ghost_target();
 
     let ResolvedTarget {
@@ -68,6 +68,7 @@ fn a_matched_rule_with_a_missing_target_is_skipped_to_the_tail() {
     } = tunnel
         .inner()
         .resolve_proxy(&metadata())
+        .await
         .expect("the no-match tail always resolves");
 
     // The MATCH was skipped, not honored: nothing matched, so the reported
@@ -77,12 +78,13 @@ fn a_matched_rule_with_a_missing_target_is_skipped_to_the_tail() {
     assert_eq!(proxy.adapter_type(), AdapterType::Direct);
 }
 
-#[test]
-fn a_skipped_match_does_not_count_as_a_rule_hit() {
+#[tokio::test]
+async fn a_skipped_match_does_not_count_as_a_rule_hit() {
     let tunnel = tunnel_with_ghost_target();
     tunnel
         .inner()
         .resolve_proxy(&metadata())
+        .await
         .expect("the no-match tail always resolves");
 
     assert!(
@@ -93,8 +95,8 @@ fn a_skipped_match_does_not_count_as_a_rule_hit() {
 
 /// The parity case: `DOMAIN,ads.x,ghost` followed by `DOMAIN,ads.x,REJECT`
 /// must refuse the connection, not silently direct-dial it.
-#[test]
-fn a_later_rule_still_matches_after_a_skipped_dead_target() {
+#[tokio::test]
+async fn a_later_rule_still_matches_after_a_skipped_dead_target() {
     let tunnel = tunnel_with_builtin_registry();
     let rules: Vec<Box<dyn Rule>> = vec![
         Box::new(meow_rules::domain::DomainRule::new(
@@ -113,6 +115,7 @@ fn a_later_rule_still_matches_after_a_skipped_dead_target() {
     } = tunnel
         .inner()
         .resolve_proxy(&metadata())
+        .await
         .expect("the FINAL rule resolves");
 
     assert_eq!(rule, "MATCH");
@@ -147,8 +150,8 @@ async fn the_lazy_resolve_path_skips_the_same_way() {
     );
 }
 
-#[test]
-fn a_target_the_registry_holds_is_used_as_is() {
+#[tokio::test]
+async fn a_target_the_registry_holds_is_used_as_is() {
     let tunnel = tunnel_with_builtin_registry();
     let rules: Vec<Box<dyn Rule>> = vec![Box::new(FinalRule::new("REJECT-DROP"))];
     tunnel.update_rules(rules);
@@ -161,6 +164,7 @@ fn a_target_the_registry_holds_is_used_as_is() {
     } = tunnel
         .inner()
         .resolve_proxy(&metadata())
+        .await
         .expect("a MATCH rule always resolves");
 
     assert_eq!(proxy.adapter_type(), AdapterType::RejectDrop);
@@ -171,8 +175,8 @@ fn a_target_the_registry_holds_is_used_as_is() {
     );
 }
 
-#[test]
-fn a_rule_naming_direct_needs_no_registry_entry() {
+#[tokio::test]
+async fn a_rule_naming_direct_needs_no_registry_entry() {
     // DIRECT is a built-in the tunnel owns an adapter for, so a rule naming it
     // must resolve even before any registry snapshot has been published — and
     // must not be reported as a fallback, because it is the intended target.
@@ -189,6 +193,7 @@ fn a_rule_naming_direct_needs_no_registry_entry() {
     } = tunnel
         .inner()
         .resolve_proxy(&metadata())
+        .await
         .expect("a MATCH rule always resolves");
 
     assert_eq!(proxy.adapter_type(), AdapterType::Direct);
@@ -198,8 +203,8 @@ fn a_rule_naming_direct_needs_no_registry_entry() {
     );
 }
 
-#[test]
-fn no_rule_matching_still_falls_through_to_direct() {
+#[tokio::test]
+async fn no_rule_matching_still_falls_through_to_direct() {
     // Nothing matching at all is the ordinary end of the rule list, which has
     // never touched the match counters.
     let tunnel = tunnel_with_builtin_registry();
@@ -214,6 +219,7 @@ fn no_rule_matching_still_falls_through_to_direct() {
     } = tunnel
         .inner()
         .resolve_proxy(&metadata())
+        .await
         .expect("the no-match path still yields DIRECT");
 
     assert_eq!(rule, "Final");
@@ -226,8 +232,8 @@ fn no_rule_matching_still_falls_through_to_direct() {
 
 /// mihomo's `match()` runs a second `continue` for UDP flows: a matched rule
 /// whose target lacks `SupportUDP()` is skipped, not dialed to failure.
-#[test]
-fn udp_flow_skips_a_target_without_udp_support() {
+#[tokio::test]
+async fn udp_flow_skips_a_target_without_udp_support() {
     let yaml =
         "proxies:\n  - name: TCP-ONLY\n    type: http\n    server: 127.0.0.1\n    port: 8080\n";
     let raw: meow_config::raw::RawConfig = serde_yaml::from_str(yaml).unwrap();
@@ -255,6 +261,7 @@ fn udp_flow_skips_a_target_without_udp_support() {
     } = tunnel
         .inner()
         .resolve_proxy(&udp_meta)
+        .await
         .expect("the later rule must win");
 
     // TCP flow still lands on the http adapter; UDP flow skips to REJECT —
@@ -270,6 +277,7 @@ fn udp_flow_skips_a_target_without_udp_support() {
     } = tunnel
         .inner()
         .resolve_proxy(&metadata())
+        .await
         .expect("tcp resolves");
     assert_eq!(tcp_proxy.adapter_type(), AdapterType::Http);
 }

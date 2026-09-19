@@ -2234,36 +2234,41 @@ async fn spawn_tun_from_raw(
     // device creation fails (e.g. os error 5 / permission denied). The
     // timeout guards against a genuinely stuck startup path; immediate
     // failures are reported through `TunReady::Failed` without delay.
-    let core_done = match tokio::time::timeout(crate::TUN_STARTUP_TIMEOUT, ready_rx).await {
-        Ok(Ok(meow_listener::TunReady::Ready(core_done))) => core_done,
-        Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
-            tracing::error!(
-                "TUN listener failed to start: {msg} \
+    let (core_done, udp_flows) =
+        match tokio::time::timeout(crate::TUN_STARTUP_TIMEOUT, ready_rx).await {
+            Ok(Ok(meow_listener::TunReady::Ready {
+                core_done,
+                udp_flows,
+            })) => (core_done, udp_flows),
+            Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
+                tracing::error!(
+                    "TUN listener failed to start: {msg} \
                  (check permissions / admin / CAP_NET_ADMIN)"
-            );
-            handle.abort();
-            return Err(msg);
-        }
-        Ok(Err(_)) => {
-            // Should not happen with ReadyNotifier, but handle defensively.
-            tracing::error!("TUN listener readiness signal dropped unexpectedly");
-            handle.abort();
-            return Err("TUN listener readiness signal dropped unexpectedly".into());
-        }
-        Err(_) => {
-            let msg = format!(
-                "TUN listener startup timed out after {} s",
-                crate::TUN_STARTUP_TIMEOUT.as_secs()
-            );
-            tracing::error!("{msg}");
-            handle.abort();
-            return Err(msg);
-        }
-    };
+                );
+                handle.abort();
+                return Err(msg);
+            }
+            Ok(Err(_)) => {
+                // Should not happen with ReadyNotifier, but handle defensively.
+                tracing::error!("TUN listener readiness signal dropped unexpectedly");
+                handle.abort();
+                return Err("TUN listener readiness signal dropped unexpectedly".into());
+            }
+            Err(_) => {
+                let msg = format!(
+                    "TUN listener startup timed out after {} s",
+                    crate::TUN_STARTUP_TIMEOUT.as_secs()
+                );
+                tracing::error!("{msg}");
+                handle.abort();
+                return Err(msg);
+            }
+        };
 
     Ok(Some(meow_tunnel::TunHandle {
         task: handle,
         core_done: Some(core_done),
+        udp_flows,
     }))
 }
 

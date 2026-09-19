@@ -87,6 +87,11 @@ Consequences:
   `auto-route` has nothing safe to route and warns; you can still add routes
   to the device manually, but you are then responsible for loop avoidance.
 - UDP flows (including QUIC) to fake IPs are captured and routed per-rule.
+  The flow table is bounded at 1024 live entries — at capacity the
+  least-recently-active flow is evicted — and `dns-hijack` runs at most 64
+  concurrent in-process answers (queries it cannot decide locally past
+  that bound are dropped; clients retry). Live occupancy is observable via
+  `Tunnel::tun_udp_flow_count`.
 - ICMP echo requests entering the device are answered by the userspace
   stack itself — `ping` to a fake IP confirms the tun is up, but is not an
   end-to-end probe of the remote host.

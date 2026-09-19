@@ -3378,7 +3378,7 @@ async fn cold_reload_terminates_live_stream_without_drain_delay() {
         adapter: proxy,
         route: _route,
         ..
-    } = state.tunnel.inner().resolve_proxy(&metadata).unwrap();
+    } = state.tunnel.inner().resolve_proxy(&metadata).await.unwrap();
     assert_eq!(
         proxy.name(),
         "REJECT",
@@ -3507,7 +3507,7 @@ async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
             adapter: proxy,
             route: _route,
             ..
-        } = state.tunnel.inner().resolve_proxy(&metadata).unwrap();
+        } = state.tunnel.inner().resolve_proxy(&metadata).await.unwrap();
         assert_eq!(proxy.name(), "REJECT");
         let inner = Arc::clone(state.tunnel.inner());
         let fresh_task = tokio::spawn(async move {
@@ -4261,6 +4261,7 @@ fn fake_tun_handle() -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBo
             }
         }),
         core_done: None,
+        udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
     (handle, flag)
 }

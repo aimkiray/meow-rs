@@ -802,7 +802,7 @@ where
         adapter: proxy,
         route: _route,
         ..
-    }) = inner.resolve_proxy(&metadata)
+    }) = inner.resolve_proxy(&metadata).await
     else {
         return Err(format!(
             "no matching rule for {}",

@@ -11,6 +11,17 @@ use tracing::{debug, error, info, warn};
 /// TTL stamped on regular (non-fake-IP) A/AAAA answers built by this server.
 const DEFAULT_ANSWER_TTL_SECS: u32 = 60;
 
+/// Hard bound on concurrent upstream-bound query tasks (issue #515).
+/// Queries decidable from local state (hosts, fake-IP, fresh cache) are
+/// answered inline and never consume a permit; beyond this cap additional
+/// upstream-bound queries are dropped and counted — UDP semantics, the
+/// client retries. Tests use a small cap so saturation is exercised
+/// deterministically.
+#[cfg(not(test))]
+const MAX_IN_FLIGHT: usize = 512;
+#[cfg(test)]
+const MAX_IN_FLIGHT: usize = 8;
+
 /// Minimal EDNS0 OPT pseudo-record (11 bytes) appended to responses when the
 /// query carried one in the additional section.  Windows DNS Client (used by
 /// `Resolve-DnsName` and `curl`) sends EDNS0 queries and may reject or time
@@ -37,6 +48,21 @@ pub type ResolverSlot = Arc<parking_lot::RwLock<Arc<Resolver>>>;
 /// returned `Arc`, not freshly wrapped copies of the resolver.
 pub fn new_resolver_slot(resolver: Arc<Resolver>) -> ResolverSlot {
     Arc::new(parking_lot::RwLock::new(resolver))
+}
+
+/// Outcome of [`DnsServer::try_answer_local`] — the synchronous probe the
+/// receive loop runs before dispatching a query (issue #515).
+#[derive(Debug)]
+pub enum LocalAnswer {
+    /// Fully answered from local state — send these bytes now.
+    Answer(Vec<u8>),
+    /// Malformed or otherwise unanswerable — drop silently, exactly what
+    /// [`DnsServer::handle_query`]'s error path does, but without spending
+    /// an in-flight permit or a task spawn on guaranteed-failure packets.
+    Drop,
+    /// Needs the upstream pipeline (or a full `handle_query` pass) —
+    /// dispatch a bounded task.
+    Upstream,
 }
 
 /// Simple DNS server that handles queries by forwarding to our resolver.
@@ -73,6 +99,7 @@ impl DnsServer {
         Ok(BoundDnsServer {
             resolver: Arc::clone(&self.resolver),
             socket,
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -201,6 +228,122 @@ impl DnsServer {
             AddressLookupResult::NxDomain => Self::build_nxdomain(id, data, flags, question_len),
             AddressLookupResult::Failed => Self::build_servfail(id, data, flags, question_len),
         })
+    }
+
+    /// Answer a query entirely from local resolver state — hosts entries,
+    /// fake-IP synthesis, IPv6-disabled AAAA suppression, and fresh cache
+    /// hits — without spending an in-flight permit or a task spawn. The
+    /// serve loop calls this before dispatching so a warm-cache query never
+    /// queues behind a slow upstream (issue #515).
+    ///
+    /// Mirrors the decidable prefix of [`Self::handle_query`] step for step:
+    /// the hosts trie is checked BEFORE the IPv6-disable short-circuit (a
+    /// hosts entry is an explicit user override that outranks the global
+    /// toggle — including for AAAA), and malformed packets classify as
+    /// [`LocalAnswer::Drop`] so garbage under flood never spends a permit.
+    ///
+    /// `pub` for the TUN dns-hijack path (`meow-listener`), which answers
+    /// locally-decidable queries inline instead of spending a task spawn.
+    pub fn try_answer_local(data: &[u8], resolver: &Resolver) -> LocalAnswer {
+        if data.len() < 12 {
+            return LocalAnswer::Drop; // handle_query errs — silently dropped
+        }
+        let id = u16::from_be_bytes([data[0], data[1]]);
+        let flags = u16::from_be_bytes([data[2], data[3]]);
+        let qdcount = u16::from_be_bytes([data[4], data[5]]);
+        if qdcount == 0 {
+            return LocalAnswer::Drop; // handle_query errs — silently dropped
+        }
+        // Same rule as handle_query: multi-question queries get FORMERR.
+        if qdcount != 1 {
+            return LocalAnswer::Answer(Self::build_formerr(id, flags));
+        }
+        let Ok((domain, qtype, question_len)) = Self::parse_question(&data[12..]) else {
+            // Parity with handle_query's per-error debug log — the inline
+            // path would otherwise swallow malformed questions silently.
+            debug!("DNS query: malformed question section — dropped");
+            return LocalAnswer::Drop;
+        };
+        if qtype != 1 && qtype != 28 {
+            return LocalAnswer::Upstream; // generic forward always needs upstream
+        }
+
+        let outcome = {
+            // Mirror handle_query's ordering exactly: check the hosts trie
+            // BEFORE the IPv6-disable short-circuit — an AAAA query for a
+            // hosts entry with a v6 address must still be answered under
+            // `ipv6: false`. (The resolver-internal `lookup_ipv6_local`
+            // suppresses v6 first, which is correct for name resolution but
+            // not on the wire.)
+            if let Some(all_ips) = resolver.lookup_hosts_all(&domain) {
+                let ip = if qtype == 1 {
+                    all_ips.iter().find(|ip| ip.is_ipv4()).copied()
+                } else {
+                    all_ips.iter().find(|ip| ip.is_ipv6()).copied()
+                };
+                LocalAnswer::Answer(match ip {
+                    Some(addr) => Self::build_response(
+                        id,
+                        data,
+                        flags,
+                        question_len,
+                        qtype,
+                        addr,
+                        DEFAULT_ANSWER_TTL_SECS,
+                    ),
+                    None => Self::build_noerror_empty(id, data, flags, question_len),
+                })
+            } else if qtype == 28 && !resolver.ipv6_enabled() {
+                LocalAnswer::Answer(Self::build_noerror_empty(id, data, flags, question_len))
+            } else {
+                // lookup_*_local covers the remaining local decisions:
+                // hosts alias → upstream, fake-IP synthesis, and fresh
+                // per-family cache hits.
+                let local = if qtype == 1 {
+                    resolver.lookup_ipv4_local(&domain)
+                } else {
+                    resolver.lookup_ipv6_local(&domain)
+                };
+                match local {
+                    crate::resolver::LocalLookup::Decided(lookup) => {
+                        LocalAnswer::Answer(match lookup {
+                            AddressLookupResult::Answer(addr, ttl) => {
+                                let ttl_secs = ttl.as_secs().clamp(1, u64::from(u32::MAX)) as u32;
+                                Self::build_response(
+                                    id,
+                                    data,
+                                    flags,
+                                    question_len,
+                                    qtype,
+                                    addr,
+                                    ttl_secs,
+                                )
+                            }
+                            AddressLookupResult::NoData => {
+                                Self::build_noerror_empty(id, data, flags, question_len)
+                            }
+                            AddressLookupResult::NxDomain => {
+                                Self::build_nxdomain(id, data, flags, question_len)
+                            }
+                            // Local probes never yield `Failed` today (they
+                            // produce `Upstream` instead); kept so a future
+                            // `Decided` variant can't silently change wire
+                            // semantics.
+                            AddressLookupResult::Failed => {
+                                Self::build_servfail(id, data, flags, question_len)
+                            }
+                        })
+                    }
+                    crate::resolver::LocalLookup::Upstream(_) => LocalAnswer::Upstream,
+                }
+            }
+        };
+        // Observability parity with handle_query's per-query debug log —
+        // the inline path would otherwise drop the most common query class.
+        if let LocalAnswer::Answer(_) = &outcome {
+            debug!("DNS query: id={id:#06x} domain={domain} qtype={qtype} answered locally");
+        }
+        outcome
     }
 
     /// Forward a non-A/AAAA query through the resolver pipeline and emit the
@@ -515,6 +658,9 @@ impl DnsServer {
 pub struct BoundDnsServer {
     resolver: ResolverSlot,
     socket: Arc<UdpSocket>,
+    /// Queries dropped because `MAX_IN_FLIGHT` upstream-bound tasks were
+    /// already running. Exposed for stats/observability (issue #515).
+    dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl BoundDnsServer {
@@ -531,6 +677,7 @@ impl BoundDnsServer {
         Self {
             resolver: Arc::new(parking_lot::RwLock::new(resolver)),
             socket: Arc::new(socket),
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -540,7 +687,22 @@ impl BoundDnsServer {
         Self {
             resolver,
             socket: Arc::new(socket),
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Queries dropped without a response since this server started — for
+    /// want of an in-flight slot or a full local-answer send buffer
+    /// (issue #515 — a drop was previously invisible).
+    pub fn dropped_queries(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Shared handle to the drop counter. [`Self::run`] consumes the
+    /// server, so embedders that want live observability must clone this
+    /// `Arc` beforehand.
+    pub fn dropped_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.dropped)
     }
 
     /// The slot the serve loop reads per query.
@@ -555,68 +717,33 @@ impl BoundDnsServer {
 
     /// Serve queries until the future is dropped.
     ///
+    /// Dispatch model (issue #515): queries the resolver can fully decide
+    /// without an upstream round-trip — hosts, fake-IP, fresh cache,
+    /// IPv6-disabled AAAA — are answered inline on the receive loop, so a
+    /// cache hit never queues behind a slow upstream. Everything else gets
+    /// one task per query, bounded by `MAX_IN_FLIGHT` permits; on
+    /// exhaustion the query is dropped and counted (UDP semantics: the
+    /// client retries). This replaces the 4-worker serial pool whose fixed
+    /// concurrency let four slow upstreams stall the whole server.
+    ///
     /// Ownership contract: the serve loop holds the ONLY strong `Arc` to the
-    /// listen socket — workers hold `Weak` refs and upgrade per reply. When an
-    /// embedder aborts the task running this future, the socket drops with the
-    /// future's frame and the port is released immediately, even while a worker
-    /// is still parked inside `handle_query` awaiting an upstream (previously
-    /// the workers' strong clones kept the port bound for up to the ~5 s query
-    /// timeout after an abort, so an immediate stop→start rebind of a fixed
-    /// port hit EADDRINUSE).
+    /// listen socket — query tasks hold `Weak` refs and upgrade per reply.
+    /// When an embedder aborts the task running this future, the socket
+    /// drops with the future's frame and the port is released immediately,
+    /// even while a task is still parked inside `handle_query` awaiting an
+    /// upstream (previously worker-held strong clones kept the port bound
+    /// for up to the ~5 s query timeout after an abort, so an immediate
+    /// stop→start rebind of a fixed port hit EADDRINUSE).
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let BoundDnsServer { resolver, socket } = self;
+        let BoundDnsServer {
+            resolver,
+            socket,
+            dropped,
+        } = self;
 
-        // Worker pool: pre-spawn N workers and round-robin packets to them via
-        // bounded mpsc channels. Replaces the previous `tokio::spawn`-per-packet
-        // pattern (one task allocation per query under W4 load).
-        const N_WORKERS: usize = 4;
-        const CHANNEL_DEPTH: usize = 256;
-        let mut senders: Vec<tokio::sync::mpsc::Sender<(Vec<u8>, SocketAddr)>> =
-            Vec::with_capacity(N_WORKERS);
-        for worker_id in 0..N_WORKERS {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_DEPTH);
-            let resolver_slot = Arc::clone(&resolver);
-            let sock: Weak<UdpSocket> = Arc::downgrade(&socket);
-            tokio::spawn(async move {
-                while let Some((data, src)) = rx.recv().await {
-                    // Snapshot the current resolver generation per query —
-                    // a `PUT /configs` DNS reload swaps the slot (issue #514).
-                    // The read guard must drop before `.await`: it is !Send.
-                    let resolver = Arc::clone(&resolver_slot.read());
-                    // Panic guard: a panic inside query handling must not kill
-                    // the worker — a dead worker silently blackholes its
-                    // round-robin share of ALL queries for the server's
-                    // remaining lifetime (try_send to a dropped rx reads as
-                    // ordinary backpressure at the accept loop).
-                    let outcome = AssertUnwindSafe(DnsServer::handle_query(&data, &resolver))
-                        .catch_unwind()
-                        .await;
-                    match outcome {
-                        Ok(Ok(response)) => {
-                            // Upgrade per reply; hold the strong ref only across
-                            // the send so the serve loop stays the socket owner.
-                            let Some(sock) = sock.upgrade() else {
-                                // Server dropped — exit so the port stays free.
-                                break;
-                            };
-                            if let Err(e) = sock.send_to(&response, src).await {
-                                warn!("DNS send error: {}", e);
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            debug!("DNS query handling error: {}", e);
-                        }
-                        Err(_) => {
-                            error!("DNS worker {} survived a query panic", worker_id);
-                        }
-                    }
-                }
-            });
-            senders.push(tx);
-        }
+        let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
 
         let mut buf = vec![0u8; 4096];
-        let mut rr: usize = 0;
         loop {
             let (len, src) = match socket.recv_from(&mut buf).await {
                 Ok(v) => v,
@@ -626,15 +753,84 @@ impl BoundDnsServer {
                 }
             };
 
-            let data = buf[..len].to_vec();
-            // Round-robin to a worker. If the channel is full we drop the
-            // query (DNS is best-effort UDP — better to drop one packet
-            // than block the recv loop and stall all queries).
-            let worker = rr % N_WORKERS;
-            rr = rr.wrapping_add(1);
-            if senders[worker].try_send((data, src)).is_err() {
-                debug!("DNS worker {} backpressure; dropping query", worker);
+            // Fast path: answer entirely from local state (hosts, fake-IP,
+            // fresh cache) without spending an in-flight permit. The read
+            // guard is scoped to the probe so no lock is held across .await.
+            let local = {
+                let resolver_guard = resolver.read();
+                DnsServer::try_answer_local(&buf[..len], &resolver_guard)
+            };
+            match local {
+                LocalAnswer::Answer(response) => {
+                    // `try_send_to`, not `send_to().await`: a transient
+                    // full send buffer must not head-of-line block every
+                    // later query behind one slow reply (UDP semantics —
+                    // the stub resolver retries). Counted like the
+                    // saturation drops below so `dropped_queries` stays a
+                    // truthful "no response was sent" signal.
+                    match socket.try_send_to(&response, src) {
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(e) => warn!("DNS send error: {e}"),
+                        Ok(_) => {}
+                    }
+                    continue;
+                }
+                // Malformed/unanswerable — exactly what the task's
+                // handle_query error path does, minus the task.
+                LocalAnswer::Drop => continue,
+                LocalAnswer::Upstream => {}
             }
+
+            // Acquire the permit BEFORE copying the payload: under
+            // saturation a dropped query must not pay the alloc either.
+            let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
+                let n = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                // Power-of-two warn cadence: first drop is loud, sustained
+                // saturation stays bounded in the log.
+                if n.is_power_of_two() {
+                    warn!(
+                        "DNS server saturated: {n} queries dropped ({MAX_IN_FLIGHT} in-flight cap)"
+                    );
+                }
+                continue;
+            };
+
+            let data = buf[..len].to_vec();
+            let resolver_slot = Arc::clone(&resolver);
+            let sock: Weak<UdpSocket> = Arc::downgrade(&socket);
+            tokio::spawn(async move {
+                let _permit = permit;
+                // Snapshot the current resolver generation per query —
+                // a `PUT /configs` DNS reload swaps the slot (issue #514).
+                // The read guard must drop before `.await`: it is !Send.
+                let resolver = Arc::clone(&resolver_slot.read());
+                // Panic guard: a panicked task would drop the query, so keep
+                // the panic scoped to this one request and log it loudly.
+                let outcome = AssertUnwindSafe(DnsServer::handle_query(&data, &resolver))
+                    .catch_unwind()
+                    .await;
+                match outcome {
+                    Ok(Ok(response)) => {
+                        // Upgrade per reply; hold the strong ref only across
+                        // the send so the serve loop stays the socket owner.
+                        let Some(sock) = sock.upgrade() else {
+                            // Server dropped — exit so the port stays free.
+                            return;
+                        };
+                        if let Err(e) = sock.send_to(&response, src).await {
+                            warn!("DNS send error: {}", e);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        debug!("DNS query handling error: {}", e);
+                    }
+                    Err(_) => {
+                        error!("DNS query task survived a panic");
+                    }
+                }
+            });
         }
     }
 }
@@ -1180,5 +1376,376 @@ mod tests {
             "port must be released at abort, got {:?}",
             rebind.err()
         );
+    }
+
+    /// Wire-format A/AAAA query for an arbitrary name (`sample_query` is
+    /// fixed to example.com).
+    fn query_named(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+        let mut q = Vec::with_capacity(64);
+        q.extend_from_slice(&id.to_be_bytes());
+        q.extend_from_slice(&[0x01, 0x00]); // standard query, RD=1
+        q.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+        q.extend_from_slice(&[0x00; 6]); // AN/NS/AR = 0
+        for label in name.split('.') {
+            q.push(u8::try_from(label.len()).unwrap());
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0);
+        q.extend_from_slice(&qtype.to_be_bytes());
+        q.extend_from_slice(&[0x00, 0x01]); // QCLASS IN
+        q
+    }
+
+    /// Spawn a loopback upstream that swallows every datagram and never
+    /// replies — clients park for the full query timeout (a TEST-NET address
+    /// would fail fast on ICMP unreachable instead of parking).
+    async fn spawn_blackhole_upstream() -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while socket.recv_from(&mut buf).await.is_ok() {}
+        });
+        addr
+    }
+
+    /// Extract the answer bytes from a probe, asserting it was locally
+    /// decided.
+    fn answered(outcome: super::LocalAnswer) -> Vec<u8> {
+        match outcome {
+            super::LocalAnswer::Answer(bytes) => bytes,
+            other => panic!("expected a local answer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_answer_local_answers_hosts_entry_without_upstream() {
+        let mut hosts = meow_trie::DomainTrie::new();
+        hosts.insert(
+            "myhost.test",
+            crate::resolver::HostEntry::Addresses(vec![std::net::IpAddr::V4(Ipv4Addr::new(
+                10, 0, 0, 7,
+            ))]),
+        );
+        let resolver = crate::resolver::Resolver::new(
+            vec!["192.0.2.1:53".parse().unwrap()],
+            Vec::new(),
+            DnsMode::Normal,
+            hosts,
+            true,
+            true,
+        );
+        let q = query_named(0x1234, "myhost.test", 1);
+        let resp = answered(DnsServer::try_answer_local(&q, &resolver));
+        assert_eq!(&resp[0..2], &[0x12, 0x34], "ID echoed");
+        assert_eq!(&resp[resp.len() - 4..], &[10, 0, 0, 7], "hosts A record");
+    }
+
+    #[test]
+    fn try_answer_local_answers_fresh_cache_hit() {
+        let resolver = empty_resolver();
+        resolver.preload_cache(
+            "example.com",
+            &[std::net::IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
+            std::time::Duration::from_secs(300),
+        );
+        let q = sample_query(9, 1);
+        let resp = answered(DnsServer::try_answer_local(&q, &resolver));
+        assert_eq!(&resp[resp.len() - 4..], &[1, 2, 3, 4]);
+        // TTL is the remaining cache lifetime, not the fixed default.
+        let ttl = u32::from_be_bytes(resp[resp.len() - 10..resp.len() - 6].try_into().unwrap());
+        assert!(
+            (290..=300).contains(&ttl),
+            "cache TTL carried through, got {ttl}"
+        );
+    }
+
+    #[test]
+    fn try_answer_local_returns_upstream_when_upstream_needed() {
+        let resolver = empty_resolver();
+        assert!(
+            matches!(
+                DnsServer::try_answer_local(&sample_query(1, 1), &resolver),
+                super::LocalAnswer::Upstream
+            ),
+            "uncached name needs the upstream pipeline"
+        );
+        assert!(
+            matches!(
+                DnsServer::try_answer_local(&sample_query(1, 16), &resolver),
+                super::LocalAnswer::Upstream
+            ),
+            "non-A/AAAA types always go through generic forward"
+        );
+    }
+
+    #[test]
+    fn try_answer_local_drops_malformed_without_permit() {
+        let resolver = empty_resolver();
+        // Every shape where handle_query errs (→ the task logs and drops)
+        // classifies as Drop — garbage must not spend a permit (issue #515).
+        for (label, q) in [
+            ("truncated header", vec![0u8; 8]),
+            ("zero questions", {
+                let mut q = sample_query(1, 1);
+                q[4] = 0;
+                q[5] = 0;
+                q
+            }),
+            ("unparseable question", {
+                let mut q = sample_query(1, 1);
+                q.truncate(13); // question label chopped mid-length
+                q
+            }),
+        ] {
+            assert!(
+                matches!(
+                    DnsServer::try_answer_local(&q, &resolver),
+                    super::LocalAnswer::Drop
+                ),
+                "{label} must classify as Drop"
+            );
+        }
+        // Multi-question is wire-legal and gets FORMERR, not a drop.
+        let mut q = sample_query(1, 1);
+        q[5] = 2; // qdcount = 2
+        let resp = answered(DnsServer::try_answer_local(&q, &resolver));
+        assert_eq!(resp[3] & 0x0f, 1, "FORMERR rcode");
+    }
+
+    #[test]
+    fn try_answer_local_suppresses_aaaa_when_ipv6_disabled() {
+        let resolver = crate::resolver::Resolver::new(
+            Vec::new(),
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            /* ipv6 = */ false,
+        );
+        let q = sample_query(2, 28);
+        let resp = answered(DnsServer::try_answer_local(&q, &resolver));
+        assert_eq!(resp[3] & 0x0f, 0, "NOERROR, not an error rcode");
+        assert_eq!(&resp[6..8], &[0, 0], "ANCOUNT = 0");
+    }
+
+    /// Regression for the probe-vs-`handle_query` ordering divergence: a
+    /// hosts entry is an explicit user override checked BEFORE the IPv6
+    /// short-circuit, so an AAAA query for a hosts v6 address must be
+    /// answered even under `ipv6: false` (issue #515).
+    #[test]
+    fn try_answer_local_hosts_v6_outranks_ipv6_disable() {
+        let mut hosts = meow_trie::DomainTrie::new();
+        hosts.insert(
+            "v6host.test",
+            crate::resolver::HostEntry::Addresses(vec![
+                std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+                "::1".parse().unwrap(),
+            ]),
+        );
+        let resolver = crate::resolver::Resolver::new(
+            Vec::new(),
+            Vec::new(),
+            DnsMode::Normal,
+            hosts,
+            true,
+            /* ipv6 = */ false,
+        );
+        let q = query_named(0x1234, "v6host.test", 28);
+        let resp = answered(DnsServer::try_answer_local(&q, &resolver));
+        assert_eq!(resp[3] & 0x0f, 0, "NOERROR");
+        assert_eq!(&resp[6..8], &[0, 1], "ANCOUNT = 1 — hosts v6 answered");
+        assert_eq!(
+            &resp[resp.len() - 16..],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            "hosts AAAA ::1"
+        );
+        // Same query for a non-hosts name still gets the empty NOERROR.
+        let resp = answered(DnsServer::try_answer_local(&sample_query(3, 28), &resolver));
+        assert_eq!(&resp[6..8], &[0, 0], "non-hosts AAAA: ANCOUNT = 0");
+    }
+
+    /// Byte-level parity (issue #515): every locally-decidable query must
+    /// produce exactly the response `handle_query` would have produced.
+    #[tokio::test]
+    async fn try_answer_local_matches_handle_query_bytes() {
+        let mut hosts = meow_trie::DomainTrie::new();
+        hosts.insert(
+            "myhost.test",
+            crate::resolver::HostEntry::Addresses(vec![std::net::IpAddr::V4(Ipv4Addr::new(
+                10, 0, 0, 7,
+            ))]),
+        );
+        let resolver = crate::resolver::Resolver::new(
+            Vec::new(),
+            Vec::new(),
+            DnsMode::Normal,
+            hosts,
+            true,
+            true,
+        );
+        resolver.preload_cache(
+            "example.com",
+            &[std::net::IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
+            std::time::Duration::from_secs(300),
+        );
+
+        for (label, q) in [
+            ("hosts A", query_named(0x1111, "myhost.test", 1)),
+            ("cache hit", sample_query(0x2222, 1)),
+        ] {
+            let local = answered(DnsServer::try_answer_local(&q, &resolver));
+            let full = DnsServer::handle_query(&q, &resolver)
+                .await
+                .expect("handle_query must succeed");
+            assert_eq!(local, full, "{label}: local answer diverged");
+        }
+    }
+
+    /// The spawned-task path end-to-end (issue #515): an upstream-bound
+    /// query must be answered through the `Weak<UdpSocket>` upgrade +
+    /// `send_to`, not just counted.
+    #[tokio::test]
+    async fn spawned_task_delivers_upstream_answer() {
+        // Echo upstream: flips the header to a NOERROR response (QR|RA),
+        // returns the query unchanged — an empty-answer response.
+        let upstream_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream = upstream_socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((len, src)) = upstream_socket.recv_from(&mut buf).await {
+                buf[2] = 0x81;
+                buf[3] = 0x80;
+                let _ = upstream_socket.send_to(&buf[..len], src).await;
+            }
+        });
+
+        let resolver = Arc::new(crate::resolver::Resolver::new(
+            vec![upstream],
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let server = DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap());
+        let bound = server.bind().await.unwrap();
+        let addr = bound.local_addr().unwrap();
+        let serve = tokio::spawn(bound.run());
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&sample_query(0xbeef, 1), addr)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("upstream-bound query must be answered by the task")
+        .unwrap();
+        assert_eq!(&buf[0..2], &[0xbe, 0xef], "response id echoed");
+        assert!(len >= 12);
+        serve.abort();
+    }
+
+    /// Saturation contract (issue #515): once `MAX_IN_FLIGHT` queries are
+    /// parked on upstream, further upstream-bound queries are dropped and
+    /// counted rather than queueing unboundedly.
+    #[tokio::test]
+    async fn saturated_server_drops_and_counts_upstream_queries() {
+        let upstream = spawn_blackhole_upstream().await;
+        let resolver = Arc::new(crate::resolver::Resolver::new(
+            vec![upstream],
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let server = DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap());
+        let bound = server.bind().await.unwrap();
+        let dropped = Arc::clone(&bound.dropped);
+        let addr = bound.local_addr().unwrap();
+        let serve = tokio::spawn(bound.run());
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Blast well past the test cap; the kernel may absorb a few, so keep
+        // sending until the counter moves (bounded by a deadline).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut sent = 0u16;
+        while dropped.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            client.send_to(&sample_query(sent, 1), addr).await.unwrap();
+            sent += 1;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drop counter never moved after {sent} queries"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(sent > MAX_IN_FLIGHT as u16);
+        serve.abort();
+    }
+
+    /// Head-of-line guarantee (issue #515): with the upstream cap fully
+    /// parked, a locally-decidable query (hosts) is still answered inline on
+    /// the receive loop — it never waits for a permit.
+    #[tokio::test]
+    async fn local_answer_bypasses_saturated_upstream_cap() {
+        let mut hosts = meow_trie::DomainTrie::new();
+        hosts.insert(
+            "local.test",
+            crate::resolver::HostEntry::Addresses(vec![std::net::IpAddr::V4(Ipv4Addr::new(
+                10, 9, 9, 9,
+            ))]),
+        );
+        let upstream = spawn_blackhole_upstream().await;
+        let resolver = Arc::new(crate::resolver::Resolver::new(
+            vec![upstream],
+            Vec::new(),
+            DnsMode::Normal,
+            hosts,
+            true,
+            true,
+        ));
+        let server = DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap());
+        let bound = server.bind().await.unwrap();
+        let dropped = Arc::clone(&bound.dropped);
+        let addr = bound.local_addr().unwrap();
+        let serve = tokio::spawn(bound.run());
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Park exactly MAX_IN_FLIGHT uncached queries on the blackhole
+        // upstream — permits exhausted, nothing dropped yet.
+        for i in 0..MAX_IN_FLIGHT as u16 {
+            client.send_to(&sample_query(i, 1), addr).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // The hosts query is answered inline despite zero free permits.
+        client
+            .send_to(&query_named(0xfeed, "local.test", 1), addr)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("hosts answer must not wait for a permit")
+        .unwrap();
+        assert_eq!(&buf[0..2], &[0xfe, 0xed]);
+        assert_eq!(&buf[len - 4..len], &[10, 9, 9, 9]);
+        // Exactly the cap's worth of queries were sent; none should have
+        // been dropped.
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the first MAX_IN_FLIGHT queries all got permits"
+        );
+        serve.abort();
     }
 }
