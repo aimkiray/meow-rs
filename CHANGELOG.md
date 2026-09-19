@@ -595,6 +595,31 @@ the canonical, in-repo source a release is cut from.
   `Fn(&str) -> bool` closure still satisfies it (`true` → usable, `false`
   → missing-and-warned). Both are breaking trait changes for external
   implementers. (#533)
+- **`dialer-proxy` on provider-sourced nodes is no longer silently ignored
+  (issue #489).** Proxy-provider payloads carrying `dialer-proxy` were parsed
+  as if the field were absent — the node dialed its server directly, leaking
+  past a chain the subscription declared. Provider nodes now get the same
+  treatment as static `proxies:` entries: an injected by-name dialer for
+  adapter types that support it, the relay-based `DialerProxyAdapter`
+  fallback for the rest, re-applied on every provider refresh. The
+  provider-level `dialer-proxy` field and `override.dialer-proxy` (mihomo
+  `OverrideSchema`) are honoured with upstream precedence — `override` >
+  provider > node, the stronger levels writing unconditionally — and a
+  malformed `dialer-proxy` value or `override.dialer-proxy` rejects the
+  node/provider instead of silently dialling direct. Payload YAML merge keys
+  are expanded so a merged `dialer-proxy` is honoured too. Dialer names resolve against
+  the *live* route map at dial time (mihomo's by-name model: top-level
+  `proxies:`/`proxy-groups:` entries, not sibling provider nodes) via a
+  registry the tunnel republishes on every routing install. A chain that
+  would recurse through provider group membership — unknowable to the static
+  cycle check — degrades to a named dial error at 16 hops instead of
+  overflowing the native stack; the same bound now also guards the
+  `DialerProxyAdapter` relay path.
+
+  Breaking for crate consumers: `Config` gains a `dialer_registry` field;
+  `ProxyProvider::new`, `load_proxy_providers`, and
+  `parse_proxy_provider_node` take the registry/dialer arguments; and
+  `subscription_refresh::run_loop` takes the provider map.
 
 - **TLS handshakes no longer fail on multiplexed transports whose
   `poll_flush` pends.** Every TLS-over-mux handshake — AnyTLS, smux, and any

@@ -41,6 +41,7 @@ fn make_state_with_cap(cap: usize) -> (Arc<AppState>, broadcast::Sender<LogMessa
         raw_config: Arc::new(RwLock::new(raw)),
         log_tx: log_tx.clone(),
         proxy_providers: Arc::new(DashMap::new()),
+        provider_dialer_registry: Default::default(),
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
         rule_provider_refresh: Default::default(),
         listeners: vec![],

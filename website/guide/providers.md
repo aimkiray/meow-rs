@@ -38,7 +38,14 @@ proxy-groups:
 | `exclude-type` | string \| list | `[]` | Drop proxy types, e.g. `[ss]` |
 | `health-check` | block | — | Periodic probing (below) |
 | `header` | map | `{}` | Extra HTTP request headers (`http` only) |
+| `dialer-proxy` | string | — | Chain every node through the named `proxies:`/`proxy-groups:` entry. Overrides node-level `dialer-proxy` fields (mihomo writes it into each node unconditionally) |
+| `override` | map | — | Provider-level node defaults (mihomo `OverrideSchema`). Only `dialer-proxy` is honoured — it chains every node **unconditionally**, outranking both provider-level and node-level values; a malformed value rejects the provider. Other keys log a warning |
 | `allow-external-plugin` | bool | `false` | Permit `ss` nodes to launch external SIP003 plugin executables. **Security-sensitive opt-in**: provider content is remote-controlled and the plugin name reaches `Command::new`, so off means such nodes are rejected. Built-in plugins (`obfs`, `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`, `kcptun`, `ech-tls-tunnel` — all in the default feature set) are always allowed; a non-default build without one treats its name as external. meow-rs extension; absent in mihomo |
+
+Provider nodes may also carry a per-node `dialer-proxy` field in the payload itself,
+and it is re-applied on every refresh. The target must be a top-level
+`proxies:`/`proxy-groups:` entry — sibling provider node names are not valid
+targets (same as mihomo).
 
 ### `type: http`
 

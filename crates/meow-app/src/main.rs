@@ -806,6 +806,10 @@ async fn run(
     // Share the DNS config's resolver slot so runtime `set_resolver` swaps
     // reach the map's DIRECT adapters built from this slot (issue #514).
     let tunnel = Tunnel::new_with_slot(Arc::clone(&config.dns.resolver_slot));
+    // Provider-sourced nodes resolve `dialer-proxy` names against this
+    // registry; install before the first `update_routing` so it publishes
+    // the initial route map (issue #489).
+    tunnel.set_dialer_registry(config.provider_dialer_registry.clone());
     tunnel.set_mode(config.general.mode);
     tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
     tunnel.spawn_background_tasks();
@@ -852,6 +856,7 @@ async fn run(
         let rule_providers = Arc::clone(&rule_providers);
         let proxy_providers = Arc::clone(&proxy_providers);
         let rule_provider_refresh = Arc::clone(&rule_provider_refresh);
+        let provider_dialer_registry = config.provider_dialer_registry.clone();
         tokio::spawn(async move {
             meow_app::subscription_refresh::run_loop(
                 raw_config,
@@ -860,6 +865,7 @@ async fn run(
                 dns_server,
                 rule_providers,
                 proxy_providers,
+                provider_dialer_registry,
                 rule_provider_refresh,
             )
             .await;
@@ -1111,6 +1117,7 @@ async fn run(
             named_listeners.clone(),
             config.api.external_ui.clone(),
             Arc::clone(&dns_server_handle),
+            config.provider_dialer_registry.clone(),
         );
         tokio::spawn(async move {
             if let Err(e) = api_server.run().await {

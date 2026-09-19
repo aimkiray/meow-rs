@@ -711,6 +711,17 @@ The following are unsupported or intentionally rejected:
     rather than leaking the real source path. UDP carried inside a mux session
     (`smux`/`yamux`/`h2mux`) does traverse the chain and keeps working.
 
+  `dialer-proxy` on **provider-sourced nodes** is honoured too (issue #489):
+  the name resolves against the live route map at dial time — static proxies
+  and groups, but not other provider nodes (they are not registry entries;
+  mihomo resolves the same restricted namespace) — and is re-applied on every
+  provider refresh. Provider-level `dialer-proxy` and `override.dialer-proxy`
+  follow mihomo's unconditional-write precedence — `override` > provider >
+  node (`OverrideSchema.Apply` writes last and always wins). A node whose
+  dialer name never resolves keeps loading but fails its dials loudly; a
+  malformed value or a self-reference rejects the node instead of silently
+  dialling direct.
+
 ---
 
 ## Getting help

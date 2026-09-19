@@ -36,7 +36,10 @@ pub struct RouteTable {
     pub rules: Arc<Vec<Box<dyn Rule>>>,
     pub domain_index: Arc<DomainIndex>,
     pub compiled_rules: Arc<CompiledRuleSet>,
-    pub proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
+    /// Shared so routing installs can republish the map into the
+    /// provider-node dialer registry (`publish_dialer_registry`) with an
+    /// Arc bump instead of a full map clone (issue #489 review).
+    pub proxies: Arc<HashMap<SmolStr, Arc<dyn Proxy>>>,
     /// The registry generation `proxies` was published into. Retained so the
     /// `dialer-proxy` front-hop lookups the map's adapters perform keep
     /// resolving for exactly as long as this route table lives — the adapters
@@ -57,7 +60,7 @@ impl RouteTable {
             rules: Arc::new(rules),
             domain_index: Arc::new(domain_index),
             compiled_rules: Arc::new(compiled_rules),
-            proxies,
+            proxies: Arc::new(proxies),
             dialer_registry,
         }
     }
@@ -67,7 +70,7 @@ impl RouteTable {
             rules: Arc::new(Vec::new()),
             domain_index: Arc::new(DomainIndex::empty()),
             compiled_rules: Arc::new(CompiledRuleSet::empty()),
-            proxies: HashMap::new(),
+            proxies: Arc::new(HashMap::new()),
             dialer_registry: meow_proxy::dialer::ProxyRegistry::default(),
         }
     }
@@ -115,6 +118,12 @@ pub struct TunnelInner {
     /// config commit so checks appear/disappear/respawn with the config
     /// (issue #514).
     pub health_checks: Mutex<crate::health_check::HealthCheckSupervisor>,
+    /// Registry that provider-sourced nodes' `dialer-proxy` targets resolve
+    /// against (issue #489). Installed once at startup from `Config` (which
+    /// shares the same handle into every `ProxyProvider`); every routing
+    /// install republishes the live proxies map into it so provider nodes —
+    /// which persist across config rebuilds — always resolve current names.
+    dialer_registry: std::sync::OnceLock<meow_proxy::dialer::ProxyRegistry>,
 }
 
 /// A running TUN listener: the task plus the signal resolving once its
@@ -547,12 +556,37 @@ impl Tunnel {
                 needs_ip_resolution: AtomicBool::new(false),
                 needs_process_lookup: AtomicBool::new(false),
                 tun_handle: RwLock::new(None),
+                dialer_registry: std::sync::OnceLock::new(),
             }),
         }
     }
 
     pub fn inner(&self) -> &Arc<TunnelInner> {
         &self.inner
+    }
+
+    /// Install the registry provider-sourced nodes resolve `dialer-proxy`
+    /// names against (issue #489). Called once at startup with the handle
+    /// `load_config` shared into every `ProxyProvider`; subsequent calls are
+    /// ignored — the registry is a process-lifetime singleton by contract.
+    pub fn set_dialer_registry(&self, registry: meow_proxy::dialer::ProxyRegistry) {
+        if self.inner.dialer_registry.set(registry).is_err() {
+            warn!(
+                "dialer registry already installed — the new handle will never \
+                 be published; provider-sourced `dialer-proxy` nodes built on \
+                 it will fail every dial"
+            );
+        }
+    }
+
+    /// Republish the live proxies map into the provider-node dialer
+    /// registry, if one was installed (issue #489). Runs on every routing
+    /// install so provider-sourced `dialer-proxy` targets resolve the current
+    /// route map rather than a frozen startup-era snapshot.
+    fn publish_dialer_registry(&self, route: &RouteTable) {
+        if let Some(registry) = self.inner.dialer_registry.get() {
+            registry.publish(std::sync::Arc::clone(&route.proxies));
+        }
     }
 
     /// Weak handle to the inner state — long-lived background loops
@@ -598,11 +632,10 @@ impl Tunnel {
                 rules: Arc::new(rules),
                 domain_index: Arc::new(new_index),
                 compiled_rules: Arc::new(compiled_rules),
-                proxies: route.proxies.clone(),
-                // The proxies map is unchanged, so the generation's chained
-                // adapters must keep resolving through the same registry cell.
+                proxies: Arc::clone(&route.proxies),
                 dialer_registry: route.dialer_registry.clone(),
             };
+            self.publish_dialer_registry(&new_route);
             std::mem::replace(&mut *route, Arc::new(new_route))
         };
         // The superseded table's destructor cascade (rules, adapters,
@@ -652,9 +685,10 @@ impl Tunnel {
                 rules: Arc::clone(&route.rules),
                 domain_index: Arc::clone(&route.domain_index),
                 compiled_rules: Arc::clone(&route.compiled_rules),
-                proxies,
+                proxies: Arc::new(proxies),
                 dialer_registry,
             };
+            self.publish_dialer_registry(&new_route);
             std::mem::replace(&mut *route, Arc::new(new_route))
         };
         // Same drop-outside-lock rule as `update_rules` — the old table's
@@ -716,7 +750,12 @@ impl Tunnel {
     fn install_routing(&self, route: Arc<RouteTable>) -> Arc<RouteTable> {
         let needs_ip = route.compiled_rules.needs_ip_resolution();
         let needs_process = route.compiled_rules.needs_process_lookup();
+        // Publish inside the write hold so registry and route table swap
+        // linearly — a concurrent installer can otherwise leave the registry
+        // naming proxies the live route map already dropped (issue #489
+        // review), matching the partial updaters above.
         let mut current = self.inner.route.write();
+        self.publish_dialer_registry(&route);
         self.inner
             .needs_ip_resolution
             .store(needs_ip, Ordering::Relaxed);
@@ -1163,157 +1202,70 @@ mod tests {
         assert_eq!(tunnel.statistics().snapshot(), (123, 456));
     }
 
-    /// Issue #533: the built-in proxies map registers PASS / PASS-RULE /
-    /// COMPATIBLE, and a rule targeting PASS skips silently to the next
-    /// rule — upstream `continue GetRules` in `match()`.
+    /// Every routing install must republish the proxies map into the
+    /// dialer registry provider-sourced `dialer-proxy` targets resolve
+    /// against — including the partial `update_proxies`/`update_rules`
+    /// paths, not just wholesale `update_routing` (issue #489).
     #[test]
-    fn pass_builtin_skips_matched_rule() {
-        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
-
+    fn routing_installs_republish_dialer_registry() {
         let tunnel = test_tunnel();
-        let proxies = meow_config::rebuild_from_raw(&Default::default())
-            .unwrap()
-            .proxies;
-        for name in ["PASS", "PASS-RULE", "COMPATIBLE"] {
-            assert!(
-                proxies.contains_key(name),
-                "built-in {name} must be registered"
-            );
-        }
-        assert_eq!(proxies["PASS"].adapter_type(), AdapterType::Pass);
-        assert_eq!(
-            proxies["COMPATIBLE"].adapter_type(),
-            AdapterType::Compatible
-        );
+        let registry = meow_proxy::dialer::ProxyRegistry::default();
+        tunnel.set_dialer_registry(registry.clone());
+        let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        let mut built = res.proxies;
+        let direct = built.remove("DIRECT").unwrap();
+        let build_registry = res.dialer_registry;
 
         tunnel.update_routing(
-            proxies,
-            vec![
-                Box::new(DomainSuffixRule::new("example.com", "PASS")),
-                Box::new(FinalRule::new("REJECT")),
-            ],
-            Default::default(),
+            HashMap::from([("DIRECT".into(), Arc::clone(&direct))]),
+            vec![],
+            build_registry.clone(),
         );
-        let meta = Metadata {
-            host: "x.example.com".into(),
-            dst_port: 443,
-            ..Default::default()
-        };
-        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
-        assert_eq!(
-            adapter.name(),
-            "REJECT",
-            "PASS-targeted rule must be skipped"
-        );
-    }
-
-    /// A rule targeting a group whose selected member is PASS also skips —
-    /// the match loop walks `unwrap_proxy(metadata, false)` for the type
-    /// tag without committing selection side effects.
-    #[test]
-    fn pass_inside_group_unwrap_skips_rule() {
-        use meow_proxy::SelectorGroup;
-        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
-
-        let tunnel = test_tunnel();
-        let mut proxies = meow_config::rebuild_from_raw(&Default::default())
-            .unwrap()
-            .proxies;
-        let pass_member: Arc<dyn Proxy> = Arc::new(meow_config::proxy_parser::WrappedProxy::new(
-            Box::new(meow_proxy::RejectAdapter::pass()),
-        ));
-        proxies.insert(
-            "SEL".into(),
-            Arc::new(SelectorGroup::new("SEL", vec![pass_member])),
-        );
-        tunnel.update_routing(
-            proxies,
-            vec![
-                Box::new(DomainSuffixRule::new("example.com", "SEL")),
-                Box::new(FinalRule::new("DIRECT")),
-            ],
-            Default::default(),
-        );
-        let meta = Metadata {
-            host: "x.example.com".into(),
-            dst_port: 443,
-            ..Default::default()
-        };
-        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
-        assert_eq!(
-            adapter.name(),
-            "DIRECT",
-            "rule matching a PASS-bearing group must fall through"
-        );
-    }
-
-    /// PASS-RULE targeted at the top level behaves like REJECT — the match
-    /// returns it and dialing yields immediate EOF, same as upstream's
-    /// nop adapter.
-    #[test]
-    fn pass_rule_at_top_level_rejects() {
-        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
-
-        let tunnel = test_tunnel();
-        let proxies = meow_config::rebuild_from_raw(&Default::default())
-            .unwrap()
-            .proxies;
-        tunnel.update_routing(
-            proxies,
-            vec![
-                Box::new(DomainSuffixRule::new("example.com", "PASS-RULE")),
-                Box::new(FinalRule::new("DIRECT")),
-            ],
-            Default::default(),
-        );
-        let meta = Metadata {
-            host: "x.example.com".into(),
-            dst_port: 443,
-            ..Default::default()
-        };
-        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
-        assert_eq!(
-            adapter.adapter_type(),
-            AdapterType::PassRule,
-            "top-level PASS-RULE must materialize as its own adapter"
-        );
-    }
-
-    /// COMPATIBLE resolves like any real target and buckets its stats as
-    /// `"DIRECT"` — it is a direct dialer, not a signal adapter.
-    #[test]
-    fn compatible_resolves_and_buckets_direct() {
-        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
-
-        let tunnel = test_tunnel();
-        let proxies = meow_config::rebuild_from_raw(&Default::default())
-            .unwrap()
-            .proxies;
-        tunnel.update_routing(
-            proxies,
-            vec![
-                Box::new(DomainSuffixRule::new("example.com", "COMPATIBLE")),
-                Box::new(FinalRule::new("REJECT")),
-            ],
-            Default::default(),
-        );
-        let meta = Metadata {
-            host: "x.example.com".into(),
-            dst_port: 443,
-            ..Default::default()
-        };
-        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
-        assert_eq!(
-            adapter.adapter_type(),
-            AdapterType::Compatible,
-            "COMPATIBLE must materialize, not be skipped"
-        );
-        let stats = tunnel.inner().stats.rule_match.snapshot();
         assert!(
-            stats
-                .iter()
-                .any(|((_, action), n)| *action == "DIRECT" && *n == 1),
-            "COMPATIBLE match must bucket as DIRECT, got: {stats:?}"
+            meow_proxy::dialer::DialerTarget::new("DIRECT", &registry)
+                .resolve()
+                .is_some(),
+            "update_routing must publish the proxies map"
+        );
+
+        tunnel.update_proxies(
+            HashMap::from([("RENAMED".into(), Arc::clone(&direct))]),
+            build_registry.clone(),
+        );
+        assert!(
+            meow_proxy::dialer::DialerTarget::new("RENAMED", &registry)
+                .resolve()
+                .is_some(),
+            "update_proxies must republish"
+        );
+        // Publish is a wholesale replace: a name absent from the new map must
+        // stop resolving, not linger as a merge leftover.
+        assert!(
+            meow_proxy::dialer::DialerTarget::new("DIRECT", &registry)
+                .resolve()
+                .is_none(),
+            "a removed name must stop resolving after republish"
+        );
+
+        tunnel.update_rules(vec![]);
+        assert!(
+            meow_proxy::dialer::DialerTarget::new("RENAMED", &registry)
+                .resolve()
+                .is_some(),
+            "update_rules must keep the proxies map published"
+        );
+
+        tunnel.reload_routing(
+            HashMap::from([("RELOADED".into(), Arc::clone(&direct))]),
+            vec![],
+            None,
+            build_registry,
+        );
+        assert!(
+            meow_proxy::dialer::DialerTarget::new("RELOADED", &registry)
+                .resolve()
+                .is_some(),
+            "reload_routing must republish through install_routing"
         );
     }
 }

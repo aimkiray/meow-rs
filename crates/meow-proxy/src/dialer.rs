@@ -139,6 +139,11 @@ impl TcpDialer for DirectDialer {
 ///
 /// Calls `proxy.dial_tcp()` with metadata targeting `host:port`, then adapts
 /// the returned `ProxyConn` into a `Stream` for the caller's transport chain.
+///
+/// This is the *unguarded* inner of the by-name path: it carries no
+/// [`scoped_chain_dial`] depth accounting, so nothing should be built on it
+/// that can re-enter by-name resolution — use [`NamedProxyDialer`] for a
+/// `dialer-proxy` chain edge (issue #489).
 pub struct ProxyDialer {
     proxy: Arc<dyn Proxy>,
 }
@@ -283,60 +288,66 @@ mod packet_conn_socket {
 #[cfg(feature = "kcptun")]
 use packet_conn_socket::PacketConnSocket;
 
+/// Build the `Metadata` for a chained front-hop dial by `host`/`port`.
+///
+/// An IP-literal `host` becomes a typed `dst_ip` so the front proxy encodes
+/// an IP address rather than a domain name that happens to look like one.
+/// `conn_type` is explicit `Inner`: `Metadata::default()` would yield
+/// `ConnType::Http` (the first enum variant), but this is an internal
+/// chained-relay dial — the front proxy's rules, /connections list, and
+/// stats must not classify it as an HTTP inbound.
+///
+/// `internal` carries the caller's usage-accounting marker through the
+/// reconstruction — otherwise a probe or fetch chained through
+/// `dialer-proxy` would reach a lazy front-hop group as ordinary `Inner`
+/// traffic and be counted as use, keeping the group's probe loop awake
+/// forever (issue #555).
+fn inner_dial_metadata(host: &str, port: u16, internal: bool) -> Metadata {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => Metadata {
+            network: Network::Tcp,
+            conn_type: ConnType::Inner,
+            dst_ip: Some(ip),
+            dst_port: port,
+            internal,
+            ..Default::default()
+        },
+        Err(_) => Metadata {
+            network: Network::Tcp,
+            conn_type: ConnType::Inner,
+            host: host.into(),
+            dst_port: port,
+            internal,
+            ..Default::default()
+        },
+    }
+}
+
+/// Same as [`inner_dial_metadata`] for a typed `SocketAddr`: carries the
+/// literal in `dst_ip` rather than rendering it into `host`, so adapters
+/// emit an IP-typed address — what mihomo does and what SOCKS5/Trojan/VLESS
+/// address encoding expects.
+fn inner_dial_metadata_at(addr: SocketAddr, internal: bool) -> Metadata {
+    Metadata {
+        network: Network::Tcp,
+        conn_type: ConnType::Inner,
+        dst_ip: Some(addr.ip()),
+        dst_port: addr.port(),
+        internal,
+        ..Default::default()
+    }
+}
+
 #[async_trait]
 impl TcpDialer for ProxyDialer {
     async fn dial(&self, host: &str, port: u16, internal: bool) -> io::Result<Box<dyn Stream>> {
-        // An IP-literal `host` becomes a typed `dst_ip` so the front proxy
-        // encodes an IP address rather than a domain name that happens to look
-        // like one.
-        //
-        // `network` / `conn_type` are explicit: `Metadata::default()` yields
-        // `ConnType::Http` (the first enum variant), but this is an internal
-        // chained-relay dial — the front proxy's rules, /connections list,
-        // and stats must classify it as `Inner`, not as an HTTP inbound
-        // (review B2).
-        // `internal` carries the caller's usage-accounting marker through
-        // the reconstruction — otherwise a probe or fetch chained through
-        // `dialer-proxy` would reach a lazy front-hop group as ordinary
-        // `Inner` traffic and be counted as use, keeping the group's probe
-        // loop awake forever.
-        let meta = match host.parse::<std::net::IpAddr>() {
-            Ok(ip) => Metadata {
-                network: Network::Tcp,
-                conn_type: ConnType::Inner,
-                dst_ip: Some(ip),
-                dst_port: port,
-                internal,
-                ..Default::default()
-            },
-            Err(_) => Metadata {
-                network: Network::Tcp,
-                conn_type: ConnType::Inner,
-                host: host.into(),
-                dst_port: port,
-                internal,
-                ..Default::default()
-            },
-        };
-        self.dial_metadata(meta).await
+        self.dial_metadata(inner_dial_metadata(host, port, internal))
+            .await
     }
 
     async fn dial_addr(&self, addr: SocketAddr, internal: bool) -> io::Result<Box<dyn Stream>> {
-        // Carry the literal address in `dst_ip` instead of rendering it into
-        // `host`: adapters that encode the target for the front proxy then emit
-        // an IP-typed address rather than a domain-typed one holding a
-        // dotted-quad, which is what mihomo does and what SOCKS5/Trojan/VLESS
-        // address encoding expects.
-        // Explicit Inner conn_type — see `dial()` (review B2).
-        let meta = Metadata {
-            network: Network::Tcp,
-            conn_type: ConnType::Inner,
-            dst_ip: Some(addr.ip()),
-            dst_port: addr.port(),
-            internal,
-            ..Default::default()
-        };
-        self.dial_metadata(meta).await
+        self.dial_metadata(inner_dial_metadata_at(addr, internal))
+            .await
     }
 
     fn is_proxy(&self) -> bool {
@@ -493,24 +504,86 @@ impl NamedProxyDialer {
     pub fn new(target: DialerTarget) -> Self {
         Self { target }
     }
+
+    async fn dial_front(&self, meta: Metadata) -> io::Result<Box<dyn Stream>> {
+        let front = self
+            .target
+            .resolve()
+            .ok_or_else(|| io::Error::other(self.target.missing_error()))?;
+        ProxyDialer::new(front).dial_metadata(meta).await
+    }
+}
+
+tokio::task_local! {
+    /// Depth of nested `dialer-proxy` chained dials on the current task.
+    ///
+    /// Static configs are cycle-checked at build time
+    /// (`reject_group_membership_cycles`), but a *provider-sourced* node may
+    /// also carry `dialer-proxy`, and group membership over provider slots is
+    /// dynamic — `node → dialer G → G selects node` recurses in one task's
+    /// poll chain and would exhaust the native stack. The counter lives on
+    /// the task rather than in `Metadata` because every hop rebuilds the
+    /// metadata it passes down (issue #489).
+    static DIALER_CHAIN_DEPTH: usize;
+}
+
+/// Bound on nested `dialer-proxy` hops: the chain recurses inside one
+/// task's poll chain, so an unbounded chain would exhaust the native
+/// stack. 16 is far above any sane front-hop depth.
+pub const MAX_DIALER_CHAIN_DEPTH: usize = 16;
+
+/// Run `f` as one nested `dialer-proxy` hop; `over_limit` produces the
+/// caller's error type when the chain exceeds [`MAX_DIALER_CHAIN_DEPTH`].
+/// Both by-name dial entry points — [`NamedProxyDialer`] and
+/// `DialerProxyAdapter`'s relay path — funnel through this so a cycle that
+/// only becomes reachable through dynamic group membership degrades to a
+/// dial error instead of unbounded same-task recursion.
+///
+/// Mux-enabled nodes are the one shape that never reaches this guard: the
+/// nested dial pends on the session mutex the outer frame holds and
+/// surfaces as a session-setup timeout instead — bounded, but diagnosed as
+/// a timeout rather than a cycle.
+pub async fn scoped_chain_dial<F, T, E>(
+    target_name: &str,
+    over_limit: impl FnOnce(&str) -> E,
+    f: F,
+) -> Result<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let depth = DIALER_CHAIN_DEPTH.try_with(|d| *d).unwrap_or(0);
+    if depth >= MAX_DIALER_CHAIN_DEPTH {
+        return Err(over_limit(target_name));
+    }
+    DIALER_CHAIN_DEPTH.scope(depth + 1, f).await
+}
+
+impl NamedProxyDialer {
+    async fn dial_inner(&self, meta: Metadata) -> io::Result<Box<dyn Stream>> {
+        scoped_chain_dial(
+            self.target.name(),
+            |name| {
+                io::Error::other(format!(
+                    "dialer-proxy '{name}': chain exceeds {MAX_DIALER_CHAIN_DEPTH} hops; \
+                     a provider member or group is routing the dial back into itself"
+                ))
+            },
+            self.dial_front(meta),
+        )
+        .await
+    }
 }
 
 #[async_trait]
 impl TcpDialer for NamedProxyDialer {
     async fn dial(&self, host: &str, port: u16, internal: bool) -> io::Result<Box<dyn Stream>> {
-        let front = self
-            .target
-            .resolve()
-            .ok_or_else(|| io::Error::other(self.target.missing_error()))?;
-        ProxyDialer::new(front).dial(host, port, internal).await
+        self.dial_inner(inner_dial_metadata(host, port, internal))
+            .await
     }
 
     async fn dial_addr(&self, addr: SocketAddr, internal: bool) -> io::Result<Box<dyn Stream>> {
-        let front = self
-            .target
-            .resolve()
-            .ok_or_else(|| io::Error::other(self.target.missing_error()))?;
-        ProxyDialer::new(front).dial_addr(addr, internal).await
+        self.dial_inner(inner_dial_metadata_at(addr, internal))
+            .await
     }
 
     fn is_proxy(&self) -> bool {
@@ -814,6 +887,155 @@ mod tests {
         assert!(
             err.to_string().contains("registry generation dropped"),
             "expected the dead-cell error, got: {err}"
+        );
+    }
+
+    /// A `dialer-proxy` cycle that static analysis cannot see — here a
+    /// provider-member-style loop where `loop`'s own dial re-enters the
+    /// by-name dialer — must degrade to a dial error at
+    /// [`MAX_DIALER_CHAIN_DEPTH`] instead of recursing until the native
+    /// stack overflows (issue #489).
+    #[tokio::test]
+    async fn named_dialer_recursion_is_depth_bounded() {
+        struct LoopProxy {
+            dialer: NamedProxyDialer,
+        }
+
+        #[async_trait]
+        impl ProxyAdapter for LoopProxy {
+            fn name(&self) -> &str {
+                "loop"
+            }
+            fn adapter_type(&self) -> AdapterType {
+                AdapterType::Socks5
+            }
+            fn addr(&self) -> &str {
+                "127.0.0.1:1"
+            }
+            fn support_udp(&self) -> bool {
+                false
+            }
+            async fn dial_tcp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyConn>> {
+                // Re-enter the by-name chain — the loop only terminates via
+                // the depth guard.
+                self.dialer
+                    .dial("127.0.0.1", 1, false)
+                    .await
+                    .map_err(|e| meow_common::MeowError::Proxy(e.to_string()))?;
+                Err(meow_common::MeowError::NotSupported(
+                    "unreachable past the depth bound".to_string(),
+                ))
+            }
+            async fn dial_udp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyPacketConn>> {
+                unimplemented!("test mock has no UDP")
+            }
+            fn health(&self) -> &ProxyHealth {
+                static H: std::sync::OnceLock<ProxyHealth> = std::sync::OnceLock::new();
+                H.get_or_init(ProxyHealth::new)
+            }
+        }
+
+        impl Proxy for LoopProxy {
+            fn alive(&self) -> bool {
+                true
+            }
+            fn alive_for_url(&self, _url: &str) -> bool {
+                true
+            }
+            fn last_delay(&self) -> u16 {
+                0
+            }
+            fn last_delay_for_url(&self, _url: &str) -> u16 {
+                0
+            }
+            fn delay_history(&self) -> Vec<DelayHistory> {
+                Vec::new()
+            }
+        }
+
+        let registry = ProxyRegistry::default();
+        let target = DialerTarget::new("loop", &registry);
+        let looper: Arc<dyn Proxy> = Arc::new(LoopProxy {
+            dialer: NamedProxyDialer::new(target),
+        });
+        registry.publish(Arc::new(HashMap::from([(SmolStr::from("loop"), looper)])));
+
+        // Dial through the chain; recursion must stop at the bound with a
+        // named error, not a stack overflow.
+        let dialer = NamedProxyDialer::new(DialerTarget::new("loop", &registry));
+        let err = dialer
+            .dial("203.0.113.1", 443, false)
+            .await
+            .err()
+            .expect("the cycle must surface as an error");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "depth bound must be the surfaced error: {err}"
+        );
+    }
+
+    /// `NamedProxyDialer` must produce the same `Inner`/`Tcp` metadata the
+    /// `ProxyDialer` path produces — a regression would misclassify chained
+    /// dials in the front proxy's rules, /connections, and stats.
+    #[tokio::test]
+    async fn named_dialer_metadata_matches_proxy_dialer() {
+        let registry = ProxyRegistry::default();
+        let front = Arc::new(CapturingProxy {
+            seen: Mutex::new(Vec::new()),
+        });
+        registry.publish(Arc::new(HashMap::from([(
+            SmolStr::from("front"),
+            Arc::clone(&front) as Arc<dyn Proxy>,
+        )])));
+
+        let dialer = NamedProxyDialer::new(DialerTarget::new("front", &registry));
+        // Hostname → `host` field; IP literal → typed `dst_ip`.
+        let _ = dialer.dial("example.com", 443, false).await;
+        let _ = dialer.dial("203.0.113.7", 8443, false).await;
+        let _ = dialer
+            .dial_addr("[2001:db8::1]:1080".parse().unwrap(), false)
+            .await;
+
+        let seen = front.seen.lock().unwrap();
+        let [host_meta, ip_meta, v6_meta] = seen.as_slice() else {
+            panic!("three dials must reach the front: {seen:?}")
+        };
+        assert_eq!(host_meta.host, "example.com");
+        assert_eq!(host_meta.dst_ip, None);
+        assert_eq!(host_meta.dst_port, 443);
+        assert_eq!(ip_meta.dst_ip, Some("203.0.113.7".parse().unwrap()));
+        assert!(ip_meta.host.is_empty());
+        assert_eq!(v6_meta.dst_ip, Some("2001:db8::1".parse().unwrap()));
+        for m in seen.iter() {
+            assert_eq!(m.conn_type, ConnType::Inner);
+            assert_eq!(m.network, Network::Tcp);
+        }
+    }
+
+    /// The relay-wrapper entry point needs the same bound: a
+    /// `DialerProxyAdapter` registered under the very name it resolves
+    /// recurses through `relay_tcp` on every hop (issue #489).
+    #[tokio::test]
+    async fn dialer_proxy_adapter_recursion_is_depth_bounded() {
+        let registry = ProxyRegistry::default();
+        let target = DialerTarget::new("x", &registry);
+        let inner: Arc<dyn Proxy> = Arc::new(CapturingProxy {
+            seen: Mutex::new(Vec::new()),
+        });
+        let dpa: Arc<dyn Proxy> = Arc::new(crate::DialerProxyAdapter::new(inner, target));
+        registry.publish(Arc::new(HashMap::from([(
+            SmolStr::from("x"),
+            Arc::clone(&dpa),
+        )])));
+
+        let err = dpa
+            .dial_tcp(&Metadata::default())
+            .await
+            .err()
+            .expect("the self-referencing wrapper must fail");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "depth bound must be the surfaced error: {err}"
         );
     }
 }

@@ -71,6 +71,11 @@ pub struct AppState {
     pub log_tx: broadcast::Sender<LogMessage>,
     /// Live proxy-provider registry — refreshed by background task and PUT endpoint.
     pub proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
+    /// The cell provider-sourced `dialer-proxy` targets resolve against.
+    /// Newly declared providers materialized by a `PUT /configs` rebuild
+    /// must share it — it is the registry the tunnel republishes the route
+    /// map into (issue #489).
+    pub provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
     /// Live rule-provider registry — swapped wholesale to the committed
     /// build's provider set on every successful config commit, so `RULE-SET`
     /// rules, DNS `rule-set:` matchers, and `PUT /providers/rules/{name}`
@@ -374,7 +379,7 @@ struct ProxiesResponse {
 async fn get_proxies(State(state): State<Arc<AppState>>) -> Json<ProxiesResponse> {
     let route = state.tunnel.route_snapshot();
     let mut result = std::collections::HashMap::new();
-    for (name, proxy) in &route.proxies {
+    for (name, proxy) in route.proxies.iter() {
         result.insert(name.to_string(), ProxyInfo::from_proxy(proxy));
     }
     Json(ProxiesResponse { proxies: result })
@@ -1097,9 +1102,15 @@ async fn apply_raw_to_tunnel(
     let resolver_slot = state.tunnel.resolver_slot();
     // A rebuild failure is a defect in the candidate config the caller
     // supplied — 400, not 500 (issue #533 review).
-    let result = rebuild_from_raw_runtime_async(raw.clone(), resolver_slot, providers, cache_dir)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let result = rebuild_from_raw_runtime_async(
+        raw.clone(),
+        resolver_slot,
+        providers,
+        cache_dir,
+        state.provider_dialer_registry.clone(),
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let meow_config::RebuildResult {
         proxies,
         rules,
@@ -1529,6 +1540,7 @@ async fn rebuild_from_raw_runtime_async(
     resolver_slot: meow_dns::ResolverSlot,
     providers: HashMap<String, Arc<ProxyProvider>>,
     cache_dir: std::path::PathBuf,
+    provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
 ) -> Result<meow_config::RebuildResult, String> {
     tokio::task::spawn_blocking(move || {
         meow_config::rebuild_from_raw_runtime(
@@ -1536,6 +1548,7 @@ async fn rebuild_from_raw_runtime_async(
             Some(&resolver_slot),
             &providers,
             Some(&cache_dir),
+            &provider_dialer_registry,
         )
     })
     .await
@@ -2562,6 +2575,7 @@ async fn put_configs(
         Arc::clone(&resolver_slot),
         providers.clone(),
         cache_dir.clone(),
+        state.provider_dialer_registry.clone(),
     )
     .await
     {
@@ -2584,6 +2598,7 @@ async fn put_configs(
                     resolver_slot,
                     providers,
                     cache_dir,
+                    state.provider_dialer_registry.clone(),
                 )
                 .await
                 {
@@ -2823,7 +2838,7 @@ async fn get_metrics(State(_state): State<Arc<AppState>>) -> Response {
         let proxy_alive = Family::<Vec<(String, String)>, Gauge<i64, AtomicI64>>::default();
         let proxy_delay = Family::<Vec<(String, String)>, Gauge<i64, AtomicI64>>::default();
         let route = _state.tunnel.route_snapshot();
-        for (name, proxy) in &route.proxies {
+        for (name, proxy) in route.proxies.iter() {
             let labels = vec![
                 ("proxy_name".to_string(), name.to_string()),
                 ("adapter_type".to_string(), proxy.adapter_type().to_string()),
@@ -3579,7 +3594,9 @@ mod tests {
         let mk = |name: &str| {
             let def: RawProxyProvider =
                 serde_yaml::from_str("type: http\nurl: http://127.0.0.1:1/x.yaml").unwrap();
-            Arc::new(ProxyProvider::new(name, &def, None, false, false).unwrap())
+            Arc::new(
+                ProxyProvider::new(name, &def, None, false, false, Default::default()).unwrap(),
+            )
         };
         let registry: DashMap<String, Arc<ProxyProvider>> = DashMap::new();
         let keep = mk("keep");

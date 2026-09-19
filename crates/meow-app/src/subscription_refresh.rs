@@ -19,6 +19,11 @@ use tracing::{error, info, warn};
 /// The loop captures the tunnel weakly (issue #514): an embedder that drops
 /// every `Tunnel` handle stops this loop instead of leaving it mutating a
 /// dead tunnel's route table forever.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a shared handle wired at startup; grouping \
+              them would only rename the same list"
+)]
 pub async fn run_loop(
     raw_config: Arc<RwLock<RawConfig>>,
     tunnel: Tunnel,
@@ -32,6 +37,10 @@ pub async fn run_loop(
     // keep the live provider's slot, health state, and fetched content
     // instead of rebinding a freshly loaded (initially empty) provider.
     proxy_providers: Arc<dashmap::DashMap<String, Arc<ProxyProvider>>>,
+    // The live provider-dialer cell (`Config::provider_dialer_registry`) —
+    // providers a commit materializes for newly declared defs share the
+    // registry the tunnel republishes (issue #489).
+    provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
     // Shared supervisor — reconciled after each committed registry swap so
     // provider additions/removals/interval changes gain/lose their refresh
     // task without a restart (issue #543).
@@ -151,9 +160,15 @@ pub async fn run_loop(
                     };
 
                     let resolver = tunnel.resolver_slot();
+                    // Rebuild against the live provider slots and the global
+                    // selector store — the empty-providers variant would
+                    // strand `use:`/`include-all` group members (and the
+                    // dialer chains provider nodes declare, issue #489) on
+                    // every subscription commit.
                     let rebuild = tokio::task::spawn_blocking({
                         let candidate = candidate.clone();
                         let cache_dir = cache_dir.clone();
+                        let provider_dialer_registry = provider_dialer_registry.clone();
                         // Snapshot inside the mutation lane so the rebuild
                         // resolves `use:` against the committed provider set.
                         let proxy_providers: std::collections::HashMap<_, _> = proxy_providers
@@ -175,6 +190,7 @@ pub async fn run_loop(
                                 Some(&resolver),
                                 &proxy_providers,
                                 Some(cache_dir.as_path()),
+                                &provider_dialer_registry,
                             )
                         }
                     })

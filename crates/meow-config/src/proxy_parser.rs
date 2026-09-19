@@ -135,10 +135,16 @@ pub fn node_selects_external_plugin(config: &HashMap<String, serde_yaml::Value>)
 /// `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`,
 /// `kcptun`, `ech-tls-tunnel`) stay allowed — mihomo
 /// implements those in-process too, so gating them would diverge.
+///
+/// `dialer` is the pluggable TCP dialer the node's adapter dials its server
+/// through — [`meow_proxy::dialer::DirectDialer`] for an unchained node, or a
+/// [`meow_proxy::dialer::NamedProxyDialer`] when the node declares
+/// `dialer-proxy` (issue #489).
 pub fn parse_proxy_provider_node(
     config: &HashMap<String, serde_yaml::Value>,
     ipv6: bool,
     allow_external_plugin: bool,
+    dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     if !allow_external_plugin && node_selects_external_plugin(config) {
         let name = config.get("name").and_then(|v| v.as_str()).unwrap_or("?");
@@ -151,13 +157,14 @@ pub fn parse_proxy_provider_node(
         ));
     }
     let _ = allow_external_plugin;
-    parse_proxy(config, ipv6)
+    parse_proxy_with_dialer(config, dialer, ipv6)
 }
 
 /// Like [parse_proxy] but injects a custom [meow_proxy::dialer::TcpDialer]
-/// into every adapter. Used by apply_dialer_proxies to inject a
-/// [meow_proxy::dialer::ProxyDialer] so that dialer-proxy chaining works
-/// for all protocols without requiring connect_over.
+/// into every adapter. Used by apply_dialer_proxies — and by provider node
+/// parsing (issue #489) — to inject a [meow_proxy::dialer::NamedProxyDialer]
+/// so that dialer-proxy chaining works for all protocols without requiring
+/// connect_over.
 pub fn parse_proxy_with_dialer(
     config: &HashMap<String, serde_yaml::Value>,
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
@@ -4294,11 +4301,20 @@ tls: true
             health_check: None,
             header: None,
             allow_external_plugin: None,
+            override_: None,
+            proxy: None,
+            dialer_proxy: None,
         };
         let cache_dir = path.parent().expect("temp file has a parent dir");
-        let provider =
-            crate::proxy_provider::ProxyProvider::new(name, &raw, Some(cache_dir), true, false)
-                .unwrap();
+        let provider = crate::proxy_provider::ProxyProvider::new(
+            name,
+            &raw,
+            Some(cache_dir),
+            true,
+            false,
+            Default::default(),
+        )
+        .unwrap();
         provider.refresh().await.unwrap();
         Arc::new(provider)
     }
@@ -4549,6 +4565,11 @@ tls: true
     // ─── issue #513: provider nodes cannot select a local executable ─────────
 
     #[cfg(feature = "ss")]
+    fn direct_dialer() -> std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> {
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer)
+    }
+
+    #[cfg(feature = "ss")]
     fn external_plugin_ss() -> HashMap<String, serde_yaml::Value> {
         proxy_config(
             "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
@@ -4563,7 +4584,7 @@ tls: true
     #[test]
     fn provider_node_rejects_external_plugin_by_default() {
         let cfg = external_plugin_ss();
-        let Err(err) = super::parse_proxy_provider_node(&cfg, true, false) else {
+        let Err(err) = super::parse_proxy_provider_node(&cfg, true, false, &direct_dialer()) else {
             panic!("external plugin must be rejected without the opt-in")
         };
         assert!(err.contains("allow-external-plugin"), "msg: {err}");
@@ -4571,7 +4592,7 @@ tls: true
         // With the opt-in the gate opens: parse proceeds and fails at the
         // *plugin spawn* boundary (the binary does not exist), proving the
         // gate — not the plugin dispatch — did the rejecting above.
-        let Err(err) = super::parse_proxy_provider_node(&cfg, true, true) else {
+        let Err(err) = super::parse_proxy_provider_node(&cfg, true, true, &direct_dialer()) else {
             panic!("with opt-in, parse must reach adapter construction")
         };
         assert!(err.contains("failed to start ss plugin"), "msg: {err}");
@@ -4585,14 +4606,14 @@ tls: true
             "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
              plugin: obfs\nplugin-opts:\n  mode: http\n",
         );
-        assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
+        assert!(super::parse_proxy_provider_node(&cfg, true, false, &direct_dialer()).is_ok());
 
         // A stray `plugin:` on a trojan node is ignored by its parser —
         // the gate must not reject it either.
         let cfg = proxy_config(
             "name: t\ntype: trojan\nserver: 1.2.3.4\nport: 443\npassword: p\nplugin: whatever\n",
         );
-        assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
+        assert!(super::parse_proxy_provider_node(&cfg, true, false, &direct_dialer()).is_ok());
     }
 
     /// v2ray-plugin is a built-in in-process plugin — the gate must let it
@@ -4604,7 +4625,7 @@ tls: true
             "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
              plugin: v2ray-plugin\n",
         );
-        assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
+        assert!(super::parse_proxy_provider_node(&cfg, true, false, &direct_dialer()).is_ok());
     }
 
     /// gost-plugin is likewise built-in — the external-plugin gate must not
@@ -4619,7 +4640,14 @@ tls: true
             "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
              plugin: gost-plugin\nplugin-opts:\n  mode: websocket\n  mux: false\n",
         );
-        assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
+        assert!(super::parse_proxy_provider_node(
+            &cfg,
+            true,
+            false,
+            &(std::sync::Arc::new(meow_proxy::dialer::DirectDialer)
+                as std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>),
+        )
+        .is_ok());
     }
 
     /// shadow-tls is a built-in in-process plugin too — the provider gate
@@ -4632,7 +4660,14 @@ tls: true
             "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
              plugin: shadow-tls\nplugin-opts:\n  host: cover.example.com\n  version: 3\n",
         );
-        assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
+        assert!(super::parse_proxy_provider_node(
+            &cfg,
+            true,
+            false,
+            &(std::sync::Arc::new(meow_proxy::dialer::DirectDialer)
+                as std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>),
+        )
+        .is_ok());
     }
 
     /// The provider opt-in key is `allow-external-plugin` (kebab-case like

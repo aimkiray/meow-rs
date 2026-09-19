@@ -495,6 +495,23 @@ pub struct RawProxyProvider {
     /// (issue #513). mihomo has no external-plugin mechanism, so no
     /// mihomo subscription relies on it.
     pub allow_external_plugin: Option<bool>,
+    /// mihomo `proxy:` — route this provider's fetches through a named
+    /// proxy/group. Parsed so it can warn instead of being silently dropped;
+    /// fetch-through-proxy is not implemented for proxy providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// mihomo `dialer-proxy` — chain every node in this provider through the
+    /// named front hop. Upstream writes it into each node's mapping
+    /// unconditionally, so it overrides node-level `dialer-proxy` fields
+    /// (and is itself overridden by `override.dialer-proxy`) (issue #489).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialer_proxy: Option<String>,
+    /// mihomo `override:` block — provider-level defaults applied to every
+    /// node unconditionally (`OverrideSchema.Apply` writes last, so it
+    /// outranks node-level fields). Only `dialer-proxy` is honoured
+    /// (issue #489); other keys warn at load time.
+    #[serde(rename = "override", skip_serializing_if = "Option::is_none")]
+    pub override_: Option<HashMap<String, serde_yaml::Value>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

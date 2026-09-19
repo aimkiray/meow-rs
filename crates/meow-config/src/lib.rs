@@ -73,6 +73,13 @@ pub struct Config {
     pub dns: DnsConfig,
     pub proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
     pub proxy_providers: HashMap<String, Arc<ProxyProvider>>,
+    /// Registry that provider-sourced nodes' `dialer-proxy` targets resolve
+    /// against (issue #489). Unlike the per-build registry inside
+    /// `rebuild_from_raw_impl`, this handle outlives a single build: the
+    /// tunnel republishes the live route map into it on every routing
+    /// update, so provider nodes — which persist across rebuilds — always
+    /// resolve the *current* name map.
+    pub provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
     pub rules: Vec<Box<dyn Rule>>,
     pub rule_providers: HashMap<String, Arc<rule_provider::RuleProvider>>,
     /// The `dialer-proxy` registry generation `proxies` was published into.
@@ -760,6 +767,7 @@ pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::E
         None,
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
+        &meow_proxy::dialer::ProxyRegistry::default(),
         None,
     )
 }
@@ -819,6 +827,7 @@ pub fn rebuild_from_raw_with_resolver(
         None,
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
+        &meow_proxy::dialer::ProxyRegistry::default(),
         shared_rule_providers,
     )
 }
@@ -834,6 +843,11 @@ pub fn rebuild_from_raw_runtime(
     resolver: Option<&meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     cache_dir: Option<&Path>,
+    // The live provider-dialer cell — providers a commit materializes for
+    // newly declared defs must share the registry the tunnel republishes,
+    // or their `dialer-proxy` chains never resolve (issue #489). Pass
+    // `Config::provider_dialer_registry`.
+    provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
 ) -> Result<RebuildResult, anyhow::Error> {
     let store = meow_proxy::SelectorStore::global();
     if store.is_none() {
@@ -853,6 +867,7 @@ pub fn rebuild_from_raw_runtime(
         None,
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
+        provider_dialer_registry,
         None,
     )
 }
@@ -874,6 +889,7 @@ pub fn rebuild_from_raw_with_cache_dir(
         None,
         None,
         None,
+        &meow_proxy::dialer::ProxyRegistry::default(),
         &meow_proxy::dialer::ProxyRegistry::default(),
         None,
     )
@@ -1289,7 +1305,9 @@ fn reject_declared_group_cycles(raw_groups: &[raw::RawProxyGroup]) -> Result<(),
 /// members are all
 /// treated as reachable heads (only the first member's dialer can actually
 /// fire); provider-slot members (`use:` / `include-all`) are dead ends —
-/// provider nodes never carry a `dialer-proxy`.
+/// provider nodes CAN carry a `dialer-proxy` (issue #489) but provider
+/// membership is dynamic and unknowable here, so that recursion shape is
+/// caught by the dial-time depth guard in `meow_proxy::dialer` instead.
 fn reject_group_membership_cycles(
     edges: &[(SmolStr, SmolStr)],
     raw_groups: &[raw::RawProxyGroup],
@@ -1559,6 +1577,10 @@ fn materialize_proxy_providers(
     live: &HashMap<String, Arc<ProxyProvider>>,
     cache_dir: Option<&Path>,
     strict: bool,
+    // The long-lived cell the tunnel republishes the route map into —
+    // newly declared providers must share it, or their `dialer-proxy`
+    // nodes can never resolve (issue #489).
+    provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
 ) -> Result<HashMap<String, Arc<ProxyProvider>>, anyhow::Error> {
     let Some(raw_map) = raw.proxy_providers.as_ref() else {
         return Ok(HashMap::new());
@@ -1572,7 +1594,14 @@ fn materialize_proxy_providers(
                 continue;
             }
         }
-        match ProxyProvider::new(name, def, cache_dir, ipv6, strict) {
+        match ProxyProvider::new(
+            name,
+            def,
+            cache_dir,
+            ipv6,
+            strict,
+            provider_dialer_registry.clone(),
+        ) {
             Ok(provider) => {
                 out.insert(name.clone(), Arc::new(provider));
             }
@@ -2095,6 +2124,12 @@ fn rebuild_from_raw_impl(
     // registry generation across passes; it is returned in [`RebuildResult`]
     // so the generation owner can retain it (issue #533).
     registry: &meow_proxy::dialer::ProxyRegistry,
+    // The cell provider-sourced `dialer-proxy` targets resolve against —
+    // reused providers already hold it internally; newly declared ones are
+    // constructed with it here. Callers without a long-lived cell (config
+    // validation, tests) may pass a throwaway: providers built on it never
+    // dial in those contexts (issue #489).
+    provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
     // An already-loaded provider set to bind into this build (startup's
     // two-pass build shares the set it loaded for DNS so rules, DNS
     // `rule-set:` matchers, and `Config.rule_providers` all reference one
@@ -2118,7 +2153,8 @@ fn rebuild_from_raw_impl(
     // provider" (issue #533 review). `strict` also validates newly
     // declared defs here so a bad def can't be committed and then fail the
     // next startup.
-    let candidate_providers = materialize_proxy_providers(raw, providers, cache_dir, strict)?;
+    let candidate_providers =
+        materialize_proxy_providers(raw, providers, cache_dir, strict, provider_dialer_registry)?;
     let proxies = build_proxy_layer(
         raw,
         resolver,
@@ -2138,6 +2174,23 @@ fn rebuild_from_raw_impl(
     // tunnel keep resolving the snapshot they were built from — while the
     // owning generation is still retained (the cell is only held weakly by
     // the adapters, issue #533).
+    // Provider-sourced nodes may also declare `dialer-proxy` (issue #489).
+    // Their names cannot be hard-validated the way static edges are — the
+    // payload is remote content and the dialer name may point at a group
+    // built above — so warn about references that will never resolve and let
+    // the by-name lookup surface a loud dial error at runtime.
+    for provider in candidate_providers.values() {
+        for dialer in provider.declared_dialer_names() {
+            if !proxies.contains_key(dialer.as_str()) {
+                warn!(
+                    provider = %provider.name,
+                    "provider node declares dialer-proxy '{dialer}', which is \
+                     not a built proxy or group — chained dials will fail"
+                );
+            }
+        }
+    }
+
     registry.publish(Arc::new(proxies.clone()));
 
     let download_proxy = internal_http::first_named_proxy(raw.proxies.as_deref(), &proxies);
@@ -2325,6 +2378,9 @@ async fn rebuild_from_raw_impl_async(
     // adapters retained elsewhere (DNS `#PROXY` handles, provider fetch
     // contexts) resolve the latest published snapshot (issue #533).
     registry: meow_proxy::dialer::ProxyRegistry,
+    // The live provider-dialer cell newly declared providers share
+    // (issue #489) — see `rebuild_from_raw_impl`.
+    provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
     // Startup's pass-2 shares the provider set already loaded for DNS so
     // rules, `rule-set:` matchers, and `Config.rule_providers` reference one
     // object per provider (issue #533 review). `None` = load fresh.
@@ -2340,6 +2396,7 @@ async fn rebuild_from_raw_impl_async(
             Some(&ctx),
             Some(provider_payloads),
             &registry,
+            &provider_dialer_registry,
             shared_providers,
         )
     })
@@ -3412,6 +3469,12 @@ async fn build_config(
         bind_address,
     };
 
+    // Registry the provider nodes' `dialer-proxy` targets resolve against
+    // (issue #489). It is shared into every provider *before* they load so
+    // nodes parsed during the initial refresh already hold the handle; the
+    // tunnel publishes the live route map into it on every routing install.
+    let provider_dialer_registry = meow_proxy::dialer::ProxyRegistry::default();
+
     // Load proxy providers (async: may HTTP-fetch provider files).
     let proxy_providers = if let Some(raw_pp) = raw.proxy_providers.as_ref() {
         if raw_pp.is_empty() {
@@ -3422,6 +3485,7 @@ async fn build_config(
                 cache_dir,
                 general.ipv6,
                 raw.strict.unwrap_or(false),
+                &provider_dialer_registry,
             )
             .await?
         }
@@ -3506,6 +3570,7 @@ async fn build_config(
             ctx.clone(),
             Arc::clone(&provider_payloads),
             dialer_registry.clone(),
+            provider_dialer_registry.clone(),
             None,
         )
         .await?;
@@ -3558,6 +3623,7 @@ async fn build_config(
             ctx.clone(),
             Arc::clone(&provider_payloads),
             dialer_registry.clone(),
+            provider_dialer_registry.clone(),
             // Share the provider set already loaded for DNS so rules,
             // `rule-set:` matchers, and `Config.rule_providers` reference
             // one object per provider (issue #533 review).
@@ -3637,6 +3703,7 @@ async fn build_config(
         dns: dns_config,
         proxies,
         proxy_providers,
+        provider_dialer_registry,
         rules,
         rule_providers,
         dialer_registry,
@@ -4262,21 +4329,33 @@ mod dialer_proxy_tests {
         assert!(was_wrapped(&before, &proxies, "A"));
     }
 
-    /// A malformed `dialer-proxy` value is warned about and skipped — the node
-    /// keeps its direct dialer rather than dying on a typo.
+    /// A malformed `dialer-proxy` value is a config error — mihomo's
+    /// `ParseProxy` type-asserts the field, and warn-skipping would silently
+    /// direct-dial the node (upstream parity; issue #489 review).
     #[test]
-    fn malformed_dialer_proxy_is_ignored() {
+    fn malformed_dialer_proxy_is_a_config_error() {
         let mut proxies = registry(&["A", "B"]);
-        let before = proxies.clone();
         let mut raw = raw_proxy("A", None);
         raw.insert(
             "dialer-proxy".to_string(),
             serde_yaml::Value::Number(serde_yaml::Number::from(42)),
         );
-        apply_chains(&mut proxies, &[raw]).expect("malformed dialer-proxy is skipped");
+        // Malformed values are a hard error under `strict` — the lenient
+        // warn-and-skip arm is covered by `strict_mode_tests` at the rebuild
+        // level. `apply_chains` runs the lenient path.
+        let err = apply_dialer_proxies(
+            &mut proxies,
+            &[raw],
+            &[],
+            &meow_proxy::dialer::ProxyRegistry::default(),
+            true,
+            true,
+        )
+        .map(|_| ())
+        .expect_err("malformed dialer-proxy must fail under strict");
         assert!(
-            !was_wrapped(&before, &proxies, "A"),
-            "a non-string dialer-proxy must not apply a chain"
+            err.to_string().contains("malformed dialer-proxy"),
+            "error must name the field: {err}"
         );
     }
 
@@ -5492,8 +5571,14 @@ rules:
 
         // `rebuild_from_raw_runtime` — used by meow-api's `PUT /configs`
         // family via `rebuild_from_raw_runtime_async`.
-        let result = rebuild_from_raw_runtime(&raw, None, &HashMap::new(), Some(dir.path()))
-            .expect(
+        let result = rebuild_from_raw_runtime(
+            &raw,
+            None,
+            &HashMap::new(),
+            Some(dir.path()),
+            &Default::default(),
+        )
+        .expect(
             "trusted runtime rebuild with the real cache dir must not hard-fail on a file provider",
         );
         assert_eq!(result.rules.len(), 2);
@@ -5734,6 +5819,7 @@ proxy-providers:
             None,
             false,
             true,
+            &Default::default(),
         )
         .await;
         let Err(err) = result else {
@@ -5748,6 +5834,7 @@ proxy-providers:
             None,
             false,
             false,
+            &Default::default(),
         )
         .await
         .expect("lenient load never errors");
@@ -5780,6 +5867,7 @@ proxy-providers:
             Some(dir.path()),
             false,
             true,
+            &Default::default(),
         )
         .await;
         let Err(err) = result else {
@@ -5793,6 +5881,7 @@ proxy-providers:
             Some(dir.path()),
             false,
             false,
+            &Default::default(),
         )
         .await
         .expect("lenient load never errors");
@@ -5996,6 +6085,7 @@ proxy-providers:
             Some(dir.path()),
             false,
             true,
+            &Default::default(),
         )
         .await
         .expect("an unfetchable provider must stay lenient even under strict");
@@ -6055,7 +6145,9 @@ rules:
     fn strict_use_fails_when_candidate_removes_provider() {
         let live_def: raw::RawProxyProvider =
             serde_yaml::from_str("type: http\nurl: http://127.0.0.1:1/x.yaml").unwrap();
-        let live_provider = ProxyProvider::new("airport", &live_def, None, false, false).unwrap();
+        let live_provider =
+            ProxyProvider::new("airport", &live_def, None, false, false, Default::default())
+                .unwrap();
         let live: HashMap<String, Arc<ProxyProvider>> =
             HashMap::from([("airport".to_string(), Arc::new(live_provider))]);
 
@@ -6320,7 +6412,15 @@ rule-providers:
             dir.path().join("nodes.yaml").display()
         ))
         .unwrap();
-        let provider = ProxyProvider::new("p", &def, Some(dir.path()), false, false).unwrap();
+        let provider = ProxyProvider::new(
+            "p",
+            &def,
+            Some(dir.path()),
+            false,
+            false,
+            Default::default(),
+        )
+        .unwrap();
 
         // Lenient refresh: bad node skipped, good node lands.
         provider
@@ -6439,20 +6539,33 @@ rules:
 "#;
         let cache_dir = std::path::Path::new("/tmp");
         let raw = raw_config(yaml);
-        let first = materialize_proxy_providers(&raw, &HashMap::new(), Some(cache_dir), false)
-            .expect("provider materializes");
+        let first = materialize_proxy_providers(
+            &raw,
+            &HashMap::new(),
+            Some(cache_dir),
+            false,
+            &Default::default(),
+        )
+        .expect("provider materializes");
         let provider = Arc::clone(first.get("p").unwrap());
 
         // Unchanged def → same Arc reused.
         let again =
-            materialize_proxy_providers(&raw, &first, Some(cache_dir), false).expect("reuse");
+            materialize_proxy_providers(&raw, &first, Some(cache_dir), false, &Default::default())
+                .expect("reuse");
         assert!(Arc::ptr_eq(again.get("p").unwrap(), &provider));
 
         // Changed def (filter added) → a new object materializes.
         let changed_yaml = yaml.replace("path: nodes.yaml", "path: nodes.yaml\n    filter: '^ok'");
         let changed_raw = raw_config(&changed_yaml);
-        let rebuilt = materialize_proxy_providers(&changed_raw, &first, Some(cache_dir), false)
-            .expect("changed def materializes fresh");
+        let rebuilt = materialize_proxy_providers(
+            &changed_raw,
+            &first,
+            Some(cache_dir),
+            false,
+            &Default::default(),
+        )
+        .expect("changed def materializes fresh");
         assert!(
             !Arc::ptr_eq(rebuilt.get("p").unwrap(), &provider),
             "a changed provider def must not reuse the live object"
@@ -6523,7 +6636,7 @@ rules:
         std::fs::write(dir.join("empty.yaml"), "# nothing here\n").unwrap();
         let raw: raw::RawProxyProvider =
             serde_yaml::from_str("type: file\npath: empty.yaml\n").unwrap();
-        let provider = ProxyProvider::new("p", &raw, Some(&dir), false, true)
+        let provider = ProxyProvider::new("p", &raw, Some(&dir), false, true, Default::default())
             .expect("file provider constructs");
         provider
             .refresh()

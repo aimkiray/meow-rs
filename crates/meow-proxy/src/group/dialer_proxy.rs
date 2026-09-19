@@ -98,12 +98,28 @@ impl ProxyAdapter for DialerProxyAdapter {
         // `[dialer, inner]`: dialer dials inner's server, inner connects to the
         // real target via `connect_over`. An unresolvable front hop must fail —
         // dialling direct would leak past a chain configured for policy reasons.
-        let front = self
-            .dialer
-            .resolve()
-            .ok_or_else(|| MeowError::Proxy(self.dialer.missing_error()))?;
-        let chain = [front, Arc::clone(&self.inner)];
-        relay_tcp(&chain, metadata).await
+        // The depth guard mirrors `NamedProxyDialer`: a provider-sourced member
+        // can route the front hop's group selection back to this adapter
+        // (issue #489).
+        crate::dialer::scoped_chain_dial(
+            self.dialer.name(),
+            |name| {
+                MeowError::Proxy(format!(
+                    "dialer-proxy '{name}': chain exceeds {} hops; a provider \
+                     member or group is routing the dial back into itself",
+                    crate::dialer::MAX_DIALER_CHAIN_DEPTH
+                ))
+            },
+            async {
+                let front = self
+                    .dialer
+                    .resolve()
+                    .ok_or_else(|| MeowError::Proxy(self.dialer.missing_error()))?;
+                let chain = [front, Arc::clone(&self.inner)];
+                relay_tcp(&chain, metadata).await
+            },
+        )
+        .await
     }
 
     async fn dial_udp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
