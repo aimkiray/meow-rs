@@ -166,6 +166,7 @@ pub async fn run_loop(
                                 dialer_registry: new_registry,
                                 rule_providers: new_rule_providers,
                                 proxy_providers: new_proxy_providers,
+                                prefetched_payloads: new_prefetched_payloads,
                             } = result;
                             // A swapped proxy set changes the objects a
                             // `#name` nameserver or `rule-set:` policy key
@@ -178,6 +179,7 @@ pub async fn run_loop(
                                 &config_path,
                                 &new_proxies,
                                 Some(&new_rule_providers),
+                                Some(&new_prefetched_payloads),
                                 Some(tunnel.resolver()),
                                 Some(&new_registry),
                             )

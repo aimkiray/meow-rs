@@ -561,6 +561,12 @@ pub struct RebuildResult {
     /// and a newly declared provider becomes refreshable (issue #533
     /// review).
     pub proxy_providers: HashMap<String, Arc<ProxyProvider>>,
+    /// The file/http rule-provider payload bytes this rebuild prefetched.
+    /// The same commit's DNS rebuild should reuse them rather than
+    /// fetching again inside `CONFIG_MUTATION`, and its geo-scan needs
+    /// them to see `GEOSITE`/`GEOIP`/`IP-ASN` rules that live only inside
+    /// provider payloads (issue #543).
+    pub prefetched_payloads: Arc<rule_provider::PrefetchedPayloads>,
 }
 
 /// Rebuild proxies and rules from a RawConfig (used for runtime updates).
@@ -696,11 +702,6 @@ pub fn rebuild_from_raw_with_cache_dir(
 /// same payload must succeed, and a PUT removing one must not let the old
 /// matcher zombie-bind (issue #514 review).
 ///
-/// When providers were loaded, `registry` (if given) is swapped to the
-/// freshly loaded set on success — the policy matchers capture the same
-/// `Arc<RuleProvider>` objects, so `PUT /providers/rules/{name}` and
-/// name-resolved refresh loops keep reaching the live generation instead
-/// of orphaned startup-era objects (issue #514 review).
 /// `prior_resolver` is the resolver generation being replaced — reload
 /// paths pass the tunnel's live resolver so the rebuilt one can inherit
 /// the fake-IP pool when the range and store identity (in-memory vs the
@@ -714,17 +715,29 @@ pub fn rebuild_from_raw_with_cache_dir(
 /// is shared by the rules, the matchers, and the live registry the caller
 /// commits (issue #533 review). `None` loads `raw.rule_providers`
 /// standalone (callers that never wired a rebuild, e.g. tests).
+///
+/// `prefetched_payloads` is the same commit's prefetched file/http
+/// provider payload bytes (`RebuildResult::prefetched_payloads`) — the
+/// geo-scan context needs them to see `GEOSITE`/`GEOIP`/`IP-ASN` rules
+/// that live only inside provider payloads, and a private provider load
+/// parses the same bytes instead of fetching again inside
+/// `CONFIG_MUTATION` (issue #543). `None` builds a payload-blind context
+/// and fetches on demand — the status quo for callers without a routing
+/// rebuild in flight.
 pub async fn parse_dns_from_raw(
     raw: &raw::RawConfig,
     cache_dir: Option<&Path>,
     proxy_registry: &HashMap<SmolStr, Arc<dyn Proxy>>,
     rule_providers: Option<&HashMap<String, Arc<rule_provider::RuleProvider>>>,
+    prefetched_payloads: Option<&Arc<rule_provider::PrefetchedPayloads>>,
     prior_resolver: Option<&meow_dns::Resolver>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<DnsConfig, anyhow::Error> {
     let geo = geodata::parse_geodata(raw.geodata.as_ref())?;
-    let payloads = rule_provider::PrefetchedPayloads::default();
-    let ctx = build_parser_context_from_raw(raw, &payloads)?;
+    let empty = rule_provider::PrefetchedPayloads::default();
+    let payloads: &rule_provider::PrefetchedPayloads =
+        prefetched_payloads.map_or(&empty, Arc::as_ref);
+    let ctx = build_parser_context_from_raw(raw, payloads)?;
     let rule_providers = if dns_parser::dns_needs_rule_providers(raw) {
         match rule_providers {
             Some(shared) => shared.clone(),
@@ -735,7 +748,10 @@ pub async fn parse_dns_from_raw(
                     ctx.clone(),
                     internal_http::first_named_proxy(raw.proxies.as_deref(), proxy_registry),
                     proxy_registry.clone(),
-                    Arc::new(payloads),
+                    prefetched_payloads.map_or_else(
+                        || Arc::new(rule_provider::PrefetchedPayloads::default()),
+                        Arc::clone,
+                    ),
                     dialer_registry.cloned(),
                     raw.strict.unwrap_or(false),
                 )
@@ -1792,7 +1808,7 @@ fn rebuild_from_raw_impl(
     providers: &HashMap<String, Arc<ProxyProvider>>,
     selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
     shared_ctx: Option<&meow_rules::ParserContext>,
-    prefetched_payloads: Option<&rule_provider::PrefetchedPayloads>,
+    prefetched_payloads: Option<Arc<rule_provider::PrefetchedPayloads>>,
     // `dialer-proxy` front hops are resolved by name against this registry on
     // every dial; it is published once the build below has finished. The
     // caller supplies the cell so a multi-pass build (startup) can share one
@@ -1864,29 +1880,31 @@ fn rebuild_from_raw_impl(
 
     // Fetch/read rule-provider payload bytes once — the parser-context build
     // scans them for geo keys (issue #277) and the provider load below parses
-    // the same bytes, so nothing is fetched twice.
-    let owned_payloads;
-    let payloads = match prefetched_payloads {
+    // the same bytes, so nothing is fetched twice. The `Arc` is returned on
+    // `RebuildResult` so the same commit's DNS rebuild can share it (issue
+    // #543).
+    let payloads: Arc<rule_provider::PrefetchedPayloads> = match prefetched_payloads {
         Some(p) => p,
-        None => {
-            owned_payloads = match raw.rule_providers.as_ref() {
-                Some(map) if !map.is_empty() => rule_provider::prefetch_payloads(
-                    map,
-                    cache_dir,
-                    download_proxy.as_ref(),
-                    &proxy_lookup,
-                ),
-                _ => HashMap::new(),
-            };
-            &owned_payloads
-        }
+        // `shared_providers` rebuilds bind the live provider objects — their
+        // payloads are never re-parsed, so prefetching would only re-fetch
+        // every http provider per geodata tick for bytes nothing reads.
+        None if shared_providers.is_some() => Arc::new(HashMap::new()),
+        None => Arc::new(match raw.rule_providers.as_ref() {
+            Some(map) if !map.is_empty() => rule_provider::prefetch_payloads(
+                map,
+                cache_dir,
+                download_proxy.as_ref(),
+                &proxy_lookup,
+            ),
+            _ => HashMap::new(),
+        }),
     };
 
     let owned_ctx;
     let ctx = match shared_ctx {
         Some(c) => c,
         None => {
-            owned_ctx = build_parser_context_from_raw(raw, payloads)?;
+            owned_ctx = build_parser_context_from_raw(raw, &payloads)?;
             &owned_ctx
         }
     };
@@ -1900,7 +1918,7 @@ fn rebuild_from_raw_impl(
                 ctx,
                 download_proxy.as_ref(),
                 &proxy_lookup,
-                payloads,
+                &payloads,
                 Some(registry),
                 strict,
             )?,
@@ -1949,6 +1967,7 @@ fn rebuild_from_raw_impl(
         dialer_registry: registry.clone(),
         rule_providers,
         proxy_providers: candidate_providers,
+        prefetched_payloads: payloads,
     })
 }
 
@@ -2039,7 +2058,7 @@ async fn rebuild_from_raw_impl_async(
             &providers,
             selector_store.as_ref(),
             Some(&ctx),
-            Some(&provider_payloads),
+            Some(provider_payloads),
             &registry,
             shared_providers,
         )
@@ -2612,8 +2631,12 @@ fn collect_geo_scan_lines(
             }
         }
     }
-    for bytes in provider_payloads.values() {
-        if meow_rules::is_mrs_bytes(bytes) {
+    // Only payloads belonging to providers this raw actually declares are
+    // scanned — a caller-supplied superset map must not trigger geo loads
+    // for providers the candidate does not carry (issue #543).
+    let declared = raw.rule_providers.as_ref();
+    for (name, bytes) in provider_payloads {
+        if !declared.is_some_and(|m| m.contains_key(name)) || meow_rules::is_mrs_bytes(bytes) {
             continue;
         }
         let text = String::from_utf8_lossy(bytes);
@@ -4376,10 +4399,30 @@ mod geoip_context_tests {
     }
 
     /// Issue #277 — prefetched file/http provider payload bytes are scanned
-    /// (yaml and text forms); binary MRS payloads are skipped.
+    /// (yaml and text forms); binary MRS payloads are skipped. Payloads
+    /// keyed to providers the raw does not declare are ignored (issue
+    /// #543).
     #[test]
     fn scan_lines_include_prefetched_provider_payloads() {
-        let raw = raw::RawConfig::default();
+        let provider = || raw::RawRuleProvider {
+            provider_type: "file".to_string(),
+            behavior: "classical".to_string(),
+            format: None,
+            url: None,
+            path: Some("/tmp/p.yaml".to_string()),
+            interval: None,
+            proxy: None,
+            header: None,
+            payload: None,
+        };
+        let raw = raw::RawConfig {
+            rule_providers: Some(HashMap::from([
+                ("yaml-provider".to_string(), provider()),
+                ("text-provider".to_string(), provider()),
+                ("mrs-provider".to_string(), provider()),
+            ])),
+            ..Default::default()
+        };
         let mut payloads: rule_provider::PrefetchedPayloads = HashMap::new();
         payloads.insert(
             "yaml-provider".to_string(),
@@ -4397,10 +4440,15 @@ mod geoip_context_tests {
             )
             .unwrap(),
         );
+        payloads.insert("undeclared".to_string(), b"GEOIP,FR\n".to_vec());
         let lines = collect_geo_scan_lines(&raw, &payloads);
         let countries = collect_geoip_countries(&lines);
         assert!(countries.contains("BR"), "yaml payload GEOIP must be seen");
         assert!(!countries.contains("XX"), "comment lines must be skipped");
+        assert!(
+            !countries.contains("FR"),
+            "payloads for undeclared providers must be ignored"
+        );
         assert!(collect_asn_numbers(&lines).contains(&15169));
     }
 
@@ -6089,5 +6137,140 @@ rules:
         // balanced/unbalanced ones never reach the cap.
         let scalar = "proxies:\n  - { name: \"[weird] name {x\", type: direct }\n";
         assert!(yaml_within_depth(scalar));
+    }
+}
+
+#[cfg(test)]
+mod dns_provider_sharing_tests {
+    use super::*;
+
+    /// `dns:` with a `rule-set:p` nameserver-policy key (so the DNS parse
+    /// needs providers) plus a file-backed `p` provider.
+    fn dns_raw_with_file_provider(path: &std::path::Path, behavior: &str) -> raw::RawConfig {
+        let yaml = format!(
+            "dns:\n  enable: true\n  nameserver:\n    - 127.0.0.1\n  nameserver-policy:\n    rule-set:p: 127.0.0.1\nrule-providers:\n  p:\n    type: file\n    behavior: {behavior}\n    path: \"{}\"\nrules:\n  - MATCH,DIRECT\n",
+            path.display()
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    /// Issue #543 — the DNS rebuild must share the commit's prefetched
+    /// payload bytes instead of fetching again. The
+    /// `(rule_providers=None, payloads=Some)` combination pinned here is
+    /// defensive — commit paths pass the two in lockstep — but any caller
+    /// without the shared map must still not refetch.
+    ///
+    /// Discrimination: under `strict`, a payload *parse* defect is a hard
+    /// error while a missing file is only an acquisition failure (the
+    /// provider registers empty). So a malformed shared payload must fail
+    /// even while the on-disk file is valid — iff the private load
+    /// consumes the shared bytes.
+    #[tokio::test]
+    async fn dns_rebuild_reuses_prefetched_payloads_without_refetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("p.yaml");
+        std::fs::write(&file, b"payload:\n  - '+.example.com'\n").unwrap();
+        let mut raw = dns_raw_with_file_provider(&file, "domain");
+        raw.strict = Some(true);
+        let proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+
+        let mut payloads = rule_provider::PrefetchedPayloads::new();
+        payloads.insert("p".to_string(), b"not: [valid: yaml".to_vec());
+        let payloads = Arc::new(payloads);
+
+        let err = parse_dns_from_raw(
+            &raw,
+            Some(dir.path()),
+            &proxies,
+            None, // no preloaded map → private load
+            Some(&payloads),
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("a malformed shared payload must fail strict parsing");
+        assert!(
+            format!("{err:#}").contains("rule-provider 'p'"),
+            "error must name the provider whose payload failed: {err:#}"
+        );
+
+        // The same raw with no shared map parses the on-disk file fine —
+        // the error above came from the shared bytes, not the config.
+        parse_dns_from_raw(&raw, Some(dir.path()), &proxies, None, None, None, None)
+            .await
+            .expect("the on-disk payload must parse cleanly");
+
+        // And with the file gone, a valid shared payload still satisfies
+        // the load — the bytes the routing rebuild fetched are the ones
+        // the DNS rebuild parses.
+        let mut payloads = rule_provider::PrefetchedPayloads::new();
+        payloads.insert("p".to_string(), std::fs::read(&file).unwrap());
+        let payloads = Arc::new(payloads);
+        std::fs::remove_file(&file).unwrap();
+        parse_dns_from_raw(
+            &raw,
+            Some(dir.path()),
+            &proxies,
+            None,
+            Some(&payloads),
+            None,
+            None,
+        )
+        .await
+        .expect("shared payloads must satisfy the private provider load");
+    }
+
+    /// Issue #543 — the DNS rebuild's geo scan must see `GEOSITE`/`GEOIP`/
+    /// `IP-ASN` rules that live only inside provider payloads. Observable
+    /// as the fail-fast missing-MMDB error naming the payload line that
+    /// triggered it.
+    #[tokio::test]
+    async fn dns_rebuild_geo_scan_sees_provider_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("p.yaml");
+        std::fs::write(&file, b"payload:\n  - GEOIP,CN,DIRECT\n").unwrap();
+        let mut raw = dns_raw_with_file_provider(&file, "classical");
+        raw.geodata =
+            Some(serde_yaml::from_str("mmdb-path: /nonexistent-543/Country.mmdb").unwrap());
+        let proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+
+        let mut payloads = rule_provider::PrefetchedPayloads::new();
+        payloads.insert("p".to_string(), std::fs::read(&file).unwrap());
+        let payloads = Arc::new(payloads);
+
+        let err = parse_dns_from_raw(
+            &raw,
+            Some(dir.path()),
+            &proxies,
+            None,
+            Some(&payloads),
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("a payload GEOIP rule must trigger the mmdb load");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/nonexistent-543/Country.mmdb"),
+            "error must name the attempted mmdb path: {msg}"
+        );
+        assert!(
+            msg.contains("GEOIP,CN"),
+            "error must name the payload line that triggered the load: {msg}"
+        );
+
+        // The payload-blind call never attempts the mmdb load — the scan
+        // saw no geo reference (the provider's GEOIP rule is itself
+        // warn-skipped by the classical ruleset builder with no ctx).
+        if let Err(err) =
+            parse_dns_from_raw(&raw, Some(dir.path()), &proxies, None, None, None, None).await
+        {
+            assert!(
+                !format!("{err}").contains("/nonexistent-543/Country.mmdb"),
+                "without shared payloads the scan must stay payload-blind: {err}"
+            );
+        }
     }
 }

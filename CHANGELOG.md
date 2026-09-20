@@ -565,3 +565,17 @@ the canonical, in-repo source a release is cut from.
   panicking its task. Embedders: `ApiServer::new` and
   `subscription_refresh::run_loop` each gained a required
   `Arc<RefreshSupervisor>` parameter. (issue #543)
+
+- **The DNS rebuild now shares the commit's prefetched rule-provider
+  payload snapshot.** Its parser context was built from an empty payload
+  map — blind to `GEOIP`/`GEOSITE`/`IP-ASN` rules that live only inside
+  provider payloads — and the private provider load it runs when no
+  shared provider map is in hand re-read the same bytes the routing
+  rebuild had just fetched, potentially seeing different file content
+  mid-commit. `RebuildResult` now carries the prefetched payload `Arc`
+  and every commit path (`PUT /configs`, subscription refresh,
+  `apply_raw_to_tunnel`) passes it to the DNS rebuild, so both parser
+  contexts scan the same bytes and a private load parses the
+  commit-consistent snapshot. Embedders: `reconcile_dns_config` and
+  `parse_dns_from_raw` gained a `prefetched_payloads` parameter.
+  (issue #543)

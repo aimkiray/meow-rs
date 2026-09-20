@@ -1104,6 +1104,7 @@ async fn apply_raw_to_tunnel(
         dialer_registry,
         rule_providers,
         proxy_providers,
+        prefetched_payloads,
     } = result;
     if let Some(missing) = expected_groups
         .iter()
@@ -1125,6 +1126,7 @@ async fn apply_raw_to_tunnel(
         &state.config_path,
         &proxies,
         Some(&rule_providers),
+        Some(&prefetched_payloads),
         Some(state.tunnel.resolver()),
         Some(&dialer_registry),
     )
@@ -1280,6 +1282,10 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
 /// (`RebuildResult::rule_providers`) — `rule-set:` policy matchers clone
 /// these Arcs so the resolver shares one provider object with the rules
 /// and the live registry the commit installs (issue #533 review).
+/// `prefetched_payloads` is the same build's payload snapshot
+/// (`RebuildResult::prefetched_payloads`) — the DNS geo scan and private
+/// provider load reuse those bytes instead of re-fetching them (issue
+/// #543). Pass `None` only when no routing rebuild ran for this commit.
 /// `prior_resolver` is the resolver generation being replaced — the
 /// tunnel's live resolver — so the rebuild can carry the fake-IP pool
 /// over when the range and store identity (in-memory vs the same
@@ -1288,12 +1294,17 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
 /// into — the candidate build's own cell. Provider fetch contexts built
 /// here retain it so chained download adapters keep resolving after later
 /// rebuilds (issue #533).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct piece of one commit's rebuild context"
+)]
 pub async fn reconcile_dns_config(
     raw_config: &RwLock<RawConfig>,
     candidate: &RawConfig,
     config_path: &str,
     proxies: &std::collections::HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
     rule_providers: Option<&HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>>,
+    prefetched_payloads: Option<&Arc<meow_config::rule_provider::PrefetchedPayloads>>,
     prior_resolver: Option<Arc<meow_dns::Resolver>>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<Option<meow_config::DnsConfig>, (StatusCode, String)> {
@@ -1319,6 +1330,7 @@ pub async fn reconcile_dns_config(
         Some(&cache_dir),
         proxies,
         rule_providers,
+        prefetched_payloads,
         prior_resolver.as_deref(),
         dialer_registry,
     )
@@ -2510,6 +2522,7 @@ async fn put_configs(
         dialer_registry,
         rule_providers,
         proxy_providers,
+        prefetched_payloads,
     } = result;
 
     // Issue #514: rebuild the DNS runtime too when its inputs changed —
@@ -2522,6 +2535,7 @@ async fn put_configs(
         &state.config_path,
         &proxies,
         Some(&rule_providers),
+        Some(&prefetched_payloads),
         Some(state.tunnel.resolver()),
         Some(&dialer_registry),
     )
@@ -2547,6 +2561,7 @@ async fn put_configs(
                         &state.config_path,
                         &proxies,
                         Some(&rule_providers),
+                        Some(&prefetched_payloads),
                         Some(state.tunnel.resolver()),
                         Some(&dialer_registry),
                     )

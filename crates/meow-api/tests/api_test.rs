@@ -3829,3 +3829,85 @@ async fn put_configs_publishes_rule_provider_registry_changes() {
         "GET /providers/rules must show an empty registry after removal: {json}"
     );
 }
+
+/// Issue #543 — one `PUT /configs` commit must fetch each rule-provider
+/// payload exactly once: the routing rebuild's prefetched bytes are shared
+/// with the DNS rebuild instead of being fetched a second time inside
+/// `CONFIG_MUTATION`. A counting HTTP listener makes a second fetch
+/// observable. The provider declares no `interval`, so every fetch hits
+/// the wire (`prefer_cache` is off).
+#[tokio::test]
+async fn put_configs_fetches_rule_provider_payload_once() {
+    use base64::Engine as _;
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = {
+        let hits = Arc::clone(&hits);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        // The accepted stream can inherit the listener's
+                        // nonblocking flag; force blocking for read/write.
+                        stream.set_nonblocking(false).unwrap();
+                        let mut buf = [0_u8; 2048];
+                        let _ = stream.read(&mut buf);
+                        let body = "payload:\n  - '+.example.com'\n";
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+
+    let state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    // `rule-set:p` in nameserver-policy makes the DNS rebuild resolve
+    // providers — the second fetch path this guards against.
+    let yaml = format!(
+        "mode: rule\ndns:\n  enable: true\n  nameserver:\n    - 127.0.0.1\n  nameserver-policy:\n    rule-set:p: 127.0.0.1\nrule-providers:\n  p:\n    type: http\n    behavior: domain\n    url: http://{addr}/rules.yaml\nrules:\n  - MATCH,DIRECT\n"
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "one commit must fetch the provider payload exactly once"
+    );
+}

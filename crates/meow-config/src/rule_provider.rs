@@ -676,10 +676,14 @@ fn load_file(
         // re-reads it; there is no separate cache to write.
         None,
     );
-    let bytes = match prefetched {
-        Some(b) => b.to_vec(),
+    let bytes_owned;
+    let bytes: &[u8] = match prefetched {
+        Some(b) => b,
         None => match std::fs::read(&path) {
-            Ok(b) => b,
+            Ok(b) => {
+                bytes_owned = b;
+                &bytes_owned
+            }
             // Move the empty provider into the error so the caller can
             // register it — the name stays resolvable for `RULE-SET` and a
             // manual refresh re-reads the path.
@@ -691,7 +695,7 @@ fn load_file(
             }
         },
     };
-    let rules = parse_bytes_to_ruleset_with_format(&bytes, behavior, explicit_format, ctx, strict)
+    let rules = parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
         .map_err(LoadError::Payload)?;
     provider.swap_rules(rules);
     Ok(provider)
@@ -748,8 +752,9 @@ fn load_http(
         explicit_format,
         cache_path.clone(),
     );
-    let bytes = match prefetched {
-        Some(b) => b.to_vec(),
+    let bytes_owned;
+    let bytes: &[u8] = match prefetched {
+        Some(b) => b,
         None => match fetch_http_blocking_with_cache(
             url,
             cache_path.as_deref(),
@@ -757,11 +762,14 @@ fn load_http(
             interval > 0,
             &headers,
         ) {
-            Ok(b) => b,
+            Ok(b) => {
+                bytes_owned = b;
+                &bytes_owned
+            }
             Err(e) => return Err(LoadError::Acquisition(Box::new(provider), e)),
         },
     };
-    let rules = parse_bytes_to_ruleset_with_format(&bytes, behavior, explicit_format, ctx, strict)
+    let rules = parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
         .map_err(LoadError::Payload)?;
     provider.swap_rules(rules);
     Ok(provider)
