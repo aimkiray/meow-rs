@@ -3,7 +3,8 @@
 //! Supports `http`, `file`, and `inline` provider types; `yaml`, `text`,
 //! and `mrs` formats (auto-detected by magic bytes for http/file).
 //! HTTP providers with `interval > 0` expose a `refresh()` method that is
-//! called from a background tokio task spawned by `main.rs`.
+//! called from per-provider tasks owned by
+//! [`crate::rule_provider_refresh::RefreshSupervisor`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -52,8 +53,10 @@ impl std::fmt::Display for ProviderType {
 /// so multi-value headers repeat the name — RFC 9110 §5.2).
 ///
 /// `_dialer_registry` retains the registry generation `proxy` was built from:
-/// providers outlive route-table swaps (`state.rule_providers` is populated
-/// once at startup), and a chained adapter's `dialer-proxy` lookup resolves
+/// a provider object can outlive that generation — a geodata rules-only
+/// rebuild binds the *live* providers into a fresh route table whose
+/// dialers belong to a different generation — and a chained adapter's
+/// `dialer-proxy` lookup resolves
 /// through that cell weakly — without this keepalive its dials would fail
 /// closed on the first refresh after a config reload (issue #533). The cell
 /// pins that generation's *entire* snapshot map, not just this adapter —
@@ -553,8 +556,11 @@ fn load_one(
 }
 
 /// An empty rule set of the right behavior for a provider whose payload is
-/// unavailable — registered so `RULE-SET` references resolve and a later
-/// refresh can fill it.
+/// unavailable — registered so `RULE-SET` references resolve. A later
+/// `refresh()` fills the provider's slot (visible to `GET
+/// /providers/rules` and DNS `rule-set:` policies, which snapshot per
+/// query); routing matchers that snapshotted the empty set keep it until
+/// the next rebuild (issue #553).
 fn empty_rule_set(behavior: RuleSetBehavior, ctx: &ParserContext) -> Box<dyn RuleSet> {
     build_rule_set(behavior, &[], ctx)
 }
@@ -775,6 +781,28 @@ fn make_provider(
         ctx,
         format,
     }
+}
+
+/// Minimal provider for supervisor/refresh tests — an empty domain ruleset
+/// is fine because the loops under test never observe content.
+#[cfg(test)]
+pub(crate) fn test_provider(
+    name: &str,
+    provider_type: ProviderType,
+    interval: u64,
+) -> Arc<RuleProvider> {
+    Arc::new(make_provider(
+        name,
+        provider_type,
+        RuleSetBehavior::Domain,
+        String::new(),
+        interval,
+        meow_rules::build_rule_set(RuleSetBehavior::Domain, &[], &ParserContext::empty()),
+        FetchContext::default(),
+        false,
+        ParserContext::empty(),
+        None,
+    ))
 }
 
 /// Flattened `header:` pairs for one provider; empty when none declared.

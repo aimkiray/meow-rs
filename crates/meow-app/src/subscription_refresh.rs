@@ -31,6 +31,10 @@ pub async fn run_loop(
     // against it on every rebuild. Passing an empty map instead would make
     // `strict: true` reject every `use:` group on each refresh.
     proxy_providers: Arc<dashmap::DashMap<String, Arc<ProxyProvider>>>,
+    // Shared supervisor — reconciled after each committed registry swap so
+    // provider additions/removals/interval changes gain/lose their refresh
+    // task without a restart (issue #543).
+    rule_provider_refresh: Arc<meow_config::rule_provider_refresh::RefreshSupervisor>,
 ) {
     // Same provider-cache directory `load_config` used at startup — trusted
     // rebuilds of the daemon's own config must keep resolving relative
@@ -229,6 +233,9 @@ pub async fn run_loop(
                                 &new_proxy_providers,
                                 candidate.strict.unwrap_or(false),
                             );
+                            // Interval-refresh loops follow the committed
+                            // provider set (issue #543).
+                            rule_provider_refresh.reconcile(&rule_providers);
                             // Commit raw + routing together inside the lane:
                             // the on-disk/dashboard view and the running
                             // router can no longer diverge on failure.

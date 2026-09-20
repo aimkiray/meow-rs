@@ -62,6 +62,7 @@ fn test_state(raw: RawConfig) -> Arc<AppState> {
         config_mutation_lock: tokio::sync::Mutex::new(()),
         proxy_providers: Arc::new(DashMap::new()),
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
+        rule_provider_refresh: Default::default(),
         listeners: vec![],
         external_ui: None,
         traffic_feed: Default::default(),
@@ -99,6 +100,7 @@ fn test_state_with_route(raw: RawConfig, named: Vec<(&str, Arc<dyn Proxy>)>) -> 
         config_mutation_lock: tokio::sync::Mutex::new(()),
         proxy_providers: Arc::new(DashMap::new()),
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
+        rule_provider_refresh: Default::default(),
         listeners: vec![],
         external_ui: None,
         traffic_feed: Default::default(),
@@ -139,6 +141,7 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
         config_mutation_lock: tokio::sync::Mutex::new(()),
         proxy_providers: Arc::new(DashMap::new()),
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
+        rule_provider_refresh: Default::default(),
         listeners: vec![],
         external_ui: None,
         traffic_feed: Default::default(),
@@ -224,6 +227,7 @@ async fn external_ui_serves_static_directory() {
         config_mutation_lock: tokio::sync::Mutex::new(()),
         proxy_providers: Arc::new(DashMap::new()),
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
+        rule_provider_refresh: Default::default(),
         listeners: vec![],
         external_ui: Some(dir.path().to_path_buf()),
         traffic_feed: Default::default(),
@@ -1868,6 +1872,7 @@ mod delay_support {
             config_mutation_lock: tokio::sync::Mutex::new(()),
             proxy_providers: Arc::new(DashMap::new()),
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
+            rule_provider_refresh: Default::default(),
             listeners: vec![],
             external_ui: None,
             traffic_feed: Default::default(),
@@ -1924,6 +1929,7 @@ mod delay_support {
             config_mutation_lock: tokio::sync::Mutex::new(()),
             proxy_providers: Arc::new(DashMap::new()),
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
+            rule_provider_refresh: Default::default(),
             listeners: vec![],
             external_ui: None,
             traffic_feed: Default::default(),
@@ -2868,6 +2874,7 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
         config_mutation_lock: tokio::sync::Mutex::new(()),
         proxy_providers: Arc::new(DashMap::new()),
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
+        rule_provider_refresh: Default::default(),
         listeners: vec![],
         external_ui: None,
         traffic_feed: Default::default(),
@@ -3691,5 +3698,134 @@ async fn put_configs_rebuilds_resolver_when_dns_uses_runtime_refs() {
     assert!(
         !Arc::ptr_eq(&first, &state.tunnel.resolver()),
         "a `#name`-tagged dns section must force a resolver rebuild on every commit"
+    );
+}
+
+/// PUT /configs commits must publish the rebuilt rule-provider map into the
+/// live registry — previously only the DNS reconcile path wrote the
+/// registry, so this PUT left `GET /providers/rules` and
+/// `PUT /providers/rules/{name}` operating on startup-era objects (or
+/// nothing) while the matchers referenced a detached generation (#543).
+#[tokio::test]
+async fn put_configs_publishes_rule_provider_registry_changes() {
+    use base64::Engine as _;
+    let state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    let put = |yaml: &str| {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+
+    // Add a provider with no `dns:` section — DNS inputs are unchanged, so
+    // the publish can only have come from the routing rebuild.
+    let yaml = concat!(
+        "mode: rule\n",
+        "rule-providers:\n",
+        "  doms:\n",
+        "    type: inline\n",
+        "    behavior: domain\n",
+        "    payload:\n",
+        "      - '+.example.com'\n",
+        "rules:\n",
+        "  - RULE-SET,doms,REJECT\n",
+        "  - MATCH,DIRECT\n",
+    );
+    assert_eq!(
+        put(yaml).await.unwrap().status(),
+        StatusCode::NO_CONTENT,
+        "PUT adding a rule-provider must commit"
+    );
+    assert!(
+        state.rule_providers.read().contains_key("doms"),
+        "registry must publish the rebuilt provider even without a DNS change"
+    );
+
+    // `GET /providers/rules` reads the same registry — it must reflect the
+    // commit, not a startup-era snapshot.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .uri("/providers/rules")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["providers"]["doms"].is_object(),
+        "GET /providers/rules must list the committed provider: {json}"
+    );
+
+    // A failed PUT (a `dialer-proxy` referencing a missing name hard-fails
+    // the rebuild) must leave the committed registry untouched.
+    let bad = concat!(
+        "mode: rule\n",
+        "proxies:\n",
+        "  - name: p\n",
+        "    type: http\n",
+        "    server: 127.0.0.1\n",
+        "    port: 8080\n",
+        "    dialer-proxy: ghost\n",
+        "rules:\n",
+        "  - MATCH,p\n",
+    );
+    assert_eq!(
+        put(bad).await.unwrap().status(),
+        StatusCode::BAD_REQUEST,
+        "a candidate that fails validation must be rejected"
+    );
+    assert!(
+        state.rule_providers.read().contains_key("doms"),
+        "a failed PUT must not clobber the live provider registry"
+    );
+    assert!(
+        !state
+            .raw_config
+            .read()
+            .proxies
+            .as_ref()
+            .is_some_and(|p| { p.iter().any(|e| e.get("dialer-proxy").is_some()) }),
+        "a failed PUT must not commit the candidate's raw either"
+    );
+
+    // Removal publishes an empty registry — and `GET` reflects it too.
+    let yaml_removed = "mode: rule\nrules:\n  - MATCH,DIRECT\n";
+    assert_eq!(
+        put(yaml_removed).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        state.rule_providers.read().is_empty(),
+        "removing the provider must clear it from the registry"
+    );
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .uri("/providers/rules")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["providers"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty),
+        "GET /providers/rules must show an empty registry after removal: {json}"
     );
 }

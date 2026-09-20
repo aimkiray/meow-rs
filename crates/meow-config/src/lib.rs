@@ -20,6 +20,7 @@ pub mod proxy_provider;
 pub mod raw;
 pub mod rule_parser;
 pub mod rule_provider;
+pub mod rule_provider_refresh;
 mod safe_path;
 pub mod sub_rules_parser;
 pub mod subscription;
@@ -5051,6 +5052,46 @@ rules:
         assert!(
             live.read().contains_key("ads"),
             "a failed rebuild must leave the live provider registry untouched"
+        );
+    }
+
+    /// The published provider map must be the *same generation* the
+    /// RULE-SET matchers snapshotted — a separately loaded copy would
+    /// diverge on refresh (issue #543). Matchers hold the provider itself
+    /// as their `Arc<dyn RuleSet>` (issue #553 live read-through), so the
+    /// identity check is against the provider object, not a snapshot.
+    #[test]
+    fn rebuild_result_rule_providers_match_the_matcher_generation() {
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            r#"
+rule-providers:
+  doms:
+    type: inline
+    behavior: domain
+    payload:
+      - '+.example.com'
+rules:
+  - RULE-SET,doms,REJECT
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+        let result = rebuild_from_raw(&raw).expect("inline rule-provider must rebuild");
+        assert!(result.rule_providers.contains_key("doms"));
+
+        let ruleset_rule = result
+            .rules
+            .iter()
+            .find_map(|r| {
+                r.as_any()
+                    .and_then(|a| a.downcast_ref::<meow_rules::RuleSetRule>())
+            })
+            .expect("RULE-SET,doms must produce a RuleSetRule");
+        let provider = Arc::clone(&result.rule_providers["doms"]);
+        let provider: Arc<dyn meow_rules::RuleSet> = provider;
+        assert!(
+            Arc::ptr_eq(ruleset_rule.rule_set(), &provider),
+            "the published provider must be the instance the matcher snapshotted"
         );
     }
 

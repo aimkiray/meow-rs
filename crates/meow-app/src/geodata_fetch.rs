@@ -140,8 +140,12 @@ pub async fn run_on_startup(
                 Some(cache_dir.as_path()),
                 &proxy_providers,
                 // Rules-only refresh — bind the rebuilt RULE-SET rules to
-                // the LIVE provider set so `PUT /providers/rules/{name}`
-                // refreshes keep reaching them (issue #533 review).
+                // the LIVE provider set so the rebuild snapshots each
+                // provider's current (possibly refreshed) content rather
+                // than a fresh declaration (issue #533 review). Refreshes
+                // landing after this rebuild stay visible too: the
+                // matchers hold the same Arc<RuleProvider> objects the
+                // refresh supervisor mutates (issue #553).
                 Some(rule_providers.read().clone()),
             )
         }

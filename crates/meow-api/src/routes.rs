@@ -76,6 +76,10 @@ pub struct AppState {
     /// rules, DNS `rule-set:` matchers, and `PUT /providers/rules/{name}`
     /// refreshes all share one object per provider (issue #533 review).
     pub rule_providers: Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
+    /// Owns the per-provider interval refresh tasks — reconciled on every
+    /// commit that swaps `rule_providers` so providers added, removed, or
+    /// re-`interval`ed by a reload gain/lose their task (issue #543).
+    pub rule_provider_refresh: Arc<meow_config::rule_provider_refresh::RefreshSupervisor>,
     /// Snapshot of active named listeners (read-only, startup-time only in M1).
     pub listeners: Vec<NamedListener>,
     /// Validated directory for a third-party web UI. When `Some`, it is served
@@ -1149,6 +1153,10 @@ async fn apply_raw_to_tunnel(
         &proxy_providers,
         raw.strict.unwrap_or(false),
     );
+    // Then reconcile the interval refresh loops so providers added,
+    // removed, or re-intervalled by this commit gain/lose their task
+    // (issue #543).
+    state.rule_provider_refresh.reconcile(&state.rule_providers);
     Ok((dns, prior_resolver))
 }
 
@@ -2592,6 +2600,8 @@ async fn put_configs(
         &proxy_providers,
         raw_config.strict.unwrap_or(false),
     );
+    // reconcile the interval refresh loops (issue #543).
+    state.rule_provider_refresh.reconcile(&state.rule_providers);
 
     swap_config_and_reconcile_tun(&state, raw_config, dns, prior_resolver).await;
 

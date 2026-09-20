@@ -69,6 +69,9 @@ pub struct ApiServer {
     log_tx: broadcast::Sender<LogMessage>,
     proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
     rule_providers: Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
+    /// Shared supervisor the API commit paths reconcile after every
+    /// registry swap (issue #543).
+    rule_provider_refresh: Arc<meow_config::rule_provider_refresh::RefreshSupervisor>,
     listeners: Vec<NamedListener>,
     external_ui: Option<PathBuf>,
     /// Shared handle the embedder fills once the standalone DNS server is
@@ -87,6 +90,7 @@ impl ApiServer {
         log_tx: broadcast::Sender<LogMessage>,
         proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
         rule_providers: Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
+        rule_provider_refresh: Arc<meow_config::rule_provider_refresh::RefreshSupervisor>,
         listeners: Vec<NamedListener>,
         external_ui: Option<PathBuf>,
         dns_server: Arc<RwLock<Option<routes::DnsServerHandle>>>,
@@ -100,6 +104,7 @@ impl ApiServer {
             log_tx,
             proxy_providers,
             rule_providers,
+            rule_provider_refresh,
             listeners,
             external_ui,
             dns_server,
@@ -115,6 +120,7 @@ impl ApiServer {
             log_tx: self.log_tx.clone(),
             proxy_providers: Arc::clone(&self.proxy_providers),
             rule_providers: Arc::clone(&self.rule_providers),
+            rule_provider_refresh: Arc::clone(&self.rule_provider_refresh),
             listeners: self.listeners.clone(),
             external_ui: self.resolve_external_ui(),
             config_mutation_lock: tokio::sync::Mutex::new(()),

@@ -836,42 +836,12 @@ async fn run(
         });
     }
 
-    // Spawn background refresh tasks for HTTP rule-providers with interval > 0.
-    {
-        let providers_snap: Vec<_> = rule_providers
-            .read()
-            .values()
-            .filter(|p| {
-                p.interval > 0 && p.provider_type == meow_config::rule_provider::ProviderType::Http
-            })
-            .cloned()
-            .collect();
-        for provider in providers_snap {
-            let interval_secs = provider.interval;
-            let provider_name = provider.name.clone();
-            let registry = Arc::clone(&rule_providers);
-            tokio::spawn(async move {
-                let mut ticker =
-                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-                ticker.tick().await; // skip the immediate first tick
-                loop {
-                    ticker.tick().await;
-                    // Resolve by name each tick — config reloads swap the
-                    // provider objects under the registry, and refreshing a
-                    // detached startup-era Arc would never reach the live
-                    // matchers (issue #514 review). The provider re-parses
-                    // the payload in its own load-time ParserContext, so
-                    // geo-dependent entries survive refreshes (issue #533).
-                    let Some(provider) = registry.read().get(&provider_name).cloned() else {
-                        continue;
-                    };
-                    if let Err(e) = provider.refresh().await {
-                        error!(provider = %provider.name, "background refresh failed: {:#}", e);
-                    }
-                }
-            });
-        }
-    }
+    // Interval-refresh loops are owned by a supervisor so commits that
+    // swap the registry (PUT /configs, subscription refresh) can spawn or
+    // abort tasks — startup reconciles the initial set (issue #543).
+    let rule_provider_refresh =
+        Arc::new(meow_config::rule_provider_refresh::RefreshSupervisor::default());
+    rule_provider_refresh.reconcile(&rule_providers);
 
     // Start subscription background refresh task
     {
@@ -881,6 +851,7 @@ async fn run(
         let dns_server = Arc::clone(&dns_server_handle);
         let rule_providers = Arc::clone(&rule_providers);
         let proxy_providers = Arc::clone(&proxy_providers);
+        let rule_provider_refresh = Arc::clone(&rule_provider_refresh);
         tokio::spawn(async move {
             meow_app::subscription_refresh::run_loop(
                 raw_config,
@@ -889,6 +860,7 @@ async fn run(
                 dns_server,
                 rule_providers,
                 proxy_providers,
+                rule_provider_refresh,
             )
             .await;
         });
@@ -1122,6 +1094,7 @@ async fn run(
             log_tx.clone(),
             Arc::clone(&proxy_providers),
             Arc::clone(&rule_providers),
+            Arc::clone(&rule_provider_refresh),
             named_listeners.clone(),
             config.api.external_ui.clone(),
             Arc::clone(&dns_server_handle),
