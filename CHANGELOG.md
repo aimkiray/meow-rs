@@ -270,6 +270,14 @@ the canonical, in-repo source a release is cut from.
   independently; changing the API secret refreshes authentication. Add
   dashboard browser and lifecycle regression tests to CI.
 
+- **Scheduled subscription refreshes no longer reset `select` group
+  choices.** The refresh loop rebuilt each fetched candidate with
+  `rebuild_from_raw_with_resolver`, which wires no `SelectorStore` — every
+  `select` group in the committed config fell back to its first member on
+  each refresh, discarding the user's persisted pick until a manual
+  reload rebuilt through the API path. The loop now rebuilds via
+  `rebuild_from_raw_runtime`, matching `PUT /configs` (issue #543).
+
 - **Geodata DB refreshes now republish the resolver.** When the
   ASN/geosite DB files were replaced on disk, the geodata paths rebuilt
   routing but left the running resolver's `geosite:` nameserver-policy

@@ -27,9 +27,10 @@ pub async fn run_loop(
     rule_providers: Arc<
         RwLock<std::collections::HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>>,
     >,
-    // The live proxy-provider registry — group `use:` references resolve
-    // against it on every rebuild. Passing an empty map instead would make
-    // `strict: true` reject every `use:` group on each refresh.
+    // The live proxy-provider registry — `materialize_proxy_providers`
+    // reuses its entries for still-declared names so committed groups
+    // keep the live provider's slot, health state, and fetched content
+    // instead of rebinding a freshly loaded (initially empty) provider.
     proxy_providers: Arc<dashmap::DashMap<String, Arc<ProxyProvider>>>,
     // Shared supervisor — reconciled after each committed registry swap so
     // provider additions/removals/interval changes gain/lose their refresh
@@ -143,11 +144,15 @@ pub async fn run_loop(
                             .map(|e| (e.key().clone(), Arc::clone(e.value())))
                             .collect();
                         move || {
-                            // The runtime variant wires the process-wide
-                            // SelectorStore into rebuilt groups — without it
-                            // every refresh silently resets select/url-test/
-                            // fallback selections and stops persisting picks
-                            // (issue #533 review).
+                            // The runtime variant wires
+                            // `SelectorStore::global()` so a `select` group
+                            // in the fetched config keeps the user's
+                            // persisted choice — the plain resolver variant
+                            // would reset every selector to its first
+                            // member on each refresh (issue #543). The
+                            // candidate's provider set still loads fresh
+                            // and is swapped into the live registry only
+                            // once validated (issue #533).
                             meow_config::rebuild_from_raw_runtime(
                                 &candidate,
                                 Some(&resolver),

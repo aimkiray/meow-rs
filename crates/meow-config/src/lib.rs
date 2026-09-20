@@ -5014,8 +5014,8 @@ rules:
         )
         .unwrap();
 
-        // `rebuild_from_raw_with_resolver` — used by subscription_refresh
-        // and geodata_fetch.
+        // `rebuild_from_raw_with_resolver` — used by geodata_fetch's
+        // rules-only rebuilds.
         let result =
             rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
                 .expect(

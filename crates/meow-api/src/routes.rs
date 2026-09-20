@@ -1094,10 +1094,9 @@ async fn apply_raw_to_tunnel(
     let resolver_slot = state.tunnel.resolver_slot();
     // A rebuild failure is a defect in the candidate config the caller
     // supplied — 400, not 500 (issue #533 review).
-    let result =
-        rebuild_from_raw_with_resolver_async(raw.clone(), resolver_slot, providers, cache_dir)
-            .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let result = rebuild_from_raw_runtime_async(raw.clone(), resolver_slot, providers, cache_dir)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let meow_config::RebuildResult {
         proxies,
         rules,
@@ -1486,7 +1485,7 @@ pub async fn publish_dns(
     }
 }
 
-async fn rebuild_from_raw_with_resolver_async(
+async fn rebuild_from_raw_runtime_async(
     raw: RawConfig,
     resolver_slot: meow_dns::ResolverSlot,
     providers: HashMap<String, Arc<ProxyProvider>>,
@@ -2459,7 +2458,7 @@ async fn put_configs(
     // error under `strict: true` but resolvable under the mode that
     // actually built `proxies` (issue #533 review).
     let mut dns_raw: Option<RawConfig> = None;
-    let result = match rebuild_from_raw_with_resolver_async(
+    let result = match rebuild_from_raw_runtime_async(
         raw_config.clone(),
         Arc::clone(&resolver_slot),
         providers.clone(),
@@ -2481,7 +2480,7 @@ async fn put_configs(
                 );
                 let mut lenient = raw_config.clone();
                 lenient.strict = Some(false);
-                match rebuild_from_raw_with_resolver_async(
+                match rebuild_from_raw_runtime_async(
                     lenient.clone(),
                     resolver_slot,
                     providers,

@@ -1,0 +1,263 @@
+//! Integration test for [`meow_app::subscription_refresh::run_loop`].
+//!
+//! Issue #543: the scheduled refresh rebuilt the candidate with
+//! `rebuild_from_raw_with_resolver`, which wires no `SelectorStore`. A
+//! fetched `select` group lost the user's persisted choice on every
+//! refresh (and a `use:`/`include-all` group resolved against an empty
+//! provider map before the shared registry was threaded). The loop must
+//! rebuild via `rebuild_from_raw_runtime` — matching `PUT /configs`.
+
+use dashmap::DashMap;
+use meow_common::DnsMode;
+use meow_config::proxy_provider::{load_proxy_providers, ProxyProvider};
+use meow_config::raw::RawConfig;
+use meow_config::rule_provider_refresh::RefreshSupervisor;
+use meow_dns::Resolver;
+use meow_proxy::SelectorStore;
+use meow_trie::DomainTrie;
+use meow_tunnel::Tunnel;
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::io::Write as _;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+/// Serve one subscription payload over plain HTTP/1.1 (close per request).
+async fn spawn_origin(body: &'static str) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                // Consume the request head before responding — a short
+                // single read could leave tail bytes that turn the close
+                // into an RST, clobbering the buffered response.
+                let mut buf = [0u8; 4096];
+                let mut head = Vec::new();
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            head.extend_from_slice(&buf[..n]);
+                            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+fn resolver() -> Arc<Resolver> {
+    Arc::new(Resolver::new(
+        vec!["8.8.8.8:53".parse().unwrap()],
+        vec![],
+        DnsMode::Normal,
+        DomainTrie::new(),
+        true,
+        true,
+    ))
+}
+
+struct Fixture {
+    // Held so the tempdir (config + provider payload) outlives the test.
+    dir: tempfile::TempDir,
+    tunnel: Tunnel,
+    raw_config: Arc<RwLock<RawConfig>>,
+    config_path: String,
+    proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
+}
+
+/// Shared scaffolding: a two-node file provider `prov` and an origin
+/// serving `sub_body` as subscription `s`. The loop is NOT spawned here —
+/// each test finishes arranging global state (e.g. the SelectorStore)
+/// before calling [`spawn_loop`] so the first pass can't race it.
+async fn fixture(sub_body: &'static str) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    // The provider cache dir is derived from `config_path`'s parent (no
+    // home-dir override in tests), so the provider payload lives beside
+    // the config file.
+    let provider_path = dir.path().join("provider_prov.yaml");
+    let mut provider_file = std::fs::File::create(&provider_path).unwrap();
+    // `type: http` keeps its configured name — a `direct` node's `name()`
+    // is hardcoded "DIRECT" and would mask the membership assertion.
+    write!(
+        provider_file,
+        "proxies:\n\
+         \x20 - name: node-a\n\
+         \x20   type: http\n\
+         \x20   server: 127.0.0.1\n\
+         \x20   port: 9\n\
+         \x20 - name: node-b\n\
+         \x20   type: http\n\
+         \x20   server: 127.0.0.1\n\
+         \x20   port: 9\n"
+    )
+    .unwrap();
+
+    let sub_addr = spawn_origin(sub_body).await;
+
+    let raw: RawConfig = serde_yaml::from_str(&format!(
+        "mode: rule\n\
+         proxy-providers:\n\
+         \x20 prov:\n\
+         \x20   type: file\n\
+         \x20   path: provider_prov.yaml\n\
+         subscriptions:\n\
+         \x20 - name: s\n\
+         \x20   url: http://{sub_addr}/sub\n\
+         \x20   interval: 3600\n\
+         rules:\n\
+         \x20 - MATCH,DIRECT\n"
+    ))
+    .unwrap();
+
+    // The shared provider registry, populated the same way startup does.
+    // `ipv6` must match what the rebuild computes (`effective_ipv6` of the
+    // fixture YAML = false): a mismatch makes `matches_def` reject the
+    // live provider, and the commit would wire a fresh empty slot that a
+    // detached refresh fills asynchronously — a race, not a test.
+    let proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>> = Arc::new(
+        load_proxy_providers(
+            raw.proxy_providers.as_ref().unwrap(),
+            Some(dir.path()),
+            false,
+            false,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .collect(),
+    );
+    assert_eq!(
+        proxy_providers.get("prov").unwrap().proxies().len(),
+        2,
+        "file provider must load its nodes before the test"
+    );
+
+    // Diverge the on-disk payload AFTER the live provider loaded it: a
+    // commit that reuses the shared provider keeps [node-a, node-b],
+    // while one that rebuilds the provider from scratch re-reads the
+    // file and sees only [node-a]. That makes the members assertion
+    // below discriminate provider-map sharing deterministically instead
+    // of racing a detached refresh fill.
+    let mut provider_file = std::fs::File::create(&provider_path).unwrap();
+    write!(
+        provider_file,
+        "proxies:\n\
+         \x20 - name: node-a\n\
+         \x20   type: http\n\
+         \x20   server: 127.0.0.1\n\
+         \x20   port: 9\n"
+    )
+    .unwrap();
+
+    let config_path = dir.path().join("config.yaml");
+    std::fs::write(&config_path, "").unwrap();
+
+    Fixture {
+        tunnel: Tunnel::new(resolver()),
+        raw_config: Arc::new(RwLock::new(raw)),
+        config_path: config_path.to_string_lossy().into_owned(),
+        proxy_providers,
+        dir,
+    }
+}
+
+fn spawn_loop(fx: &Fixture) {
+    tokio::spawn(meow_app::subscription_refresh::run_loop(
+        Arc::clone(&fx.raw_config),
+        fx.tunnel.clone(),
+        fx.config_path.clone(),
+        Arc::new(RwLock::new(None)),
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::clone(&fx.proxy_providers),
+        Arc::new(RefreshSupervisor::default()),
+    ));
+}
+
+/// Poll the tunnel until group `name` is committed by the refresh loop.
+async fn wait_group(tunnel: &Tunnel, name: &str) -> Arc<dyn meow_common::Proxy> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(group) = tunnel.proxy(name) {
+                break group;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("group '{name}' must be committed by the refresh"))
+}
+
+/// A refreshed subscription whose group draws members from a *local*
+/// `proxy-providers:` entry must keep them — the refresh commit rebuilds
+/// against the live provider registry, not an empty map.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refreshed_use_group_keeps_provider_members() {
+    let fx = fixture(
+        "proxies: []\n\
+         proxy-groups:\n\
+         \x20 - name: g\n\
+         \x20   type: select\n\
+         \x20   use: [prov]\n\
+         rules:\n\
+         \x20 - MATCH,g\n",
+    )
+    .await;
+    spawn_loop(&fx);
+
+    let group = wait_group(&fx.tunnel, "g").await;
+    let members = group.members().unwrap_or_default();
+    assert_eq!(members, vec!["node-a".to_string(), "node-b".to_string()]);
+}
+
+/// The user's persisted `select` choice must survive a refresh commit.
+/// `rebuild_from_raw_runtime` wires `SelectorStore::global()` into the
+/// rebuilt groups; the plain resolver variant builds them with no store,
+/// resetting `selected` to the first member on every refresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refreshed_select_group_keeps_persisted_choice() {
+    let fx = fixture(
+        "proxies: []\n\
+         proxy-groups:\n\
+         \x20 - name: sel-g\n\
+         \x20   type: select\n\
+         \x20   use: [prov]\n\
+         rules:\n\
+         \x20 - MATCH,sel-g\n",
+    )
+    .await;
+
+    // Persist `sel-g → node-b` BEFORE the loop spawns — `with_store`
+    // reads the store once at group construction, so the choice must be
+    // in place before the first refresh commits.
+    let store = SelectorStore::open(fx.dir.path().join("sel.json"));
+    store.set("sel-g", "node-b");
+    spawn_loop(&fx);
+
+    let group = wait_group(&fx.tunnel, "sel-g").await;
+    let metadata = meow_common::Metadata::default();
+    let picked = group
+        .unwrap_proxy(&metadata, false)
+        .expect("select group must resolve a member");
+    assert_eq!(
+        picked.name(),
+        "node-b",
+        "refresh must restore the persisted choice, not the first member"
+    );
+}
