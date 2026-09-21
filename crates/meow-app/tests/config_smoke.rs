@@ -15,7 +15,8 @@ async fn load_minimal_config_parses_without_error() {
         .expect("minimal.yaml must parse cleanly");
 
     // Proxies: the fixture declares one named proxy ("proxy-out") plus the
-    // three built-in adapters (DIRECT, REJECT, REJECT-DROP) wired by the parser.
+    // built-in adapters (DIRECT, REJECT, REJECT-DROP, COMPATIBLE, PASS,
+    // PASS-RULE) wired by the parser.
     assert!(
         !config.proxies.is_empty(),
         "expected at least one proxy, got none"

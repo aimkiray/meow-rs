@@ -161,10 +161,12 @@ pub trait ProxyAdapter: Send + Sync {
     /// Resolve one selection layer — for groups, the member a dial would
     /// use. `touch` mirrors upstream `Unwrap(metadata, touch)`: `false` is
     /// a peek for match-time probing (round-robin counters do not advance,
-    /// usage stats are not recorded); `true` is the real dial path. The one
-    /// permitted peek-time write is upstream's stale-pin GC — Fallback may
-    /// drop a `fixed` selection whose member went dead, exactly as
-    /// `findAliveProxy` does regardless of `touch`.
+    /// usage stats are not recorded); `true` is the real dial path. The
+    /// permitted peek-time writes are upstream's: Fallback may drop a
+    /// `fixed` selection whose member went dead (as `findAliveProxy` does
+    /// regardless of `touch`), and UrlTest may refresh its `fastest` pick
+    /// (as `fast(touch)` does) so the probe can never disagree with the
+    /// next dial.
     fn unwrap_proxy(&self, _metadata: &Metadata, _touch: bool) -> Option<Arc<dyn Proxy>> {
         None
     }

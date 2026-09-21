@@ -22,6 +22,9 @@ These always exist and need no definition:
 | `DIRECT` | Connect straight to the destination, no proxy |
 | `REJECT` | Silently close the connection |
 | `REJECT-DROP` | Drop packets with no response |
+| `COMPATIBLE` | Dial direct, tagged `Compatible` (mihomo compat) |
+| `PASS` | As a rule target: skip the rule silently and keep matching |
+| `PASS-RULE` | Inside `SUB-RULE` blocks: skip the inner rule; at top level it rejects |
 
 ## Common fields
 

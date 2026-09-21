@@ -421,6 +421,24 @@ mod tests {
         assert_eq!(names, vec!["a", "b", "p1", "p2"]);
     }
 
+    /// `unwrap_proxy(meta, touch)` — upstream `Unwrap`: the peek must not
+    /// record usage (lazy groups stay asleep on match probes) but must
+    /// still return the same member the next dial would pick.
+    #[test]
+    fn unwrap_peek_returns_pick_without_touching_usage() {
+        let g = UrlTestGroup::new("auto", vec![MockProxy::new("a"), MockProxy::new("b")], 150);
+        let meta = Metadata::default();
+        let peeked = g.unwrap_proxy(&meta, false).expect("peek yields a member");
+        assert_eq!(
+            peeked.name(),
+            g.pick_for_dial().unwrap().name(),
+            "peek must agree with the next pick"
+        );
+        assert_eq!(g.usage_generation(), 0, "touch=false must not record usage");
+        let _ = g.unwrap_proxy(&meta, true);
+        assert_eq!(g.usage_generation(), 1, "touch=true records the use");
+    }
+
     fn pick(g: &UrlTestGroup) -> String {
         g.pick_for_dial().unwrap().name().to_string()
     }

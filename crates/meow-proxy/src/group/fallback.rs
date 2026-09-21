@@ -422,9 +422,12 @@ mod tests {
     /// it must not record usage; `touch=true` (the real dial path) does.
     #[test]
     fn unwrap_peek_does_not_touch_usage() {
-        let g = FallbackGroup::new("fb", vec![MockProxy::new("a")]);
+        let g = FallbackGroup::new("fb", vec![MockProxy::new("a"), MockProxy::new("b")]);
         let meta = Metadata::default();
-        let _ = g.unwrap_proxy(&meta, false);
+        let peeked = g
+            .unwrap_proxy(&meta, false)
+            .expect("peek yields the first alive member");
+        assert_eq!(peeked.name(), "a", "peek must return the pick target");
         assert_eq!(
             g.usage_generation(),
             0,

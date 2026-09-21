@@ -13,6 +13,9 @@ pub struct SelectorGroup {
     static_proxies: Vec<Arc<dyn Proxy>>,
     provider_slots: Vec<ProviderSlot>,
     /// Name of the currently selected proxy; `None` means use the first.
+    /// (Upstream prefers a `COMPATIBLE` member as the initial default;
+    /// we keep the simpler first-member default — COMPATIBLE dials like
+    /// DIRECT either way, so the divergence is cosmetic.)
     selected: RwLock<Option<SmolStr>>,
     /// Optional write-through persistence; primed at construction.
     store: Option<Arc<SelectorStore>>,
@@ -320,6 +323,23 @@ mod tests {
         assert!(!g.select("nope"));
         // Unknown name must not clobber the previous choice.
         assert_eq!(g.selected_proxy().unwrap().name(), "b");
+    }
+
+    /// `unwrap_proxy` must surface the *selected* member, not the first —
+    /// a peek that returned `static_proxies[0]` would misclassify a
+    /// selector pinned to PASS as a live target (issue #533).
+    #[test]
+    fn unwrap_peek_returns_the_selected_member() {
+        let g = SelectorGroup::new("sel", vec![MockProxy::new("a"), MockProxy::new("b")]);
+        let meta = Metadata::default();
+        assert_eq!(g.unwrap_proxy(&meta, false).unwrap().name(), "a");
+        assert!(g.select("b"));
+        assert_eq!(
+            g.unwrap_proxy(&meta, false).unwrap().name(),
+            "b",
+            "peek must reflect the selection, not the first member"
+        );
+        assert_eq!(g.unwrap_proxy(&meta, true).unwrap().name(), "b");
     }
 
     #[test]

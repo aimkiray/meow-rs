@@ -282,29 +282,40 @@ rules:
 /// entry is dropped with a warning (upstream hard-errors on the duplicate).
 #[test]
 fn builtin_names_cannot_be_shadowed() {
+    // All six built-ins are shadow-proof: a leaf named like one is dropped
+    // (warn), a group named like one is dropped — each name must still
+    // resolve to the built-in adapter type.
     let raw: RawConfig = serde_yaml::from_str(
         r#"
 proxies:
   - {name: "PASS", type: socks5, server: 127.0.0.1, port: 9}
+  - {name: "PASS-RULE", type: socks5, server: 127.0.0.1, port: 9}
+  - {name: "COMPATIBLE", type: socks5, server: 127.0.0.1, port: 9}
+  - {name: "DIRECT", type: socks5, server: 127.0.0.1, port: 9}
   - {name: "HK 01", type: socks5, server: 127.0.0.1, port: 2}
 proxy-groups:
   - {name: "REJECT", type: select, proxies: ["HK 01"]}
+  - {name: "REJECT-DROP", type: select, proxies: ["HK 01"]}
 rules:
   - MATCH,HK 01
 "#,
     )
     .unwrap();
     let proxies = rebuild_from_raw(&raw).unwrap().proxies;
-    assert_eq!(
-        proxies["PASS"].adapter_type(),
-        meow_common::AdapterType::Pass,
-        "shadowing leaf must not replace the PASS built-in"
-    );
-    assert_eq!(
-        proxies["REJECT"].adapter_type(),
-        meow_common::AdapterType::Reject,
-        "shadowing group must not replace the REJECT built-in"
-    );
+    for (name, want) in [
+        ("PASS", meow_common::AdapterType::Pass),
+        ("PASS-RULE", meow_common::AdapterType::PassRule),
+        ("COMPATIBLE", meow_common::AdapterType::Compatible),
+        ("DIRECT", meow_common::AdapterType::Direct),
+        ("REJECT", meow_common::AdapterType::Reject),
+        ("REJECT-DROP", meow_common::AdapterType::RejectDrop),
+    ] {
+        assert_eq!(
+            proxies[name].adapter_type(),
+            want,
+            "shadowing entry must not replace the {name} built-in"
+        );
+    }
 }
 
 #[test]

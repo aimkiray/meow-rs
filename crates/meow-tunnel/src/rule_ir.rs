@@ -3215,6 +3215,34 @@ mod tests {
         assert!(!logs.contains("PASS"), "got: {logs}");
     }
 
+    // The lazy hit-slot PASS arm must not push the skip into the deferred
+    // buffer either — a terminal `Matched` drains it, so a wrongly
+    // buffered Pass would surface as a warn here.
+    #[test]
+    fn lazy_pass_hit_slot_skips_silently_on_matched() {
+        let mut rules = filler_suffix_rules(70);
+        rules.push(Box::new(DomainSuffixRule::new("example.com", "PASS")));
+        rules.push(Box::new(FinalRule::new("DIRECT")));
+        let set = CompiledRuleSet::build(&rules);
+        assert!(!set.uses_linear_scan_plan(), "must run the indexed plan");
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe));
+        match outcome {
+            LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DIRECT"),
+            LazyMatchOutcome::NeedsEnrichment { .. } | LazyMatchOutcome::NoMatch => {
+                panic!("PASS trie hit must not block the terminal match")
+            }
+        }
+        assert!(
+            !logs.contains("PASS"),
+            "a PASS trie hit must never warn, got: {logs}"
+        );
+    }
+
     // SUB-RULE inner scans skip inner rules resolving to `PASS-RULE` —
     // either by literal name or by adapter type (`CheckPassRule` upstream).
     #[test]

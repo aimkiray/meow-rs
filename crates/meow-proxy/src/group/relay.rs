@@ -450,6 +450,14 @@ impl ProxyAdapter for RelayGroup {
 }
 
 impl Proxy for RelayGroup {
+    // Deliberately no `unwrap_proxy` override: a relay resolves its hops
+    // lazily per-dial (metadata may differ per connection), so a
+    // match-time peek cannot name "the" member. Upstream `Relay` likewise
+    // never overrode `Unwrap` — a PASS hop deep in a chain surfaces as a
+    // loud `RelayHopFailed` at dial (flattening rejects nop hops) rather
+    // than a silent rule skip. Match-time `unwraps_to(Pass)` therefore
+    // sees a relay group as opaque — the rule materializes and fails
+    // closed at dial.
     fn alive(&self) -> bool {
         self.health.alive()
     }

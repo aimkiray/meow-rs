@@ -83,7 +83,7 @@ proxies:
     udp: true
     # dialer-proxy: reach this server *through* another proxy/group (chained
     # dialing, mihomo-compatible). The referenced name may be any proxy or
-    # group; cycles are detected and ignored. TCP only — UDP is not routed
+    # group; cycles are rejected at load time. TCP only — UDP is not routed
     # through the dialer.
     # dialer-proxy: "Proxy"
 

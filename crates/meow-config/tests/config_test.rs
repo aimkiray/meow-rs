@@ -14,7 +14,7 @@ mixed-port: 7890
     assert!(config.listeners.http_port.is_none());
     // Default mode is Rule
     assert_eq!(config.general.mode.to_string(), "rule");
-    // Built-in proxies: DIRECT, REJECT, REJECT-DROP
+    // Built-in proxies: DIRECT, REJECT, REJECT-DROP, COMPATIBLE, PASS, PASS-RULE
     assert!(config.proxies.contains_key("DIRECT"));
     assert!(config.proxies.contains_key("REJECT"));
     assert!(config.proxies.contains_key("REJECT-DROP"));

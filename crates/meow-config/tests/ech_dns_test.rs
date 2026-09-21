@@ -209,7 +209,8 @@ proxies:
         .expect("config must still load (parse_vless logs and skips bad proxy)");
     // Top-level parse must not register the proxy with malformed ECH config —
     // parse_vless returns Err and the loader logs+skips, leaving only the
-    // built-in proxies (DIRECT, REJECT, REJECT-DROP).
+    // built-in proxies (DIRECT, REJECT, REJECT-DROP, COMPATIBLE, PASS,
+    // PASS-RULE).
     assert!(
         !cfg.proxies.contains_key("bad-ech"),
         "proxy with invalid ECH base64 must NOT register; got: {:?}",

@@ -443,6 +443,40 @@ mod tests {
         drop(conn);
     }
 
+    /// `COMPATIBLE` is a real direct dialer under the `Compatible` tag —
+    /// not a display alias. Prove it with a real loopback exchange.
+    #[tokio::test]
+    async fn compatible_dials_direct_tcp_and_udp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let echo = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 16];
+            let n = s.read(&mut buf).await.unwrap();
+            s.write_all(&buf[..n]).await.unwrap();
+        });
+
+        let adapter = DirectAdapter::compatible();
+        assert_eq!(adapter.adapter_type(), AdapterType::Compatible);
+        let mut conn = adapter
+            .dial_tcp(&tcp_metadata("127.0.0.1", port))
+            .await
+            .expect("COMPATIBLE must dial direct");
+        conn.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        echo.await.unwrap();
+
+        let udp = adapter
+            .dial_udp(&udp_metadata(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+            .await
+            .expect("COMPATIBLE must bind a UDP session");
+        assert!(udp.local_addr().unwrap().is_ipv4());
+    }
+
     /// Regression for QUIC/HTTP3 direct: `dial_udp` must bind the reply socket
     /// in the destination's address family. A v6 destination on an AF_INET
     /// socket cannot be written, so the NAT session — and thus the reply
