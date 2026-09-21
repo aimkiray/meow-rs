@@ -31,9 +31,9 @@ pub struct LoadBalanceGroup {
     health: ProxyHealth,
     usage: UsageTracker,
     /// mihomo `GroupBase.onDialFailed` escalation: repeated member dial
-    /// failures mark the member dead between sweeps — the only liveness
-    /// signal provider members get, since the sweep resolves group members
-    /// by name through the route map (provider names are not registered).
+    /// failures mark the member dead between sweeps — an additional
+    /// liveness signal on top of the periodic sweep, which probes provider
+    /// members too via `member_proxies()` (issue #543).
     dial_failures: DialFailureTracker,
 }
 
@@ -197,12 +197,13 @@ fn src_ip_bytes(metadata: &Metadata) -> ([u8; 16], usize) {
     }
 }
 
-/// FNV-1a 32-bit hash.
+/// FNV-1a 32-bit hash over the client src-IP bytes, taken modulo the
+/// alive count — "same client → same member" stickiness.
 ///
-/// Inline implementation — no crate dep.
-/// upstream: adapter/outbound/loadbalance.go uses fnv.New32() (FNV-1, not FNV-1a);
-/// we use FNV-1a which has slightly better avalanche properties at no cost.
-/// Result is stable for a given input but NOT bit-for-bit identical to Go output.
+/// Inline implementation — no crate dep. Upstream mihomo instead hashes a
+/// *destination* key (`getKey`: IP host → host, domain → eTLD+1, else
+/// `DstIP`) with `utils.MapHash` and picks via `jumpHash` over the full
+/// member list — a deliberately different scheme (spec divergence 4).
 fn fnv1a(data: &[u8]) -> u32 {
     const OFFSET_BASIS: u32 = 0x811c9dc5;
     const PRIME: u32 = 0x01000193;
@@ -813,15 +814,20 @@ mod tests {
             vec![slot],
         );
         let meta = meta_no_src();
-        for _ in 0..4 {
-            assert_ne!(group.select(&meta).unwrap().name(), "PD");
-        }
+        // Assert the full cycle, not just "PD is never picked" — a pick
+        // space that ignored slots entirely would also satisfy that.
+        let got: Vec<String> = (0..4)
+            .map(|_| group.select(&meta).unwrap().name().to_string())
+            .collect();
+        assert_eq!(got, ["A", "P1", "A", "P1"]);
     }
 
     #[test]
     fn consistent_hashing_stable_across_slots() {
         // Same src IP must keep landing on the same member whether the alive
-        // set is static or slot-sourced.
+        // set is static or slot-sourced. Find a src IP whose hash lands on a
+        // slot member first — otherwise a statics-only pick space would
+        // satisfy the stability assertion vacuously.
         let slot = slot_of(vec![MockProxy::new("P1"), MockProxy::new("P2")]);
         let group = LoadBalanceGroup::new_with_providers(
             "lb",
@@ -829,8 +835,13 @@ mod tests {
             LbStrategy::ConsistentHashing,
             vec![slot],
         );
-        let meta = meta_src(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
-        let first = group.select(&meta).unwrap().name().to_string();
+        let (meta, first) = (0..=255u8)
+            .map(|last| meta_src(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))))
+            .find_map(|m| {
+                let name = group.select(&m).unwrap().name().to_string();
+                (name != "A").then_some((m, name))
+            })
+            .expect("some src IP must hash onto a slot member");
         for _ in 0..9 {
             assert_eq!(group.select(&meta).unwrap().name(), first);
         }
@@ -883,11 +894,11 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_dial_failures_mark_slot_member_dead() {
-        // Provider members are never probed by the group sweep (their names
-        // don't resolve through the route map), so mihomo's onDialFailed
-        // escalation — DialAttempt/DialFailureTracker — is their only
-        // liveness signal between refreshes. Mirrors urltest's
-        // `repeated_dial_failures_mark_member_dead`.
+        // The group sweep probes provider members via `member_proxies()`
+        // (issue #543); mihomo's onDialFailed escalation —
+        // DialAttempt/DialFailureTracker — is the additional between-sweeps
+        // signal that dead-marks a failing member faster than `interval`.
+        // Mirrors urltest's `repeated_dial_failures_mark_member_dead`.
         let failing = MockProxy::new_failing("P1", AdapterType::Shadowsocks, "dial timed out");
         let slot = slot_of(vec![Arc::clone(&failing) as Arc<dyn Proxy>]);
         let group = LoadBalanceGroup::new_with_providers(
@@ -929,6 +940,61 @@ mod tests {
         let _ = group.dial_tcp(&meta_no_src()).await; // A
         let _ = group.dial_tcp(&meta_no_src()).await; // P1 — refused
         assert!(!failing.alive(), "refused escalates on the first failure");
+    }
+
+    /// `dial_udp` runs the same `DialAttempt` escalation as `dial_tcp` —
+    /// a UDP-capable member that keeps failing must dead-mark exactly like
+    /// the TCP path, otherwise dead UDP members stay in `select_udp`'s
+    /// pick space forever between sweeps.
+    #[tokio::test]
+    async fn repeated_udp_dial_failures_mark_slot_member_dead() {
+        let failing = MockProxy::new_failing_udp("P1", AdapterType::Shadowsocks, "dial timed out");
+        let slot = slot_of(vec![Arc::clone(&failing) as Arc<dyn Proxy>]);
+        let group =
+            LoadBalanceGroup::new_with_providers("lb", vec![], LbStrategy::RoundRobin, vec![slot]);
+        for i in 1..5 {
+            let _ = group.dial_udp(&meta_no_src()).await;
+            assert!(
+                failing.alive(),
+                "UDP failure {i} below the escalation threshold"
+            );
+        }
+        let _ = group.dial_udp(&meta_no_src()).await;
+        assert!(
+            !failing.alive(),
+            "five UDP failures mark the slot member dead"
+        );
+        let _ = group.dial_udp(&meta_no_src()).await;
+        assert_eq!(
+            failing.dials(),
+            5,
+            "the dead member leaves the UDP pick space"
+        );
+    }
+
+    /// `member_proxies()` must cover provider-slot members (issue #543
+    /// item 1) and list them in `members()` order — the health sweep
+    /// and the group-delay endpoint resolve through it, not the route map.
+    #[test]
+    fn member_proxies_include_provider_slots_in_member_names_order() {
+        let slot = slot_of(vec![
+            MockProxy::new("p1") as Arc<dyn Proxy>,
+            MockProxy::new("p2") as Arc<dyn Proxy>,
+        ]);
+        let group = LoadBalanceGroup::new_with_providers(
+            "lb",
+            vec![MockProxy::new("a"), MockProxy::new("b")],
+            LbStrategy::RoundRobin,
+            vec![slot],
+        );
+        let names: Vec<String> = group
+            .member_proxies()
+            .expect("groups expose members")
+            .iter()
+            .map(|p| p.name().to_string())
+            .collect();
+        assert_eq!(names, group.members().unwrap());
+        assert_eq!(names, vec!["a", "b", "p1", "p2"]);
     }
 
     #[test]

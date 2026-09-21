@@ -1,4 +1,5 @@
 use super::fallback::FallbackGroup;
+use super::load_balance::{LbStrategy, LoadBalanceGroup};
 use super::urltest::UrlTestGroup;
 use async_trait::async_trait;
 use meow_common::DIAL_TIMEOUT;
@@ -71,6 +72,11 @@ fn group_with_member(kind: &str, member: Arc<dyn Proxy>) -> Arc<dyn Proxy> {
             "outer",
             vec![Arc::new(UrlTestGroup::new("inner", vec![member], 0))],
         )),
+        "loadbalance" => Arc::new(LoadBalanceGroup::new(
+            "loadbalance",
+            vec![member],
+            LbStrategy::RoundRobin,
+        )),
         _ => unreachable!(),
     }
 }
@@ -95,7 +101,7 @@ async fn time_out(group: &dyn Proxy, udp: bool) {
 
 #[tokio::test(start_paused = true)]
 async fn native_timeouts_still_mark_members_dead() {
-    for kind in ["fallback", "urltest"] {
+    for kind in ["fallback", "urltest", "loadbalance"] {
         for udp in [false, true] {
             let slow = Arc::new(SlowProxy {
                 health: ProxyHealth::new(),
@@ -112,7 +118,7 @@ async fn native_timeouts_still_mark_members_dead() {
 
 #[tokio::test(start_paused = true)]
 async fn global_timeouts_count_once_and_track_the_selected_member() {
-    for kind in ["fallback", "urltest", "nested"] {
+    for kind in ["fallback", "urltest", "nested", "loadbalance"] {
         for udp in [false, true] {
             let slow = Arc::new(SlowProxy {
                 health: ProxyHealth::new(),
@@ -136,7 +142,7 @@ async fn global_timeouts_count_once_and_track_the_selected_member() {
 
 #[tokio::test(start_paused = true)]
 async fn early_cancellation_does_not_count_as_a_node_failure() {
-    for kind in ["fallback", "urltest"] {
+    for kind in ["fallback", "urltest", "loadbalance"] {
         let slow = Arc::new(SlowProxy {
             health: ProxyHealth::new(),
             kind: AdapterType::Hysteria2,

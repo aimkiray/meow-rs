@@ -3590,6 +3590,66 @@ tls: true
         );
     }
 
+    // `include-all` iterates providers sorted by name — the slot order
+    // (and therefore the pick space / a selector's default member) must
+    // not depend on the providers map's insertion or iteration order.
+    #[cfg(feature = "ss")]
+    #[tokio::test]
+    async fn load_balance_include_all_orders_slots_by_provider_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut providers = HashMap::new();
+        // Deliberately insert "zeta" before "alpha".
+        providers.insert(
+            "zeta".to_string(),
+            file_provider_named(
+                &dir.path().join("z.yaml"),
+                "proxies:\n  - {name: \"Z 1\", type: ss, server: 127.0.0.1, port: 443, cipher: aes-128-gcm, password: p}\n",
+                "zeta",
+            )
+            .await,
+        );
+        providers.insert(
+            "alpha".to_string(),
+            file_provider_named(
+                &dir.path().join("a.yaml"),
+                "proxies:\n  - {name: \"A 1\", type: ss, server: 127.0.0.1, port: 443, cipher: aes-128-gcm, password: p}\n",
+                "alpha",
+            )
+            .await,
+        );
+
+        let config = crate::raw::RawProxyGroup {
+            name: "lb".to_string(),
+            group_type: "load-balance".to_string(),
+            include_all: Some(true),
+            ..Default::default()
+        };
+        let group = parse_proxy_group(&config, &HashMap::new(), &[], &providers)
+            .expect("include-all load-balance must build");
+        assert_eq!(
+            group.members().unwrap_or_default(),
+            ["A 1", "Z 1"],
+            "slots follow provider-name order, not map order"
+        );
+    }
+
+    // Config-level: an unknown `use:` provider is absorbed by the
+    // multi-pass group resolver's lenient fallback — the group still
+    // builds from its static members and the config loads (warn + skip),
+    // rather than the strict pass's error failing the whole load.
+    #[tokio::test]
+    async fn load_config_unknown_use_provider_warns_and_loads() {
+        // A `direct` leaf normalizes to the built-in DIRECT name — use ss so
+        // the static member keeps its own name in `members()`.
+        let yaml = "proxies:\n  - {name: p, type: ss, server: 127.0.0.1, port: 443, cipher: aes-128-gcm, password: x}\n\
+            proxy-groups:\n  - {name: g, type: load-balance, proxies: [p], use: [ghost]}\n";
+        let cfg = crate::load_config_from_str(yaml)
+            .await
+            .expect("an unknown `use:` provider must not fail the config");
+        let group = cfg.proxies.get("g").expect("group builds from statics");
+        assert_eq!(group.members().unwrap_or_default(), ["p"]);
+    }
+
     // `include-all` beats `use:` — upstream `Use = AllProviders`.
     #[cfg(feature = "ss")]
     #[tokio::test]
@@ -3674,10 +3734,11 @@ tls: true
     // ─── group-level filter on provider members (issue #358) ────────────────
 
     #[cfg(feature = "ss")]
-    async fn file_provider_with(
+    async fn file_provider_named(
         path: &std::path::Path,
         entries: &str,
-    ) -> HashMap<String, Arc<crate::proxy_provider::ProxyProvider>> {
+        name: &str,
+    ) -> Arc<crate::proxy_provider::ProxyProvider> {
         std::fs::write(path, entries).unwrap();
         let raw = crate::raw::RawProxyProvider {
             provider_type: "file".to_string(),
@@ -3693,11 +3754,19 @@ tls: true
         };
         let cache_dir = path.parent().expect("temp file has a parent dir");
         let provider =
-            crate::proxy_provider::ProxyProvider::new("airport", &raw, Some(cache_dir), true)
-                .unwrap();
+            crate::proxy_provider::ProxyProvider::new(name, &raw, Some(cache_dir), true).unwrap();
         provider.refresh().await.unwrap();
+        Arc::new(provider)
+    }
+
+    #[cfg(feature = "ss")]
+    async fn file_provider_with(
+        path: &std::path::Path,
+        entries: &str,
+    ) -> HashMap<String, Arc<crate::proxy_provider::ProxyProvider>> {
+        let provider = file_provider_named(path, entries, "airport").await;
         let mut providers = HashMap::new();
-        providers.insert("airport".to_string(), Arc::new(provider));
+        providers.insert("airport".to_string(), provider);
         providers
     }
 

@@ -85,8 +85,7 @@ the canonical, in-repo source a release is cut from.
   never became `alive`, and the delay endpoint returned `{}` for it. The
   `Proxy` trait gains `member_proxies()`, which every group implements
   over its static members *and* provider slots; both callers probe
-  through it. Load-balance still drops its `use:` slots at parse
-  (#555 item 3) and providers have no scheduled check of their own yet.
+  through it. Providers have no scheduled check of their own yet.
 
 - **`RULE-SET` rules now see refreshed rule-provider content without a
   config rebuild** (#553). The rule parser received a snapshot `Arc` of
@@ -190,10 +189,9 @@ the canonical, in-repo source a release is cut from.
   visible to the next selection without a config reload, and `members()`,
   `alive`, `support_udp`, and delay reporting all see the combined set.
   Load-balance also gains the dial-failure escalation its siblings already
-  had: a member that keeps failing dials is marked dead between sweeps —
-  the only liveness signal provider members get, since the group sweep
-  resolves member names through the route map where provider nodes are
-  never registered. (#533)
+  had: a member that keeps failing dials is marked dead between sweeps,
+  complementing the periodic sweep, which probes provider members too via
+  `member_proxies()`. (#533)
 
 - **TLS handshakes no longer fail on multiplexed transports whose
   `poll_flush` pends.** Every TLS-over-mux handshake — AnyTLS, smux, and any

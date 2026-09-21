@@ -71,6 +71,20 @@ impl MockProxy {
         })
     }
 
+    /// Same as [`new_failing`](Self::new_failing) but UDP-capable, so the
+    /// failure counts through `dial_udp` escalation paths too.
+    pub fn new_failing_udp(name: &str, adapter_type: AdapterType, error: &str) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.to_string(),
+            health: ProxyHealth::new(),
+            udp: true,
+            adapter_type,
+            dial_error: Some(error.to_string()),
+            udp_unsupported: false,
+            dial_count: AtomicUsize::new(0),
+        })
+    }
+
     /// Mock whose `dial_udp` returns the structural
     /// [`MeowError::UdpNotSupported`] that relay chains and dialer-proxy
     /// members produce when they cannot carry UDP. Such errors describe a
