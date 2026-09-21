@@ -439,3 +439,48 @@ fn lazy_match_zero_alloc_on_clean_scan() {
         "expected zero heap allocations per lazy rule match, got {allocs} total ({per_match:.3}/match)"
     );
 }
+
+#[test]
+fn lazy_match_zero_alloc_with_dead_target_skips() {
+    // The skipped-target buffer is a SmallVec with two inline slots — one
+    // or two dead-target matches per connection must still be
+    // allocation-free (ADR-0008); beyond that a heap spill is acceptable
+    // but bounded to once per scan.
+    let _guard = serial();
+
+    let rules: Vec<Box<dyn Rule>> = vec![
+        Box::new(SimpleDomainRule::new("dead-a.example", "GHOST-A")),
+        Box::new(SimpleDomainRule::new("dead-b.example", "GHOST-B")),
+        Box::new(SimpleDomainRule::new("example.com", "DIRECT")),
+        Box::new(FinalRule::new("DIRECT")),
+    ];
+    let compiled = CompiledRuleSet::build(&rules);
+    let meta = Metadata {
+        host: "dead-a.example".into(),
+        ..test_metadata()
+    };
+    let no_ghosts = |name: &str| !name.starts_with("GHOST");
+
+    // Warm up.
+    let _ = compiled.match_rules_lazy(&meta, &rules, &no_ghosts);
+
+    reset_counts();
+    let n = 1000;
+    for _ in 0..n {
+        let outcome = compiled.match_rules_lazy(&meta, &rules, &no_ghosts);
+        assert!(matches!(outcome, LazyMatchOutcome::Matched(_)));
+        let _ = std::hint::black_box(outcome);
+    }
+    let (allocs, _) = snapshot();
+
+    let per_match = allocs as f64 / n as f64;
+    println!("lazy_rule_match dead-target: {allocs} allocs for {n} = {per_match:.3}/match");
+    if under_coverage_instrumentation() {
+        println!("skipping alloc assertion under coverage instrumentation");
+        return;
+    }
+    assert!(
+        allocs == 0,
+        "one dead-target skip must stay inline in the SmallVec, got {allocs} allocs ({per_match:.3}/match)"
+    );
+}

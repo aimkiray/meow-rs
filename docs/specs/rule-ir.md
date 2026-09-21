@@ -605,9 +605,10 @@ TCP connections resolve through `Tunnel::resolve_proxy_lazy()`:
 4. On `Matched`/`NoMatch` the buffered dead-target warnings drain (see the
    lazy contract above) and the result materializes immediately.
 5. On `NeedsEnrichment` the tunnel materializes only the demanded fields —
-   process lookup and/or real-IP resolution on the cloned metadata — then
-   re-runs the strict `match_rules`, which re-derives the same dead-target
-   skips and warns each once.
+   process lookup works on a cloned metadata while real-IP resolution
+   writes `dst_ip` on the caller's metadata — then re-runs the strict
+   `match_rules`, which re-derives the same dead-target skips and warns
+   each once.
 6. On match, statistics are incremented from the returned `RuleType`, and the
    proxy is resolved by the returned adapter name — already proven present by
    the predicate, so a missing proxy is only a defensive fallback to DIRECT.

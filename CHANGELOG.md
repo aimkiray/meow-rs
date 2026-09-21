@@ -202,8 +202,8 @@ the canonical, in-repo source a release is cut from.
   final outcome (`Matched`/`NoMatch`); on `NeedsEnrichment` the buffer is
   dropped because the deterministic strict re-scan re-fires each skip
   exactly once. Strict `match_rules` behaviour is unchanged; the buffer
-  keeps up to two skips inline, so even a dead-target match stays
-  allocation-free. (#533)
+  keeps up to two skips inline, so a dead-target match stays
+  allocation-free in the common case. (#533)
 
 - **TLS handshakes no longer fail on multiplexed transports whose
   `poll_flush` pends.** Every TLS-over-mux handshake — AnyTLS, smux, and any

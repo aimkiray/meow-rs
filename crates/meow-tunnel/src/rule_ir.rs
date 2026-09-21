@@ -657,8 +657,8 @@ impl CompiledRuleSet {
         // Dead-target matches are buffered, not warned: a `NeedsEnrichment`
         // outcome means the caller re-runs `match_rules`, which re-fires the
         // same skips deterministically — emitting here too would warn twice
-        // per connection. The SmallVec keeps up to two skips inline, so even
-        // the dead-target path stays allocation-free.
+        // per connection. The SmallVec keeps up to two skips inline; a
+        // third spills to the heap once per scan (a degenerate-config path).
         let mut skipped: SmallVec<[CompiledMatchResult<'a>; 2]> = SmallVec::new();
         let outcome = {
             let mut on_missing = |m: CompiledMatchResult<'a>| skipped.push(m);
@@ -2979,6 +2979,35 @@ mod tests {
         assert_eq!(logs.matches("DEAD-TAIL").count(), 1, "got: {logs}");
     }
 
+    // A dead-target match in the indexed plan's *prefix* range (a
+    // non-domain rule scanned before the trie hit) reports through the
+    // same sink — each scan callsite must thread it, in both modes.
+    #[test]
+    fn dead_target_in_indexed_prefix_warns_once() {
+        let mut rules = filler_suffix_rules(70);
+        rules.push(Box::new(
+            PortRule::new("443", "DEAD-PREFIX", false).unwrap(),
+        ));
+        rules.push(Box::new(DomainSuffixRule::new("hit.example", "LIVE")));
+        rules.push(Box::new(FinalRule::new("DIRECT")));
+        let set = CompiledRuleSet::build(&rules);
+        assert!(!set.uses_linear_scan_plan(), "must run the indexed plan");
+        let usable = |name: &str| name != "DEAD-PREFIX";
+        let meta = Metadata {
+            host: "hit.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        let (result, logs) = capture_warns(|| set.match_rules(&meta, &rules, &usable));
+        assert_eq!(result.map(|m| m.adapter_name), Some("LIVE"));
+        assert_eq!(logs.matches("DEAD-PREFIX").count(), 1, "strict: {logs}");
+
+        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        assert!(matches!(outcome, LazyMatchOutcome::Matched(_)));
+        assert_eq!(logs.matches("DEAD-PREFIX").count(), 1, "lazy: {logs}");
+    }
+
     // `NoMatch` is also a final outcome: buffered warns must still drain.
     #[test]
     fn lazy_dead_target_warns_on_no_match() {
@@ -3481,13 +3510,22 @@ mod tests {
         assert_eq!(result.adapter_name, "REJECT");
         assert_eq!(result.rule_index, ghost_idx + 1);
 
-        // Lazy path agrees.
-        match set.match_rules_lazy(&meta, &rules, &present) {
+        // Lazy path agrees — and the skipped trie hit must still warn
+        // exactly once on the terminal outcome (the hit-slot arm reports
+        // through the same on_missing sink; dropping it silently loses
+        // this warn since no strict re-scan runs on Matched).
+        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &present));
+        match outcome {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "REJECT"),
             LazyMatchOutcome::NeedsEnrichment { .. } | LazyMatchOutcome::NoMatch => {
                 panic!("lazy path diverged")
             }
         }
+        assert_eq!(
+            logs.matches("GHOST").count(),
+            1,
+            "the skipped trie hit warns once, got: {logs}"
+        );
     }
 
     #[test]
