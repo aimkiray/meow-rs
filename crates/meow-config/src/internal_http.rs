@@ -440,10 +440,10 @@ fn decode_chunked(mut input: &[u8], limit: usize) -> Result<Vec<u8>> {
 }
 
 /// Pick the first proxy named in the user's `proxies:` config block and look
-/// it up in the live proxy registry.
+/// it up in the supplied proxy map.
 ///
 /// Returns `None` if there are no `proxies:` entries, if the first entry has
-/// no `name:` field, or if that name isn't in the registry (e.g. it failed to
+/// no `name:` field, or if that name isn't in the map (e.g. it failed to
 /// load during proxy construction).
 pub fn first_named_proxy(
     raw_proxies: Option<&[std::collections::HashMap<String, serde_yaml::Value>]>,

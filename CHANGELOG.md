@@ -174,9 +174,10 @@ the canonical, in-repo source a release is cut from.
   Both now share one pre-registry proxy layer built by the same code path
   as the runtime map — `dialer-proxy` chains, groups, and GLOBAL included —
   published into a private registry cell for the fetch's duration, so a
-  chained or group front hop resolves exactly as it will at runtime. When
-  the layer itself is rejected the real build hard-fails on the same
-  error moments later; explicit `proxy:` prefetches are then skipped
+  chained or group front hop resolves exactly as it will at runtime. A
+  rejected layer aborts the build before any fetch can egress — the same
+  validation error the real build would report — and a `proxy:` name the
+  layer cannot resolve is skipped and retried against the full registry
   rather than egressing unchained. (#533)
 
 - **TLS handshakes no longer fail on multiplexed transports whose

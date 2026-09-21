@@ -243,8 +243,8 @@ fn effective_download_proxy(
 ///
 /// A `proxy:` name `lookup` cannot resolve (provider-sourced proxies are
 /// never indexed by the lookup, and the prefetch layer can be absent when
-/// its build was rejected) skips the prefetch quietly — the load pass
-/// retries against the full registry.
+/// the caller had no need to build it) skips the prefetch quietly — the
+/// load pass retries against the full registry.
 pub fn prefetch_payloads(
     raw_providers: &HashMap<String, RawRuleProvider>,
     cache_dir: Option<&Path>,

@@ -2813,6 +2813,26 @@ async fn build_config(
 mod dialer_proxy_tests {
     use super::*;
 
+    /// TCP listener that accepts-and-drops, counting connections — the
+    /// observable for "which address did the dial physically contact".
+    async fn counting_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (port, count)
+    }
+
+    fn hits(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn simple_proxy(name: &str) -> Arc<dyn Proxy> {
         // A bare DIRECT adapter is enough; we only assert on registry identity.
         let direct = meow_proxy::DirectAdapter::new();
@@ -3112,6 +3132,124 @@ mod dialer_proxy_tests {
         let payloads = prefetch_rule_provider_payloads_async(&raw, None, Some(layer)).await;
         assert!(payloads.is_empty());
         assert!(b_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    }
+
+    /// A provider *without* `proxy:` rides the prefetch layer through the
+    /// default download proxy — `first_named_proxy` resolves `proxies[0]`
+    /// inside the layer, so the fetch still dials A's chained front hop B.
+    /// Reverting the default to a bare re-parse (or never building the
+    /// layer) would dial A's own listener or the provider URL direct.
+    #[tokio::test]
+    async fn build_config_prefetch_default_rides_the_chain() {
+        let (port_a, a_hits) = counting_listener().await;
+        let (port_b, b_hits) = counting_listener().await;
+        let (port_u, u_hits) = counting_listener().await;
+
+        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+            "proxies:\n\
+             \x20 - name: A\n    type: trojan\n    server: 127.0.0.1\n    port: {port_a}\n    \
+             password: x\n    dialer-proxy: B\n\
+             \x20 - name: B\n    type: trojan\n    server: 127.0.0.1\n    port: {port_b}\n    \
+             password: x\n\
+             rule-providers:\n\
+             \x20 rs:\n    type: http\n    behavior: domain\n    \
+             url: http://127.0.0.1:{port_u}/rs.yaml\n    path: ./rs.yaml\n"
+        ))
+        .unwrap();
+
+        // Every fetch fails (listeners accept-then-drop), and provider load
+        // failures warn-and-skip — the config itself still builds.
+        build_config(raw, None)
+            .await
+            .expect("config builds despite failed provider fetch");
+
+        assert!(
+            hits(&b_hits) >= 1,
+            "the prefetch fetch must reach A's front hop B"
+        );
+        assert_eq!(
+            hits(&a_hits),
+            0,
+            "a bare adapter would dial A's own listener"
+        );
+        assert_eq!(
+            hits(&u_hits),
+            0,
+            "no fetch may reach the provider URL listener directly"
+        );
+    }
+
+    /// A proxy layer the real build would reject must abort `build_config`
+    /// BEFORE any provider fetch can egress — swallowing the layer error
+    /// and continuing with a partial map would leak one direct fetch.
+    #[tokio::test]
+    async fn rejected_layer_fails_before_any_fetch() {
+        let (port_u, u_hits) = counting_listener().await;
+
+        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+            "proxies:\n\
+             \x20 - name: A\n    type: trojan\n    server: 127.0.0.1\n    port: 9\n    \
+             password: x\n    dialer-proxy: ghost\n\
+             rule-providers:\n\
+             \x20 rs:\n    type: http\n    behavior: domain\n    \
+             url: http://127.0.0.1:{port_u}/rs.yaml\n    path: ./rs.yaml\n"
+        ))
+        .unwrap();
+
+        assert!(
+            build_config(raw, None).await.is_err(),
+            "an unknown dialer target rejects the prefetch layer"
+        );
+        assert_eq!(
+            hits(&u_hits),
+            0,
+            "no fetch may egress before the config's proxy layer validates"
+        );
+    }
+
+    /// `ensure_geodata` downloads missing DBs through the same prefetch
+    /// layer — dropping its `prefetch` argument would fetch the MMDB URL
+    /// direct, and a bare re-parse would hit A's own listener, not B's.
+    #[tokio::test]
+    async fn geodata_download_rides_the_chain() {
+        let (port_a, a_hits) = counting_listener().await;
+        let (port_b, b_hits) = counting_listener().await;
+        let (port_u, u_hits) = counting_listener().await;
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.mmdb");
+
+        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+            "proxies:\n\
+             \x20 - name: A\n    type: trojan\n    server: 127.0.0.1\n    port: {port_a}\n    \
+             password: x\n    dialer-proxy: B\n\
+             \x20 - name: B\n    type: trojan\n    server: 127.0.0.1\n    port: {port_b}\n    \
+             password: x\n\
+             geodata:\n\
+             \x20 mmdb-path: {}\n\
+             \x20 url:\n        mmdb: http://127.0.0.1:{port_u}/x.mmdb\n\
+             rules:\n  - GEOIP,CN,DIRECT\n",
+            missing.display()
+        ))
+        .unwrap();
+
+        // The download fails (B drops the conn) and the parser-context
+        // build then hard-errors on the still-missing MMDB — only the dial
+        // observables matter here.
+        let _ = build_config(raw, None).await;
+        assert!(
+            hits(&b_hits) >= 1,
+            "the geodata download must reach A's front hop B"
+        );
+        assert_eq!(
+            hits(&a_hits),
+            0,
+            "a bare adapter would dial A's own listener"
+        );
+        assert_eq!(
+            hits(&u_hits),
+            0,
+            "the MMDB URL must not be fetched directly"
+        );
     }
 
     #[test]
