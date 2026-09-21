@@ -251,9 +251,9 @@ wrapper.
 
 | Dimension | Impact |
 |-----------|--------|
-| Build toolchain | Requires cmake 3.14+, a C++ compiler (clang or gcc), and Ninja (or make) |
+| Build toolchain | Requires cmake 3.22+ (`boring-sys` 5.x's vendored BoringSSL declares `cmake_minimum_required(VERSION 3.22)`), a C++ compiler (clang or gcc), and Ninja (or make) |
 | macOS | Works with Xcode Command Line Tools; no extra steps |
-| Linux (Ubuntu/Debian) | `apt install cmake clang` — standard in CI images |
+| Linux (Ubuntu/Debian) | `apt install cmake clang` — standard in CI images. Ubuntu 20.04 (cmake 3.16) and Debian 11 (cmake 3.18) ship too-old versions: install ≥3.22 from Kitware's apt repository (`apt.kitware.com`) or `pip install cmake` |
 | Windows | Requires MSVC or cross-compilation; boring-sys has Windows support but adds ~5 min build time |
 | Binary size | BoringSSL static lib adds approximately 8–12 MB to the release binary |
 | Compile time | Clean build adds ~2–4 min on a typical 8-core CI worker |
@@ -309,8 +309,6 @@ profile or via a workspace feature.
 
 | Item | Reason |
 |------|--------|
-| DNS HTTPS-record ECH config sourcing (`ech-opts.enable` without `ech-opts.config`) | Requires SVCB/HTTPS record query support in `meow-dns` (hickory-resolver HTTPS records exist but no wrapper in this repo) |
-| ECH retry-on-rejection | Needs per-connection `SslConnector` rebuild with `get_ech_retry_configs()` result; complex async flow |
 | `randomized` fingerprint profile | Requires per-connection weight-sampled extension list; deferred until boring extension-level API is better understood |
 | `randomized` custom profiles | Requires per-connection weight-sampled extension list; deferred until boring extension-level API is better understood |
 | Deprecated fingerprints (`chrome_psk`, etc.) | Actively discouraged upstream; not implemented |

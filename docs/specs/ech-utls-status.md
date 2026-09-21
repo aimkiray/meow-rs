@@ -7,7 +7,7 @@
 
 ## Summary
 
-Encrypted Client Hello (ECH) and uTLS-style browser fingerprint spoofing are implemented in meow-rs's TLS transport via a new `boring-tls` cargo feature backed by BoringSSL (boring 5.2 + tokio-boring 5.2 since #572; the workspace sat on 4.22 while the published quiche still required `boring < 5`). Six fingerprint profiles ship, inline-config and DNS-sourced ECH both work end-to-end, ECH key rotation self-heals on `ech_required` rejection, and all C1–C16 tests pass against a real loopback BoringSSL server with a live ECH keypair.
+Encrypted Client Hello (ECH) and uTLS-style browser fingerprint spoofing are implemented in meow-rs's TLS transport via a new `boring-tls` cargo feature backed by BoringSSL (boring 5.2 + tokio-boring 5.2 since #572; the workspace sat on 4.22 while the published quiche still required `boring < 5`). Six fingerprint profiles ship, inline-config and DNS-sourced ECH both work end-to-end, ECH key rotation self-heals on `ech_required` rejection, and all C1–C17 tests pass against a real loopback BoringSSL server with a live ECH keypair.
 
 ---
 
@@ -21,16 +21,16 @@ Encrypted Client Hello (ECH) and uTLS-style browser fingerprint spoofing are imp
 - `random` meta-profile (weighted pick at `TlsLayer::new` time: chrome×6, safari×3, ios×2, firefox×1)
 - `TlsConfig.ech: Option<EchOpts>` with `EchOpts::Config(Vec<u8>)` for inline ECH config list
 - `EchKeyPairGenerator` — FFI-based HPKE keypair generation for tests (boring-sys `SSL_ECH_KEYS_*`)
-- `spawn_ech_server()` — real server-side ECH via `SSL_CTX_set1_ech_keys`, used by C13–C15 for full end-to-end handshakes
+- `spawn_ech_server()` / `spawn_ech_server_multi()` — real server-side ECH via `SSL_CTX_set1_ech_keys`, used by C13–C17 for full end-to-end handshakes
 - JA3 hash reference consts for firefox, android, edge (hardcoded; chrome uses property-based assertions; safari and ios alias at the wire level, see Key Decisions)
-- Feature-gated test suite: `boring_tls_test` (20 cases including real C13–C15), plus retained rustls suite (11 cases); 31 total passing
+- Feature-gated test suite: `boring_tls_test` (23 cases including real C13–C17), plus retained rustls suite (11 cases); 34 total passing
 
 ### Added since v1
 
 - **BoringSSL is the only TLS backend.** The rustls backend and the rustls
   `ech` feature are removed; `tls` *is* BoringSSL and `boring-tls` is a
   no-op alias. The `SslConnector` is memoised per
-  `(fingerprint, alpn, skip_cert_verify)` and SNI is omitted for IP-literal
+  `(fingerprint, curves, alpn, skip_cert_verify)` and SNI is omitted for IP-literal
   server names. URL-test health probes, the internal HTTP fetcher (which
   replaced `reqwest`), DoT/DoH and the vendored anytls client all go
   through the same `TlsLayer`. rustls survives only as a dev-dependency for
@@ -38,7 +38,7 @@ Encrypted Client Hello (ECH) and uTLS-style browser fingerprint spoofing are imp
   BoringSSL.
 
 - **DNS-sourced ECH** (`ech-opts.enable: true` with no inline `config:`) — async pre-resolution pass over the proxy YAML map (`meow_config::ech_dns::preresolve_ech`) uses `hickory-resolver` against the system DNS config to fetch the wire-format `ECHConfigList` from the HTTPS (RR 65) record, then writes it back as base64 so the sync `parse_proxy` path stays sync. Wired into `build_config`, the API config-reload handlers, the proxy-provider refresh, and the subscription auto-update path.
-- **ECH retry self-heal** — when the server returns `ech_required` with fresh `retry_configs`, `BoringInner` (now holding `ech: Mutex<Option<EchOpts>>`) rotates its stored ECH bytes to the server-signed key. The current connect still fails (the inner stream is consumed by `tokio_boring::connect`), but every subsequent connect through the same `TlsLayer` uses the refreshed key. Validated end-to-end by `c16_ech_self_heal_uses_retry_configs_on_next_connect`.
+- **ECH retry self-heal** — when the server returns `ech_required` with fresh `retry_configs`, `BoringInner` (now holding `ech: Mutex<Option<EchOpts>>`) rotates its stored ECH bytes to the server-signed key. The current connect still fails (the inner stream is consumed by `tokio_boring::connect`), but every subsequent connect through the same `TlsLayer` uses the refreshed key. The `retry_configs` read is gated on an authenticated `SSL_R_ECH_REJECTED` — `SSL_get0_ech_retry_configs` aborts debug builds and returns a malformed placeholder on any other failure. Validated end-to-end by `c16_ech_self_heal_uses_retry_configs_on_next_connect` and `c17_non_ech_failure_preserves_stored_ech_config`.
 
 ### Still deferred / out of scope
 

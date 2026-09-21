@@ -301,6 +301,17 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **A non-ECH mid-handshake TLS failure no longer corrupts ECH state**
+  (#572). `SSL_get0_ech_retry_configs` is only legal after an
+  authenticated `SSL_R_ECH_REJECTED`, but the self-heal path read it on
+  any handshake failure when ECH was configured: debug builds hit
+  BoringSSL's `assert(0)`, and release builds stored a 5-byte malformed
+  placeholder into the layer's ECH config so every subsequent connect
+  failed at `set_ech_config_list`. The read is now gated on a real
+  mid-handshake `SSL_R_ECH_REJECTED` failure
+  (`handshake_failed_ech_rejected`, covered by C17 in
+  `boring_tls_test`).
+
 - **Provider-sourced group members are now health-checked** (#543 item 1,
   #555). The periodic sweep and `GET /group/{name}/delay` resolved
   `group.members()` names through the route table, where `use:` /

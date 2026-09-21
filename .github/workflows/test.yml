@@ -236,6 +236,7 @@ jobs:
             --test geodata_fetch_test \
             --test subscription_refresh_test \
             --test tls_test \
+            --test boring_tls_test \
             --test ws_test \
             --test crate_invariants_test \
             --test crate_publish_metadata_test \
@@ -432,6 +433,7 @@ jobs:
             --test api_test \
             --test trojan_integration \
             --test tls_test \
+            --test boring_tls_test \
             --test ws_test \
             --test crate_publish_metadata_test --retries 2 --no-fail-fast
 
@@ -472,6 +474,7 @@ jobs:
             --test api_test \
             --test trojan_integration \
             --test tls_test \
+            --test boring_tls_test \
             --test ws_test \
             --test crate_publish_metadata_test --retries 2 --no-fail-fast
 

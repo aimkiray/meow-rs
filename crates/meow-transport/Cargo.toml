@@ -15,8 +15,9 @@ description = "Reusable composable stream-transport layers (TLS, WS, gRPC, H2, H
 [features]
 default = ["tls", "ws"]
 # tls: the `TlsLayer` client transport, backed by BoringSSL (boring +
-# tokio-boring; boring-sys vendors and builds BoringSSL, so cmake 3.14+ and a
-# C++ compiler are required at build time). Plain TLS, uTLS fingerprint
+# tokio-boring; boring-sys vendors and builds BoringSSL, so cmake 3.22+ and a
+# C++ compiler are required at build time — Ubuntu 20.04/Debian 11 ship older
+# cmake and need Kitware's apt repo or `pip install cmake`). Plain TLS, uTLS fingerprint
 # shaping, ECH (with server retry_configs self-healing), mTLS and ALPN are all
 # native here. There is no rustls backend: the hysteria2 outbound (meow-proxy)
 # runs quiche on the same vendored BoringSSL, and rustls is linked only by the

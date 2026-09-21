@@ -201,29 +201,36 @@ pub fn build_tls_layer(
              authenticator"
         );
     }
-    TlsLayer::new(&build_tls_config(cfg, client_fingerprint)).map_err(transport_to_proxy_err)
+    let tls_config = tls_config_for(cfg, client_fingerprint);
+    TlsLayer::new(&tls_config).map_err(transport_to_proxy_err)
 }
 
-/// The `TlsConfig` [`build_tls_layer`] wraps — split out so the
-/// version-dependent shaping (version bounds, fingerprint drop,
-/// v2 MLKEM exclusion) is assertable without a live handshake.
-fn build_tls_config(cfg: &ShadowTlsConfig, client_fingerprint: Option<&str>) -> TlsConfig {
+/// Build the [`TlsConfig`] for the cover handshake. Split out from
+/// [`build_tls_layer`] so tests can pin the per-version shaping matrix
+/// (v1 fingerprint drop, v1 max-version cap, v2 ML-KEM strip).
+fn tls_config_for(cfg: &ShadowTlsConfig, client_fingerprint: Option<&str>) -> TlsConfig {
+    let fingerprint = client_fingerprint
+        .filter(|_| cfg.version != 1)
+        .map(str::to_string);
     TlsConfig {
         alpn: cfg.alpn.clone(),
         skip_cert_verify: cfg.skip_cert_verify,
         verify_name: cfg.verify_name.clone(),
         cert_pin: cfg.cert_pin,
         client_cert: cfg.client_cert.clone(),
-        fingerprint: client_fingerprint
-            .filter(|_| cfg.version != 1)
-            .map(str::to_string),
-        // v2 breaks against real servers when the cover CH carries a
-        // hybrid-PQ keyshare (mihomo d900c71 swaps HelloChrome_Auto →
-        // HelloChrome_120).  Every fingerprint profile's curve list
-        // already excludes X25519MLKEM768 — only the no-fingerprint path
-        // needs the explicit drop.
-        curves_list: (cfg.version == 2 && client_fingerprint.is_none())
-            .then(|| "X25519:P-256:P-384".to_string()),
+        // Upstream removes X25519MLKEM768 from the v2 ClientHello after
+        // uTLS shaping (`BuildRemovedX25519MLKEM768HandshakeState` — a
+        // hybrid-PQ keyshare breaks v2 servers). The strip is surgical:
+        // it must not clobber a resolved profile's own group list
+        // (firefox advertises P-521, android orders P-256 first), and
+        // every shipped profile already excludes ML-KEM — so the classic
+        // pin is needed only when no profile shapes the hello and the
+        // vendored BoringSSL default (which does offer ML-KEM) applies.
+        curves: (cfg.version == 2
+            && client_fingerprint
+                .is_none_or(|fp| !meow_transport::tls::is_supported_fingerprint(fp)))
+        .then(|| "X25519:P-256:P-384".to_string()),
+        fingerprint,
         min_version: Some(TlsVersion::Tls12),
         max_version: (cfg.version == 1).then_some(TlsVersion::Tls12),
         ..TlsConfig::new(&cfg.host)
@@ -309,6 +316,38 @@ mod tests {
         }
     }
 
+    /// Upstream removes the hybrid-PQ `X25519MLKEM768` key share from the
+    /// v2 ClientHello after uTLS shaping — the strip never replaces the
+    /// shaped group list. Every shipped profile already excludes ML-KEM,
+    /// so the classic pin applies only when no profile resolves and the
+    /// vendored-BoringSSL default hello (which offers ML-KEM) would run.
+    #[test]
+    fn tls_config_for_pins_v2_classic_curves() {
+        for (version, want) in [(1u8, None), (2, Some("X25519:P-256:P-384")), (3, None)] {
+            let cfg = parse_opts(&format!("host=h;version={version};password=p")).unwrap();
+            let tls = tls_config_for(&cfg, None);
+            assert_eq!(
+                tls.curves.as_deref(),
+                want,
+                "version {version} curves pin mismatch"
+            );
+        }
+        // A resolved fingerprint lifts the pin — its own group list is
+        // already ML-KEM-free, and overriding it would break the profile
+        // (firefox's P-521, android's P-256-first ordering).
+        let cfg = parse_opts("host=h;version=2;password=p").unwrap();
+        for fp in ["chrome", "firefox", "android", "random"] {
+            let tls = tls_config_for(&cfg, Some(fp));
+            assert_eq!(tls.curves.as_deref(), None, "{fp} must keep its own list");
+            assert_eq!(tls.fingerprint.as_deref(), Some(fp));
+        }
+        // A deferred/unknown fingerprint resolves to nothing — the
+        // default hello offers ML-KEM, so the pin must hold.
+        let tls = tls_config_for(&cfg, Some("randomized"));
+        assert_eq!(tls.curves.as_deref(), Some("X25519:P-256:P-384"));
+        assert_eq!(tls.fingerprint.as_deref(), Some("randomized"));
+    }
+
     #[test]
     fn parse_opts_defaults() {
         let cfg = parse_opts("host=cover.example.com;version=2").unwrap();
@@ -357,33 +396,29 @@ mod tests {
 
     /// The version-dependent TlsConfig shaping, asserted field by field:
     /// a dropped `max_version` would send a TLS 1.3 ClientHello for v1;
-    /// a dropped `curves_list` reintroduces X25519MLKEM768 into v2.
+    /// a dropped `curves` pin reintroduces X25519MLKEM768 into v2.
     #[test]
-    fn build_tls_config_shapes_per_version() {
+    fn tls_config_for_shapes_per_version() {
         use meow_transport::tls::TlsVersion;
         for v in 1..=3u8 {
             let cfg = parse_opts(&format!("host=cover.example.com;version={v}")).unwrap();
-            let c = build_tls_config(&cfg, None);
+            let c = tls_config_for(&cfg, None);
             assert_eq!(c.min_version, Some(TlsVersion::Tls12), "v{v} floor");
             assert_eq!(
                 c.max_version,
                 (v == 1).then_some(TlsVersion::Tls12),
                 "v{v} cap"
             );
-            assert_eq!(
-                c.curves_list.is_some(),
-                v == 2,
-                "v{v} MLKEM drop applies to v2 without a fingerprint only"
-            );
+            assert_eq!(c.curves.is_some(), v == 2, "v{v} MLKEM drop applies to v2");
         }
-        // An explicit fingerprint already excludes MLKEM via the
-        // profile's own curve list — no override on v2, and v1 drops
-        // the fingerprint entirely (upstream parity).
+        // A resolved v2 fingerprint keeps its own (ML-KEM-free) group
+        // list — the pin lifts — while v1 drops the fingerprint entirely
+        // (upstream parity).
         let cfg = parse_opts("host=cover.example.com;version=2").unwrap();
-        let c = build_tls_config(&cfg, Some("chrome"));
-        assert!(c.curves_list.is_none() && c.fingerprint.is_some());
+        let c = tls_config_for(&cfg, Some("chrome"));
+        assert!(c.curves.is_none() && c.fingerprint.is_some());
         let cfg = parse_opts("host=cover.example.com;version=1").unwrap();
-        let c = build_tls_config(&cfg, Some("chrome"));
+        let c = tls_config_for(&cfg, Some("chrome"));
         assert!(
             c.fingerprint.is_none(),
             "v1 must not carry a 1.3-shaped profile"

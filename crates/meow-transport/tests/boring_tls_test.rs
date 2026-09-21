@@ -20,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use meow_transport::{
-    tls::{EchOpts, TlsConfig, TlsLayer},
+    tls::{ConnectTypedError, EchOpts, TlsConfig, TlsLayer},
     Transport,
 };
 use support::loopback::{gen_cert, install_crypto_provider, spawn_tls_server, ServerOptions};
@@ -1022,7 +1022,7 @@ async fn c16_ech_self_heal_uses_retry_configs_on_next_connect() {
         support::loopback::EchKeyPairGenerator::generate().expect("ECH keypair B (client)");
     let (cert_der, key_der, _, _) = gen_cert(&["loopback.test"]);
 
-    let (addr, _conn_rx) = support::loopback::spawn_ech_server_multi(
+    let (addr, mut conn_rx) = support::loopback::spawn_ech_server_multi(
         support::loopback::BoringServerOptions {
             cert_der,
             key_der,
@@ -1064,6 +1064,108 @@ async fn c16_ech_self_heal_uses_retry_configs_on_next_connect() {
         r2.is_ok(),
         "second connect must succeed after self-heal; err={:?}",
         r2.err().map(|e| e.to_string())
+    );
+
+    // Server-side reports, in accept order: attempt 1 rejected ECH,
+    // attempt 2 must report ech_accepted — proving the rotated key
+    // actually negotiated ECH rather than silently completing a
+    // non-ECH handshake.
+    let i1 = conn_rx.recv().await.expect("attempt-1 conn info");
+    assert!(!i1.ech_accepted, "rejected attempt must not accept ECH");
+    let i2 = conn_rx.recv().await.expect("attempt-2 conn info");
+    assert!(i2.ech_accepted, "self-healed attempt must accept ECH");
+}
+
+// ─── C17: a non-ECH mid-handshake failure must not poison the stored ECH ───
+//
+// `SSL_get0_ech_retry_configs` is only legal in response to
+// `SSL_R_ECH_REJECTED`: on any other failure BoringSSL `assert(0)`s (debug
+// abort) and returns a 5-byte garbage placeholder that the error path would
+// store into `self.ech`, breaking every subsequent connect at
+// `set_ech_config_list`.  The `handshake_failed_ech_rejected` gate guards
+// that read.  Drive the gap:
+//
+//   1. First connect goes to a listener that accepts then immediately drops
+//      the socket — a mid-handshake reset, *not* an authenticated ECH
+//      rejection.  The attempt must fail cleanly and leave `self.ech`
+//      untouched (without the gate this either aborts the test binary under
+//      a debug build or writes the placeholder).
+//   2. The same `TlsLayer` then connects to a real ECH server whose keypair
+//      matches the client's stored config: the handshake only succeeds if
+//      the stored list was never replaced.
+#[tokio::test]
+async fn c17_non_ech_failure_preserves_stored_ech_config() {
+    install_crypto_provider();
+
+    let (server_config_list, server_keys) =
+        support::loopback::EchKeyPairGenerator::generate().expect("ECH keypair");
+    let (cert_der, key_der, _, _) = gen_cert(&["loopback.test"]);
+
+    // Server 1: accept-then-drop — the handshake dies mid-flight for a
+    // reason that is not ECH rejection.
+    let reset_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reset listener bind");
+    let reset_addr = reset_listener.local_addr().expect("reset local_addr");
+    tokio::spawn(async move {
+        if let Ok((tcp, _)) = reset_listener.accept().await {
+            drop(tcp);
+        }
+    });
+
+    // Server 2: a real ECH server holding the keypair the client configs.
+    let (ech_addr, conn_rx) =
+        support::loopback::spawn_ech_server(support::loopback::BoringServerOptions {
+            cert_der,
+            key_der,
+            server_alpn: vec![],
+            require_client_cert_ca: None,
+            ech_config: Some(support::loopback::BoringEchConfig {
+                config_list_bytes: server_config_list.clone(),
+                keys_handle: server_keys,
+            }),
+        })
+        .await;
+
+    let config = TlsConfig {
+        skip_cert_verify: true,
+        sni: Some("loopback.test".into()),
+        ech: Some(EchOpts::Config(server_config_list)),
+        ..TlsConfig::new("loopback.test")
+    };
+    let layer = TlsLayer::new(&config).expect("TlsLayer::new");
+
+    // Attempt 1 — reset mid-handshake: must surface a mid-handshake
+    // `Failure` (the only variant where `get_ech_retry_configs` is even
+    // reachable), and leave `self.ech` untouched.
+    let tcp1 = tokio::net::TcpStream::connect(reset_addr)
+        .await
+        .expect("TCP to reset listener");
+    let Err(ConnectTypedError::Handshake(e1)) = layer.connect_typed(tcp1).await else {
+        panic!("reset mid-handshake must fail with a Handshake error");
+    };
+    assert!(
+        e1.ssl().is_some(),
+        "expected a mid-handshake Failure carrying the aborted Ssl"
+    );
+
+    // Attempt 2 — real ECH server: succeeds only when `self.ech` still
+    // holds the client's original (valid) config list.
+    let tcp2 = tokio::net::TcpStream::connect(ech_addr)
+        .await
+        .expect("TCP to ECH server");
+    let r2 = layer.connect(Box::new(tcp2)).await;
+    assert!(
+        r2.is_ok(),
+        "second connect must succeed — a non-ECH failure must not poison \
+         the stored ECH config; err={:?}",
+        r2.err().map(|e| e.to_string())
+    );
+    let info = conn_rx.await.expect("ECH server conn info");
+    assert!(
+        info.ech_accepted,
+        "second connect must negotiate ECH — a stored-config loss would \
+         silently complete a non-ECH handshake"
     );
 }
 
