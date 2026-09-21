@@ -4255,6 +4255,19 @@ tls: true
         assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
     }
 
+    /// shadow-tls is a built-in in-process plugin too — the provider gate
+    /// must route it through without `allow-external-plugin`.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn provider_node_allows_shadow_tls_plugin() {
+        assert!(!is_external_sip003_plugin(Some("shadow-tls")));
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: shadow-tls\nplugin-opts:\n  host: cover.example.com\n  version: 3\n",
+        );
+        assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
+    }
+
     /// The provider opt-in key is `allow-external-plugin` (kebab-case like
     /// the rest of `RawProxyProvider`) — a rename regression would leave the
     /// gate permanently closed for users who set it.

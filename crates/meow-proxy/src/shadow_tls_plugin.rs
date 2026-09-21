@@ -15,6 +15,7 @@
 //! | `fingerprint` | SHA-256 **certificate pin** (upstream
 //!   `FingerprintVerifier`), *not* a uTLS profile | — |
 //! | `certificate` / `private-key` | mTLS pair — inline PEM or file path | — |
+//! | `strict-mode` | v3 only: refuse a cover that negotiates below TLS 1.3 (upstream `ClientConfig.StrictMode`) | `false` |
 //!
 //! The node-level `client-fingerprint` option shapes the cover
 //! ClientHello (uTLS profile → `TlsConfig::fingerprint`), matching
@@ -62,6 +63,10 @@ pub struct ShadowTlsConfig {
     pub cert_pin: Option<[u8; 32]>,
     /// mTLS client certificate (`certificate` + `private-key`, PEM or path).
     pub client_cert: Option<ClientCert>,
+    /// `strict-mode` — v3 only: refuse a cover that negotiates below
+    /// TLS 1.3 (upstream `ClientConfig.StrictMode`; v1/v2 ignore it,
+    /// matching upstream where the check lives in the v3 arm).
+    pub strict_mode: bool,
 }
 
 /// Parse a flattened SIP003 opts string for `shadow-tls`
@@ -80,6 +85,7 @@ pub fn parse_opts(s: &str) -> Result<ShadowTlsConfig> {
         verify_name: None,
         cert_pin: None,
         client_cert: None,
+        strict_mode: false,
     };
     let mut version_seen = false;
     let mut alpn_seen = false;
@@ -120,6 +126,9 @@ pub fn parse_opts(s: &str) -> Result<ShadowTlsConfig> {
             }
             // Explicit-empty value clears the opt — same as absent.
             "name-cert-verify" | "fingerprint" => {}
+            "strict-mode" => {
+                cfg.strict_mode = parse_bool_strict(&value, PLUGIN, "strict-mode")?;
+            }
             "certificate" => cert_pem = Some(load_pem_or_path(&value, "certificate", PLUGIN)?),
             "private-key" => key_pem = Some(load_pem_or_path(&value, "private-key", PLUGIN)?),
             other => warn!("{PLUGIN}: ignoring unknown opt '{other}'"),
@@ -192,7 +201,14 @@ pub fn build_tls_layer(
              authenticator"
         );
     }
-    let tls_config = TlsConfig {
+    TlsLayer::new(&build_tls_config(cfg, client_fingerprint)).map_err(transport_to_proxy_err)
+}
+
+/// The `TlsConfig` [`build_tls_layer`] wraps — split out so the
+/// version-dependent shaping (version bounds, fingerprint drop,
+/// v2 MLKEM exclusion) is assertable without a live handshake.
+fn build_tls_config(cfg: &ShadowTlsConfig, client_fingerprint: Option<&str>) -> TlsConfig {
+    TlsConfig {
         alpn: cfg.alpn.clone(),
         skip_cert_verify: cfg.skip_cert_verify,
         verify_name: cfg.verify_name.clone(),
@@ -201,11 +217,17 @@ pub fn build_tls_layer(
         fingerprint: client_fingerprint
             .filter(|_| cfg.version != 1)
             .map(str::to_string),
+        // v2 breaks against real servers when the cover CH carries a
+        // hybrid-PQ keyshare (mihomo d900c71 swaps HelloChrome_Auto →
+        // HelloChrome_120).  Every fingerprint profile's curve list
+        // already excludes X25519MLKEM768 — only the no-fingerprint path
+        // needs the explicit drop.
+        curves_list: (cfg.version == 2 && client_fingerprint.is_none())
+            .then(|| "X25519:P-256:P-384".to_string()),
         min_version: Some(TlsVersion::Tls12),
         max_version: (cfg.version == 1).then_some(TlsVersion::Tls12),
         ..TlsConfig::new(&cfg.host)
-    };
-    TlsLayer::new(&tls_config).map_err(transport_to_proxy_err)
+    }
 }
 
 /// Dial a TCP + shadow-tls connection to `server_host:server_port` and
@@ -225,9 +247,15 @@ pub async fn dial(
         .dial(server_host, server_port)
         .await
         .map_err(MeowError::Io)?;
-    shadow_tls::dial(Box::new(tcp), tls, cfg.version, cfg.password.as_bytes())
-        .await
-        .map_err(transport_to_proxy_err)
+    shadow_tls::dial(
+        Box::new(tcp),
+        tls,
+        cfg.version,
+        cfg.password.as_bytes(),
+        cfg.strict_mode,
+    )
+    .await
+    .map_err(transport_to_proxy_err)
 }
 
 #[cfg(test)]
@@ -260,6 +288,14 @@ mod tests {
             ("", false),                       // empty → no host
             ("host=h;version=2;fingerprint=chrome", false), // uTLS name rejected
             ("host=h;version=2;fingerprint=zz", false), // bad hex
+            // Security-relevant booleans parse strictly — a typo is a
+            // config error, not a silent downgrade.
+            ("host=h;version=2;skip-cert-verify=bogus", false),
+            ("host=h;version=3;strict-mode=bogus", false),
+            ("host=h;version=3;strict-mode=true", true),
+            // Explicit-empty value clears the opt — same as absent.
+            ("host=h;version=2;fingerprint=", true),
+            ("host=h;version=2;name-cert-verify=", true),
             ("host=h;version=2;certificate=nonexistent.pem", false), // path missing
             ("host=h;version=2;certificate=-----BEGIN X-----\nPEM", false), // key missing
         ];
@@ -316,5 +352,51 @@ mod tests {
         build_tls_layer(&cfg, Some("chrome")).unwrap();
         let cfg = parse_opts("host=cover.example.com;version=1").unwrap();
         build_tls_layer(&cfg, Some("chrome")).unwrap();
+    }
+
+    /// The version-dependent TlsConfig shaping, asserted field by field:
+    /// a dropped `max_version` would send a TLS 1.3 ClientHello for v1;
+    /// a dropped `curves_list` reintroduces X25519MLKEM768 into v2.
+    #[test]
+    fn build_tls_config_shapes_per_version() {
+        use meow_transport::tls::TlsVersion;
+        for v in 1..=3u8 {
+            let cfg = parse_opts(&format!("host=cover.example.com;version={v}")).unwrap();
+            let c = build_tls_config(&cfg, None);
+            assert_eq!(c.min_version, Some(TlsVersion::Tls12), "v{v} floor");
+            assert_eq!(
+                c.max_version,
+                (v == 1).then_some(TlsVersion::Tls12),
+                "v{v} cap"
+            );
+            assert_eq!(
+                c.curves_list.is_some(),
+                v == 2,
+                "v{v} MLKEM drop applies to v2 without a fingerprint only"
+            );
+        }
+        // An explicit fingerprint already excludes MLKEM via the
+        // profile's own curve list — no override on v2, and v1 drops
+        // the fingerprint entirely (upstream parity).
+        let cfg = parse_opts("host=cover.example.com;version=2").unwrap();
+        let c = build_tls_config(&cfg, Some("chrome"));
+        assert!(c.curves_list.is_none() && c.fingerprint.is_some());
+        let cfg = parse_opts("host=cover.example.com;version=1").unwrap();
+        let c = build_tls_config(&cfg, Some("chrome"));
+        assert!(
+            c.fingerprint.is_none(),
+            "v1 must not carry a 1.3-shaped profile"
+        );
+    }
+
+    /// `strict-mode` is parsed strictly and threaded to the transport
+    /// dial (the wire-level gate itself is e2e'd in meow-transport's
+    /// `v3_strict_mode_rejects_tls12_cover`).
+    #[test]
+    fn strict_mode_parses() {
+        let cfg = parse_opts("host=h;version=3;strict-mode=true").unwrap();
+        assert!(cfg.strict_mode);
+        let cfg = parse_opts("host=h;version=3").unwrap();
+        assert!(!cfg.strict_mode);
     }
 }

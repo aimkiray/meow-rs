@@ -48,7 +48,7 @@ Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vme
 | `password` | string | ✓ | — | |
 | `cipher` | string | ✓ | — | e.g. `aes-256-gcm`, `chacha20-ietf-poly1305` |
 | `udp` | bool | | `false` | Enable UDP relay |
-| `plugin` | string | | — | `obfs`, `v2ray-plugin`, `gost-plugin` (built-in, no external binary) |
+| `plugin` | string | | — | `obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `ech-tls-tunnel` (built-in, no external binary) |
 | `plugin-opts` | string \| map | | — | Plugin options |
 
 ```yaml
@@ -87,6 +87,28 @@ TLS and smux. Upstream defaults apply: `host` defaults to `bing.com` and
     # skip-cert-verify: false
     # name-cert-verify: real.example.com
     # fingerprint: "AA:BB:…"   # SHA-256 cert pin (SSL pinning), not uTLS
+```
+
+`shadow-tls` runs in-process too — a cover-TLS record transport with all
+three upstream protocol versions. `host` (cover SNI) and `version`
+(1/2/3) are required; `strict-mode: true` refuses non-TLS-1.3 covers.
+
+```yaml
+- name: ss-stls
+  type: ss
+  server: 1.2.3.4
+  port: 8388
+  cipher: aes-256-gcm
+  password: "•••"
+  plugin: shadow-tls
+  plugin-opts:
+    host: cover.example.com   # required — cover server name (TLS SNI)
+    version: 3                # required — 1, 2 or 3
+    password: "psk"
+    # alpn: h2,http/1.1       # default; explicit `alpn:` suppresses the extension
+    # strict-mode: false      # v3: fail unless the cover negotiates TLS 1.3
+    # skip-cert-verify: false
+    # fingerprint: "AA:BB:…"  # SHA-256 cert pin, not uTLS
 ```
 
 ---

@@ -1265,6 +1265,39 @@ mod tests {
         }
     }
 
+    /// A relay-supplied stream already terminates at the real SS server —
+    /// a built-in transport that owns its TCP dial (shadow-tls) must fail
+    /// loudly on `connect_over` rather than send unwrapped SS traffic
+    /// through the front hop.
+    #[tokio::test]
+    async fn shadow_tls_refuses_relay_supplied_stream() {
+        let adapter = ShadowsocksAdapter::new(
+            "ss-test",
+            "127.0.0.1",
+            8388,
+            "password",
+            "aes-256-gcm",
+            true,
+            Some("shadow-tls"),
+            Some("host=cover.example.com;password=p;version=2"),
+            None,
+            Arc::new(crate::dialer::DirectDialer),
+        )
+        .expect("shadow-tls adapter builds");
+        let (stream, _peer) = tokio::io::duplex(64);
+        let stream = crate::stream_conn::StreamConn(Box::new(stream));
+        match adapter
+            .connect_over(Box::new(stream), &Metadata::default())
+            .await
+        {
+            Err(MeowError::NotSupported(m)) => {
+                assert!(m.contains("shadow-tls"), "refusal names itself: {m}");
+            }
+            Err(e) => panic!("expected NotSupported, got: {e}"),
+            Ok(_) => panic!("shadow-tls must refuse a relay-supplied stream"),
+        }
+    }
+
     /// SIP022 §3.2.2/§3.2.4: a client session mints a non-zero ID, counts
     /// packets up, and filters replies — echo match, replay drop, and
     /// server-session rotation resetting the window.

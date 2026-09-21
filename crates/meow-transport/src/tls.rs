@@ -137,6 +137,16 @@ pub struct TlsConfig {
     /// defaults.
     pub fingerprint: Option<String>,
 
+    /// Explicit supported-groups list override (BoringSSL
+    /// `set_curves_list` syntax, e.g. `"X25519:P-256:P-384"`).
+    /// `None` = BoringSSL default.  Applied after `fingerprint` shaping,
+    /// so it wins over the profile's own curve list — shadow-tls v2 uses
+    /// it to drop `X25519MLKEM768` when no fingerprint is shaping the
+    /// ClientHello anyway (a hybrid-PQ keyshare breaks v2 servers;
+    /// upstream parity with mihomo's `HelloChrome_Auto → HelloChrome_120`
+    /// swap).
+    pub curves_list: Option<String>,
+
     /// Extra CA certificates (DER-encoded) added to the root store in
     /// addition to `webpki-roots`.  Used in tests with self-signed certs;
     /// production deployments leave this empty.
@@ -171,6 +181,7 @@ impl TlsConfig {
             cert_pin: None,
             client_cert: None,
             fingerprint: None,
+            curves_list: None,
             additional_roots: Vec::new(),
             ech: None,
             reality: None,
@@ -276,9 +287,9 @@ impl TlsLayer {
     /// `SslStream<S>` so the inner stream can be recovered afterwards via
     /// `SslStream::get_mut` — used by shadow-tls, which discards the TLS
     /// session once the cover handshake ends and continues on the raw
-    /// conn.  Unlike [`Transport::connect`], `inner` is *not* wrapped in
-    /// the pending-flush workaround; wrap it yourself if `S` can pend
-    /// `poll_flush` (mux transports).
+    /// conn.  `inner` sees BoringSSL's flush pends as ordinary
+    /// `Pending`s (boring 5.x retries `BIO_CTRL_FLUSH` natively); a shim
+    /// `S` must still implement poll contracts itself.
     ///
     /// Handshake failures surface as [`ConnectTypedError::Handshake`],
     /// which keeps the source stream recoverable (shadow-tls v3 treats a

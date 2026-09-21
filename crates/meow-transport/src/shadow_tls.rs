@@ -303,6 +303,7 @@ pub async fn dial(
     tls: &TlsLayer,
     version: u8,
     password: &[u8],
+    strict_mode: bool,
 ) -> Result<Box<dyn Stream>> {
     match version {
         1 | 2 => {
@@ -338,7 +339,7 @@ pub async fn dial(
                 }
             }
         }
-        3 => dial_v3(tls, HandshakeShim::new(inner, 3, password)).await,
+        3 => dial_v3(tls, HandshakeShim::new(inner, 3, password), strict_mode).await,
         other => Err(TransportError::Config(format!(
             "shadow-tls: unknown protocol version {other} (expected 1, 2 or 3)"
         ))),
@@ -364,7 +365,11 @@ pub async fn dial(
 /// cover).  With a **TLS 1.2** cover the handshake is plaintext, so cert
 /// verification does run before the Finished failure — keep it fail
 /// closed via the aborted `Ssl`'s `verify_result`.
-async fn dial_v3(tls: &TlsLayer, shim: HandshakeShim) -> Result<Box<dyn Stream>> {
+async fn dial_v3(
+    tls: &TlsLayer,
+    shim: HandshakeShim,
+    strict_mode: bool,
+) -> Result<Box<dyn Stream>> {
     use boring::ssl::SslVerifyMode;
 
     let shim = match tls.connect_typed(shim).await {
@@ -398,6 +403,13 @@ async fn dial_v3(tls: &TlsLayer, shim: HandshakeShim) -> Result<Box<dyn Stream>>
                 return Err(TransportError::Tls(format!("boring TLS handshake: {msg}")));
             };
             let state = shim.v3_state();
+            // Upstream `strictMode && !isTLS13` runs before the
+            // authorized check — same order here.
+            if strict_mode && !state.is_tls13 {
+                return Err(TransportError::Tls(
+                    "shadow-tls: strict-mode requires a TLS 1.3 cover".into(),
+                ));
+            }
             if !state.authorized {
                 // The handshake died before the relay proved itself.
                 return Err(TransportError::Tls(format!(
@@ -415,6 +427,14 @@ async fn dial_v3(tls: &TlsLayer, shim: HandshakeShim) -> Result<Box<dyn Stream>>
             shim
         }
     };
+    // The recovered-shim path above checks strict-mode first; the
+    // (practically unreachable) completed-handshake arm lands here —
+    // apply the same gate so both exits agree.
+    if strict_mode && !shim.v3_state().is_tls13 {
+        return Err(TransportError::Tls(
+            "shadow-tls: strict-mode requires a TLS 1.3 cover".into(),
+        ));
+    }
     // `pending` holds de-swizzled records destined for the now-dead TLS
     // stack (e.g. a cover session ticket) — drop it, exactly like
     // upstream dropping `streamWrapper.buffer`.
@@ -805,10 +825,15 @@ fn rewrite_sh_session_id_echo(record: &mut Vec<u8>, orig: &[u8; SESSION_ID_LEN])
         record[echo_start..echo_start + SESSION_ID_LEN].copy_from_slice(orig);
         return;
     }
+    let new_len = record.len() - echo_len + SESSION_ID_LEN;
+    if new_len - RECORD_HDR > u16::MAX as usize {
+        return; // spliced record would overflow the u16 length field
+    }
     record.splice(echo_start..echo_start + echo_len, orig.iter().copied());
-    let rec_len = (record.len() - RECORD_HDR) as u16;
+    record[CH_SID_LEN_INDEX] = SESSION_ID_LEN as u8;
+    let rec_len = (new_len - RECORD_HDR) as u16;
     record[3..RECORD_HDR].copy_from_slice(&rec_len.to_be_bytes());
-    let hs_len = (record.len() - RECORD_HDR - 4) as u32;
+    let hs_len = (new_len - RECORD_HDR - 4) as u32;
     record[RECORD_HDR + 1..RECORD_HDR + 4].copy_from_slice(&hs_len.to_be_bytes()[1..]);
 }
 
@@ -1023,21 +1048,20 @@ impl AsyncWrite for HandshakeShim {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Never surface Pending to BoringSSL's BIO_ctrl(BIO_CTRL_FLUSH):
-        // a WouldBlock there maps to SSL_ERROR_SYSCALL and kills the
-        // handshake — the same hazard TolerantFlushStream masks on the
-        // normal connect path.  poll_read re-drains the outbox before
-        // waiting on the peer, so staged bytes still go out.
-        if let Poll::Ready(Err(e)) = self.as_mut().poll_drain(cx) {
-            return Poll::Ready(Err(e));
+        // Drain staged handshake bytes first, then report the inner
+        // flush faithfully: boring 5.x maps a WouldBlock inside
+        // BIO_CTRL_FLUSH to a retry-write, so Pending is safe to
+        // surface (the SSL_ERROR_SYSCALL hazard TolerantFlushStream
+        // masked is gone).
+        match self.as_mut().poll_drain(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
         }
         let Some(inner) = self.inner.as_mut() else {
             return Poll::Ready(Ok(()));
         };
-        match Pin::new(&mut *inner).poll_flush(cx) {
-            Poll::Pending | Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-        }
+        Pin::new(&mut *inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1094,24 +1118,28 @@ impl FramedStream {
     /// Stage one framed record into the outbox.
     ///
     /// Note: the first v2 record carries `prefix` + `payload` unchunked
-    /// (upstream `WriteVectorised` parity) — a caller-supplied buf >
-    /// 65,527 bytes would truncate the u16 length field, exactly like
-    /// upstream's `uint16(dataLen)`.  In-tree callers pass ≤ 16 KiB.
-    fn push_record(&mut self, payload: &[u8], prefix: Option<&[u8]>) {
+    /// (upstream `WriteVectorised` parity).  A buf > 65,527 bytes fails
+    /// loud — upstream's `uint16(dataLen)` silently truncates, which
+    /// desyncs the record stream.  In-tree callers pass ≤ 16 KiB.
+    fn push_record(&mut self, payload: &[u8], prefix: Option<&[u8]>) -> io::Result<()> {
         let extra = prefix.map_or(0, <[u8]>::len);
-        debug_assert!(
-            payload.len() + extra <= u16::MAX as usize,
-            "record payload {payload_len} + prefix {extra} overflows the u16 length field",
-            payload_len = payload.len(),
-        );
+        let len = u16::try_from(payload.len() + extra).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "shadow-tls: record payload {} + prefix {extra} overflows the u16 length field",
+                    payload.len()
+                ),
+            )
+        })?;
         self.outbox
             .extend([RECORD_APPDATA, RECORD_VER[0], RECORD_VER[1]]);
-        self.outbox
-            .extend(((payload.len() + extra) as u16).to_be_bytes());
+        self.outbox.extend(len.to_be_bytes());
         if let Some(p) = prefix {
             self.outbox.extend(p.iter().copied());
         }
         self.outbox.extend(payload.iter().copied());
+        Ok(())
     }
 }
 
@@ -1185,10 +1213,10 @@ impl AsyncWrite for FramedStream {
         if let Some(sum) = self.first_sum.take() {
             // Upstream emits the first record as a single writev of
             // `sum || payload` — one record, unchunked.
-            self.push_record(buf, Some(&sum));
+            self.push_record(buf, Some(&sum))?;
         } else {
             for chunk in buf.chunks(MAX_CHUNK) {
-                self.push_record(chunk, None);
+                self.push_record(chunk, None)?;
             }
         }
         match self.poll_drain(cx) {
@@ -1547,6 +1575,29 @@ mod tests {
         assert_eq!(u16::from_be_bytes([hdr[3], hdr[4]]), 8 + 16384 + 100);
     }
 
+    /// Once the first-sum record is spent, subsequent writes chunk at
+    /// MAX_CHUNK — a >16 KiB second write must split into two records.
+    #[tokio::test]
+    async fn v2_subsequent_writes_chunk_at_max() {
+        let (inner, mut peer) = tokio::io::duplex(1 << 20);
+        let mut s = framed(Box::new(inner), Some([1; 8]), VecDeque::new());
+        s.write_all(b"hello").await.unwrap(); // consumes first_sum
+        s.write_all(&vec![0xABu8; MAX_CHUNK + 1]).await.unwrap();
+        // Skip the unchunked first record (sum + "hello").
+        let mut first = vec![0u8; 5 + 8 + 5];
+        read_exact_duplex(&mut peer, &mut first).await;
+        // Then two records: MAX_CHUNK and the 1-byte remainder.
+        let mut hdr = [0u8; 5];
+        read_exact_duplex(&mut peer, &mut hdr).await;
+        assert_eq!(u16::from_be_bytes([hdr[3], hdr[4]]), MAX_CHUNK as u16);
+        let mut rest = vec![0u8; MAX_CHUNK + 5];
+        read_exact_duplex(&mut peer, &mut rest[..MAX_CHUNK]).await;
+        read_exact_duplex(&mut peer, &mut hdr).await;
+        assert_eq!(u16::from_be_bytes([hdr[3], hdr[4]]), 1);
+        read_exact_duplex(&mut peer, &mut rest[..1]).await;
+        assert_eq!(rest[0], 0xAB);
+    }
+
     #[tokio::test]
     async fn v2_read_parses_records() {
         let (inner, mut peer) = tokio::io::duplex(4096);
@@ -1702,6 +1753,81 @@ mod tests {
         let mut alert = [0u8; 5];
         read_exact_duplex(&mut peer, &mut alert).await;
         assert_eq!(alert[0], RECORD_ALERT);
+    }
+
+    /// The rolling tag chain feeds each verified tag back into the
+    /// HMAC — record #2+ in each direction only verifies when the link
+    /// is kept.  A mutation dropping `chain.update(&tag)` passes every
+    /// single-record test and breaks real servers on the second record.
+    #[tokio::test]
+    async fn v3_rolling_tags_chain_across_records() {
+        let (inner, mut peer) = tokio::io::duplex(4096);
+        let (state, server_random) = mk_v3_parts(Box::new(inner));
+        let mut srv_s = sha1_hmac(PASSWORD);
+        srv_s.update(&server_random);
+        srv_s.update(b"S");
+        let mut srv_c = sha1_hmac(PASSWORD);
+        srv_c.update(&server_random);
+        srv_c.update(b"C");
+        let mut s = VerifiedStream::new(state);
+
+        // Two server→client records; the second tag chains on the first.
+        let r1 = server_record(&mut srv_s, b"one");
+        let r2 = server_record(&mut srv_s, b"two!");
+        peer.write_all(&r1).await.unwrap();
+        peer.write_all(&r2).await.unwrap();
+        let mut out = [0u8; 8];
+        let n = s.read(&mut out).await.unwrap();
+        assert_eq!(&out[..n], b"one");
+        let n = s.read(&mut out).await.unwrap();
+        assert_eq!(&out[..n], b"two!");
+
+        // Two client→server writes verified sequentially on the "C" chain.
+        s.write_all(b"first").await.unwrap();
+        s.write_all(b"next!").await.unwrap();
+        for expect in [b"first".as_slice(), b"next!"] {
+            let mut hdr = [0u8; 9];
+            read_exact_duplex(&mut peer, &mut hdr).await;
+            assert_eq!(&hdr[..3], &[23, 3, 3]);
+            let plen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize - 4;
+            let mut body = vec![0u8; plen];
+            read_exact_duplex(&mut peer, &mut body).await;
+            srv_c.update(&body);
+            let tag = hmac_sum::<4>(&srv_c);
+            srv_c.update(&tag);
+            assert_eq!(&hdr[5..9], &tag[..], "client tag must chain");
+            assert_eq!(&body[..], expect);
+        }
+    }
+
+    /// An undrained tail of the doomed client flight is carried into the
+    /// VerifiedStream outbox and drains ahead of the first tagged record
+    /// — the relay consumes the client flight byte-for-byte mid-record.
+    #[tokio::test]
+    async fn v3_outbox_tail_drains_ahead_of_first_record() {
+        let (inner, mut peer) = tokio::io::duplex(4096);
+        let (mut state, server_random) = mk_v3_parts(Box::new(inner));
+        // A client Finished tail whose socket write pended at handover.
+        state.outbox.extend([20, 3, 3, 0, 1, 1]); // CCS record bytes
+        let mut srv_c = sha1_hmac(PASSWORD);
+        srv_c.update(&server_random);
+        srv_c.update(b"C");
+        let mut s = VerifiedStream::new(state);
+
+        s.write_all(b"ping").await.unwrap();
+        let mut tail = [0u8; 6];
+        read_exact_duplex(&mut peer, &mut tail).await;
+        assert_eq!(tail, [20, 3, 3, 0, 1, 1], "flight tail drains first");
+        let mut hdr = [0u8; 9];
+        read_exact_duplex(&mut peer, &mut hdr).await;
+        assert_eq!(&hdr[..3], &[23, 3, 3]);
+        let plen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize - 4;
+        let mut body = vec![0u8; plen];
+        read_exact_duplex(&mut peer, &mut body).await;
+        srv_c.update(&body);
+        let tag = hmac_sum::<4>(&srv_c);
+        assert_eq!(&hdr[5..9], &tag[..]);
+        assert_eq!(&body[..], b"ping");
     }
 
     #[tokio::test]
@@ -1924,6 +2050,39 @@ mod tests {
         assert!(err.to_string().contains("hijacked"), "{err}");
     }
 
+    /// A bad-tag record on a TLS 1.2 cover must revoke the authorization
+    /// the ServerHello granted: `deswizzle` resets `authorized` on every
+    /// swizzled record — dropping that reset lets a hijacked 1.2 cover
+    /// (trusted cert, wrong password) survive to the cert gate.
+    #[tokio::test]
+    async fn shim_v3_tls12_bad_tag_revokes_authorization() {
+        let (inner, mut peer) = tokio::io::duplex(4096);
+        let mut shim = HandshakeShim::new(Box::new(inner), 3, PASSWORD);
+        let sh = server_hello_record(&[9u8; 32], false); // TLS 1.2 cover
+        peer.write_all(&sh).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = shim.read(&mut buf).await.unwrap();
+        assert_eq!(n, sh.len());
+        assert!(
+            shim.v3_state().authorized,
+            "1.2 SH authorizes at sight (upstream parity)"
+        );
+        // Mistagged appdata — must revoke, then fail the read.
+        peer.write_all(&[23, 3, 3, 0, 9, 1, 2, 3, 4, 9, 8, 7, 6, 5])
+            .await
+            .unwrap();
+        let err = shim.read(&mut buf).await.unwrap_err();
+        assert!(err.to_string().contains("hmac mismatch"), "{err}");
+        assert!(
+            !shim.v3_state().authorized,
+            "bad-tag record must revoke the SH-granted authorization"
+        );
+        assert!(
+            shim.into_v3_parts().is_err(),
+            "a de-authorized shim must not hand over"
+        );
+    }
+
     /// RFC 8446 §4.1.3 — the HRR detection constant must be the real
     /// `SHA-256("HelloRetryRequest")` value.
     #[test]
@@ -1982,14 +2141,31 @@ mod tests {
             "HRR neither seeds nor authorizes"
         );
 
-        // The real ServerHello follows — here echoing the same patched
-        // sid (a cover echoes whatever the second CH carried; the same
-        // restore applies).
+        // Upstream sends a second ClientHello after HRR — it must be
+        // re-patched on the wire with a fresh tagged sid.
+        shim.write_all(&synthetic_ch(&orig_sid)).await.unwrap();
+        shim.flush().await.unwrap();
+        let mut wire_ch2 = vec![0u8; RECORD_HDR];
+        peer.read_exact(&mut wire_ch2).await.unwrap();
+        let ch2_len = u16::from_be_bytes([wire_ch2[3], wire_ch2[4]]) as usize;
+        wire_ch2.resize(RECORD_HDR + ch2_len, 0);
+        peer.read_exact(&mut wire_ch2[RECORD_HDR..]).await.unwrap();
+        let wire_sid2: [u8; 32] = wire_ch2[sid_start..sid_start + 32].try_into().unwrap();
+        assert_ne!(wire_sid2, orig_sid, "CH2 sid must be re-patched");
+        assert_eq!(
+            &wire_sid2[28..],
+            &server_tag(&wire_ch2, PASSWORD)[..],
+            "CH2 sid tag must verify server-side"
+        );
+
+        // The real ServerHello follows — echoing CH2's patched sid (a
+        // cover echoes whatever the second CH carried; the same restore
+        // applies).
         let server_random = [7u8; 32];
         let mut sh_body = vec![2u8, 0, 0, 0, 3, 3];
         sh_body.extend(server_random);
         sh_body.push(32);
-        sh_body.extend(wire_sid);
+        sh_body.extend(wire_sid2);
         sh_body.extend([0x13, 0x01]);
         sh_body.push(0);
         sh_body.extend(6u16.to_be_bytes());
@@ -2182,17 +2358,25 @@ mod tests {
         );
     }
 
-    /// BoringSSL's BIO_ctrl(BIO_CTRL_FLUSH) maps a WouldBlock to
-    /// SSL_ERROR_SYSCALL — the shim must never report a flush Pending.
-    #[test]
-    fn shim_flush_never_pends() {
-        let (inner, _handle) = gated_stream(&[]);
+    /// poll_flush drains the staged outbox, then reports the inner flush
+    /// faithfully — boring 5.x retries BIO_CTRL_FLUSH on WouldBlock, so
+    /// surfacing Pending is safe (the 4.x SSL_ERROR_SYSCALL hazard is
+    /// gone).  The gate closes the inner: flush pends, then completes
+    /// once the gate opens.
+    #[tokio::test]
+    async fn shim_flush_drains_then_propagates() {
+        let (inner, (open, _written)) = gated_stream(&[]);
         let mut shim = HandshakeShim::new(Box::new(inner), 2, PASSWORD);
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        assert!(matches!(
-            Pin::new(&mut shim).poll_flush(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
+        assert!(
+            matches!(Pin::new(&mut shim).poll_flush(&mut cx), Poll::Pending),
+            "closed inner gate pends the flush"
+        );
+        open.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            matches!(Pin::new(&mut shim).poll_flush(&mut cx), Poll::Ready(Ok(()))),
+            "opened gate flushes through"
+        );
     }
 
     // ── regression: zero-payload records must disarm the serve cursor ──

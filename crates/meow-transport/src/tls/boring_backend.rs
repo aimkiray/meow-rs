@@ -314,6 +314,7 @@ struct ConnectorKey {
     fingerprint: Option<String>,
     alpn: Vec<String>,
     skip_cert_verify: bool,
+    curves_list: Option<String>,
 }
 
 /// Process-wide cache of BoringSSL `SslConnector`s.
@@ -345,6 +346,7 @@ fn shared_connector(config: &TlsConfig) -> Result<boring::ssl::SslConnector> {
         fingerprint: config.fingerprint.clone(),
         alpn: config.alpn.clone(),
         skip_cert_verify: config.skip_cert_verify,
+        curves_list: config.curves_list.clone(),
     };
     let cache = CONNECTOR_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
@@ -498,6 +500,13 @@ impl BoringInner {
                     fp_str
                 );
             }
+        }
+
+        // Explicit curves override — applied after fingerprint shaping so
+        // it wins over the profile's list (see TlsConfig::curves_list).
+        if let Some(curves) = &config.curves_list {
+            b.set_curves_list(curves)
+                .map_err(|e| TransportError::Config(format!("boring: set_curves_list: {e}")))?;
         }
 
         // ── ALPN ────────────────────────────────────────────────────────────

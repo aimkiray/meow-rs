@@ -248,6 +248,12 @@ fn client_layer(version: u8, cert_der: &rustls::pki_types::CertificateDer<'stati
     if version == 1 {
         cfg.max_version = Some(TlsVersion::Tls12);
     }
+    if version == 2 {
+        // Mirrors `build_tls_layer` (meow-proxy): with no
+        // client-fingerprint the cover CH must drop X25519MLKEM768
+        // (upstream mihomo d900c71).
+        cfg.curves_list = Some("X25519:P-256:P-384".to_string());
+    }
     TlsLayer::new(&cfg).expect("tls layer")
 }
 
@@ -358,7 +364,7 @@ async fn v1_end_to_end() {
 
     let tcp = TcpStream::connect(addr).await.unwrap();
     let layer = client_layer(1, &cert);
-    let mut s = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 1, PASSWORD)
+    let mut s = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 1, PASSWORD, false)
         .await
         .expect("v1 dial");
     s.write_all(b"v1-payload").await.unwrap();
@@ -421,7 +427,7 @@ async fn v2_end_to_end() {
 
     let tcp = TcpStream::connect(addr).await.unwrap();
     let layer = client_layer(2, &cert);
-    let mut s = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 2, PASSWORD)
+    let mut s = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 2, PASSWORD, false)
         .await
         .expect("v2 dial");
     s.write_all(b"v2-payload").await.unwrap();
@@ -455,7 +461,7 @@ async fn v3_end_to_end() {
 
     let tcp = TcpStream::connect(addr).await.unwrap();
     let layer = client_layer(3, &cert);
-    let mut s = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 3, PASSWORD)
+    let mut s = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 3, PASSWORD, false)
         .await
         .expect("v3 dial — cover Finished fails but the relay authorized");
     s.write_all(b"v3-payload").await.unwrap();
@@ -520,7 +526,8 @@ async fn v3_tls12_cover_cert_gate() {
         }
         let layer = TlsLayer::new(&cfg).expect("tls layer");
         let tcp = TcpStream::connect(addr).await.unwrap();
-        let dial = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 3, PASSWORD).await;
+        let dial =
+            meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 3, PASSWORD, false).await;
         match (dial, expect_ok) {
             (Ok(mut s), true) => {
                 s.write_all(b"v3-tls12").await.unwrap();
@@ -539,6 +546,44 @@ async fn v3_tls12_cover_cert_gate() {
         }
         server.await.unwrap();
     }
+}
+
+/// `strict-mode` refuses a cover that negotiates below TLS 1.3 — even
+/// when the TLS 1.2 cover would otherwise authorize (upstream
+/// `ClientConfig.StrictMode`, checked before `authorized`).
+#[tokio::test]
+async fn v3_strict_mode_rejects_tls12_cover() {
+    install_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (mut conn, cert) = server_conn_tls12();
+    let password = PASSWORD.to_vec();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            v3_relay_server(tcp, &mut conn, &password),
+        )
+        .await;
+    });
+
+    let mut cfg = TlsConfig::new("cover.example.com");
+    cfg.alpn = vec!["h2".to_string(), "http/1.1".to_string()];
+    cfg.min_version = Some(TlsVersion::Tls12);
+    cfg.additional_roots = vec![cert.as_ref().to_vec()]; // trusted 1.2 cover
+    let layer = TlsLayer::new(&cfg).expect("tls layer");
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let err = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 3, PASSWORD, true)
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        err.contains("strict-mode"),
+        "strict-mode must refuse the 1.2 cover, got {err}"
+    );
+    server.await.unwrap();
 }
 
 /// A plain-TLS peer (no shadow-tls relay) must fail closed: its unswizzled
@@ -562,7 +607,7 @@ async fn v3_hijacked_cover_fails() {
 
     let tcp = TcpStream::connect(addr).await.unwrap();
     let layer = client_layer(3, &cert);
-    let err = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 3, PASSWORD)
+    let err = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 3, PASSWORD, false)
         .await
         .err()
         .map(|e| e.to_string())
