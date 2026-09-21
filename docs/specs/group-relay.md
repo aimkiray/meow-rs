@@ -385,9 +385,12 @@ boundary.
 **Sequencing (updated post-#570):** `connect_over` has a default
 `Err(NotSupported)` impl and is now implemented by every TCP-capable
 adapter — direct, reject, http, socks5, snell, vless, vmess, trojan,
-shadowsocks (built-in transports), anytls. Hysteria2 stays first-hop
-only; SS external SIP003 plugins fail loudly. Mux pooling is bypassed
-on relay-supplied streams.
+shadowsocks, anytls. Hysteria2 stays first-hop only. SS transports that
+own their outbound leg fail loudly at a non-first hop: external SIP003
+plugins (the subprocess dials itself) and `gost-plugin` (its `dial` owns
+the TCP dial — a `handshake_over` split would be needed to terminate on
+a relay-supplied stream). Mux pooling is bypassed on relay-supplied
+streams.
 
 - [ ] Add `AdapterType::Relay` to `meow-common/src/adapter_type.rs`.
 - [ ] Add `connect_over(&self, stream: Box<dyn ProxyConn>, meta: &Metadata) -> Result<Box<dyn ProxyConn>>`

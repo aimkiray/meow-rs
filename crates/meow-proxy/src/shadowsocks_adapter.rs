@@ -219,6 +219,26 @@ impl ShadowsocksAdapter {
         self.mux = Some(MuxClient::new(dial, options));
         self
     }
+
+    /// Whether the configured plugin transport can carry UDP. The ws-based
+    /// plugins are TCP-only (`dial_udp` refuses them); keep the advertised
+    /// `support_udp()` capability in sync so load-balance member filtering
+    /// and `GET /proxies` don't claim UDP for a node that cannot serve it.
+    fn plugin_supports_udp(&self) -> bool {
+        !matches!(
+            self.core.plugin,
+            PluginKind::V2ray(..) | PluginKind::Gost(..)
+        ) && {
+            #[cfg(feature = "ech-tls-tunnel")]
+            {
+                !matches!(self.core.plugin, PluginKind::EchTlsTunnel(..))
+            }
+            #[cfg(not(feature = "ech-tls-tunnel"))]
+            {
+                true
+            }
+        }
+    }
 }
 
 impl SsCore {
@@ -817,7 +837,8 @@ impl ProxyAdapter for ShadowsocksAdapter {
         // enforcement point: `meow-tunnel`'s UDP path calls `dial_udp`
         // directly without consulting `support_udp`, so the refusal is
         // re-checked there.  Keep the two in sync.
-        let plain_udp_ok = self.support_udp && !self.core.dialer.is_proxy();
+        let plain_udp_ok =
+            self.support_udp && !self.core.dialer.is_proxy() && self.plugin_supports_udp();
         plain_udp_ok || {
             #[cfg(feature = "mux")]
             {
@@ -1147,6 +1168,38 @@ mod tests {
             Ok(_) => panic!("plain UDP must be refused under a proxy dialer"),
         }
 
+        assert!(
+            !adapter.support_udp(),
+            "advertised capability must agree with the refusal"
+        );
+    }
+
+    /// gost-plugin is a TCP-only ws transport — `dial_udp` must refuse
+    /// loudly (`NotSupported` naming the plugin) and `support_udp()` must
+    /// agree, regardless of the `udp: true` config flag.
+    #[tokio::test]
+    async fn gost_plugin_refuses_udp() {
+        let adapter = ShadowsocksAdapter::new(
+            "ss-gost",
+            "127.0.0.1",
+            8388,
+            "password",
+            "aes-256-gcm",
+            true,
+            Some("gost-plugin"),
+            Some("mode=websocket;mux=false"),
+            Arc::new(crate::dialer::DirectDialer),
+        )
+        .expect("adapter builds");
+
+        match adapter.dial_udp(&Metadata::default()).await {
+            Err(MeowError::NotSupported(m)) => assert!(
+                m.contains("gost-plugin"),
+                "refusal should name the plugin, got: {m}"
+            ),
+            Err(other) => panic!("expected NotSupported, got: {other:?}"),
+            Ok(_) => panic!("gost-plugin must refuse UDP"),
+        }
         assert!(
             !adapter.support_udp(),
             "advertised capability must agree with the refusal"

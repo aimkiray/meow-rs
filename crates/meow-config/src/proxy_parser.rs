@@ -4161,6 +4161,21 @@ tls: true
         assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
     }
 
+    /// gost-plugin is likewise built-in — the external-plugin gate must not
+    /// reject it on provider nodes, and `is_external_sip003_plugin` must
+    /// agree (a misclassification would silently drop subscription nodes).
+    /// `mux: false` keeps the fixture valid under a `ss`-without-`mux` build.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn provider_node_allows_gost_plugin() {
+        assert!(!is_external_sip003_plugin(Some("gost-plugin")));
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: gost-plugin\nplugin-opts:\n  mode: websocket\n  mux: false\n",
+        );
+        assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
+    }
+
     /// The provider opt-in key is `allow-external-plugin` (kebab-case like
     /// the rest of `RawProxyProvider`) — a rename regression would leave the
     /// gate permanently closed for users who set it.

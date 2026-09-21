@@ -130,6 +130,19 @@ jobs:
           sudo install -m 755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
           command -v sing-box
 
+      # Real-peer gost-plugin interop (gost_plugin_integration) runs against
+      # this pinned gost binary — with it on PATH the suite exercises a real
+      # `ss+mws` server instead of printing SKIP.
+      - name: Install gost (gost-plugin interop E2E)
+        run: |
+          set -euo pipefail
+          GOST_VERSION=3.3.0
+          curl -fsSL -o /tmp/gost.tar.gz \
+            "https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_amd64.tar.gz"
+          tar -xzf /tmp/gost.tar.gz -C /tmp gost
+          sudo install -m 755 /tmp/gost /usr/local/bin/gost
+          command -v gost
+
       - name: Build
         run: cargo build --tests
 

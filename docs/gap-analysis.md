@@ -63,8 +63,8 @@ Rust port currently supports:
 
 | Transport        | Upstream | Rust | Status |
 |------------------|:--------:|:----:|--------|
-| WebSocket (ws)   | Yes      | Yes (v2ray-plugin only) | Partial — not yet a reusable transport attachable to VMess/VLESS/Trojan |
-| TLS              | Yes      | Yes (Trojan, v2ray-plugin) | Partial — no reusable layer |
+| WebSocket (ws)   | Yes      | Yes (v2ray-plugin, gost-plugin) | Partial — not yet a reusable transport attachable to VMess/VLESS/Trojan |
+| TLS              | Yes      | Yes (Trojan, v2ray-plugin, gost-plugin) | Partial — no reusable layer |
 | gRPC             | Yes      | No   | **Gap** |
 | HTTP/2           | Yes      | No   | **Gap** |
 | HTTP upgrade     | Yes      | No   | **Gap** |

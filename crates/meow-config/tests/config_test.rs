@@ -1123,22 +1123,24 @@ async fn test_proxy_parsing_ss_with_gost_plugin() {
     }
 
     let cases = [
+        // `mux: false` keeps every fixture valid under a `ss`-without-`mux`
+        // build, where the upstream `mux` default (`true`) is a parse error.
         Case {
             label: "yaml map, mode=websocket",
             name: "ss-gost-basic",
-            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: websocket\n      host: cdn.example.com\n      path: /ws\n      tls: true\n",
+            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: websocket\n      host: cdn.example.com\n      path: /ws\n      tls: true\n      mux: false\n",
             expect_present: true,
         },
         Case {
             label: "nested headers map",
             name: "ss-gost-headers",
-            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: websocket\n      headers:\n        CF-Token: abc\n        Host: edge.example.com\n",
+            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: websocket\n      mux: false\n      headers:\n        CF-Token: abc\n        Host: edge.example.com\n",
             expect_present: true,
         },
         Case {
             label: "nested ech-opts map",
             name: "ss-gost-ech",
-            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: websocket\n      tls: true\n      ech-opts:\n        enable: true\n        config: \"QUJD\"\n",
+            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: websocket\n      mux: false\n      tls: true\n      ech-opts:\n        enable: true\n        config: \"QUJD\"\n",
             expect_present: true,
         },
         Case {
@@ -1150,19 +1152,19 @@ async fn test_proxy_parsing_ss_with_gost_plugin() {
         Case {
             label: "missing mode -> skipped",
             name: "ss-gost-no-mode",
-            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      host: example.com\n",
+            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      host: example.com\n      mux: false\n",
             expect_present: false,
         },
         Case {
             label: "unsupported mode -> skipped",
             name: "ss-gost-bad-mode",
-            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: quic\n",
+            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: quic\n      mux: false\n",
             expect_present: false,
         },
         Case {
             label: "lone certificate -> skipped",
             name: "ss-gost-bad-cert",
-            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: websocket\n      certificate: PEM\n",
+            plugin_block: "    plugin: gost-plugin\n    plugin-opts:\n      mode: websocket\n      mux: false\n      certificate: PEM\n",
             expect_present: false,
         },
     ];

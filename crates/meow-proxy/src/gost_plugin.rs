@@ -671,6 +671,11 @@ mod tests {
                 input: "mode=websocket;mux=false;skip-cert-verify=tru",
                 check: |r| r.is_err(),
             },
+            Case {
+                name: "bad_ech_enable_bool_errors",
+                input: "mode=websocket;mux=false;ech-opts.enable=yep;ech-opts.config=QUJD",
+                check: |r| r.is_err(),
+            },
         ];
 
         let mut failures = Vec::new();
@@ -788,7 +793,8 @@ mod tests {
     }
 
     /// ws-only path (mux=false): raw WebSocket echo, no smux framing.
-    #[cfg(feature = "mux")]
+    /// Ungated on purpose — this is the only dial path a `ss`-without-`mux`
+    /// build can exercise, so it must compile and run there too.
     #[tokio::test]
     async fn dial_ws_echo_round_trip() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -820,5 +826,172 @@ mod tests {
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
         server.abort();
+    }
+
+    /// A wss acceptor for the loopback tests: rcgen leaf → rustls → ws echo.
+    /// Returns (port, leaf sha256 pin, server task).
+    async fn start_wss_echo(cn: &str) -> (u16, String, tokio::task::JoinHandle<()>) {
+        use sha2::Digest;
+
+        let ck = rcgen::generate_simple_self_signed(vec![cn.into()]).unwrap();
+        let pin: String = sha2::Sha256::digest(ck.cert.der())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(
+                    ck.cert.der().to_vec(),
+                )],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der()),
+                ),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tls).await.unwrap();
+            use futures::{SinkExt, StreamExt};
+            while let Some(msg) = ws.next().await {
+                let Ok(msg) = msg else { return };
+                if msg.is_binary() {
+                    ws.send(msg).await.unwrap();
+                }
+            }
+        });
+        (port, pin, server)
+    }
+
+    /// The `tls=true` wire path: real TLS handshake + ws upgrade through the
+    /// `TlsLayer`, authenticated by `fingerprint` alone — a self-signed cert
+    /// with no `skip-cert-verify`, so a dropped pin-plumbing or TLS-skip
+    /// mutant cannot pass.
+    #[tokio::test]
+    async fn dial_wss_cert_pin_round_trip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (port, pin, server) = start_wss_echo("test.example").await;
+        let cfg = parse_opts(&format!(
+            "mode=websocket;tls;mux=false;host=test.example;fingerprint={pin}"
+        ))
+        .unwrap();
+        let tls = build_tls_layer(&cfg).unwrap();
+        let ws = build_ws_layer(&cfg).unwrap();
+        let dialer = crate::dialer::DirectDialer;
+        let mut stream = dial(&cfg, tls.as_ref(), &ws, "127.0.0.1", port, &dialer)
+            .await
+            .unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        server.abort();
+    }
+
+    /// A wrong pin must still reject under `skip-cert-verify` — the custom
+    /// verify callback overrides `VERIFY_NONE`, so the combination can never
+    /// silently downgrade to an unverified connection.
+    #[tokio::test]
+    async fn dial_wss_wrong_pin_rejected_despite_skip_cert_verify() {
+        let (port, _pin, server) = start_wss_echo("test.example").await;
+        let cfg = parse_opts(
+            "mode=websocket;tls;mux=false;host=test.example;\
+             skip-cert-verify=true;\
+             fingerprint=0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let tls = build_tls_layer(&cfg).unwrap();
+        let ws = build_ws_layer(&cfg).unwrap();
+        let dialer = crate::dialer::DirectDialer;
+        match dial(&cfg, tls.as_ref(), &ws, "127.0.0.1", port, &dialer).await {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("TLS") || msg.contains("tls") || msg.contains("certificate"),
+                    "expected a TLS verification failure, got: {msg}"
+                );
+            }
+            Ok(_) => panic!("a non-matching pin must reject the handshake"),
+        }
+        server.abort();
+    }
+
+    /// A `Host` entry in `headers` must win the wire Host header over `host`
+    /// (upstream: `config.Headers.Get("Host")` replaces `request.Host` and
+    /// drives SNI). Without it the request carries `host` verbatim.
+    #[tokio::test]
+    async fn dial_ws_host_header_overrides_host_opt() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn one_round(opts: &str) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut tx = Some(tx);
+                let mut ws = tokio_tungstenite::accept_hdr_async(
+                    tcp,
+                    // tungstenite's `Callback` fixes the error type at
+                    // `Response<Option<String>>` — nothing to box.
+                    #[allow(
+                        clippy::result_large_err,
+                        reason = "tungstenite callback signature is fixed"
+                    )]
+                    move |req: &http::Request<()>,
+                          resp: http::Response<()>|
+                          -> std::result::Result<
+                        http::Response<()>,
+                        http::Response<Option<String>>,
+                    > {
+                        if let Some(tx) = tx.take() {
+                            let host = req
+                                .headers()
+                                .get(http::header::HOST)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let _ = tx.send(host);
+                        }
+                        Ok(resp)
+                    },
+                )
+                .await
+                .unwrap();
+                use futures::{SinkExt, StreamExt};
+                while let Some(msg) = ws.next().await {
+                    let Ok(msg) = msg else { return };
+                    if msg.is_binary() {
+                        ws.send(msg).await.unwrap();
+                    }
+                }
+            });
+
+            let cfg = parse_opts(opts).unwrap();
+            let ws = build_ws_layer(&cfg).unwrap();
+            let dialer = crate::dialer::DirectDialer;
+            let mut stream = dial(&cfg, None, &ws, "127.0.0.1", port, &dialer)
+                .await
+                .unwrap();
+            stream.write_all(b"ping").await.unwrap();
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            server.abort();
+            rx.await.unwrap()
+        }
+
+        assert_eq!(
+            one_round("mode=websocket;mux=false;host=test.example;header=Host:cdn.override").await,
+            "cdn.override"
+        );
+        assert_eq!(
+            one_round("mode=websocket;mux=false;host=test.example").await,
+            "test.example"
+        );
     }
 }

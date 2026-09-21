@@ -747,6 +747,12 @@ fn verify_cert_pin(
 /// drive it without an `SslRef`: a pin on `certs[0]` accepts the leaf
 /// as-pinned (upstream `FingerprintVerifier`'s `i == 0` arm — no name or
 /// chain check); a deeper pin runs [`verify_leaf_under_pinned_cert`].
+///
+/// Divergence note: upstream composes `NewNameCertVerifier` *around* the
+/// fingerprint verifier, so a leaf-pin hit still runs `VerifyHostname`
+/// when `name-cert-verify` is set. Here a leaf pin is an identity check —
+/// the cert bytes themselves are the pinned identity — so no name check
+/// applies on that arm (meow accepts where upstream rejects).
 fn pinned_chain_decision(
     chain: &boring::stack::StackRef<boring::x509::X509>,
     pin: &[u8; 32],
@@ -799,7 +805,10 @@ fn verify_leaf_under_pinned_cert(
         // terminate the chain — Go's `Roots:` semantics. Without
         // PARTIAL_CHAIN the lookup keeps walking to a root that was never
         // sent and fails with "unable to get issuer certificate".
-        param.set_flags(X509VerifyFlags::PARTIAL_CHAIN);
+        // TRUSTED_FIRST is already the client default, but the partial-chain
+        // check relies on it (the store copy of the pinned cert must be
+        // preferred over the presented one), so set it explicitly.
+        param.set_flags(X509VerifyFlags::PARTIAL_CHAIN | X509VerifyFlags::TRUSTED_FIRST);
         // A client `SSL_CTX` verifies with purpose `sslserver` by default;
         // this hand-built context must match that so a cert minted by the
         // pinned CA but unusable for server auth (e.g. a clientAuth-only
@@ -1181,6 +1190,14 @@ mod tests {
         assert!(
             pinned_chain_decision(&chain, &wrong, "srv.example.com").is_err(),
             "a pin matching nothing in the chain must fail"
+        );
+        // A one-byte-off pin must still fail — guards a prefix/truncated
+        // compare in `pinned_chain_decision`.
+        let mut near_miss = pin;
+        near_miss[31] ^= 0xff;
+        assert!(
+            pinned_chain_decision(&chain, &near_miss, "srv.example.com").is_err(),
+            "a pin differing only in the last byte must fail"
         );
     }
 
