@@ -99,6 +99,12 @@ pub struct RuleProvider {
     /// Retained for `refresh()` — a `format: text` file whose bytes aren't
     /// MRS must not be reparsed as YAML on refresh (issue #533 review).
     format: Option<RuleSetFormat>,
+    /// Resolved on-disk cache location, http providers only (inside
+    /// `cache_dir`; `None` when the build context has no cache directory).
+    /// `refresh()` writes each successfully parsed payload here so a
+    /// `prefer_cache` restart loads the newest refresh instead of the
+    /// initial-load-era file (issue #543).
+    cache_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for RuleProvider {
@@ -202,11 +208,20 @@ impl RuleProvider {
         let strict = self.strict;
         let ctx_clone = self.ctx.clone();
         let format = self.format;
-        let boxed: Box<dyn RuleSet> = crate::spawn_blocking_with_current_dispatcher(move || {
+        let (bytes, boxed) = crate::spawn_blocking_with_current_dispatcher(move || {
             parse_bytes_to_ruleset_with_format(&bytes, behavior, format, &ctx_clone, strict)
+                .map(|rules| (bytes, rules))
         })
         .await
         .map_err(|e| anyhow!("parse task panicked: {e}"))??;
+        let boxed: Box<dyn RuleSet> = boxed;
+        // Persist the payload only *after* the parse succeeds so the cache
+        // always holds the last usable payload — a `prefer_cache` restart
+        // then picks up the newest refresh rather than the
+        // initial-load-era file (issue #543).
+        if let Some(path) = &self.cache_path {
+            write_cache(path, &bytes);
+        }
         let count = boxed.len();
         let new_rules: Arc<dyn RuleSet> = Arc::from(boxed);
         // The compiled rule table bakes each RULE-SET slot's "needs IP /
@@ -511,7 +526,8 @@ pub fn live_ruleset_map(
     providers
         .iter()
         .map(|(name, p)| {
-            let live: Arc<dyn RuleSet> = Arc::clone(p) as Arc<RuleProvider>;
+            let live = Arc::clone(p);
+            let live: Arc<dyn RuleSet> = live;
             (name.clone(), live)
         })
         .collect()
@@ -556,11 +572,10 @@ fn load_one(
 }
 
 /// An empty rule set of the right behavior for a provider whose payload is
-/// unavailable — registered so `RULE-SET` references resolve. A later
-/// `refresh()` fills the provider's slot (visible to `GET
-/// /providers/rules` and DNS `rule-set:` policies, which snapshot per
-/// query); routing matchers that snapshotted the empty set keep it until
-/// the next rebuild (issue #553).
+/// unavailable — registered so `RULE-SET` references resolve. Matchers
+/// hold the provider itself (issue #553 live read-through), so a later
+/// `refresh()` fills it under their feet — no rebuild needed; `GET
+/// /providers/rules` and DNS `rule-set:` policies observe the same fill.
 fn empty_rule_set(behavior: RuleSetBehavior, ctx: &ParserContext) -> Box<dyn RuleSet> {
     build_rule_set(behavior, &[], ctx)
 }
@@ -612,6 +627,7 @@ fn load_inline(
         strict,
         ctx.clone(),
         None,
+        None,
     ))
 }
 
@@ -656,6 +672,9 @@ fn load_file(
         strict,
         ctx.clone(),
         explicit_format,
+        // A file provider's path *is* the payload source — `refresh()`
+        // re-reads it; there is no separate cache to write.
+        None,
     );
     let bytes = match prefetched {
         Some(b) => b.to_vec(),
@@ -727,6 +746,7 @@ fn load_http(
         strict,
         ctx.clone(),
         explicit_format,
+        cache_path.clone(),
     );
     let bytes = match prefetched {
         Some(b) => b.to_vec(),
@@ -762,6 +782,7 @@ fn make_provider(
     strict: bool,
     ctx: ParserContext,
     format: Option<RuleSetFormat>,
+    cache_path: Option<PathBuf>,
 ) -> RuleProvider {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -780,6 +801,7 @@ fn make_provider(
         strict,
         ctx,
         format,
+        cache_path,
     }
 }
 
@@ -791,16 +813,29 @@ pub(crate) fn test_provider(
     provider_type: ProviderType,
     interval: u64,
 ) -> Arc<RuleProvider> {
+    test_provider_with_vehicle(name, provider_type, interval, String::new())
+}
+
+/// [`test_provider`] with an explicit `vehicle` — file-provider refresh
+/// tests point it at a real temp file.
+#[cfg(test)]
+pub(crate) fn test_provider_with_vehicle(
+    name: &str,
+    provider_type: ProviderType,
+    interval: u64,
+    vehicle: String,
+) -> Arc<RuleProvider> {
     Arc::new(make_provider(
         name,
         provider_type,
         RuleSetBehavior::Domain,
-        String::new(),
+        vehicle,
         interval,
         meow_rules::build_rule_set(RuleSetBehavior::Domain, &[], &ParserContext::empty()),
         FetchContext::default(),
         false,
         ParserContext::empty(),
+        None,
         None,
     ))
 }
@@ -1793,6 +1828,48 @@ header:
         );
         assert!(!rule.match_metadata(&old, &helper));
         assert_eq!(map["live"].len(), 1);
+    }
+
+    /// Issue #543: a successful `refresh()` must persist the payload to the
+    /// provider's cache file — otherwise a `prefer_cache` restart reverts
+    /// to the initial-load-era payload until the next tick.
+    #[tokio::test]
+    async fn refresh_writes_payload_cache_after_successful_parse() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_in_order(
+            listener,
+            vec![
+                "payload:\n  - 'old.example'\n",
+                "payload:\n  - 'new.example'\n",
+            ],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut providers = HashMap::new();
+        providers.insert(
+            "live".to_string(),
+            RawRuleProvider {
+                url: Some(format!("http://{addr}/rules.yaml")),
+                ..http_cfg(None)
+            },
+        );
+        let out =
+            load_providers(&providers, Some(dir.path()), &ctx(), None, false).expect("load failed");
+        let provider = out.get("live").unwrap();
+        // The load wrote the implicit `<cache_dir>/rule-providers/live.yaml`.
+        let cache = dir.path().join("rule-providers").join("live.yaml");
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            "payload:\n  - 'old.example'\n"
+        );
+
+        provider.refresh().await.expect("refresh");
+        server.join().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            "payload:\n  - 'new.example'\n",
+            "refresh must persist the new payload for prefer_cache restarts"
+        );
     }
 
     // -- issue #429: provider paths must stay inside the cache dir ---------

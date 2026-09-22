@@ -406,8 +406,8 @@ pub fn dns_needs_rule_providers(raw: &crate::raw::RawConfig) -> bool {
 ///
 /// `geosite:` patterns are compiled into matchers when a geosite DB is loaded.
 /// `rule-set:` patterns are compiled into matchers from the loaded
-/// rule-providers; the matcher snapshots the provider on each lookup so
-/// background refreshes take effect automatically.
+/// rule-providers; the matcher reads through the provider object on each
+/// lookup so background refreshes take effect automatically.
 /// Other prefixed patterns (anything with `:`) warn once and skip.
 ///
 /// An entry with no valid nameservers after skipping → hard error.

@@ -9,14 +9,21 @@
 //! startup, so reloads could only ever refresh startup-era providers.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 use tokio::task::JoinHandle;
-use tracing::error;
+use tracing::{debug, error, warn};
 
 use crate::rule_provider::{ProviderType, RuleProvider};
+
+/// Largest interval the supervisor will spawn a loop for (~10 years).
+/// `RawRuleProvider.interval` is an unchecked `u64`: an absurd value
+/// would overflow `Instant + Duration` inside `tokio::time::interval`
+/// and panic the task on every reconcile — an over-ceiling provider is
+/// treated as non-refreshable instead (issue #543 review).
+const MAX_REFRESH_INTERVAL_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 
 /// Tracks the live refresh task per provider name. Cheap to share via
 /// `Arc`; all mutation goes through [`reconcile`](Self::reconcile), which
@@ -50,11 +57,31 @@ impl RefreshSupervisor {
     /// Reaping runs only inside `reconcile`, i.e. on commits: a task that
     /// dies between commits stays dead until the next one (same semantics
     /// as the health-check supervisor).
+    ///
+    /// Callers must not hold the registry's write guard — `reconcile`
+    /// takes `registry.read()` and `parking_lot` locks are not reentrant.
+    /// Commits that swap the map should prefer
+    /// [`commit_registry`](Self::commit_registry), which performs the swap
+    /// and this call in the only safe order.
     pub fn reconcile(&self, registry: &Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>) {
+        debug_assert!(
+            tokio::runtime::Handle::try_current().is_ok(),
+            "RefreshSupervisor::reconcile must run inside a tokio runtime"
+        );
         let wanted: HashMap<String, u64> = registry
             .read()
             .iter()
-            .filter(|(_, p)| p.interval > 0 && p.provider_type == ProviderType::Http)
+            .filter(|(_, p)| {
+                if p.interval > MAX_REFRESH_INTERVAL_SECS {
+                    warn!(
+                        provider = %p.name,
+                        interval = p.interval,
+                        "rule-provider interval exceeds the maximum; not auto-refreshing"
+                    );
+                    return false;
+                }
+                p.interval > 0 && p.provider_type == ProviderType::Http
+            })
             .map(|(name, p)| (name.clone(), p.interval))
             .collect();
 
@@ -70,14 +97,31 @@ impl RefreshSupervisor {
             if tasks.contains_key(&name) {
                 continue;
             }
-            let task = tokio::spawn(refresh_loop(name.clone(), interval, Arc::clone(registry)));
+            let task = tokio::spawn(refresh_loop(
+                name.clone(),
+                interval,
+                Arc::downgrade(registry),
+            ));
             tasks.insert(name, (interval, task));
         }
     }
 
+    /// Install a rebuilt provider map and reconcile refresh tasks — the
+    /// two steps every registry-mutating commit performs, in the only
+    /// safe order (publish first, then supervise). Call under the same
+    /// exclusion that serialised the rebuild (`CONFIG_MUTATION` in-tree).
+    pub fn commit_registry(
+        &self,
+        registry: &Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
+        map: HashMap<String, Arc<RuleProvider>>,
+    ) {
+        *registry.write() = map;
+        self.reconcile(registry);
+    }
+
     /// Number of running refresh tasks (test introspection).
     #[cfg(test)]
-    pub fn task_count(&self) -> usize {
+    fn task_count(&self) -> usize {
         self.tasks.lock().len()
     }
 
@@ -109,7 +153,8 @@ impl RefreshSupervisor {
 
 impl Drop for RefreshSupervisor {
     /// Abort every supervised task — otherwise the `JoinHandle`s detach on
-    /// drop and the loops keep an embedder's dropped registry alive.
+    /// drop and, while the registry is still alive, the loops keep
+    /// refreshing providers nobody supervises.
     fn drop(&mut self) {
         for (_, (_, task)) in self.tasks.get_mut().drain() {
             task.abort();
@@ -120,7 +165,7 @@ impl Drop for RefreshSupervisor {
 async fn refresh_loop(
     name: String,
     interval_secs: u64,
-    registry: Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
+    registry: Weak<RwLock<HashMap<String, Arc<RuleProvider>>>>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     // `Delay` — a suspend longer than `interval` must not fire every missed
@@ -130,7 +175,15 @@ async fn refresh_loop(
     ticker.tick().await; // skip the immediate first tick
     loop {
         ticker.tick().await;
+        // Weak like the health-check loop: a supervisor that outlives its
+        // embedder's registry must not pin the map (and transitively a
+        // proxy-registry generation via `FetchContext`) forever — the
+        // task exits and reconcile will not respawn it.
+        let Some(registry) = registry.upgrade() else {
+            return;
+        };
         let Some(provider) = registry.read().get(&name).cloned() else {
+            debug!(provider = %name, "rule-provider gone; refresh task idle until reconcile aborts it");
             continue;
         };
         // The provider re-parses the payload in its own load-time
@@ -172,6 +225,11 @@ mod tests {
         ]);
         sup.reconcile(&reg);
         assert_eq!(sup.task_count(), 2, "only http providers with interval > 0");
+        assert_eq!(sup.task_interval("http-a"), Some(3600));
+        assert_eq!(sup.task_interval("http-b"), Some(60));
+        assert_eq!(sup.task_interval("file"), None);
+        assert_eq!(sup.task_interval("inline"), None);
+        assert_eq!(sup.task_interval("no-interval"), None);
     }
 
     #[tokio::test]
@@ -180,18 +238,35 @@ mod tests {
         let reg = registry(&[
             ("a", ProviderType::Http, 3600),
             ("b", ProviderType::Http, 60),
+            ("c", ProviderType::Http, 300),
+        ]);
+        sup.reconcile(&reg);
+        assert_eq!(sup.task_count(), 3);
+        let kept_id = sup.task_id("c").unwrap();
+        let old_a = sup.task_id("a").unwrap();
+
+        // "b" removed, "a" interval changed → both tasks re-dispatched.
+        *reg.write() = registry_map(&[
+            ("a", ProviderType::Http, 120),
+            ("c", ProviderType::Http, 300),
         ]);
         sup.reconcile(&reg);
         assert_eq!(sup.task_count(), 2);
-
-        // "b" removed, "a" interval changed → both tasks re-dispatched.
-        *reg.write() = registry_map(&[("a", ProviderType::Http, 120)]);
-        sup.reconcile(&reg);
-        assert_eq!(sup.task_count(), 1);
         assert_eq!(
             sup.task_interval("a"),
             Some(120),
             "the interval change must respawn the task with the new tick"
+        );
+        assert_ne!(
+            sup.task_id("a"),
+            Some(old_a),
+            "the interval change must spawn a *new* task, not rewrite the old one"
+        );
+        assert_eq!(
+            sup.task_id("c"),
+            Some(kept_id),
+            "an unchanged provider must keep its task — churn would restart \
+             the interval countdown on every commit"
         );
     }
 
@@ -221,5 +296,81 @@ mod tests {
         *reg.write() = HashMap::new();
         sup.reconcile(&reg);
         assert_eq!(sup.task_count(), 0);
+    }
+
+    /// The loop itself: ticks resolve the provider *by name* so a registry
+    /// swap is followed without a respawn, and `abort()` actually stops
+    /// further refreshes. Driven with real temp files through a `File`
+    /// provider (the loop does not check `provider_type` — only
+    /// `reconcile`'s wanted set does).
+    #[tokio::test]
+    async fn refresh_loop_follows_swaps_and_stops_on_abort() {
+        use crate::rule_provider::test_provider_with_vehicle;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path1 = dir.path().join("one.yaml");
+        let path2 = dir.path().join("two.yaml");
+        std::fs::write(&path1, "payload:\n  - 'a.example'\n").unwrap();
+        std::fs::write(&path2, "payload:\n  - 'b.example'\n  - 'c.example'\n").unwrap();
+
+        let p1 =
+            test_provider_with_vehicle("p", ProviderType::File, 0, path1.display().to_string());
+        let reg = registry(&[]);
+        *reg.write() = HashMap::from([("p".to_string(), p1)]);
+
+        let mut task = tokio::spawn(refresh_loop("p".to_string(), 1, Arc::downgrade(&reg)));
+        // First real tick lands one interval after spawn.
+        wait_rule_count(&reg, "p", 1).await;
+
+        // Swap a new provider object in under the same name — the running
+        // task must refresh *it*, not the retired generation.
+        let p2 =
+            test_provider_with_vehicle("p", ProviderType::File, 0, path2.display().to_string());
+        let p1 = Arc::clone(&reg.read()["p"]);
+        *reg.write() = HashMap::from([("p".to_string(), Arc::clone(&p2))]);
+        for _ in 0..40 {
+            if p2.rule_count() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(p2.rule_count(), 2, "name resolution must follow the swap");
+        assert_eq!(
+            p1.rule_count(),
+            1,
+            "the retired provider must not be refreshed again"
+        );
+
+        // Abort: no further refresh even though the payload file changed.
+        std::fs::write(
+            &path2,
+            "payload:\n  - 'b.example'\n  - 'c.example'\n  - 'd.example'\n",
+        )
+        .unwrap();
+        task.abort();
+        assert!(
+            (&mut task).await.unwrap_err().is_cancelled(),
+            "the aborted task must actually terminate"
+        );
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(p2.rule_count(), 2);
+    }
+
+    async fn wait_rule_count(
+        reg: &RwLock<HashMap<String, Arc<RuleProvider>>>,
+        name: &str,
+        want: usize,
+    ) {
+        for _ in 0..40 {
+            if reg.read()[name].rule_count() == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            reg.read()[name].rule_count(),
+            want,
+            "the tick must have refreshed the file provider"
+        );
     }
 }

@@ -5056,10 +5056,10 @@ rules:
     }
 
     /// The published provider map must be the *same generation* the
-    /// RULE-SET matchers snapshotted — a separately loaded copy would
-    /// diverge on refresh (issue #543). Matchers hold the provider itself
-    /// as their `Arc<dyn RuleSet>` (issue #553 live read-through), so the
-    /// identity check is against the provider object, not a snapshot.
+    /// RULE-SET matchers hold — a separately loaded copy would diverge on
+    /// refresh (issue #543). Matchers retain the provider itself as their
+    /// `Arc<dyn RuleSet>` (issue #553 live read-through), so the identity
+    /// check is against the provider object, not a snapshot.
     #[test]
     fn rebuild_result_rule_providers_match_the_matcher_generation() {
         let raw: raw::RawConfig = serde_yaml::from_str(
@@ -5091,7 +5091,7 @@ rules:
         let provider: Arc<dyn meow_rules::RuleSet> = provider;
         assert!(
             Arc::ptr_eq(ruleset_rule.rule_set(), &provider),
-            "the published provider must be the instance the matcher snapshotted"
+            "the published provider must be the instance the matcher holds"
         );
     }
 

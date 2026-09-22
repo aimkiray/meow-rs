@@ -126,11 +126,11 @@ warn-and-skip; under `strict: true` it is a hard config error.
 Only HTTP **rule providers** with a non-zero `interval` are refreshed
 automatically by a background task; proxy providers reload on manual
 refresh (`PUT /providers/proxies/{name}` — a `file` provider re-reads its
-file) or restart, and `inline` providers never refresh. The refresh tasks
-are spawned once at startup from the providers configured then — a
-rule-provider *added* later via `PUT /configs` gets no background task
-(though a changed `interval` on an existing provider is picked up, since
-each tick re-resolves the provider by name).
+file) or restart, and `inline` providers never refresh. A refresh
+supervisor reconciles the task set on every config commit: a provider
+*added* later via `PUT /configs` or a subscription refresh gains a task,
+a removed one loses it, and a changed `interval` respawns it — while an
+untouched provider keeps its existing task (and countdown).
 
 ## Subscriptions
 

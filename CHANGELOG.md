@@ -558,6 +558,10 @@ the canonical, in-repo source a release is cut from.
   interval-changed, and reaping dead loops — and each loop resolves its
   provider by name on every tick so it follows registry swaps. Ticks use
   `MissedTickBehavior::Delay`, so a suspend longer than `interval` no
-  longer fires a back-to-back refresh storm. Embedders: `ApiServer::new`
-  and `subscription_refresh::run_loop` each gained a required
+  longer fires a back-to-back refresh storm. A successful `refresh()`
+  also writes the provider's payload cache file now, so a `prefer_cache`
+  restart loads the newest refresh rather than the initial-load-era
+  file; an `interval` beyond ~10 years is warn-skipped instead of
+  panicking its task. Embedders: `ApiServer::new` and
+  `subscription_refresh::run_loop` each gained a required
   `Arc<RefreshSupervisor>` parameter. (issue #543)

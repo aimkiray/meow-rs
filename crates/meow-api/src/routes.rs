@@ -1146,17 +1146,17 @@ async fn apply_raw_to_tunnel(
     // Commit point reached: every fallible check passed. The candidate's
     // provider sets become the live registries — the rules and DNS
     // `rule-set:` matchers installed above already reference these Arcs
-    // (issue #533 review).
-    *state.rule_providers.write() = rule_providers;
+    // (issue #533 review). `commit_registry` publishes the map *and*
+    // reconciles the interval refresh loops so providers added, removed,
+    // or re-intervalled by this commit gain/lose their task (issue #543).
+    state
+        .rule_provider_refresh
+        .commit_registry(&state.rule_providers, rule_providers);
     commit_proxy_providers(
         &state.proxy_providers,
         &proxy_providers,
         raw.strict.unwrap_or(false),
     );
-    // Then reconcile the interval refresh loops so providers added,
-    // removed, or re-intervalled by this commit gain/lose their task
-    // (issue #543).
-    state.rule_provider_refresh.reconcile(&state.rule_providers);
     Ok((dns, prior_resolver))
 }
 
@@ -2497,7 +2497,9 @@ async fn put_configs(
     let Some(result) = result else {
         // The force contract accepts the config even when nothing in it
         // builds — persist the raw config but keep the previous routing,
-        // resolver, and provider registries untouched.
+        // resolver, and provider registries untouched. Refresh tasks
+        // intentionally follow the *retained* registry (its providers
+        // still back the live route table), so no reconcile runs here.
         let prior_resolver = state.tunnel.resolver();
         swap_config_and_reconcile_tun(&state, raw_config, None, prior_resolver).await;
         return StatusCode::NO_CONTENT.into_response();
@@ -2593,15 +2595,16 @@ async fn put_configs(
     }
     // Commit point: install the candidate's provider sets — the rules and
     // DNS `rule-set:` matchers above already reference these Arcs
-    // (issue #533 review).
-    *state.rule_providers.write() = rule_providers;
+    // (issue #533 review). `commit_registry` publishes the map *and*
+    // reconciles the interval refresh loops in one step (issue #543).
+    state
+        .rule_provider_refresh
+        .commit_registry(&state.rule_providers, rule_providers);
     commit_proxy_providers(
         &state.proxy_providers,
         &proxy_providers,
         raw_config.strict.unwrap_or(false),
     );
-    // reconcile the interval refresh loops (issue #543).
-    state.rule_provider_refresh.reconcile(&state.rule_providers);
 
     swap_config_and_reconcile_tun(&state, raw_config, dns, prior_resolver).await;
 
