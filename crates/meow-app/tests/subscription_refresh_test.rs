@@ -246,6 +246,12 @@ async fn refreshed_select_group_keeps_persisted_choice() {
     // Persist `sel-g → node-b` BEFORE the loop spawns — `with_store`
     // reads the store once at group construction, so the choice must be
     // in place before the first refresh commits.
+    // NOTE: `SelectorStore::open` binds the process-global on first call
+    // and later `open`s never rebind it — under plain `cargo test` this
+    // store leaks into sibling tests' `rebuild_from_raw_runtime` groups
+    // (harmless today: priming is keyed by group name). Nextest gives
+    // each test its own process, so CI is immune; keep it that way by
+    // not asserting `global()` identity in other tests of this file.
     let store = SelectorStore::open(fx.dir.path().join("sel.json"));
     store.set("sel-g", "node-b");
     spawn_loop(&fx);

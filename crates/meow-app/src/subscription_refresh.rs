@@ -173,6 +173,32 @@ pub async fn run_loop(
                                 proxy_providers: new_proxy_providers,
                                 prefetched_payloads: new_prefetched_payloads,
                             } = result;
+                            // Same guard as `apply_raw_to_tunnel`: a group
+                            // warn-dropped under lenient parsing must not
+                            // commit silently — rules still reference it
+                            // and would dead-route (issue #543 review).
+                            if let Some(missing) = candidate
+                                .proxy_groups
+                                .as_deref()
+                                .unwrap_or_default()
+                                .iter()
+                                .map(|group| group.name.clone())
+                                .find(|name| !new_proxies.contains_key(name.as_str()))
+                            {
+                                warn!(
+                                    "subscription '{name}': proxy group '{missing}' \
+                                     failed validation; NOT committing"
+                                );
+                                let mut live = raw_config.write();
+                                if let Some(sub) = live
+                                    .subscriptions
+                                    .as_mut()
+                                    .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
+                                {
+                                    sub.last_updated = Some(now);
+                                }
+                                continue;
+                            }
                             // A swapped proxy set changes the objects a
                             // `#name` nameserver or `rule-set:` policy key
                             // references — reconcile BEFORE the raw write so
