@@ -691,6 +691,14 @@ fn load_http(
         .url
         .as_deref()
         .ok_or_else(|| LoadError::Defect(anyhow!("http provider '{name}' requires a 'url'")))?;
+    // An unparseable `url:` is a permanent defect — under strict fail the
+    // load instead of registering an empty provider that retries the same
+    // bad URL on every interval (issue #533 review).
+    if strict && url::Url::parse(url).is_err() {
+        return Err(LoadError::Defect(anyhow!(
+            "rule-provider '{name}': invalid url '{url}' (strict mode)"
+        )));
+    }
     let cache_path = resolve_path(cfg, cache_dir, name, false).map_err(LoadError::Defect)?;
     let explicit_format = parse_explicit_format(cfg).map_err(LoadError::Defect)?;
     let interval = cfg.interval.unwrap_or(0);
@@ -814,6 +822,9 @@ fn parse_bytes_to_ruleset_with_format(
 }
 
 fn parse_yaml_payload(raw: &str, strict: bool) -> Result<Vec<String>> {
+    if !crate::yaml_within_depth(raw) {
+        return Err(anyhow!("rule-set yaml exceeds the nesting-depth limit"));
+    }
     let root: serde_yaml::Value = serde_yaml::from_str(raw).context("rule-set yaml parse error")?;
     let payload = root
         .get("payload")

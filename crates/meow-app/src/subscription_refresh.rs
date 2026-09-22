@@ -139,15 +139,16 @@ pub async fn run_loop(
                             .map(|e| (e.key().clone(), Arc::clone(e.value())))
                             .collect();
                         move || {
-                            meow_config::rebuild_from_raw_with_resolver(
+                            // The runtime variant wires the process-wide
+                            // SelectorStore into rebuilt groups — without it
+                            // every refresh silently resets select/url-test/
+                            // fallback selections and stops persisting picks
+                            // (issue #533 review).
+                            meow_config::rebuild_from_raw_runtime(
                                 &candidate,
                                 Some(&resolver),
-                                Some(cache_dir.as_path()),
                                 &proxy_providers,
-                                // Commit path: the candidate's provider set
-                                // loads fresh and is swapped into the live
-                                // registry only once validated (issue #533).
-                                None,
+                                Some(cache_dir.as_path()),
                             )
                         }
                     })
@@ -286,7 +287,30 @@ pub async fn run_loop(
                         }
                     }
                 }
-                Err(e) => error!("Failed to refresh subscription '{}': {}", name, e),
+                Err(e) => {
+                    error!("Failed to refresh subscription '{}': {}", name, e);
+                    // A payload defect is permanent until the publisher fixes
+                    // it — stamp `last_updated` so the pass honors `interval`
+                    // rather than re-downloading the same garbled body every
+                    // 60 s (issue #533 review). Transport failures stay
+                    // unstamped so a flaky network retries next pass.
+                    if e.downcast_ref::<meow_config::subscription::PayloadDefect>()
+                        .is_some()
+                    {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        let mut live = raw_config.write();
+                        if let Some(sub) = live
+                            .subscriptions
+                            .as_mut()
+                            .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
+                        {
+                            sub.last_updated = Some(now);
+                        }
+                    }
+                }
             }
         }
 

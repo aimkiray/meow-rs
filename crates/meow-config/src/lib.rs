@@ -447,6 +447,40 @@ pub async fn load_config_from_str(content: &str) -> Result<Config, anyhow::Error
     build_config(raw, None).await
 }
 
+/// Upper bound on YAML document nesting for remote-controlled documents.
+/// `serde_yaml` deserializes `Value` recursively — a document of `[[[[…` or
+/// of ever-deepening indentation recurses one stack frame per level and can
+/// overflow a blocking-thread stack well inside the fetch-size caps
+/// (issue #533 review). Two cheap over-approximations bound the depth:
+///
+/// - flow nesting: unclosed `[`/`{` count. Brackets inside scalars count
+///   too — a false positive needs >128 unclosed openers in one document,
+///   which no real config produces.
+/// - block indentation: max leading-space count. Each block nesting level
+///   contributes at least one space, so depth is bounded by the widest
+///   indentation; a false positive needs a single line indented past 256
+///   spaces (e.g. inside a literal block scalar), which no real config
+///   produces.
+const MAX_YAML_DEPTH: usize = 128;
+
+pub(crate) fn yaml_within_depth(doc: &str) -> bool {
+    let mut flow = 0usize;
+    for c in doc.chars() {
+        match c {
+            '[' | '{' => {
+                flow += 1;
+                if flow > MAX_YAML_DEPTH {
+                    return false;
+                }
+            }
+            ']' | '}' => flow = flow.saturating_sub(1),
+            _ => {}
+        }
+    }
+    doc.lines()
+        .all(|l| l.len() - l.trim_start_matches(' ').len() <= MAX_YAML_DEPTH * 2)
+}
+
 /// Parse a Clash/mihomo YAML document into [`raw::RawConfig`], expanding YAML
 /// anchor merge keys (`<<: *anchor`) before deserialisation.
 ///
@@ -456,6 +490,11 @@ pub async fn load_config_from_str(content: &str) -> Result<Config, anyhow::Error
 /// "missing". Upstream mihomo configs (e.g. `rule-anchor` patterns) rely on
 /// this expansion — see meow-ios#112.
 fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
+    if !yaml_within_depth(content) {
+        return Err(anyhow::anyhow!(
+            "YAML document exceeds {MAX_YAML_DEPTH} levels of nesting"
+        ));
+    }
     let mut value: serde_yaml::Value = serde_yaml::from_str(content)?;
     value.apply_merge()?;
     Ok(serde_yaml::from_value(value)?)
@@ -2904,12 +2943,16 @@ async fn build_config(
     let geodata = geodata::parse_geodata(raw.geodata.as_ref())?;
 
     // General config
-    let mode = raw
-        .mode
-        .as_deref()
-        .unwrap_or("rule")
-        .parse::<TunnelMode>()
-        .unwrap_or(TunnelMode::Rule);
+    let mode = match raw.mode.as_deref().unwrap_or("rule").parse::<TunnelMode>() {
+        Ok(m) => m,
+        Err(e) if raw.strict.unwrap_or(false) => {
+            anyhow::bail!("mode: {e} (strict mode)");
+        }
+        Err(e) => {
+            warn!("mode: {e}; defaulting to 'rule'");
+            TunnelMode::Rule
+        }
+    };
     let log_level = raw.log_level.clone().unwrap_or_else(|| "info".to_string());
     // mihomo (and Clash Verge output) use `bind-address: '*'` as the
     // all-interfaces wildcard; normalize it here so listeners never see the
@@ -5078,7 +5121,7 @@ rules:
             )
             .replace("  - \"NOSUCHRULE,x,DIRECT\"\n", "");
         let err = expect_strict_failure(&yaml, "a bad proxies: entry");
-        assert!(err.to_string().contains("strict mode"), "unexpected: {err}");
+        assert!(err.to_string().contains("broken"), "unexpected: {err}");
     }
 
     #[test]
@@ -5087,7 +5130,7 @@ rules:
             .replace("  - { name: broken, type: nosuchtype }\n", "")
             .replace("  - \"NOSUCHRULE,x,DIRECT\"\n", "");
         let err = expect_strict_failure(&yaml, "a bad proxy-groups: entry");
-        assert!(err.to_string().contains("strict mode"), "unexpected: {err}");
+        assert!(err.to_string().contains("g-broken"), "unexpected: {err}");
     }
 
     #[test]
@@ -5099,7 +5142,7 @@ rules:
                 "",
             );
         let err = expect_strict_failure(&yaml, "a bad rules: entry");
-        assert!(err.to_string().contains("strict mode"), "unexpected: {err}");
+        assert!(err.to_string().contains("NOSUCHRULE"), "unexpected: {err}");
     }
 
     #[test]
@@ -5574,6 +5617,40 @@ rules:
         );
     }
 
+    /// An unparseable provider `url:` is a permanent defect, not a
+    /// transient acquisition failure — under strict it fails the definition
+    /// rather than registering an empty provider that retries the same bad
+    /// URL on every interval (issue #533 review).
+    #[test]
+    fn strict_rejects_invalid_provider_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+strict: {STRICT}
+proxy-providers:
+  bad-proxy:
+    type: http
+    url: 'not a url'
+rule-providers:
+  bad-rule:
+    type: http
+    behavior: domain
+    url: 'not a url'
+"#;
+        let raw = raw_config(&yaml.replace("{STRICT}", "true"));
+        let Err(err) =
+            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
+        else {
+            panic!("strict must reject an unparseable provider url");
+        };
+        assert!(err.to_string().contains("url"), "unexpected: {err}");
+
+        // Lenient keeps the acquisition-failure contract: the bad URL is a
+        // fetch-time error → empty registered provider.
+        let raw = raw_config(&yaml.replace("{STRICT}", "false"));
+        rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
+            .expect("lenient registers an empty provider on bad url");
+    }
+
     /// A bad `format:` is a DEFECT in the definition, not an acquisition
     /// failure — strict rejects it even though no bytes were ever fetched.
     #[test]
@@ -5926,4 +6003,50 @@ pub fn extract_health_check_specs(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod yaml_depth_tests {
+    //! Remote YAML (subscriptions, provider payloads, PUT /configs) must not
+    //! drive serde_yaml's recursive Value deserializer past a bounded depth —
+    //! `[[[[…` or ever-deepening indentation overflows a blocking-thread
+    //! stack inside the fetch-size caps (issue #533 review).
+    use super::yaml_within_depth;
+
+    #[test]
+    fn deep_flow_nesting_is_rejected() {
+        let doc = format!("k: {}", "[".repeat(500));
+        assert!(!yaml_within_depth(&doc));
+    }
+
+    #[test]
+    fn deep_block_indentation_is_rejected() {
+        let mut doc = String::from("a:");
+        for i in 1..200 {
+            doc.push('\n');
+            doc.push_str(&" ".repeat(i * 4));
+            doc.push_str("a:");
+        }
+        assert!(!yaml_within_depth(&doc));
+    }
+
+    #[test]
+    fn real_config_shapes_pass() {
+        let doc = r#"
+mixed-port: 7890
+proxies:
+  - { name: a, type: direct }
+proxy-groups:
+  - name: g
+    type: select
+    proxies: [a, DIRECT]
+rules:
+  - MATCH,g
+"#;
+        assert!(yaml_within_depth(doc));
+        // Brackets inside a scalar string count toward flow depth but a few
+        // balanced/unbalanced ones never reach the cap.
+        let scalar = "proxies:\n  - { name: \"[weird] name {x\", type: direct }\n";
+        assert!(yaml_within_depth(scalar));
+    }
 }

@@ -73,14 +73,33 @@ impl ParserContext {
     }
 }
 
+/// Bounds for rule-line parsing. Rule text reaches this parser from remote
+/// surfaces (subscriptions, rule-provider payloads): a line like
+/// `AND,((AND,((…` recurses one stack frame per nesting level and copies
+/// the inner text per level, so an unbounded line overflows the stack and
+/// amplifies transient allocation (issue #533 review).
+const MAX_LOGIC_DEPTH: usize = 64;
+const MAX_RULE_LINE_LEN: usize = 64 * 1024;
+
 pub fn parse_rule(line: &str, ctx: &ParserContext) -> Result<Box<dyn Rule>, String> {
+    parse_rule_depth(line, ctx, 0)
+}
+
+fn parse_rule_depth(
+    line: &str,
+    ctx: &ParserContext,
+    logic_depth: usize,
+) -> Result<Box<dyn Rule>, String> {
+    if line.len() > MAX_RULE_LINE_LEN {
+        return Err(format!("rule line exceeds {MAX_RULE_LINE_LEN} bytes"));
+    }
     // Logic rules (AND/OR/NOT) must be detected before the naive `splitn(4, ',')`
     // below, because their payloads contain parenthesised sub-rules whose
     // commas would be split incorrectly.
     if let Some((ty, rest)) = split_once_trimmed(line, ',') {
         let upper = ty.to_ascii_uppercase();
         if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
-            return parse_logic_rule(&upper, rest, ctx);
+            return parse_logic_rule(&upper, rest, ctx, logic_depth);
         }
     }
 
@@ -229,7 +248,13 @@ fn parse_logic_rule(
     rule_type: &str,
     rest: &str,
     ctx: &ParserContext,
+    logic_depth: usize,
 ) -> Result<Box<dyn Rule>, String> {
+    if logic_depth >= MAX_LOGIC_DEPTH {
+        return Err(format!(
+            "{rule_type} rule: nesting exceeds {MAX_LOGIC_DEPTH} levels"
+        ));
+    }
     let rest = rest.trim_start();
     if !rest.starts_with('(') {
         return Err(format!(
@@ -271,7 +296,7 @@ fn parse_logic_rule(
     let mut inner_rules: Vec<Box<dyn Rule>> = Vec::with_capacity(groups.len());
     for g in &groups {
         let patched = splice_inner_adapter(g.trim());
-        inner_rules.push(parse_rule(&patched, ctx)?);
+        inner_rules.push(parse_rule_depth(&patched, ctx, logic_depth + 1)?);
     }
 
     match rule_type {
@@ -556,5 +581,55 @@ mod tests {
     #[test]
     fn test_parse_geosite_without_db_tolerated() {
         assert!(parse_rule("GEOSITE,cn,DIRECT", &ctx()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    /// Remote rule payloads (subscriptions, provider bodies) must not be
+    /// able to drive unbounded recursion or per-level copying: nesting past
+    /// MAX_LOGIC_DEPTH fails the line instead of overflowing the stack
+    /// (issue #533 review).
+    #[test]
+    fn deeply_nested_logic_rule_errors_instead_of_overflowing() {
+        // Each nested level is `AND,(( <inner-rule> ))` — the inner rule
+        // carries no adapter (splice_inner_adapter substitutes a
+        // placeholder for logic types).
+        let mut line = String::new();
+        for _ in 0..200 {
+            line.push_str("AND,((");
+        }
+        line.push_str("DOMAIN,a.com");
+        for _ in 0..200 {
+            line.push_str("))");
+        }
+        line.push_str(",DIRECT");
+        let Err(err) = parse_rule(&line, &ParserContext::empty()) else {
+            panic!("nesting must error");
+        };
+        assert!(err.contains("nesting"), "unexpected error: {err}");
+    }
+
+    /// Sane nesting still parses.
+    #[test]
+    fn moderately_nested_logic_rule_parses() {
+        let rule = parse_rule(
+            "AND,((OR,((DOMAIN,a.com),(DOMAIN,b.com))),(NOT,((DOMAIN,c.com)))),DIRECT",
+            &ParserContext::empty(),
+        );
+        assert!(rule.is_ok(), "unexpected: {}", rule.err().unwrap());
+    }
+
+    /// A single line beyond the length cap fails fast — bounds the
+    /// per-level copy cost to depth × cap (issue #533 review).
+    #[test]
+    fn overlong_rule_line_errors() {
+        let line = format!("AND,(({})),DIRECT", "x".repeat(MAX_RULE_LINE_LEN));
+        let Err(err) = parse_rule(&line, &ParserContext::empty()) else {
+            panic!("overlong line must error");
+        };
+        assert!(err.contains("exceeds"), "unexpected error: {err}");
     }
 }

@@ -20,8 +20,31 @@ pub async fn fetch_subscription(
 ) -> Result<SubscriptionData, anyhow::Error> {
     let bytes = crate::internal_http::fetch_direct(url).await?;
     let text = String::from_utf8(bytes)
-        .map_err(|e| anyhow::anyhow!("subscription body is not UTF-8: {e}"))?;
+        .map_err(|e| PayloadDefect(anyhow::anyhow!("subscription body is not UTF-8: {e}")))?;
     parse_subscription_yaml(&text, strict)
+        .map_err(PayloadDefect)
+        .map_err(Into::into)
+}
+
+/// Marks a subscription *payload* defect (UTF-8/YAML/shape, incl. strict
+/// mode) as opposed to a transport failure — re-fetching the same URL
+/// reproduces the same error, so periodic refreshers stamp `last_updated`
+/// and honor `interval` instead of retrying every pass (issue #533 review).
+/// Reachable via `err.downcast_ref::<PayloadDefect>()` on the
+/// `anyhow::Error` [`fetch_subscription`] returns.
+#[derive(Debug)]
+pub struct PayloadDefect(pub anyhow::Error);
+
+impl std::fmt::Display for PayloadDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for PayloadDefect {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
 }
 
 /// Parse a Clash YAML string and extract proxies, proxy-groups, and rules.
@@ -29,6 +52,11 @@ pub fn parse_subscription_yaml(
     text: &str,
     strict: bool,
 ) -> Result<SubscriptionData, anyhow::Error> {
+    if !crate::yaml_within_depth(text) {
+        return Err(anyhow::anyhow!(
+            "subscription YAML exceeds the nesting-depth limit"
+        ));
+    }
     let mut root: Value =
         serde_yaml::from_str(text).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     // Expand `<<: *anchor` merge keys so subscriptions that share anchor

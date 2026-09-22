@@ -174,6 +174,15 @@ impl ProxyProvider {
                     .as_deref()
                     .ok_or("http proxy-provider requires 'url'")?
                     .to_string();
+                // An unparseable `url:` is a permanent defect, not a
+                // transient fetch failure — under strict surface it at
+                // load instead of registering an empty provider that
+                // retries forever (issue #533 review).
+                if strict && url::Url::parse(&url).is_err() {
+                    return Err(format!(
+                        "proxy-provider '{name}': invalid url '{url}' (strict mode)"
+                    ));
+                }
                 let cache_path = match (raw.path.as_deref(), cache_dir) {
                     (Some(p), Some(dir)) => Some(
                         crate::safe_path::resolve_contained(dir, Path::new(p))
@@ -342,6 +351,15 @@ impl ProxyProvider {
     /// unparseable node; the lenient path warns and skips instead.
     async fn parse_proxies(&self, content: &str) -> Result<Vec<Arc<dyn Proxy>>, String> {
         let strict = self.strict.load(Ordering::Relaxed);
+        if !crate::yaml_within_depth(content) {
+            if strict {
+                return Err(
+                    "provider YAML exceeds the nesting-depth limit (strict mode)".to_string(),
+                );
+            }
+            warn!(provider = %self.name, "provider YAML exceeds the nesting-depth limit");
+            return Ok(Vec::new());
+        }
         let doc: serde_yaml::Value = match serde_yaml::from_str(content) {
             Ok(v) => v,
             Err(e) => {

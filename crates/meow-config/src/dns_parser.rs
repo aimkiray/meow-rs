@@ -74,6 +74,13 @@ pub async fn parse_dns(
     let mode = match dns.enhanced_mode.as_deref() {
         Some("fake-ip") => DnsMode::FakeIp,
         Some("redir-host") => DnsMode::Mapping,
+        Some(other) if strict => {
+            anyhow::bail!("dns.enhanced-mode: unknown value '{other}' (strict mode)");
+        }
+        Some(other) => {
+            warn!("dns.enhanced-mode: unknown value '{other}'; using the default resolver mode");
+            DnsMode::Normal
+        }
         _ => DnsMode::Normal,
     };
 
