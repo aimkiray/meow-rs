@@ -306,6 +306,7 @@ impl KcpStream {
                 (self.rate_tokens + dt * self.rate_limit as f64).min(self.rate_limit as f64);
         }
 
+        let mut sent = false;
         while let Some(pkt) = self.outbox.front() {
             // A bucket smaller than one packet must still send — overdraw
             // and let the bucket recover negative (upstream's rate limiter
@@ -316,6 +317,7 @@ impl KcpStream {
             match self.socket.poll_send(cx, pkt) {
                 Poll::Ready(Ok(_)) => {
                     let pkt = self.outbox.pop_front().unwrap();
+                    sent = true;
                     if self.rate_limit > 0 {
                         self.rate_tokens -= pkt.len() as f64;
                     }
@@ -339,9 +341,16 @@ impl KcpStream {
         self.timer
             .as_mut()
             .reset(tokio::time::Instant::now() + Duration::from_millis(wait as u64));
-        // `update` + the drain above may have changed state the peer
-        // direction waits on (unacked count, outbox capacity): wake it.
-        self.progress();
+        // Wake a parked peer direction only when this pass changed state
+        // it could be waiting on. An unconditional wake ping-pongs two
+        // parked directions forever (each repoll runs `pump`, which wakes
+        // the peer back): a stalled writer + parked reader would spin a
+        // worker thread until the link died. Outbox sends are the only
+        // transition a parked peer can observe here — `poll_inbound`
+        // wakes on `got`, the dead-link arm wakes above.
+        if sent {
+            self.progress();
+        }
         Ok(())
     }
 
@@ -733,5 +742,251 @@ mod tests {
         a.read_exact(&mut back).await.unwrap();
         assert_eq!(back, msg);
         echo.abort();
+    }
+
+    /// Drops the first `n` outbound datagrams (pretends they sent) — the
+    /// KCP retransmit path is the only way the payload can arrive.
+    struct DropFirst {
+        inner: UdpSocket,
+        left: usize,
+    }
+    impl SocketIo for DropFirst {
+        fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            if self.left > 0 {
+                self.left -= 1;
+                return Poll::Ready(Ok(buf.len()));
+            }
+            UdpSocket::poll_send(&self.inner, cx, buf)
+        }
+        fn poll_recv(
+            &mut self,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            UdpSocket::poll_recv(&self.inner, cx, buf)
+        }
+        fn apply_socket_options(&self, s: usize, d: u8) {
+            self.inner.apply_socket_options(s, d);
+        }
+    }
+
+    /// Sends succeed, receives never complete — a dead peer.
+    struct Blackhole;
+    impl SocketIo for Blackhole {
+        fn poll_send(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_recv(
+            &mut self,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    async fn udp() -> UdpSocket {
+        UdpSocket::bind("127.0.0.1:0").await.unwrap()
+    }
+
+    /// A lossy first hop: the first KCP datagrams never arrive, so
+    /// delivery only succeeds through retransmission — the core ARQ
+    /// promise loopback tests can't see.
+    #[tokio::test]
+    async fn recovers_dropped_datagrams() {
+        let cfg = KcpConfig {
+            crypt: "aes".into(),
+            interval: 10,
+            ..Default::default()
+        };
+        let sock_a = udp().await;
+        let b_sock = udp().await;
+        sock_a.connect(b_sock.local_addr().unwrap()).await.unwrap();
+        b_sock.connect(sock_a.local_addr().unwrap()).await.unwrap();
+        let mut a = KcpStream::connect(
+            Box::new(DropFirst {
+                inner: sock_a,
+                left: 3,
+            }),
+            0x11223344,
+            &cfg,
+        )
+        .unwrap();
+        let mut b = KcpStream::connect(Box::new(b_sock), 0x11223344, &cfg).unwrap();
+
+        let msg = b"payload that must survive retransmission".repeat(10);
+        let want = msg.clone();
+        let echo = tokio::spawn(async move {
+            let mut got = vec![0u8; want.len()];
+            b.read_exact(&mut got).await.unwrap();
+            b.write_all(&got).await.unwrap();
+            b.flush().await.unwrap();
+            let mut drain = [0u8; 512];
+            while b.read(&mut drain).await.is_ok() {}
+        });
+        a.write_all(&msg).await.unwrap();
+        a.flush().await.unwrap();
+        let mut back = vec![0u8; msg.len()];
+        tokio::time::timeout(Duration::from_secs(15), a.read_exact(&mut back))
+            .await
+            .expect("retransmit must recover the drop")
+            .unwrap();
+        assert_eq!(back, msg);
+        echo.abort();
+    }
+
+    /// `xmit` past the resend limit turns a silent peer into `TimedOut` —
+    /// the stream must not hang forever. (Production uses 20, upstream
+    /// `IKCP_DEADLINK`; at ~200ms×1.5 backoff that's ~20min of wall time,
+    /// so the test tightens the same code path to 3.)
+    #[tokio::test]
+    async fn dead_link_times_out() {
+        let cfg = KcpConfig {
+            crypt: "aes".into(),
+            nodelay: 1,
+            interval: 10,
+            resend: 2,
+            nc: 1,
+            ..Default::default()
+        };
+        let mut a = KcpStream::connect(Box::new(Blackhole), 0x11223344, &cfg).unwrap();
+        a.kcp.set_maximum_resend_times(3);
+        a.write_all(b"are you there").await.unwrap();
+        a.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        let err = tokio::time::timeout(Duration::from_secs(15), a.read(&mut buf))
+            .await
+            .expect("dead link must surface, not hang")
+            .expect_err("dead link must error");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+    }
+
+    /// Datagrams carrying a foreign `conv` are crypt-valid but not ours —
+    /// `kcp.input` drops them; a wrong-conv peer can never deliver data.
+    #[tokio::test]
+    async fn foreign_conv_is_dropped() {
+        let cfg = KcpConfig {
+            crypt: "aes".into(),
+            ..Default::default()
+        };
+        let a_sock = udp().await;
+        let b_sock = udp().await;
+        a_sock.connect(b_sock.local_addr().unwrap()).await.unwrap();
+        b_sock.connect(a_sock.local_addr().unwrap()).await.unwrap();
+        let mut a = KcpStream::connect(Box::new(a_sock), 0x11111111, &cfg).unwrap();
+        let mut b = KcpStream::connect(Box::new(b_sock), 0x22222222, &cfg).unwrap();
+
+        a.write_all(b"wrong conv").await.unwrap();
+        a.flush().await.unwrap();
+        let mut buf = [0u8; 16];
+        let timed_out = tokio::time::timeout(Duration::from_millis(500), b.read(&mut buf))
+            .await
+            .is_err();
+        assert!(timed_out, "foreign-conv datagrams must never deliver");
+    }
+
+    /// `mtu` below the envelope overhead is a config error, not a
+    /// truncation — upstream's `SetMtu` math leaves no room for payload.
+    #[tokio::test]
+    async fn connect_rejects_mtu_below_overhead() {
+        let cfg = KcpConfig {
+            crypt: "aes".into(),
+            mtu: 8,
+            ..Default::default()
+        };
+        match KcpStream::connect(Box::new(udp().await), 1, &cfg) {
+            Err(e) => assert!(e.to_string().contains("overhead"), "{e}"),
+            Ok(_) => panic!("mtu below overhead must fail"),
+        }
+    }
+
+    /// `apply_socket_options` receives the parsed `sockbuf`/`dscp` pair —
+    /// the tunneled-endpoint default is a no-op, so a recording fake is
+    /// the only way to see the values flow through.
+    #[tokio::test]
+    async fn socket_options_receive_dscp_and_sockbuf() {
+        struct Spy {
+            inner: UdpSocket,
+            seen: std::sync::Arc<Mutex<Option<(usize, u8)>>>,
+        }
+        impl SocketIo for Spy {
+            fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+                UdpSocket::poll_send(&self.inner, cx, buf)
+            }
+            fn poll_recv(
+                &mut self,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                UdpSocket::poll_recv(&self.inner, cx, buf)
+            }
+            fn apply_socket_options(&self, s: usize, d: u8) {
+                *self.seen.lock().unwrap() = Some((s, d));
+            }
+        }
+        let seen = std::sync::Arc::new(Mutex::new(None));
+        let cfg = KcpConfig {
+            crypt: "aes".into(),
+            sock_buf: 1 << 20,
+            dscp: 46,
+            ..Default::default()
+        };
+        let _s = KcpStream::connect(
+            Box::new(Spy {
+                inner: udp().await,
+                seen: seen.clone(),
+            }),
+            1,
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), Some((1 << 20, 46)));
+    }
+
+    /// The token bucket must actually delay egress — 12 KB at 4 KB/s
+    /// cannot flush in under a second (the first ~4 KB ride the initial
+    /// full bucket, the rest waits for tokens).
+    #[tokio::test]
+    async fn rate_limit_throttles_outbound() {
+        let cfg = KcpConfig {
+            crypt: "aes".into(),
+            rate_limit: 4_000,
+            ..Default::default()
+        };
+        let a_sock = udp().await;
+        let b_sock = udp().await;
+        a_sock.connect(b_sock.local_addr().unwrap()).await.unwrap();
+        b_sock.connect(a_sock.local_addr().unwrap()).await.unwrap();
+        let mut a = KcpStream::connect(Box::new(a_sock), 7, &cfg).unwrap();
+        let mut b = KcpStream::connect(Box::new(b_sock), 7, &cfg).unwrap();
+
+        let msg = vec![0xabu8; 12_000];
+        let want = msg.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let drain = tokio::spawn(async move {
+            let mut got = vec![0u8; want.len()];
+            b.read_exact(&mut got).await.unwrap();
+            let _ = done_tx.send(got);
+            // Keep `b` (and its socket) alive while `a` may still
+            // retransmit unacked tail segments — a closed peer port makes
+            // loopback ICMP refuse the resend, mirroring a real
+            // disconnecting peer.
+            let mut sink = [0u8; 512];
+            while b.read(&mut sink).await.is_ok() {}
+        });
+        let start = Instant::now();
+        a.write_all(&msg).await.unwrap();
+        a.flush().await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "12KB at 4KB/s flushed in {elapsed:?} — the bucket did not throttle"
+        );
+        let got = tokio::time::timeout(Duration::from_secs(15), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, msg);
+        drain.abort();
     }
 }

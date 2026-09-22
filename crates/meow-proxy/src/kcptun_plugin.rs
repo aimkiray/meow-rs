@@ -33,7 +33,7 @@ use tracing::{debug, warn};
 
 use crate::dialer::TcpDialer;
 use crate::mux::smux;
-use crate::plugin_util::{parse_bool, sip003_opts};
+use crate::plugin_util::{parse_bool, parse_bool_strict, sip003_opts};
 use crate::uot::{encode_uot_addr, read_uot_addr};
 
 /// Legacy UDP-over-TCP magic destination (sing-box `uot` v1 / mihomo
@@ -102,7 +102,9 @@ pub(crate) fn parse_opts(opts: &str) -> Result<KcpConfig> {
                 }
                 cfg.dscp = dscp;
             }
-            "nocomp" => cfg.no_comp = parse_bool(&v, "kcptun", "nocomp"),
+            // A mistyped value silently toggles the snappy layer — the
+            // wire either compresses or it does not, so this must error.
+            "nocomp" => cfg.no_comp = parse_bool_strict(&v, "kcptun", "nocomp")?,
             "acknodelay" => cfg.ack_nodelay = parse_bool(&v, "kcptun", "acknodelay"),
             "nodelay" => cfg.nodelay = num(&v, "nodelay")?,
             "interval" => cfg.interval = num(&v, "interval")?,
@@ -121,6 +123,18 @@ pub(crate) fn parse_opts(opts: &str) -> Result<KcpConfig> {
     // nodelay/interval/resend/nc under any non-manual mode — the same
     // ordering upstream applies after decoding the JSON option map.
     cfg.fill_defaults();
+
+    // Upstream accepts any `mode`/`crypt` string (`_ => {}` / default
+    // AES-256-CFB); a typo silently changes the wire, so warn loudly.
+    match cfg.mode.as_str() {
+        "normal" | "fast" | "fast2" | "fast3" | "manual" => {}
+        other => warn!("kcptun: unrecognized mode '{other}' — KCP knobs stay as configured"),
+    }
+    match cfg.crypt.as_str() {
+        "aes" | "aes-256" | "aes-128" | "aes-192" | "aes-128-gcm" | "salsa20" | "none" | "null"
+        | "xor" | "tea" | "xtea" | "blowfish" | "twofish" | "cast5" | "3des" | "sm4" => {}
+        other => warn!("kcptun: unrecognized crypt '{other}' maps to aes-256 (upstream default)"),
+    }
 
     if cfg.smux_ver != 1 {
         return Err(MeowError::Config(format!(
@@ -247,7 +261,11 @@ impl KcptunClient {
 
         let session = self.dial().await?;
         let expire_at = (self.cfg.auto_expire > 0)
-            .then(|| Instant::now() + Duration::from_secs(self.cfg.auto_expire as u64));
+            .then(|| {
+                // A deadline beyond the clock's range simply never expires.
+                Instant::now().checked_add(Duration::from_secs(self.cfg.auto_expire as u64))
+            })
+            .flatten();
         let mut pool = self.pool.lock();
         pool.retain(Self::usable);
         if pool.len() < self.cfg.conn as usize {

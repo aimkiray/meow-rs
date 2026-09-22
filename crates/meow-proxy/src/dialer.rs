@@ -184,16 +184,20 @@ mod packet_conn_socket {
         /// `&mut` poll methods go through `get_mut`, never the lock.
         inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
         outbound: Mutex<PollSender<Vec<u8>>>,
-        /// Aborted on drop: the task parks inside `read_packet` and would
-        /// otherwise outlive the socket, pinning the front-proxy UDP
-        /// association open across KCP session churn. The write pump needs
-        /// no handle — it exits when the `PollSender` side closes.
+        /// Aborted on drop: the read task parks inside `read_packet` and
+        /// would otherwise outlive the socket, pinning the front-proxy UDP
+        /// association open across KCP session churn. The write pump exits
+        /// on its own once the `PollSender` side closes — but only after
+        /// the in-flight `write_packet` completes, so a wedged front-proxy
+        /// conn would pin it indefinitely; abort that one too.
         read_task: tokio::task::JoinHandle<()>,
+        write_task: tokio::task::JoinHandle<()>,
     }
 
     impl Drop for PacketConnSocket {
         fn drop(&mut self) {
             self.read_task.abort();
+            self.write_task.abort();
         }
     }
 
@@ -212,7 +216,7 @@ mod packet_conn_socket {
                 }
                 let _ = reader.close();
             });
-            tokio::spawn(async move {
+            let write_task = tokio::spawn(async move {
                 while let Some(pkt) = out_rx.recv().await {
                     if conn.write_packet(&pkt, &remote).await.is_err() {
                         break;
@@ -225,6 +229,7 @@ mod packet_conn_socket {
                 inbound: Mutex::new(inbound),
                 outbound: Mutex::new(PollSender::new(outbound)),
                 read_task,
+                write_task,
             }
         }
     }

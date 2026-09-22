@@ -32,7 +32,7 @@ These always exist and need no definition:
 | --- | --- | --- | --- |
 | `name` | string | — | **Required.** Unique identity |
 | `type` | string | — | **Required.** Protocol (below) |
-| `dialer-proxy` | string | — | Reach this server *through* another proxy/group (chained dialing, TCP only). Cycles are detected and ignored |
+| `dialer-proxy` | string | — | Reach this server *through* another proxy/group (chained dialing). UDP-capable transports (e.g. kcptun's KCP sessions) tunnel their datagrams over the front proxy's UDP association too. Cycles are detected and ignored |
 
 Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vmess`,
 `hysteria2`, `snell`, `anytls`). Default builds enable the common set.
@@ -48,7 +48,7 @@ Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vme
 | `password` | string | ✓ | — | |
 | `cipher` | string | ✓ | — | e.g. `aes-256-gcm`, `chacha20-ietf-poly1305` |
 | `udp` | bool | | `false` | Enable UDP relay |
-| `plugin` | string | | — | `obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`, `ech-tls-tunnel` (built-in, no external binary) |
+| `plugin` | string | | — | `obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`, `kcptun`, `ech-tls-tunnel` (built-in, no external binary) |
 | `plugin-opts` | string \| map | | — | Plugin options |
 
 ```yaml
@@ -157,6 +157,46 @@ There is deliberately no `skip-cert-verify`: jls's random authentication
 *is* the certificate check — an authenticated server random skips chain
 verification (upstream `jlsAuthenticated()`), an unauthenticated one runs
 full PKI and then rejects the connection.
+
+`kcptun` tunnels the SS stream through KCP (ARQ over UDP) — crypt
+envelope + optional Reed-Solomon FEC + snappy + smux v1, wire-compatible
+with `xtaci/kcp-go` (which mihomo's plugin tracks). UDP is relayed via
+legacy UDP-over-TCP (`uot`) on a multiplexed session, matching upstream's
+forced `UDPOverTCP`:
+
+```yaml
+- name: ss-kcptun
+  type: ss
+  server: 1.2.3.4
+  port: 8388
+  cipher: aes-256-gcm
+  password: "•••"
+  plugin: kcptun
+  plugin-opts:
+    key: "session-key"      # PBKDF2 input — the crypt secret
+    crypt: aes              # aes aes-128 aes-192 blowfish twofish cast5
+                            # 3des xtea tea xor salsa20 aes-128-gcm none null
+    mode: fast              # normal fast fast2 fast3 manual
+    conn: 1                 # parallel KCP sessions (round-robin)
+    datashard: 10           # FEC data shards (0 → default, as upstream)
+    parityshard: 3          # FEC parity shards
+    mtu: 1350
+    nocomp: false           # true disables the snappy layer
+    keepalive: 10           # smux NOP interval seconds
+    autoexpire: 0           # session rotation seconds
+    # sndwnd rcvwnd sockbuf smuxbuf framesize streambuf
+    # nodelay interval resend nc ratelimit dscp scavengettl acknodelay
+```
+
+Divergences from upstream: `crypt=sm4` is a hard error (no stable Rust
+SM4 crate — a silent AES fallback would never authenticate);
+`smuxver != 1` errors (this build speaks smux v1 only); `acknodelay` is
+accepted and ignored; `nodelay=2` degrades to level 1 (the `kcp` core
+exposes a bool, not the level knob); `scavengettl` is advisory — dead
+sessions are re-dialed lazily instead of a scavenge list; an `mtu` that
+leaves under 50 bytes of segment room after envelope overhead is a
+hard dial error (upstream ignores `SetMtu` failure and silently keeps
+1400).
 
 ---
 

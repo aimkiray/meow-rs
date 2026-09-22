@@ -712,7 +712,10 @@ impl Session {
             let ka_cancel = cancel.clone();
             let ka_writer_tx = writer_tx.clone();
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
+                // `interval` ticks once immediately — upstream's first NOP
+                // goes out a full interval after session start.
+                let mut ticker =
+                    tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
                 loop {
                     tokio::select! {
                         _ = ka_cancel.cancelled() => break,
@@ -1094,7 +1097,9 @@ impl AsyncRead for SmuxStream {
                                 return Poll::Ready(Ok(()));
                             }
                             None => {
-                                this.eof = true;
+                                // Don't latch `eof` on the error arms —
+                                // upstream returns the close error on every
+                                // read, not just the first.
                                 if this.aborted.load(Ordering::Acquire) {
                                     return Poll::Ready(Err(io::Error::new(
                                         io::ErrorKind::ConnectionAborted,
@@ -1107,6 +1112,7 @@ impl AsyncRead for SmuxStream {
                                         "smux session closed",
                                     )));
                                 }
+                                this.eof = true;
                                 return Poll::Ready(Ok(()));
                             }
                         }
@@ -1165,6 +1171,14 @@ impl AsyncWrite for SmuxStream {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "smux session closed",
+            )));
+        }
+        // A PSH queued behind the FIN would corrupt upstream ordering —
+        // `stream.Write` after `Close` is `ErrClosed`.
+        if this.fin_sent {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "smux stream closed",
             )));
         }
         let written = buf.len().min(this.session.max_frame_size);

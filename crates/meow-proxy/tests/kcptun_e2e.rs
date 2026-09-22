@@ -136,7 +136,13 @@ async fn kcptun_tcp_echo_aes_snappy_fec() {
 }
 
 #[tokio::test]
-async fn kcptun_tcp_echo_salsa20_nocomp_nofec() {
+async fn kcptun_tcp_echo_salsa20_nocomp_asymmetric_fec() {
+    // `datashard=0`/`parityshard=0` is unexpressible upstream too —
+    // `FillDefaults` maps 0 → 10/3 on both sides — so the client still
+    // encodes FEC 10+3 while the server (`-ds 0 -ps 0`, straight into
+    // kcp-go without the plugin's defaults) runs no encoder and lazily
+    // builds a 1+1 decoder + autotune. The wire is *asymmetric* FEC:
+    // client parity on, server parity off.
     let Some((_child, addr)) =
         spawn_server(&["-crypt", "salsa20", "-nocomp", "-ds", "0", "-ps", "0"]).await
     else {

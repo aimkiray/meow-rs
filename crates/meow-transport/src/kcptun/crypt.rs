@@ -529,4 +529,100 @@ mod tests {
             assert!(crypt.open(&mut vec![0u8; 3]).is_err(), "{name}");
         }
     }
+
+    /// x/crypto-generated vectors — a self-consistent roundtrip cannot
+    /// catch a symmetric misimplementation, so the in-tree ciphers are
+    /// pinned byte-exact here (and again end-to-end by the Go e2e).
+    /// `tea.NewCipherWithRounds(key, 16)` / `xtea.NewCipher(key)`.
+    #[test]
+    fn in_tree_ciphers_match_go_vectors() {
+        let key: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let mut blk = [0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48];
+        Tea16::new(&key).encrypt(&mut blk);
+        assert_eq!(blk, [0x1c, 0x5f, 0x50, 0xd6, 0xf3, 0xd8, 0xed, 0xb9]);
+        let mut blk = [0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48];
+        Xtea::new(&key).encrypt(&mut blk);
+        assert_eq!(blk, [0x49, 0x7d, 0xf3, 0xd0, 0x72, 0x61, 0x2c, 0xb5]);
+
+        let key2: [u8; 16] = [
+            0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 1, 2, 3, 4, 5, 6, 7, 8,
+        ];
+        let mut blk2 = [0xff, 0x00, 0xaa, 0x55, 0x12, 0x34, 0x56, 0x78];
+        Tea16::new(&key2).encrypt(&mut blk2);
+        assert_eq!(blk2, [0x1c, 0xc6, 0x86, 0xa3, 0x64, 0xb0, 0x6b, 0xec]);
+        let mut blk2 = [0xff, 0x00, 0xaa, 0x55, 0x12, 0x34, 0x56, 0x78];
+        Xtea::new(&key2).encrypt(&mut blk2);
+        assert_eq!(blk2, [0x2f, 0x53, 0x4f, 0x95, 0x6f, 0xd1, 0x2a, 0x7a]);
+    }
+
+    /// `NewSimpleXORBlockCrypt(pass)` derives its table via a second
+    /// PBKDF2 over the *session* key — pin the head, tail, and length so
+    /// an off-by-one in `take(MTU_LIMIT)` or a salt/rounds typo fails
+    /// locally instead of only under the Go e2e.
+    #[test]
+    fn xor_table_matches_go_pbkdf2() {
+        let Crypt::Xor(tbl) = Crypt::new("xor", b"it's a secrect").unwrap() else {
+            panic!("xor must build the Xor variant");
+        };
+        assert_eq!(tbl.len(), 1500, "table must cover the MTU limit");
+        let head: [u8; 32] = tbl[..32].try_into().unwrap();
+        assert_eq!(
+            head,
+            [
+                0x0f, 0xfe, 0x89, 0x87, 0xad, 0x94, 0x75, 0x71, 0x54, 0x79, 0x1b, 0xc8, 0xfa, 0x01,
+                0xb6, 0x2c, 0x6b, 0xce, 0x01, 0x06, 0xb2, 0x95, 0x40, 0x13, 0xcd, 0x52, 0x3f, 0xbc,
+                0x1f, 0x7a, 0xac, 0x8c,
+            ]
+        );
+        let tail: [u8; 16] = tbl[1484..].try_into().unwrap();
+        assert_eq!(
+            tail,
+            [
+                0xdf, 0x44, 0x60, 0x78, 0x71, 0xb1, 0x9a, 0x36, 0x2f, 0x76, 0x40, 0xdb, 0x6a, 0x16,
+                0x01, 0x14,
+            ]
+        );
+    }
+
+    /// `crypt=sm4` has no stable Rust implementation — the build refuses
+    /// loudly at crypt-construction, not just at `plugin-opts` parsing.
+    #[test]
+    fn sm4_hard_errors() {
+        match Crypt::new("sm4", b"key") {
+            Err(e) => assert!(e.to_string().contains("sm4"), "{e}"),
+            Ok(_) => panic!("sm4 must not map to AES"),
+        }
+    }
+
+    /// The envelope must catch a wrong session key: for every crypt that
+    /// carries integrity (CRC or GCM tag), opening a packet sealed under
+    /// a different key fails. `none`/`null` carry no key-dependent check
+    /// — by design, like upstream.
+    #[test]
+    fn wrong_key_fails_envelope() {
+        for name in [
+            "aes",
+            "aes-128",
+            "aes-192",
+            "aes-128-gcm",
+            "salsa20",
+            "blowfish",
+            "cast5",
+            "3des",
+            "twofish",
+            "xtea",
+            "tea",
+            "xor",
+        ] {
+            let sealer = Crypt::new(name, b"it's a secrect").unwrap();
+            let mut buf = vec![0u8; sealer.header_size()];
+            buf.extend_from_slice(b"payload bytes");
+            sealer.seal(&mut buf);
+            let opener = Crypt::new(name, b"a different key").unwrap();
+            assert!(
+                opener.open(&mut buf).is_err(),
+                "{name} opened a packet sealed under another key"
+            );
+        }
+    }
 }
