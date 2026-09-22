@@ -119,15 +119,15 @@ to be set by hand). The semantics differ sharply from `proxy-providers`:
   is not writable the refresh still applies at runtime but persists
   nothing; if the committed `dns:` section fails to rebuild, the refresh
   is not committed at all — the previous routing stays live and nothing
-  is saved.
+  is saved (though `last-updated` is still stamped in memory, so the
+  failed document is not retried until `interval`).
 - **Refetch cadence.** A background task polls every 60 s: an entry is
   fetched when it has no `last-updated` (first run) or when `interval`
   seconds have elapsed. An entry without `interval` fetches once at
-  startup and — once a fetch succeeds — never again; a fetch that keeps
-  failing is retried every poll. Note that an explicit `interval: 0`
-  behaves differently than on providers: it refetches every poll
-  (60 s), not "never". Fetches go over a direct connection, not
-  through the tunnel.
+  startup and — once `last-updated` is stamped — never again. Note that
+  an explicit `interval: 0` behaves differently than on providers: it
+  refetches every poll (60 s), not "never". Fetches go over a direct
+  connection, not through the tunnel.
 - **One subscription at a time.** Every entry wholesale-replaces the
   same three sections, so multiple subscriptions perpetually clobber
   each other — last refresh wins. Declaring several is almost never
@@ -141,20 +141,28 @@ to be set by hand). The semantics differ sharply from `proxy-providers`:
   file exactly as written — including whatever a previous refresh wrote
   back — and exits before the refresh loop starts. (It is not fully
   network-free: `load_config` still fetches `proxy-providers:`,
-  prefetches `rule-providers:` payloads, and may download geodata.)
+  prefetches `rule-providers:` payloads, may download geodata, and
+  performs ECH pre-resolution DNS lookups.)
 - **Safety.** `ss` nodes carrying external SIP003 `plugin:` values are
   dropped at parse time: remote content must not select a local
   executable, and unlike `proxy-providers` there is no
-  `allow-external-plugin` opt-in for subscriptions. If a fetch fails,
-  the entry is retried on the next poll; if a fetched document fails to
-  rebuild, the previous routing stays live and `last-updated` is still
-  stamped, so a broken document is only retried after `interval`. Under
-  `strict: true`, payload *shape* defects (a non-mapping `proxies:`
-  entry, a malformed `proxy-groups:`/`rules:` item) are fetch errors
-  instead — retried every poll.
+  `allow-external-plugin` opt-in for subscriptions. Failure handling
+  splits on *what* failed, not where: a **transport** failure (connect
+  error, non-2xx response) leaves `last-updated` unset, so the fetch is
+  retried on the next poll. Everything else — a **payload defect**
+  (non-UTF-8 body, YAML that does not parse, a missing `proxies:`
+  section, non-sequence sections, and under `strict: true` any shape
+  defect such as a non-mapping `proxies:` entry or a malformed
+  `proxy-groups:`/`rules:` item), a fetched document that **fails to
+  rebuild**, a strict-mode **ECH pre-resolution** failure, and a `dns:`
+  reconcile failure — stamps `last-updated` instead, so the entry is
+  not retried until `interval` has elapsed (and, for an entry without
+  `interval`, never). For rebuild-class failures the previous routing
+  stays live throughout.
 
 Subscriptions can also be managed at runtime via the
-[REST API](../reference/rest-api) (`GET`/`POST`/`DELETE` `/api/subscriptions`,
+[REST API](../reference/rest-api) (`GET`/`POST` `/api/subscriptions`,
+`DELETE /api/subscriptions/{name}`,
 `POST /api/subscriptions/{name}/refresh`); those endpoints follow the same
 replace-and-write-back semantics.
 
@@ -236,10 +244,15 @@ acquired payload is fatal under strict, while a failed download is not.
 
 Two scope notes: `PUT /configs` rebuilds apply strictness to the candidate's
 `proxies:`/`proxy-groups:`/`rules:`/`rule-providers:`/`proxy-providers:` —
-unchanged provider defs are reused unvalidated, but new or changed defs are
-constructed (and validated) on PUT, and every committed provider adopts the
-candidate's `strict` flag. A provider's already-fetched *payload* is not
-re-validated on PUT. And `strict: true` combined with `subscriptions:` means a
+the two provider kinds behave differently there. `proxy-providers:` unchanged
+defs are reused unvalidated (a def changed only in `interval` still counts as
+unchanged), new or changed defs are constructed (and validated) on PUT, every
+committed provider adopts the candidate's `strict` flag, and an
+already-fetched payload is not re-validated. `rule-providers:` are rebuilt
+fully on every PUT — each definition is re-constructed *and* each payload
+re-fetched or re-read and re-validated under the candidate's strict flag, so
+a strict PUT can be rejected by a payload a lenient load accepted. And
+`strict: true` combined with `subscriptions:` means a
 subscription delivering an unparseable node makes every refresh fail — the
 previous config is kept, but check subscription contents before enabling
 strict.

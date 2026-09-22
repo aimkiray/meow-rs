@@ -31,7 +31,7 @@ static files instead.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/` | Health check — returns `"meow-rs"` |
+| `GET` | `/` | Health check — returns `{"hello":"meow"}` |
 | `GET` | `/version` | `{ version, meta: true }` |
 
 ## Proxies

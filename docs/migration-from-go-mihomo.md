@@ -526,7 +526,6 @@ using them will produce a clear error at startup.
 
 | Feature | Reason | Alternative |
 |---------|--------|-------------|
-| External plugin subprocess (v2ray-plugin bin) | No subprocess exec in M1 | Built-in transport layer (WS + TLS) |
 | TUIC, WireGuard, SSH protocols | Protocol scope and dependency budget | Revisit in M2+ if users need them |
 | TUN inbound | Out of scope for this kernel | Use `tproxy-port` with nftables/pf |
 
@@ -540,7 +539,7 @@ tools built for Go mihomo will ignore them.
 | Feature | Path / Field | Notes |
 |---------|-------------|-------|
 | Prometheus metrics | `GET /metrics` | Native scrape endpoint; Go mihomo has no equivalent (M1.H-2) |
-| Subscription management API | `GET\|POST\|DELETE /api/subscriptions[/:name]`, `POST /api/subscriptions/{name}/refresh` | meow-rs-specific |
+| Subscription management API | `GET\|POST /api/subscriptions`, `DELETE /api/subscriptions/{name}`, `POST /api/subscriptions/{name}/refresh` | meow-rs-specific |
 | Extended proxy group API | `GET\|POST\|PUT\|DELETE /api/proxy-groups[/:name]` | meow-rs-specific |
 | Rule CRUD API | `POST\|PUT\|DELETE /rules[/:index]` | Runtime rule editing |
 

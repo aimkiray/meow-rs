@@ -157,10 +157,7 @@ Upstream rules in `rules/common/` plus `logic/` and `provider/`. Rust rules in `
 
 Upstream supports provider `type: http | file | inline` and `behavior: domain | ipcidr | classical`, with `format: yaml | text | mrs`, plus periodic refresh.
 
-Rust port (`config/rule_provider.rs`) supports: http + file, domain/ipcidr/classical, yaml + text. **Gaps:**
-- `inline` provider type
-- `mrs` binary format
-- `interval` periodic refresh (field accepted but ignored — loaded once at startup; documented in `raw.rs`)
+Rust port (`config/rule_provider.rs`) supports: http + file + inline, domain/ipcidr/classical, yaml + text + mrs, and periodic refresh for http providers (M1.D-5). `interval` is ignored with a warning for `file` providers and rejected for `inline`.
 
 ---
 
@@ -226,7 +223,7 @@ Upstream `hub/route/` mounts these sub-routers, and Clash Dashboard / Yacd expec
 | `POST /cache/fakeip/flush`   | Yes | Yes | OK — clears every fake-IP allocation, 204 on success |
 | `POST /restart`              | Yes | No  | Gap — low priority |
 | `POST /upgrade`              | Yes | No  | Gap — low priority |
-| Auth (Bearer `secret`)       | Yes | No  | **Gap** — `secret` field parsed but never enforced (`#[allow(dead_code)]` in `AppState`) |
+| Auth (Bearer `secret`)       | Yes | Yes | OK — enforced on all REST routes when `secret` is non-empty |
 | CORS                         | Yes | Yes | OK (permissive) |
 | `/ui` static                 | Yes | Yes | OK |
 
@@ -235,7 +232,7 @@ Upstream `hub/route/` mounts these sub-routers, and Clash Dashboard / Yacd expec
 These are unique to this port; document them for API consumers:
 
 - `POST /api/config/save`
-- `GET|POST|DELETE /api/subscriptions[/:name[/refresh]]`
+- `GET|POST /api/subscriptions`, `DELETE /api/subscriptions/:name`, `POST /api/subscriptions/:name/refresh`
 - `GET|POST|PUT|DELETE /api/proxy-groups[/:name[/select]]`
 - `POST /rules` (replace), `PUT /rules` (update by index), `DELETE /rules/:index`, `POST /rules/reorder`
 

@@ -152,9 +152,11 @@ rules:
 # above with the fetched document's — local entries there are overwritten —
 # and the result is written back to this file (re-serialised — comments are
 # lost; a .bak of the previous file is kept once). `interval` is in seconds;
-# omit it to fetch once — a failing fetch is retried every 60 s until one
-# succeeds, then never again. `-t` validates the file as written and does
-# not fetch subscriptions. See website/guide/configuration.md.
+# omit it to fetch once. A transport failure (unreachable/non-2xx) retries
+# every 60 s, but an unparseable or shape-defective document stamps
+# last-updated and is retried only after `interval` — never, for an
+# interval-less entry. `-t` validates the file as written and does not
+# fetch subscriptions. See website/guide/configuration.md.
 # subscriptions:
 #   - name: airport
 #     url: https://example.com/clash.yaml
