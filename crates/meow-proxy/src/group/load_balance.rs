@@ -772,6 +772,19 @@ mod tests {
             0,
             "probe dials must not mark the group as used"
         );
+        // #555: housekeeping traffic marked `internal` (provider/geodata
+        // fetches, DNS-via-proxy, dialer-proxy-chained probes) is skipped
+        // the same way — both disjuncts of `is_internal()` are covered.
+        let internal_meta = Metadata {
+            internal: true,
+            ..meta_no_src()
+        };
+        let _ = group.dial_tcp(&internal_meta).await;
+        assert_eq!(
+            group.usage_generation(),
+            0,
+            "internal dials must not mark the group as used"
+        );
         let _ = group.dial_tcp(&meta_no_src()).await;
         assert_eq!(group.usage_generation(), 1, "real traffic still marks use");
     }

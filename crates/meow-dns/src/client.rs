@@ -2049,4 +2049,83 @@ mod tests {
         let ans = classify_family_message(&msg);
         assert!(matches!(ans, FamilyAnswer::Failed));
     }
+
+    /// `Proxy` that records the `Metadata` of every `dial_tcp` and refuses
+    /// the connection — pins the `internal` marker on DNS-via-proxy
+    /// exchanges (#555): a `lazy` group serving `#PROXY` upstreams must
+    /// not count resolver housekeeping as use.
+    struct CapturingMetaProxy {
+        seen: std::sync::Mutex<Vec<meow_common::Metadata>>,
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for CapturingMetaProxy {
+        fn name(&self) -> &str {
+            "capture"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            self.seen.lock().unwrap().push(m.clone());
+            Err(meow_common::MeowError::NotSupported(
+                "capture mock refuses connections".into(),
+            ))
+        }
+        async fn dial_udp(
+            &self,
+            _m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            unimplemented!("capture mock has no UDP")
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for CapturingMetaProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_tcp_exchange_marks_metadata_internal() {
+        let proxy = std::sync::Arc::new(CapturingMetaProxy {
+            seen: std::sync::Mutex::new(Vec::new()),
+            health: meow_common::ProxyHealth::new(),
+        });
+        let dyn_proxy: DnsProxy = std::sync::Arc::<CapturingMetaProxy>::clone(&proxy);
+        let _ = proxy_tcp_exchange(&dyn_proxy, "8.8.8.8:53".parse().unwrap(), b"\x00").await;
+        let seen = proxy.seen.lock().unwrap();
+        let meta = seen.first().expect("the exchange must reach dial_tcp");
+        assert!(
+            meta.internal,
+            "DNS-via-proxy exchanges are housekeeping — a lazy group \
+             must not count them as use"
+        );
+        assert_eq!(meta.conn_type, meow_common::ConnType::Inner);
+    }
 }

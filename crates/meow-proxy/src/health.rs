@@ -65,8 +65,9 @@ pub async fn url_test(
     // the metadata instead.  Groups skip the usage-generation bump for
     // these dials — counting probes as "use" would defeat lazy health
     // checks for nested groups.  No production dialer sets
-    // `ConnType::Tunnel` today; if a tunnel inbound ever reuses the
-    // variant, probes need their own explicit marker.
+    // `ConnType::Tunnel` today; `Metadata::internal` (#555) is the
+    // explicit escape hatch `is_internal()` also honours, should a
+    // tunnel inbound ever need to reuse the variant.
     let metadata = meow_common::Metadata {
         network: meow_common::Network::Tcp,
         conn_type: meow_common::ConnType::Tunnel,

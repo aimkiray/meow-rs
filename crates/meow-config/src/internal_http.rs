@@ -838,4 +838,83 @@ mod tests {
             .unwrap();
         assert_eq!(body, b"ok");
     }
+
+    /// `Proxy` that records the `Metadata` of every `dial_tcp` and refuses
+    /// the connection — pins the `internal` marker on housekeeping fetches
+    /// (#555): a `lazy` group serving provider/geodata downloads must not
+    /// count them as use.
+    struct CapturingMetaProxy {
+        seen: std::sync::Mutex<Vec<Metadata>>,
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for CapturingMetaProxy {
+        fn name(&self) -> &str {
+            "capture"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            m: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            self.seen.lock().unwrap().push(m.clone());
+            Err(meow_common::MeowError::NotSupported(
+                "capture mock refuses connections".into(),
+            ))
+        }
+        async fn dial_udp(
+            &self,
+            _m: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            unimplemented!("capture mock has no UDP")
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for CapturingMetaProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_via_proxy_marks_metadata_internal() {
+        let proxy = Arc::new(CapturingMetaProxy {
+            seen: std::sync::Mutex::new(Vec::new()),
+            health: meow_common::ProxyHealth::new(),
+        });
+        let dyn_proxy: Arc<dyn Proxy> = Arc::<CapturingMetaProxy>::clone(&proxy);
+        let _ = fetch_via_proxy("http://192.0.2.1/rules.yaml", &dyn_proxy).await;
+        let seen = proxy.seen.lock().unwrap();
+        let meta = seen.first().expect("the fetch must reach dial_tcp");
+        assert!(
+            meta.internal,
+            "provider/geodata downloads are housekeeping — a lazy group \
+             must not count them as use"
+        );
+        assert_eq!(meta.conn_type, ConnType::Http);
+    }
 }

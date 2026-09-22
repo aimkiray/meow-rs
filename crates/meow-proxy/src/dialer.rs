@@ -687,6 +687,14 @@ mod tests {
         assert_eq!(meta.dst_port, 853);
         assert!(!meta.internal);
 
+        // The internal arm of the same IP-literal path — the marker rides
+        // the `Ok(ip)` rebuild branch too.
+        let _ = dialer.dial("192.0.2.9", 853, true).await;
+        let meta = last_seen(&mock);
+        assert_eq!(meta.conn_type, ConnType::Inner);
+        assert_eq!(meta.dst_ip, Some("192.0.2.9".parse().unwrap()));
+        assert!(meta.internal);
+
         // SocketAddr target through dial_addr() — typed dst_ip + marker.
         let addr: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
         let _ = dialer.dial_addr(addr, true).await;
@@ -697,7 +705,36 @@ mod tests {
         assert!(meta.internal);
         assert_eq!(meta.dst_port, 443);
 
-        assert_eq!(mock.seen.lock().unwrap().len(), 4);
+        assert_eq!(mock.seen.lock().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn named_proxy_dialer_forwards_internal_marker() {
+        // `NamedProxyDialer` is the dialer every `dialer-proxy` adapter
+        // actually receives — the production path for #555. It must
+        // forward `internal` into `ProxyDialer`'s reconstruction, or the
+        // lazy front-hop group counts housekeeping dials as use while
+        // every `ProxyDialer` test still passes.
+        let registry = ProxyRegistry::default();
+        let mock = Arc::new(CapturingProxy {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert(SmolStr::from("front"), Arc::clone(&mock) as Arc<dyn Proxy>);
+        registry.publish(Arc::new(proxies));
+
+        let dialer = NamedProxyDialer::new(DialerTarget::new("front", &registry));
+        let _ = dialer.dial("chain.example", 443, true).await;
+        let meta = last_seen(&mock);
+        assert_eq!(meta.conn_type, ConnType::Inner);
+        assert!(meta.internal, "internal must survive NamedProxyDialer");
+
+        let _ = dialer.dial("chain.example", 443, false).await;
+        assert!(!last_seen(&mock).internal, "user dials stay unmarked");
+
+        let addr: SocketAddr = "192.0.2.10:8443".parse().unwrap();
+        let _ = dialer.dial_addr(addr, true).await;
+        assert!(last_seen(&mock).internal, "dial_addr forwards it too");
     }
 
     #[tokio::test]

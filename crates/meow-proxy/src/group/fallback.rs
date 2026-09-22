@@ -517,6 +517,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_dial_failures_still_mark_member_dead() {
+        // `touch_user_traffic` skips internal dials, but
+        // `record_dial_failure` deliberately does NOT (#555): a failed
+        // housekeeping dial is real evidence the member is down — the
+        // asymmetry must hold or housekeeping could mask a dead member.
+        let a = MockProxy::new_failing("a", AdapterType::Shadowsocks, "dial timed out");
+        let a_ref = Arc::clone(&a);
+        let g = FallbackGroup::new("fb", vec![a, MockProxy::new("b")]);
+        let internal_meta = Metadata {
+            internal: true,
+            ..Default::default()
+        };
+
+        for _ in 0..5 {
+            let _ = g.dial_tcp(&internal_meta).await;
+        }
+        assert!(
+            !a_ref.alive(),
+            "internal dial failures must still escalate to dead"
+        );
+        // …and the usage gate stays untouched by the same dials.
+        assert_eq!(g.usage_generation(), 0);
+    }
+
+    #[tokio::test]
     async fn connection_refused_marks_member_dead_immediately() {
         // mihomo escalates "connection refused" without waiting for the
         // failure streak.
