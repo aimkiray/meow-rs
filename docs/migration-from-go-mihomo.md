@@ -372,9 +372,11 @@ preceding hop's stream (mihomo `DialContextWithDialer` semantics).
 `anytls`, and `ss` (built-in obfs/v2ray-plugin/ech-tls-tunnel included) all
 terminate a relay chain. Two carve-outs fail loudly instead of silently
 misbehaving: `hysteria2` (QUIC/UDP cannot ride a TCP stream — first-hop
-only) and `ss` with an external SIP003 plugin (the subprocess owns its
-outbound leg). Mux pooling (`smux`/`yamux`/`h2mux`/`muxcool`) is bypassed on
-relay hops: a relay-supplied stream is single-use and cannot be re-dialled.
+only) and `ss` with `gost-plugin`/`shadow-tls`/`restls`/`jls` or an
+external SIP003 plugin (the plugin owns its outbound leg — a record-level
+transport cannot be replayed over an already-proxied stream). Mux pooling
+(`smux`/`yamux`/`h2mux`/`muxcool`) is bypassed on relay hops: a
+relay-supplied stream is single-use and cannot be re-dialled.
 
 **No health-check on the relay group itself.** Relay is a fixed chain, not
 a pool. For health-aware relay, wrap relay groups inside a Fallback group.

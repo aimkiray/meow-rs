@@ -48,7 +48,7 @@ Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vme
 | `password` | string | ✓ | — | |
 | `cipher` | string | ✓ | — | e.g. `aes-256-gcm`, `chacha20-ietf-poly1305` |
 | `udp` | bool | | `false` | Enable UDP relay |
-| `plugin` | string | | — | `obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `ech-tls-tunnel` (built-in, no external binary) |
+| `plugin` | string | | — | `obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`, `ech-tls-tunnel` (built-in, no external binary) |
 | `plugin-opts` | string \| map | | — | Plugin options |
 
 ```yaml
@@ -132,6 +132,31 @@ handshake itself is real TLS (tls12 or tls13):
     # name-cert-verify: ""     # verify the cert for this name instead of host
     # fingerprint: "AA:BB:…"   # SHA-256 cert pin, not uTLS
 ```
+
+`jls` authenticates inside a real TLS 1.3 handshake — `ClientHello`/
+`ServerHello` `random` carry an AES-256-GCM-sealed credential, so the auth
+blob is part of the handshake transcript and no generic TLS stack can
+speak it. Post-handshake is a plain TLS record stream (TLS 1.3 only):
+
+```yaml
+- name: ss-jls
+  type: ss
+  server: 1.2.3.4
+  port: 8388
+  cipher: aes-256-gcm
+  password: "•••"
+  plugin: jls
+  plugin-opts:
+    host: cover.example.com    # required — cover server name (TLS SNI)
+    username: "user"           # required — keyed into the auth nonce
+    password: "psk"            # required — keyed into the auth key
+    # alpn: "h2,http/1.1"      # comma-separated, default shown
+```
+
+There is deliberately no `skip-cert-verify`: jls's random authentication
+*is* the certificate check — an authenticated server random skips chain
+verification (upstream `jlsAuthenticated()`), an unauthenticated one runs
+full PKI and then rejects the connection.
 
 ---
 

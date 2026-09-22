@@ -470,7 +470,9 @@ fn client_cfg(cert_der: Option<&rustls::pki_types::CertificateDer<'static>>) -> 
         server_name: "cover.example.com".to_string(),
         username: USERNAME.to_string(),
         password: PASSWORD.to_string(),
-        alpn: vec![],
+        // The production default (upstream h2,http/1.1) — `alpn` empty
+        // means "no ALPN extension" since the parser owns the default.
+        alpn: vec!["h2".to_string(), "http/1.1".to_string()],
         additional_roots: cert_der
             .map(|c| vec![c.as_ref().to_vec()])
             .unwrap_or_default(),
@@ -677,22 +679,52 @@ async fn e2e_close_notify_impl() {
     server.await.unwrap();
 }
 
-/// Wrong password vs the mini jls server: the fixture's auth assertion
-/// kills it and the client's dial fails on the dropped connection.
+/// Wrong password vs a plain rustls cover: upstream behavior on failed
+/// credentials — the server cannot open the sealed random so it answers
+/// as an ordinary TLS server (unauthed SH.random), the client completes
+/// the *full* PKI-verified handshake, then rejects with the jls auth
+/// error. This exercises the client's SH-auth rejection with bad
+/// credentials — `e2e_unauthed_fails` covers only "no credentials".
 async fn e2e_wrong_password_fails_impl() {
-    let (cert_der, _key, _, _) = gen_cert(&["cover.example.com"]);
+    let (cert_der, key_der, _, _) = gen_cert(&["cover.example.com"]);
+    let cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key_der)
+        .expect("server config");
+    let mut conn = ServerConnection::new(Arc::new(cfg)).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let cert = cert_der.clone();
     let server = tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.unwrap();
-        let _ = jls_server(tcp, cert.as_ref()).await;
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        loop {
+            while conn.wants_write() {
+                let mut out = Vec::new();
+                conn.write_tls(&mut out).unwrap();
+                tcp.write_all(&out).await.unwrap();
+            }
+            if !conn.is_handshaking() {
+                return;
+            }
+            let mut buf = [0u8; 8192];
+            let n = tcp.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            conn.read_tls(&mut &buf[..n]).unwrap();
+            conn.process_new_packets().unwrap();
+        }
     });
     let mut cfg = client_cfg(Some(&cert_der));
     cfg.password = "wrong".to_string();
-    let res = jls::dial(TcpStream::connect(addr).await.unwrap(), &cfg).await;
-    assert!(res.is_err(), "wrong-password jls dial must fail");
-    let _ = server.await;
+    let err = jls::dial(TcpStream::connect(addr).await.unwrap(), &cfg)
+        .await
+        .err()
+        .expect("wrong-password jls dial must fail");
+    assert!(
+        err.to_string().contains("authentication failed"),
+        "wrong credentials must surface the jls auth rejection, got: {err}"
+    );
+    server.await.unwrap();
 }
 
 /// A KeyUpdate coalesced into the server Finished record arrives via
@@ -738,6 +770,190 @@ async fn e2e_coalesced_keyupdate_impl() {
     server.await.unwrap();
 }
 
+/// KeyUpdate(update_not_requested): the server rotates only its send
+/// epoch — the client's read key must rekey and its write key must NOT
+/// (no response record is owed). Both directions then work under their
+/// respective epochs.
+async fn e2e_ku_update_not_requested_impl() {
+    let (cert_der, _key, _, _) = gen_cert(&["cover.example.com"]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut s = jls_handshake(tcp, cert_der.as_ref(), false, &[])
+            .await
+            .unwrap();
+        // KU(0) sealed under the current epoch; server's send key rotates.
+        let rec = s.s_ap.seal(22, &[0x18, 0x00, 0x00, 0x01, 0x00]);
+        s.tcp.write_all(&rec).await.unwrap();
+        s.tcp.flush().await.unwrap();
+        s.s_ap_secret = traffic_update(&s.s_ap_secret);
+        s.s_ap = RecordCipher::new(&s.s_ap_secret);
+        let r = s.s_ap.seal(23, b"rotated");
+        s.tcp.write_all(&r).await.unwrap();
+        s.tcp.flush().await.unwrap();
+        // Client must NOT have sent a KeyUpdate — its next record is
+        // appdata under the *unrotated* client epoch.
+        let rec = read_record(&mut s.tcp).await.unwrap();
+        let (typ, body) = s.c_ap.open(&rec).expect("client reply opens old epoch");
+        assert_eq!(typ, 23);
+        assert_eq!(&body[..], b"still-epoch1");
+    });
+    let mut stream = jls::dial(TcpStream::connect(addr).await.unwrap(), &client_cfg(None))
+        .await
+        .expect("jls dial");
+    let mut buf = [0u8; 7];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"rotated");
+    stream.write_all(b"still-epoch1").await.unwrap();
+    stream.flush().await.unwrap();
+    server.await.unwrap();
+}
+
+/// A KeyUpdate with a body other than [0]/[1] is a fatal error, not a
+/// skip (upstream `unexpected_message` parity — an unrecognized KU
+/// request would desync the epoch).
+async fn e2e_malformed_keyupdate_impl() {
+    let (cert_der, _key, _, _) = gen_cert(&["cover.example.com"]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut s = jls_handshake(tcp, cert_der.as_ref(), false, &[])
+            .await
+            .unwrap();
+        let rec = s.s_ap.seal(22, &[0x18, 0x00, 0x00, 0x01, 0x02]);
+        s.tcp.write_all(&rec).await.unwrap();
+        s.tcp.flush().await.unwrap();
+    });
+    let mut stream = jls::dial(TcpStream::connect(addr).await.unwrap(), &client_cfg(None))
+        .await
+        .expect("jls dial");
+    let mut buf = [0u8; 8];
+    let err = stream
+        .read(&mut buf)
+        .await
+        .expect_err("malformed KU must fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    server.await.unwrap();
+}
+
+/// Non-KeyUpdate post-handshake handshake messages (NewSessionTicket and
+/// friends) are consumed and skipped — the stream keeps delivering data.
+async fn e2e_nst_skipped_impl() {
+    let (cert_der, _key, _, _) = gen_cert(&["cover.example.com"]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut s = jls_handshake(tcp, cert_der.as_ref(), false, &[])
+            .await
+            .unwrap();
+        // NewSessionTicket (typ 4) with a small plausible body.
+        let nst = [
+            0x04, 0x00, 0x00, 0x0a, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+        ];
+        let rec = s.s_ap.seal(22, &nst);
+        s.tcp.write_all(&rec).await.unwrap();
+        let r = s.s_ap.seal(23, b"after-nst");
+        s.tcp.write_all(&r).await.unwrap();
+        s.tcp.flush().await.unwrap();
+    });
+    let mut stream = jls::dial(TcpStream::connect(addr).await.unwrap(), &client_cfg(None))
+        .await
+        .expect("jls dial");
+    let mut buf = [0u8; 9];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"after-nst");
+    server.await.unwrap();
+}
+
+/// A fatal alert maps to ConnectionAborted; a flood of non-advancing
+/// records (stray CCS) trips the useless-record bound instead of
+/// livelocking `poll_read` inside one poll.
+async fn e2e_fatal_alert_impl() {
+    let (cert_der, _key, _, _) = gen_cert(&["cover.example.com"]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut s = jls_handshake(tcp, cert_der.as_ref(), false, &[])
+            .await
+            .unwrap();
+        let rec = s.s_ap.seal(21, &[0x02, 0x28]); // fatal + handshake_failure
+        s.tcp.write_all(&rec).await.unwrap();
+        s.tcp.flush().await.unwrap();
+    });
+    let mut stream = jls::dial(TcpStream::connect(addr).await.unwrap(), &client_cfg(None))
+        .await
+        .expect("jls dial");
+    let mut buf = [0u8; 8];
+    let err = stream
+        .read(&mut buf)
+        .await
+        .expect_err("fatal alert must fail");
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+    server.await.unwrap();
+}
+
+async fn e2e_useless_records_bounded_impl() {
+    let (cert_der, _key, _, _) = gen_cert(&["cover.example.com"]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut s = jls_handshake(tcp, cert_der.as_ref(), false, &[])
+            .await
+            .unwrap();
+        // 40 plaintext CCS records — legal noise, but past the 32 bound.
+        for _ in 0..40 {
+            s.tcp
+                .write_all(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01])
+                .await
+                .unwrap();
+        }
+        s.tcp.flush().await.unwrap();
+    });
+    let mut stream = jls::dial(TcpStream::connect(addr).await.unwrap(), &client_cfg(None))
+        .await
+        .expect("jls dial");
+    let mut buf = [0u8; 8];
+    let err = stream
+        .read(&mut buf)
+        .await
+        .expect_err("CCS flood must trip the useless bound");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    server.await.unwrap();
+}
+
+/// `shutdown()` emits a sealed close_notify ([1,0]); a write afterwards
+/// is BrokenPipe, matching real TLS stack semantics.
+async fn e2e_shutdown_close_notify_impl() {
+    let (cert_der, _key, _, _) = gen_cert(&["cover.example.com"]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut s = jls_handshake(tcp, cert_der.as_ref(), false, &[])
+            .await
+            .unwrap();
+        let rec = read_record(&mut s.tcp).await.unwrap();
+        let (typ, body) = s.c_ap.open(&rec).expect("client close_notify open");
+        assert_eq!(typ, 21);
+        assert_eq!(&body[..], &[0x01, 0x00]);
+    });
+    let mut stream = jls::dial(TcpStream::connect(addr).await.unwrap(), &client_cfg(None))
+        .await
+        .expect("jls dial");
+    stream.shutdown().await.unwrap();
+    let err = stream
+        .write_all(b"after-close")
+        .await
+        .expect_err("write after close_notify must be BrokenPipe");
+    assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    server.await.unwrap();
+}
+
 /// A ServerHello that does not echo our compat session_id is rejected by
 /// the shared driver's RFC 8446 §4.1.3 check — before the jls auth check.
 async fn e2e_session_id_mismatch_impl() {
@@ -768,14 +984,28 @@ async fn e2e_session_id_mismatch_impl() {
 /// a green round trip proves both directions against code we did not
 /// write, not self-consistency.
 ///
-/// Gated on `$JLS_SERVER_BIN`; loud-skips when unset. Build the harness
-/// from `tests/support/jls-server/`:
+/// Gated on `$JLS_SERVER_BIN`; fails when unset so a green run always
+/// exercised real-peer interop (`MEOW_JLS_E2E_ALLOW_SKIP=1` prints a loud
+/// explicit skip for local runs only — CI must never set it). Build the
+/// harness from `tests/support/jls-server/`:
 /// `(cd tests/support/jls-server && go build -o jls-server .)`
 async fn e2e_upstream_interop_impl() {
     use std::process::Stdio;
     let Some(bin) = std::env::var_os("JLS_SERVER_BIN") else {
-        eprintln!("SKIP: JLS_SERVER_BIN unset — point it at a built jls-server harness binary");
-        return;
+        if std::env::var_os("MEOW_JLS_E2E_ALLOW_SKIP").is_some() {
+            eprintln!(
+                "SKIP: JLS_SERVER_BIN unset and MEOW_JLS_E2E_ALLOW_SKIP \
+                 is set — upstream interop NOT exercised"
+            );
+            return;
+        }
+        panic!(
+            "JLS_SERVER_BIN is required for the upstream-interop leg \
+             (build tests/support/jls-server and point it at the binary). \
+             A green run must exercise real-peer interop, so this test \
+             refuses to silently skip — set MEOW_JLS_E2E_ALLOW_SKIP=1 \
+             only for a loud local skip."
+        );
     };
     let mut child = tokio::process::Command::new(&bin)
         .args([
@@ -830,4 +1060,16 @@ timed_test!(e2e_mid_record_eof, e2e_mid_record_eof_impl);
 timed_test!(e2e_close_notify, e2e_close_notify_impl);
 timed_test!(e2e_session_id_mismatch, e2e_session_id_mismatch_impl);
 timed_test!(e2e_coalesced_keyupdate, e2e_coalesced_keyupdate_impl);
+timed_test!(
+    e2e_ku_update_not_requested,
+    e2e_ku_update_not_requested_impl
+);
+timed_test!(e2e_malformed_keyupdate, e2e_malformed_keyupdate_impl);
+timed_test!(e2e_nst_skipped, e2e_nst_skipped_impl);
+timed_test!(e2e_fatal_alert, e2e_fatal_alert_impl);
+timed_test!(
+    e2e_useless_records_bounded,
+    e2e_useless_records_bounded_impl
+);
+timed_test!(e2e_shutdown_close_notify, e2e_shutdown_close_notify_impl);
 timed_test!(e2e_upstream_interop, e2e_upstream_interop_impl);

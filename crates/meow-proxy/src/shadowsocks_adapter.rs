@@ -208,7 +208,7 @@ impl ShadowsocksAdapter {
                 // `client-fingerprint` selects a uTLS profile upstream; our
                 // record-level client crafts a fixed-shape ClientHello.
                 if client_fingerprint.is_some() {
-                    debug!("SS '{name}': client-fingerprint has no effect on jls");
+                    warn!("SS '{name}': client-fingerprint has no effect on jls");
                 }
                 PluginKind::Jls(cfg)
             }

@@ -54,7 +54,7 @@ pub mod xhttp;
 
 /// Shared TLS-record assembly / outbox machinery for the record-framed
 /// SIP003 transports (`shadow_tls`, `restls`, `jls`).
-#[cfg(any(feature = "shadow-tls", feature = "restls"))]
+#[cfg(any(feature = "shadow-tls", feature = "restls", feature = "jls"))]
 mod record_io;
 
 /// shadow-tls client transport (v1/v2/v3) — real cover TLS handshake over

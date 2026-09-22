@@ -35,12 +35,9 @@ fn build_jls_client_hello(cfg: &JlsConfig, shares: &[KeyShare]) -> Result<SentCl
     let session_id: [u8; 32] = rand::random();
     // authData = the serialized CH with `random` zeroed (and PSK binders
     // zeroed — we send none, so the bytes as built are the authData).
-    // Upstream default ALPN is h2,http/1.1 (mihomo's jls option).
-    let alpn: Vec<&str> = if cfg.alpn.is_empty() {
-        vec!["h2", "http/1.1"]
-    } else {
-        cfg.alpn.iter().map(String::as_str).collect()
-    };
+    // `alpn` empty → no ALPN extension (the parser substitutes upstream's
+    // h2,http/1.1 default when the option is absent entirely).
+    let alpn: Vec<&str> = cfg.alpn.iter().map(String::as_str).collect();
     let mut sent = build_client_hello(
         &cfg.server_name,
         &[0u8; HELLO_RANDOM_LEN],

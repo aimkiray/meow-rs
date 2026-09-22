@@ -62,18 +62,29 @@ pub fn parse_opts(s: &str) -> Result<JlsPluginConfig> {
         alpn: Vec::new(),
     };
 
+    let mut alpn_seen = false;
     for (key, value) in sip003_opts(s) {
         match key.as_str() {
             "host" => cfg.host = value,
             "username" => cfg.username = value,
             "password" => cfg.password = value,
             "alpn" => {
+                alpn_seen = true;
                 cfg.alpn = value
                     .split(',')
                     .map(str::trim)
                     .filter(|p| !p.is_empty())
                     .map(str::to_string)
                     .collect();
+            }
+            // jls's random authentication *is* the certificate check —
+            // silently swallowing a request to weaken it would lie to the
+            // user (upstream has no such option either).
+            "skip-cert-verify" | "skip_cert_verify" => {
+                return Err(MeowError::Config(format!(
+                    "{PLUGIN}: 'skip-cert-verify' is not supported — jls \
+                     authenticates inside the TLS handshake itself"
+                )));
             }
             other => warn!("{PLUGIN}: ignoring unknown opt '{other}'"),
         }
@@ -90,6 +101,42 @@ pub fn parse_opts(s: &str) -> Result<JlsPluginConfig> {
                 "{PLUGIN}: missing required '{key}' opt"
             )));
         }
+    }
+    // `host` feeds the TLS SNI extension verbatim — reject values that
+    // could never be a server name before they reach the wire.
+    if cfg
+        .host
+        .chars()
+        .any(|c| c.is_whitespace() || c == ':' || c == '/')
+    {
+        return Err(MeowError::Config(format!(
+            "{PLUGIN}: invalid 'host' opt {:?}",
+            cfg.host
+        )));
+    }
+    // Absent `alpn` → upstream default; `alpn=` (explicit empty) is
+    // honored as no-ALPN, matching upstream's `opt.ALPN != nil` check
+    // (and shadow-tls's identical semantics).
+    if !alpn_seen {
+        cfg.alpn = vec!["h2".to_string(), "http/1.1".to_string()];
+    }
+    // Wire bounds: each id ≤255 B (u8 length prefix) and the encoded list
+    // ≤65535 B (u16) — a pathological config would otherwise fail per-dial
+    // or truncate inside `alpn_ext`.
+    let mut alpn_wire = 0usize;
+    for proto in &cfg.alpn {
+        if proto.len() > u8::MAX as usize {
+            return Err(MeowError::Config(format!(
+                "{PLUGIN}: ALPN id too long ({} bytes)",
+                proto.len()
+            )));
+        }
+        alpn_wire += 1 + proto.len();
+    }
+    if alpn_wire > u16::MAX as usize {
+        return Err(MeowError::Config(format!(
+            "{PLUGIN}: ALPN list too long ({alpn_wire} bytes)"
+        )));
     }
     Ok(cfg)
 }
@@ -139,6 +186,10 @@ mod tests {
             ("host=h;username=u", false),           // no password
             ("host=h;username=;password=p", false), // empty username
             ("", false),
+            // jls has no skip-cert-verify — the random auth is the cert
+            // check; accepting it would silently lie to the user.
+            ("host=h;username=u;password=p;skip-cert-verify=true", false),
+            ("host=h;username=u;password=p;skip_cert_verify=false", false),
         ];
         for (opts, ok) in cases {
             assert_eq!(

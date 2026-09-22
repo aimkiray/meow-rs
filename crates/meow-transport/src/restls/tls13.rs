@@ -422,7 +422,7 @@ pub(crate) async fn read_record<R: AsyncRead + Unpin>(r: &mut R) -> Result<Optio
 }
 
 /// Read one plaintext handshake message with the expected type, skipping
-/// CCS (counted for the server-auth gate). Handshake messages may be
+/// CCS (bounded by `MAX_FLIGHT_CCS`). Handshake messages may be
 /// fragmented across records — reassemble to the message boundary.
 async fn read_plain_handshake<R: AsyncRead + Unpin>(
     r: &mut R,
@@ -535,6 +535,17 @@ pub(crate) fn parse_server_hello(raw: &[u8]) -> Result<ParsedServerHello> {
                 let bytes = take(data, &mut p, klen)?;
                 key_share_group = group;
                 key_share = Some(bytes.to_vec());
+            }
+            // Extensions forbidden in a TLS 1.3 ServerHello — upstream
+            // `checkServerHelloOrHRR` alerts `unsupported_extension` on
+            // these (they moved to EncryptedExtensions/Certificate or are
+            // 1.2-only): status_request(5), alpn(16), sct(18),
+            // extended_master_secret(23), session_ticket(35),
+            // renegotiation_info(0xff01).
+            5 | 16 | 18 | 23 | 35 | 0xff01 => {
+                return Err(TransportError::Tls(format!(
+                    "tls13: forbidden ServerHello extension {typ}"
+                )));
             }
             _ => {}
         }
@@ -1516,7 +1527,16 @@ where
         }
     }
 
-    if !random_authed {
+    if random_authed {
+        // Upstream still *parses* every certificate DER on the
+        // authenticated path (malformed → handshake error) even though
+        // the chain verify and CV signature are skipped — a jls server
+        // presenting garbage certs fails there, so fail here too.
+        for der in &flight.certificates {
+            boring::x509::X509::from_der(der)
+                .map_err(|e| TransportError::Tls(format!("tls13: malformed certificate: {e}")))?;
+        }
+    } else {
         let name = cfg.cert.verify_name.as_deref().unwrap_or(&cfg.server_name);
         verify_certificate_chain(&cfg.cert, name, &flight.certificates)?;
     }

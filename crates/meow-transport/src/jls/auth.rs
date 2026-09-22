@@ -47,7 +47,9 @@ fn has_forbidden_suffix(random: &[u8; HELLO_RANDOM_LEN]) -> bool {
 }
 
 /// Seal a fresh seed into the 32-byte fake random. Regenerates while the
-/// ciphertext ends in a forbidden suffix, mirroring upstream.
+/// ciphertext ends in a forbidden suffix, mirroring upstream. Each retry
+/// hits a suffix with probability ~3/2⁶⁴; the bound is insurance against
+/// a broken RNG, not a reachable limit.
 pub(crate) fn build_fake_random(
     username: &str,
     password: &str,
@@ -55,7 +57,7 @@ pub(crate) fn build_fake_random(
 ) -> Result<[u8; HELLO_RANDOM_LEN]> {
     let key = auth_key(password, auth_data);
     let nonce = auth_nonce(username, auth_data);
-    loop {
+    for _ in 0..1024 {
         let seed: [u8; SEED_LEN] = rand::random();
         let mut tag = [0u8; 16];
         let ct = encrypt_aead(
@@ -74,6 +76,9 @@ pub(crate) fn build_fake_random(
             return Ok(random);
         }
     }
+    Err(TransportError::Tls(
+        "jls: fake random regen exceeded 1024 tries".into(),
+    ))
 }
 
 /// Open a peer's fake random; `true` when it decrypts to a 16-byte seed

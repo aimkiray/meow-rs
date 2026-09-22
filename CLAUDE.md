@@ -173,6 +173,15 @@ restls-server .`); `MEOW_RESTLS_E2E_ALLOW_SKIP=1` prints a loud explicit
 skip for local runs only — CI builds the harness via `actions/setup-go`
 and never sets it.
 
+`jls_e2e`'s upstream-interop leg drives the authenticated TLS 1.3
+handshake and data path against a real upstream peer
+(`metacubex/jls-tls`'s `JlsServer`) and likewise **fails** when
+`JLS_SERVER_BIN` is unset — build the harness from
+`crates/meow-transport/tests/support/jls-server` (`go build -o
+jls-server .`); `MEOW_JLS_E2E_ALLOW_SKIP=1` prints a loud explicit
+skip for local runs only — CI builds the harness via `actions/setup-go`
+and never sets it.
+
 Keep the target list in sync with `.github/workflows/test.yml`; a new `tests/`
 file that CI runs but this list omits is invisible to the local bar.
 

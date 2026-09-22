@@ -105,16 +105,16 @@ pub(crate) struct RestlsUpgraded<S> {
     pub(crate) cover_hs_pending: Vec<u8>,
 }
 
-/// What a decrypted cover record meant for the reader — the
-/// useless-record accounting differs per arm (upstream resets
-/// `retryCount` when decrypted data arrives, then ticks once per
-/// consumed handshake message; everything else just ticks).
+/// What a decrypted cover record meant for the reader. Post-handshake
+/// handshake records do NOT reset the streak — upstream resets
+/// `retryCount` only on non-empty application data (or handshake data
+/// while the handshake is still in progress), and ticks once per
+/// consumed post-handshake message; everything else ticks per record.
 enum CoverOutcome {
     /// Not a cover record at all.
     Rejected,
-    /// Consumed `n` non-advancing units; `reset` first clears the
-    /// streak (decrypted data arrived — upstream's reset).
-    Consumed { n: u8, reset: bool },
+    /// Consumed `n` non-advancing units — added to the streak.
+    Consumed(u8),
     /// `close_notify` — clean EOF, never counts toward the bound.
     Eof,
 }
@@ -400,7 +400,7 @@ impl<S> RestlsStream<S> {
                     // upstream retries them (bounded); TLS 1.3 alerts
                     // are always fatal.
                     if self.tls12_gcm && plain.len() == 2 && plain[0] == 1 {
-                        return Ok(CoverOutcome::Consumed { n: 1, reset: false });
+                        return Ok(CoverOutcome::Consumed(1));
                     }
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
@@ -412,14 +412,11 @@ impl<S> RestlsStream<S> {
                     // dropped (no resumption), but a KeyUpdate must rekey
                     // or every later cover record desyncs.
                     let n = self.handle_cover_handshake(&plain)?;
-                    return Ok(CoverOutcome::Consumed {
-                        n: n.min(MAX_USELESS_RECORDS as usize + 1) as u8,
-                        reset: true,
-                    });
+                    return Ok(CoverOutcome::Consumed(n.min(u8::MAX as usize) as u8));
                 }
                 // Other decrypted records (empty appdata, stray cover
-                // data) advance nothing — one tick, no reset.
-                Ok(CoverOutcome::Consumed { n: 1, reset: false })
+                // data) advance nothing — one tick.
+                Ok(CoverOutcome::Consumed(1))
             }
             None => Ok(CoverOutcome::Rejected),
         }
@@ -535,20 +532,10 @@ impl<S> RestlsStream<S> {
                 Ok(())
             }
             Err(_) => match self.accept_cover_record(&mut record) {
-                // Decrypted data arrived — upstream resets the streak,
-                // then ticks once per consumed handshake message.
-                Ok(CoverOutcome::Consumed { n, reset: true }) => {
-                    self.to_client_ctr += 1;
-                    self.useless_records = n;
-                    if self.useless_records > MAX_USELESS_RECORDS {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "restls: too many useless records",
-                        ));
-                    }
-                    Ok(())
-                }
-                Ok(CoverOutcome::Consumed { n, reset: false }) => {
+                // Decrypted but non-advancing — upstream ticks
+                // `retryCount` once per consumed handshake message,
+                // once per other record kind.
+                Ok(CoverOutcome::Consumed(n)) => {
                     self.to_client_ctr += 1;
                     self.useless_records = self.useless_records.saturating_add(n);
                     if self.useless_records > MAX_USELESS_RECORDS {
@@ -673,12 +660,14 @@ where
                     // desyncs; NSTs are dropped (no resumption).
                     Some((typ, plain)) if typ == TLS_RECORD_HANDSHAKE => {
                         let n = match this.handle_cover_handshake(&plain) {
-                            Ok(n) => n.min(MAX_USELESS_RECORDS as usize + 1) as u8,
+                            Ok(n) => n.min(u8::MAX as usize) as u8,
                             Err(e) => return Poll::Ready(Err(e)),
                         };
-                        // Decrypted data arrived — upstream resets the
-                        // streak, then ticks once per consumed message.
-                        this.useless_records = n;
+                        // Post-handshake handshake records do NOT reset
+                        // the streak — upstream ticks `retryCount` once
+                        // per consumed message, so a one-message-per-
+                        // record feed still dies at the cap.
+                        this.useless_records = this.useless_records.saturating_add(n);
                         if this.useless_records > MAX_USELESS_RECORDS {
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -991,20 +980,22 @@ mod tests {
         assert!(s.process_record(vec![0x17, 0x03, 0x03, 0, 6]).is_err());
     }
 
-    /// A drip of one-message handshake records is legal: decrypted data
-    /// resets the streak, then the single message ticks it to 1 —
-    /// upstream hovers the same way and never dies on NST noise.
+    /// A drip of one-message handshake records accumulates the streak —
+    /// upstream's post-handshake `retryCount++` per message never resets
+    /// on handshake data, so an endless NST feed dies at the cap.
     #[test]
-    fn cover_handshake_records_reset_streak() {
+    fn cover_handshake_records_accumulate_streak() {
         let (cover, _) = MockCover::new(std::iter::repeat_n(
             (TLS_RECORD_HANDSHAKE, vec![4u8, 0, 0, 2, 0, 0]),
             3 * MAX_USELESS_RECORDS as usize,
         ));
         let mut s = stream(true, Some(cover));
-        for _ in 0..3 * MAX_USELESS_RECORDS {
+        for i in 0..MAX_USELESS_RECORDS {
             s.process_record(vec![0x17, 0x03, 0x03, 0, 6]).unwrap();
-            assert_eq!(s.useless_records, 1);
+            assert_eq!(s.useless_records, i + 1);
         }
+        // Record MAX+1 tips the streak past the bound.
+        assert!(s.process_record(vec![0x17, 0x03, 0x03, 0, 6]).is_err());
     }
 
     /// An empty tagged record (fake/`Respond` reply) ticks the streak

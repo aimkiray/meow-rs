@@ -285,18 +285,21 @@ async fn relay_handshake(
     secret: &[u8; 32],
     mask: bool,
 ) -> io::Result<(TcpStream, [u8; 32], Option<Vec<u8>>)> {
-    relay_handshake_fin(tcp, conn, secret, mask, 0).await
+    relay_handshake_fin(tcp, conn, secret, mask, 0, 0).await
 }
 
 /// `fin_index` selects which post-CCS client record is the Finished —
 /// a client-auth cover sends Certificate first, so Finished rides
-/// record 1 instead of record 0.
+/// record 1 instead of record 0. `extra_ccs` appends synthetic compat-CCS
+/// records after the cover's own — a restls cover emitting ≥2 CCS must
+/// not defeat the unconditional server-auth mask probe.
 async fn relay_handshake_fin(
     mut tcp: TcpStream,
     conn: &mut ServerConnection,
     secret: &[u8; 32],
     mask: bool,
     fin_index: usize,
+    extra_ccs: usize,
 ) -> io::Result<(TcpStream, [u8; 32], Option<Vec<u8>>)> {
     let mut server_random = [0u8; 32];
     let mut masked = false;
@@ -329,6 +332,11 @@ async fn relay_handshake_fin(
                     masked = true;
                 }
                 tcp.write_all(&rec).await?;
+                if rec[0] == 20 {
+                    for _ in 0..extra_ccs {
+                        tcp.write_all(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]).await?;
+                    }
+                }
                 pos += RECORD_HDR + len;
             }
         }
@@ -405,6 +413,7 @@ timed_test!(
     e2e_tls12_client_cert_request_impl
 );
 timed_test!(e2e_stray_ccs_ignored, e2e_stray_ccs_ignored_impl);
+timed_test!(e2e_tagged_extra_ccs, e2e_tagged_extra_ccs_impl);
 timed_test!(e2e_respond_sent_decrement, e2e_respond_sent_decrement_impl);
 timed_test!(e2e_upstream_interop, e2e_upstream_interop_impl);
 
@@ -1207,6 +1216,49 @@ async fn e2e_upstream_interop_impl() {
     drop(child);
 }
 
+/// A cover emitting two compat-CCS records must not defeat the
+/// unconditional server-auth mask probe (regression: the removed
+/// `server_ccs == 1` gate would skip the probe here and drop the client
+/// into transparent mode — the tagged echo would then fail to parse).
+async fn e2e_tagged_extra_ccs_impl() {
+    install_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (mut conn, cert) = server_conn();
+    let secret = secret(PASSWORD);
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let (mut tcp, server_random, client_fin) =
+            relay_handshake_fin(tcp, &mut conn, &secret, true, 0, 1)
+                .await
+                .expect("relay handshake");
+        let rec = read_record(&mut tcp).await.unwrap();
+        let (data_len, _) = server_extract(
+            &rec,
+            &secret,
+            &server_random,
+            0,
+            client_fin.as_deref(),
+            false,
+        )
+        .expect("tagged record must parse — mask probe ran despite 2 CCS");
+        let data = &rec[RECORD_HDR + AUTH_HEADER_LEN..RECORD_HDR + AUTH_HEADER_LEN + data_len];
+        let out = server_build(data, &secret, &server_random, 0, [0, 0], false);
+        tcp.write_all(&out).await.unwrap();
+    });
+
+    let mut stream = restls::dial(TcpStream::connect(addr).await.unwrap(), &client_cfg(&cert))
+        .await
+        .expect("restls dial");
+    stream.write_all(b"ping").await.unwrap();
+    stream.flush().await.unwrap();
+    let mut buf = [0u8; 4];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping");
+    server.await.unwrap();
+}
+
 /// TLS 1.3 cover requesting client auth: the CertificateRequest lands
 /// between EE and Certificate; the client must answer with an empty
 /// Certificate (restls never carries client certs) or the cover aborts.
@@ -1221,7 +1273,7 @@ async fn e2e_tls13_client_cert_request_impl() {
         let (tcp, _) = listener.accept().await.unwrap();
         // Certificate precedes Finished — the tag binds record 1.
         let (mut tcp, server_random, client_fin) =
-            relay_handshake_fin(tcp, &mut conn, &secret, true, 1)
+            relay_handshake_fin(tcp, &mut conn, &secret, true, 1, 0)
                 .await
                 .expect("relay handshake");
         let rec = read_record(&mut tcp).await.unwrap();
