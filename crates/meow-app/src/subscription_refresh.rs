@@ -98,6 +98,11 @@ pub async fn run_loop(
                         // Same stamping as the rebuild-error arms below —
                         // a statically-defective payload shouldn't
                         // re-download every 60 s either (issue #533 review).
+                        // The stamp deliberately rides outside the lane:
+                        // it's loss-tolerant bookkeeping (a clobbered stamp
+                        // just re-downloads next pass) and taking the lane
+                        // could park it ~300 s behind a TUN reconcile
+                        // (issue #543 review).
                         let mut live = raw_config.write();
                         if let Some(sub) = live
                             .subscriptions
@@ -341,6 +346,9 @@ pub async fn run_loop(
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs() as i64;
+                        // Loss-tolerant stamp, deliberately outside the
+                        // lane — see the same carve-out above (issue #543
+                        // review).
                         let mut live = raw_config.write();
                         if let Some(sub) = live
                             .subscriptions

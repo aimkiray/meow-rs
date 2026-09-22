@@ -34,7 +34,8 @@ use tracing::{info, warn};
 /// proved too aggressive there; 300 s measured comfortable in practice).
 /// Trade-off to be aware of: the config-reload path awaits this inside the
 /// `CONFIG_MUTATION` lane, so a hung startup blocks every config-mutation
-/// API call for the full duration.
+/// API call for the full duration — including `POST /api/config/save`,
+/// which queues behind the same lane (issue #543).
 pub const TUN_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Map a parsed `TunConfig` onto a `TunListenerConfig`. Shared between the

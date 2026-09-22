@@ -1166,6 +1166,10 @@ async fn commit_raw_candidate(
     state: &AppState,
     candidate: RawConfig,
 ) -> Result<(), (StatusCode, String)> {
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
     let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
     swap_config_and_reconcile_tun(state, candidate, dns, prior_resolver).await;
     Ok(())
@@ -1183,11 +1187,19 @@ async fn commit_raw_candidate(
 /// declared names, or re-declared names whose definition changed — get a
 /// detached initial fetch so `use:` groups populate without a manual
 /// refresh; acquisition failure is a runtime condition, not a config defect.
+///
+/// Callers must hold the `CONFIG_MUTATION` lane (issue #543) — the
+/// insert/prune ordering below is only meaningful when no sibling commit
+/// can interleave a registry swap.
 pub fn commit_proxy_providers(
     registry: &DashMap<String, Arc<ProxyProvider>>,
     candidate: &std::collections::HashMap<String, Arc<ProxyProvider>>,
     strict: bool,
 ) {
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
     for (name, provider) in candidate {
         provider.set_strict(strict);
         // Reused providers may carry dead derived slots from failed
@@ -1312,6 +1324,10 @@ pub async fn reconcile_dns_config(
     prior_resolver: Option<Arc<meow_dns::Resolver>>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<Option<meow_config::DnsConfig>, (StatusCode, String)> {
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
     let unchanged = {
         let old = raw_config.read();
         // `#name`/`rule-set:` references capture objects whose identity is
@@ -1360,11 +1376,18 @@ pub async fn reconcile_dns_config(
 /// handles listener rebinds). Writing the slot of a soon-to-be-rebound
 /// server is harmless — it either keeps serving on the new generation or
 /// is torn down moments later.
+///
+/// Callers must hold the `CONFIG_MUTATION` lane (issue #543) — the slot
+/// swap must be ordered against the commit that produced `dns`.
 pub fn install_resolver_everywhere(
     tunnel: &Tunnel,
     dns_server: &RwLock<Option<DnsServerHandle>>,
     dns: &meow_config::DnsConfig,
 ) {
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
     tunnel.set_resolver(Arc::clone(&dns.resolver));
 
     // Same host-resolver policy as `main.rs` startup: installed whenever
@@ -1398,6 +1421,10 @@ pub async fn publish_dns(
     dns_server: &RwLock<Option<DnsServerHandle>>,
     dns: &meow_config::DnsConfig,
 ) {
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
     install_resolver_everywhere(tunnel, dns_server, dns);
 
     // Standalone `dns.listen` server keep-decision: `keep` also requires a
@@ -2248,6 +2275,10 @@ async fn swap_config_and_reconcile_tun(
     dns: Option<meow_config::DnsConfig>,
     prior_resolver: Arc<meow_dns::Resolver>,
 ) {
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
     let new_enable = candidate.tun.as_ref().is_some_and(|t| t.enable);
     // Snapshot the candidate (only on an off→on transition, before it is
     // moved into the lock) so the parking_lot write guard — which is
@@ -3433,6 +3464,9 @@ mod tests {
         let keep = mk("keep");
         registry.insert("keep".to_string(), Arc::clone(&keep));
         registry.insert("gone".to_string(), mk("gone"));
+
+        // `commit_proxy_providers` asserts the caller holds the lane.
+        let _lane = CONFIG_MUTATION.lock().await;
 
         let candidate: HashMap<String, Arc<ProxyProvider>> = HashMap::from([
             ("keep".to_string(), Arc::clone(&keep)), // reused Arc
