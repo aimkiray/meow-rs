@@ -381,3 +381,61 @@ async fn delete_during_in_flight_refresh_discards_payload() {
         "raw_config must not regain the deleted subscription's nodes"
     );
 }
+
+/// Issue #562: a subscription payload whose `proxy-groups:` declares a
+/// cycle hits the declaration-level check inside the refresh rebuild —
+/// the error arm stamps `last_updated` and keeps the previous routing,
+/// so the cyclic groups never enter the route table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refreshed_subscription_with_group_cycle_is_not_committed() {
+    let fx = fixture(
+        "proxies: []\n\
+         proxy-groups:\n\
+         \x20 - name: A\n\
+         \x20   type: select\n\
+         \x20   proxies: [B]\n\
+         \x20 - name: B\n\
+         \x20   type: select\n\
+         \x20   proxies: [A]\n\
+         rules:\n\
+         \x20 - MATCH,DIRECT\n",
+    )
+    .await;
+    spawn_loop(&fx);
+
+    // `last_updated` lands before the live raw is touched on every
+    // outcome — commit writes it via the candidate swap (after
+    // `update_routing`), rejection stamps it in place. Seeing the stamp
+    // therefore means the iteration's outcome is already decided.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if fx
+                .raw_config
+                .read()
+                .subscriptions
+                .as_ref()
+                .is_some_and(|subs| subs.iter().all(|s| s.last_updated.is_some()))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the refresh loop must attempt the cyclic subscription");
+
+    assert!(
+        fx.tunnel.proxy("A").is_none() && fx.tunnel.proxy("B").is_none(),
+        "a cyclic group set must not be committed"
+    );
+    assert!(
+        fx.raw_config
+            .read()
+            .proxy_groups
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .all(|g| g.name != "A" && g.name != "B"),
+        "the rejected candidate must not replace the live raw config"
+    );
+}

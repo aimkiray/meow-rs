@@ -109,7 +109,7 @@ no line breaks).
   error as `error!`. Does NOT bypass **syntactic** (YAML parse) errors —
   a malformed YAML body returns 400 even with `?force=true`. Structural
   invariants that cannot be degraded — duplicate proxy-group names, group
-  membership cycles — fail under force too; the raw config is persisted
+  declaration/membership cycles — fail under force too; the raw config is persisted
   while the previous routing is retained. Default: `false`.
 
 **Response (success):** `204 No Content`
@@ -358,9 +358,9 @@ line breaks. This matches what dashboard tools encode (MetaCubeXD, Yacd).
    (unknown group names, duplicate ports, etc.). YAML parse errors are always
    returned as 400 — a malformed YAML body cannot be "forced" through.
    Structural invariants that cannot be degraded to a warning (duplicate
-   proxy-group names, group membership cycles) fail the lenient retry too:
-   the endpoint returns 204, persists the raw config, and keeps the
-   previous routing.
+   proxy-group names, group declaration/membership cycles) fail the
+   lenient retry too: the endpoint returns 204, persists the raw config,
+   and keeps the previous routing.
 
 3. **`GET /configs` field scope**: return only non-null fields. Use
    `#[serde(skip_serializing_if = "Option::is_none")]` on all `Option<_>` fields

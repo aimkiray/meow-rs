@@ -292,7 +292,10 @@ Duplicate group names — including a group colliding with a `proxies:` entry
 or a built-in — are a hard error at load time, same as upstream
 (`proxy group %s: the duplicate name`). Duplicate `proxies:` leaf names are
 more permissive than upstream: the last declaration wins instead of
-erroring.
+erroring. Cyclic group declarations are likewise a hard error matching
+upstream's `proxyGroupsDagSort`; meow reports the actual cycle path
+(`proxy-group cycle detected: A -> B -> A`) where upstream lists only the
+involved names.
 
 ### selector, url-test, fallback
 

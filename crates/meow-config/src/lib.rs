@@ -1164,10 +1164,10 @@ fn apply_dialer_proxies(
 /// a cycle here. Callers must run the duplicate-name check first — this
 /// function assumes each group name is declared at most once.
 ///
-/// Stricter than mihomo in one corner: upstream's DAG check skips
-/// `exclude-filter`-matched members; meow-rs never applies `exclude-filter`
-/// to static `proxies:` members, so a declared self-reference is rejected
-/// even when a filter would have excluded it.
+/// A declared self-reference is rejected even when `exclude-filter`
+/// would have matched it — the same as upstream, whose DAG check reads
+/// the raw `proxies:` member names before any filter applies (meow-rs
+/// likewise never applies `exclude-filter` to static members).
 fn reject_declared_group_cycles(raw_groups: &[raw::RawProxyGroup]) -> Result<(), anyhow::Error> {
     debug_assert!(
         raw_groups
@@ -1305,6 +1305,13 @@ fn reject_group_membership_cycles(
             .extend(members);
     }
     if global_auto_created {
+        // `or_default().extend` also covers the corner where a GLOBAL
+        // group was declared but failed to build: its declared members
+        // merged with this all-registry list. Those phantom edges are
+        // safe — they can only point at the filtered built-ins
+        // (PASS/REJECT-DROP/COMPATIBLE), which are dead ends in this
+        // graph (built-ins are never dialer sources and have no
+        // members), so the merge cannot produce a false-positive cycle.
         members_of
             .entry("GLOBAL")
             .or_default()

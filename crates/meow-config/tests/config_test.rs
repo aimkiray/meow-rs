@@ -282,18 +282,26 @@ proxy-groups:
 /// and the result depended on declaration order.
 #[tokio::test]
 async fn test_group_cycle_is_rejected_both_declaration_orders() {
-    for groups in [
-        "  - {name: A, type: select, proxies: [B, DIRECT]}\n  - {name: B, type: select, proxies: [A]}",
-        "  - {name: B, type: select, proxies: [A]}\n  - {name: A, type: select, proxies: [B, DIRECT]}",
+    // The reported path starts at the first-declared cycle member.
+    for (groups, want) in [
+        (
+            "  - {name: A, type: select, proxies: [B, DIRECT]}\n  - {name: B, type: select, proxies: [A]}",
+            "A -> B -> A",
+        ),
+        (
+            "  - {name: B, type: select, proxies: [A]}\n  - {name: A, type: select, proxies: [B, DIRECT]}",
+            "B -> A -> B",
+        ),
     ] {
         let yaml = format!("proxy-groups:\n{groups}\n");
         let err = load_config_from_str(&yaml)
             .await
             .err()
-            .expect("a declared group cycle must be rejected");
+            .unwrap_or_else(|| panic!("a declared group cycle must be rejected: {groups}"));
         assert!(
-            err.to_string().contains("proxy-group cycle detected"),
-            "unexpected error: {err}"
+            err.to_string()
+                .contains(&format!("proxy-group cycle detected: {want}")),
+            "unexpected error for {groups}: {err}"
         );
     }
 }
@@ -452,6 +460,109 @@ proxy-groups:
     assert!(
         err.to_string().contains("proxy-group cycle detected"),
         "unexpected error: {err}"
+    );
+}
+
+/// The check is type-agnostic — a relay↔relay cycle is a declared cycle
+/// too (members still come from `proxies:`).
+#[tokio::test]
+async fn test_group_cycle_through_relay_type_is_rejected() {
+    let yaml = r#"
+proxy-groups:
+  - {name: A, type: relay, proxies: [B, DIRECT]}
+  - {name: B, type: relay, proxies: [A]}
+"#;
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("a relay group cycle must be rejected");
+    assert!(
+        err.to_string().contains("proxy-group cycle detected"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A `use:` member naming a declared group is NOT a membership edge —
+/// provider slots resolve leaf nodes only. If `use:` created edges this
+/// would read as A -> B -> A.
+#[tokio::test]
+async fn test_group_use_member_does_not_close_a_cycle() {
+    let yaml = r#"
+proxies:
+  - {name: node-a, type: socks5, server: 127.0.0.1, port: 10001}
+proxy-groups:
+  - {name: A, type: select, proxies: [node-a], use: [B]}
+  - {name: B, type: select, proxies: [node-a], use: [A]}
+rules:
+  - MATCH,A
+"#;
+    load_config_from_str(yaml)
+        .await
+        .expect("use: resolves providers only — no group edge, no cycle");
+}
+
+/// A declared self-reference is rejected even when `exclude-filter`
+/// would have matched it — filters never apply to static `proxies:`
+/// members (upstream's DAG check reads the raw member names too).
+#[tokio::test]
+async fn test_group_self_reference_with_exclude_filter_is_rejected() {
+    let yaml = r#"
+proxy-groups:
+  - {name: A, type: select, proxies: [A, DIRECT], exclude-filter: "^A$"}
+"#;
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("a filtered-out self-reference is still a declared cycle");
+    assert!(
+        err.to_string()
+            .contains("proxy-group cycle detected: A -> A"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A missing member mixed into a cycle changes nothing — `ghost` names
+/// no declared group, so it is not an edge; the A↔B cycle is still
+/// reported.
+#[tokio::test]
+async fn test_group_cycle_with_missing_mixed_member_is_rejected() {
+    let yaml = r#"
+proxy-groups:
+  - {name: A, type: select, proxies: [B, ghost]}
+  - {name: B, type: select, proxies: [A]}
+"#;
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("a cycle with a missing member is still a declared cycle");
+    assert!(
+        err.to_string()
+            .contains("proxy-group cycle detected: A -> B -> A"),
+        "unexpected error: {err}"
+    );
+}
+
+/// An acyclic edge INTO a declared GLOBAL is fine — GLOBAL is a normal
+/// declared group when the user declares it; only cycles are rejected.
+#[tokio::test]
+async fn test_acyclic_edge_into_declared_global_builds() {
+    let yaml = r#"
+proxies:
+  - {name: node-a, type: socks5, server: 127.0.0.1, port: 10001}
+proxy-groups:
+  - {name: A, type: select, proxies: [GLOBAL]}
+  - {name: GLOBAL, type: select, proxies: [node-a]}
+rules:
+  - MATCH,A
+"#;
+    let config = load_config_from_str(yaml)
+        .await
+        .expect("A -> GLOBAL is acyclic when GLOBAL is declared");
+    assert!(
+        config.proxies["A"]
+            .members()
+            .is_some_and(|m| m.iter().any(|n| n == "GLOBAL")),
+        "A must keep its declared GLOBAL member"
     );
 }
 

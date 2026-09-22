@@ -3645,6 +3645,89 @@ async fn put_configs_duplicate_group_names_rejected() {
     );
 }
 
+/// Issue #562: a `PUT /configs` whose `proxy-groups:` declares a cycle
+/// hits the declaration-level DFS — 400 and neither the committed raw
+/// config nor the route table changes. `?force=true` cannot push it
+/// through either: the check is unconditional, so the lenient retry
+/// fails identically and force lands in the "persist the raw, keep the
+/// previous routing" branch (204 with the old map retained).
+#[tokio::test]
+async fn put_configs_group_cycle_rejected() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let yaml = concat!(
+        "mode: rule\n",
+        "proxy-groups:\n",
+        "  - name: A\n",
+        "    type: select\n",
+        "    proxies: [B, DIRECT]\n",
+        "  - name: B\n",
+        "    type: select\n",
+        "    proxies: [A]\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("proxy-group cycle detected")),
+        "the 400 must come from the cycle check, got: {body}"
+    );
+    assert!(
+        state.raw_config.read().proxy_groups.is_none(),
+        "a rejected PUT must not commit the raw config"
+    );
+    assert!(
+        !state.tunnel.route_snapshot().proxies.contains_key("A"),
+        "a rejected PUT must not touch the route table"
+    );
+
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs?force=true")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !state.tunnel.route_snapshot().proxies.contains_key("A"),
+        "force keeps the previous routing when the candidate cannot build"
+    );
+    assert!(
+        state
+            .raw_config
+            .read()
+            .proxy_groups
+            .as_ref()
+            .is_some_and(|g| g.len() == 2),
+        "the force contract still persists the raw config"
+    );
+}
+
 /// Issue #514 review: a `dns.listen` change whose new socket FAILS to bind
 /// must keep the old listener alive — the config is already committed, and
 /// dropping the only working DNS server would silently break resolution
