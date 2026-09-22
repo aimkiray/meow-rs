@@ -149,17 +149,6 @@ pub(crate) fn parse_opts(opts: &str) -> Result<KcpConfig> {
             "kcptun: crypt=sm4 is not supported by this build".into(),
         ));
     }
-    if cfg.ack_nodelay {
-        warn!("kcptun: acknodelay is not supported by the kcp core — ignored");
-    }
-    if cfg.nodelay > 1 {
-        // ikcp nodelay level 2 additionally zeroes `rx_minrto`; the kcp
-        // crate's `set_nodelay` is bool-only, so 2 degrades to level 1.
-        warn!(
-            "kcptun: nodelay={} degrades to level 1 (the kcp core has no level-2 fast-ack)",
-            cfg.nodelay
-        );
-    }
     // `saturating_add`: `datashard=usize::MAX` must trip the guard, not
     // wrap past it (a wrapped sum would also panic debug builds here).
     if cfg.data_shard.saturating_add(cfg.parity_shard) > 256 {

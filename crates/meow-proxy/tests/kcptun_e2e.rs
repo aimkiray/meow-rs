@@ -374,3 +374,46 @@ async fn kcptun_raw_smux_stream_echo() {
         .expect("smux echo read");
     assert_eq!(buf, payload);
 }
+
+/// `sndwnd=2` paces outbound data two segments per ACK — the UNA-slide
+/// immediate flush (kcp-go `Input` semantics) is the only reason a 64KB
+/// echo finishes well inside the timeout; classic ikcp paced every
+/// window by the maintenance interval.
+#[tokio::test]
+async fn kcptun_tcp_echo_tiny_sndwnd() {
+    let Some((_child, addr)) = spawn_server(&["-crypt", "aes"]).await else {
+        return;
+    };
+    let adapter = adapter(addr.port(), "conn=1;sndwnd=2", false);
+    let metadata = Metadata {
+        network: Network::Tcp,
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        dst_port: 80,
+        ..Default::default()
+    };
+    let mut conn = timeout(TIMEOUT, adapter.dial_tcp(&metadata))
+        .await
+        .expect("dial_tcp timed out")
+        .expect("dial_tcp failed");
+
+    // Write in 4KB chunks — the shadowsocks crate's connect path packs
+    // the whole first user write into one handshake buffer but only
+    // encrypts ≤16KB of it (upstream quirk, debug-asserts on larger).
+    let payload = vec![0xabu8; 64 * 1024];
+    for chunk in payload.chunks(4096) {
+        timeout(TIMEOUT, conn.write_all(chunk))
+            .await
+            .expect("write timed out")
+            .expect("write");
+    }
+    timeout(TIMEOUT, conn.flush())
+        .await
+        .expect("flush timed out")
+        .expect("flush");
+    let mut buf = vec![0u8; payload.len()];
+    timeout(TIMEOUT, conn.read_exact(&mut buf))
+        .await
+        .expect("tiny-window echo timed out")
+        .expect("tiny-window echo read");
+    assert_eq!(buf, payload);
+}

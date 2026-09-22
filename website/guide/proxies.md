@@ -190,13 +190,13 @@ forced `UDPOverTCP`:
 
 Divergences from upstream: `crypt=sm4` is a hard error (no stable Rust
 SM4 crate — a silent AES fallback would never authenticate);
-`smuxver != 1` errors (this build speaks smux v1 only); `acknodelay` is
-accepted and ignored; `nodelay=2` degrades to level 1 (the `kcp` core
-exposes a bool, not the level knob); `scavengettl` is advisory — dead
-sessions are re-dialed lazily instead of a scavenge list; an `mtu` that
-leaves under 50 bytes of segment room after envelope overhead is a
-hard dial error (upstream ignores `SetMtu` failure and silently keeps
-1400).
+`smuxver != 1` errors (this build speaks smux v1 only);
+`scavengettl` is advisory — dead sessions are re-dialed lazily instead
+of a scavenge list; an `mtu` that leaves no segment room after envelope
+overhead is a hard dial error (upstream ignores `SetMtu` failure and
+silently keeps 1400). The KCP core is a vendored `kcp-go` v5.6.72 port —
+`acknodelay` and every `nodelay`/`interval`/`resend`/`nc` value behave
+exactly as upstream (upstream itself flattens `nodelay` to a bool).
 
 ---
 

@@ -17,6 +17,13 @@
 mod conn;
 mod crypt;
 mod fec;
+/// Vendored `kcp` crate reworked to `kcp-go` v5.6.72 semantics — see the
+/// file header for the ported retransmission/`Input` deltas.
+#[allow(
+    dead_code,
+    reason = "vendored library — keeps the full upstream API surface; conn.rs uses a subset"
+)]
+mod kcp_go;
 
 pub use conn::{KcpStream, SocketIo};
 

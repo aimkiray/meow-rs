@@ -233,8 +233,19 @@ impl AutoTune {
         let mut sorted: Vec<(bool, u32)> = (0..self.count)
             .map(|i| self.pulses[(self.head + i) % 258])
             .collect();
-        // Upstream orders by the wrap-aware serial diff, not raw u32 order.
-        sorted.sort_by(|&(_, a), &(_, b)| itimediff(a, b).cmp(&0));
+        // Upstream orders by the wrap-aware serial diff — but `itimediff`
+        // is not a total order (a pair 2³¹ apart compares <0 in both
+        // directions), and Rust's `sort_by` panics on that since 1.81.
+        // Sort by forward distance from the set's serial-minimum instead:
+        // a real total order that yields the same serial-ascending result.
+        let origin = sorted.iter().map(|&(_, s)| s).fold(sorted[0].1, |acc, s| {
+            if itimediff(s, acc) < 0 {
+                s
+            } else {
+                acc
+            }
+        });
+        sorted.sort_by_key(|&(_, s)| s.wrapping_sub(origin));
 
         // Left edge: first transition into `bit` on consecutive seqs —
         // a gap anywhere before the edge aborts the scan (upstream).

@@ -112,9 +112,12 @@ the canonical, in-repo source a release is cut from.
   (`key`/`crypt`/`mode`/`conn`/`autoexpire`/`scavengettl`/`mtu`/
   `ratelimit`/`sndwnd`/`rcvwnd`/`datashard`/`parityshard`/`dscp`/
   `nocomp`/`nodelay`/`interval`/`resend`/`nc`/`sockbuf`/`smuxver`/
-  `smuxbuf`/`streambuf`/`framesize`/`keepalive`); `acknodelay` is
-  accepted but ignored (no such knob on the `kcp` core), and only
-  `smuxver=1` is supported, matching our smux layer. The feature is in the `full` bundle and excluded from
+  `smuxbuf`/`streambuf`/`framesize`/`keepalive`/`acknodelay`), and only
+  `smuxver=1` is supported, matching our smux layer. The KCP core is a
+  vendored `kcp` crate reworked to `kcp-go` v5.6.72 retransmission/Input
+  semantics (immediate flush on window slide or fast-retransmit, ACK
+  clocking, `acknodelay`, linear RTO backoff, FEC-aware RTT/window
+  filtering). The feature is in the `full` bundle and excluded from
   `minimal` (cipher/FEC/snappy dependency weight). One operational
   note: `KcpStream` progress is poll-driven — retransmits and
   dead-link detection advance while the stream is polled, which the

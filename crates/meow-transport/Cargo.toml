@@ -96,14 +96,13 @@ restls = [
 jls = ["restls"]
 
 # kcptun: the kcptun SS-plugin transport (issue #533) — a kcp-go wire-compatible
-# KCP-over-UDP stream: `kcp` gives the ARQ core (same crate shadowsocks-rust /
-# kcptun-rust build on, maintained by zonyitoo), the crypt/FEC/snappy layers
-# are in-tree against the exact upstream packet formats. aes stays on the
-# cipher-0.5 line (0.9.x) to share the RustCrypto traits with the exotic
-# crypts (blowfish/cast5/twofish/des); vmess's `aes` 0.8 in meow-proxy is
-# unaffected — the two majors coexist in the lockfile.
+# KCP-over-UDP stream: the ARQ core is vendored in `kcptun/kcp_go.rs` (kcp
+# 0.6.0 reworked to upstream kcp-go v5.6.72 retransmission/Input semantics),
+# the crypt/FEC/snappy layers are in-tree against the exact upstream packet
+# formats. aes stays on the cipher-0.5 line (0.9.x) to share the RustCrypto
+# traits with the exotic crypts (blowfish/cast5/twofish/des); vmess's `aes`
+# 0.8 in meow-proxy is unaffected — the two majors coexist in the lockfile.
 kcptun = [
-    "dep:kcp",
     "dep:reed-solomon-erasure",
     "dep:crc32fast",
     "dep:pbkdf2",
@@ -156,7 +155,6 @@ x25519-dalek = { workspace = true, optional = true }
 
 # kcptun feature — see the `kcptun` feature comment above for why aes is pinned
 # to the cipher-0.5 line while vmess's aes stays on 0.8.
-kcp = { version = "0.6", optional = true }
 reed-solomon-erasure = { version = "6", optional = true }
 crc32fast = { workspace = true, optional = true }
 # pbkdf2 0.12 pairs with the digest-0.10 sha1 the workspace already pins

@@ -670,12 +670,16 @@ impl Session {
                         }
                     }
                     CMD_FIN | CMD_NOP => {
-                        // sagernet smux control frames carry no payload, but a
-                        // malformed one must not take down every stream on the
-                        // session: discard it and keep going.
-                        if length > 0
-                            && !drain_frame(&mut reader, &reader_cancel, &mut discard, length).await
-                        {
+                        // Upstream smux treats a control frame WITH a
+                        // payload as ErrInvalidProtocol and kills the
+                        // session outright — draining-and-continuing
+                        // would silently desync the frame boundary.
+                        if length > 0 {
+                            warn!(
+                                "smux: protocol error: {} frame carries {length}B payload; \
+                                 dropping session",
+                                if cmd == CMD_FIN { "FIN" } else { "NOP" }
+                            );
                             break 'reader;
                         }
                         if cmd == CMD_FIN {
@@ -1800,34 +1804,41 @@ mod tests {
         assert!(!session.is_dead());
     }
 
-    /// smux v1 control frames carry no payload, but a malformed one must cost
-    /// only its own bytes. Treating it as fatal takes down every stream on the
-    /// session, which is a peer-visible failure for traffic this client should
-    /// simply skip.
+    /// Upstream `ErrInvalidProtocol`: a control frame (FIN/NOP) carrying a
+    /// payload kills the session — silently draining it would desync the
+    /// frame boundary and let a corrupt peer keep the session alive while
+    /// delivering garbage.
     #[tokio::test]
-    async fn malformed_control_frame_does_not_kill_the_session() {
+    async fn malformed_control_frame_kills_the_session() {
         let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
         let session = Arc::new(Session::client(client_io).unwrap());
         let mut stream = session.open_stream().await.unwrap();
 
         let mut wire = Vec::new();
         wire.extend_from_slice(&encode_frame(CMD_NOP, 0, b"junk"));
-        // An unknown id, so the FIN's stream removal is a no-op and only the
-        // payload tolerance is under test.
-        wire.extend_from_slice(&encode_frame(CMD_FIN, 0xFFFF_FFFF, b"junk"));
         wire.extend_from_slice(&encode_frame(CMD_PSH, stream.id, b"alive"));
         server_io.write_all(&wire).await.unwrap();
 
         let mut buf = [0u8; 5];
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
             stream.read_exact(&mut buf),
         )
-        .await
-        .expect("the session must keep dispatching after a malformed control frame")
-        .unwrap();
-        assert_eq!(&buf, b"alive");
-        assert!(!session.is_dead());
+        .await;
+        match result {
+            // The payload-bearing NOP desyncs the session before the
+            // queued data can dispatch — upstream behavior.
+            Err(_) | Ok(Err(_)) => {}
+            Ok(Ok(n)) => panic!("malformed control frame must kill the session, read {n}"),
+        }
+        // Give the reader task a moment to land mark_dead.
+        for _ in 0..50 {
+            if session.is_dead() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(session.is_dead());
     }
 
     /// Regression: when both outbound queues are full, `queue_fin` drops one
