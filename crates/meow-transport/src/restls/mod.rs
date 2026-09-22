@@ -30,7 +30,11 @@
 //! `sent` flag into `handleRestlsCommand` for exactly this, but its
 //! `Write([]byte{})` release always reports `sent=false`, making the
 //! decrement dead code upstream; we implement the evident intent
-//! (observable only as one fewer traffic-shaping record).
+//! (observable only as one fewer traffic-shaping record); and the TLS
+//! 1.3 CertificateVerify scheme gate is offer-membership — upstream
+//! accepts any scheme in its *default* supported list (e.g. an
+//! unoffered `0x0603`), we require the scheme to have been offered per
+//! RFC 8446 §4.4.3.
 
 pub(crate) mod conn;
 pub(crate) mod script;
@@ -110,5 +114,5 @@ where
             )));
         }
     };
-    Ok(Box::new(conn::RestlsStream::new(upgraded, secret, script)))
+    Ok(Box::new(conn::RestlsStream::new(upgraded, secret, script)?))
 }

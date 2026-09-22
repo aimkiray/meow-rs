@@ -247,6 +247,11 @@ fn build_client_hello(
     Ok(hello)
 }
 
+/// Compat-CCS records tolerated while the cover's handshake flight is
+/// in progress — middlebox noise is legal but unbounded CCS spam is not
+/// (upstream bounds it via `maxUselessRecords`).
+const MAX_FLIGHT_CCS: u32 = 32;
+
 /// Signature algorithms offered for the cover's CertificateVerify.
 pub(crate) const SIG_ALGS: [u16; 8] = [
     0x0403, // ecdsa_secp256r1_sha256
@@ -375,6 +380,11 @@ async fn read_plain_handshake<R: AsyncRead + Unpin>(
         match record.typ {
             wire::TLS_RECORD_CHANGE_CIPHER_SPEC => {
                 *ccs += 1;
+                if *ccs > MAX_FLIGHT_CCS {
+                    return Err(TransportError::Tls(
+                        "restls: too many CCS records in server flight".into(),
+                    ));
+                }
                 continue;
             }
             wire::TLS_RECORD_HANDSHAKE => {
@@ -1281,10 +1291,8 @@ where
     transcript.extend_from_slice(&hello);
     let our_sid = hello[39..71].to_vec();
 
-    // Upstream's `expectServerAuth` unmask path requires exactly one
-    // inbound cipher change — a second CCS disables the masked-record
-    // probe permanently. CCS records arriving before the ServerHello
-    // count too.
+    // Stray pre-handshake CCS is legal middlebox noise — count it only
+    // to bound the streak.
     let mut server_ccs = 0u32;
     let server_hello = read_plain_handshake(&mut inner, HS_SERVER_HELLO, &mut server_ccs).await?;
     let parsed = parse_server_hello(&server_hello)?;
@@ -1316,6 +1324,11 @@ where
             .ok_or_else(|| TransportError::Tls("restls: EOF in server flight".into()))?;
         if record.typ == wire::TLS_RECORD_CHANGE_CIPHER_SPEC {
             server_ccs += 1;
+            if server_ccs > MAX_FLIGHT_CCS {
+                return Err(TransportError::Tls(
+                    "restls: too many CCS records in server flight".into(),
+                ));
+            }
             continue;
         }
         if record.typ != wire::TLS_RECORD_APPLICATION_DATA {
@@ -1329,7 +1342,12 @@ where
 
         if authed.is_none() {
             authed = Some(false);
-            let (typ, body) = if server_ccs == 1 {
+            // Upstream probes the mask on the first encrypted record
+            // whenever the server installed its handshake cipher exactly
+            // once (`numCipherChange` counts cipher installations — not
+            // CCS records). Probe unconditionally: a cover emitting zero
+            // or several compat CCS records must not skip it.
+            let (typ, body) = {
                 let (unmasked, _) = wire::unmask_server_auth(&full, secret, &server_random, false);
                 match server_hs.open(&unmasked[..5].try_into().expect("header"), &unmasked[5..]) {
                     Ok((typ, body)) => {
@@ -1338,8 +1356,6 @@ where
                     }
                     Err(_) => server_hs.open(&record.header, &record.payload)?,
                 }
-            } else {
-                server_hs.open(&record.header, &record.payload)?
             };
             if typ != wire::TLS_RECORD_HANDSHAKE {
                 return Err(TransportError::Tls(if authed == Some(true) {
@@ -1457,5 +1473,24 @@ where
         gcm_ctr_disabled: false,
         // TLS 1.3 nonces are IV-derived — no explicit slot to rewrite.
         gcm_next_seq: 0,
+        cover_hs_pending: handshake_buf.into_iter().collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 1.3 CV gate is exactly the offered list minus the PKCS#1
+    /// v1.5 schemes — stricter than upstream's default-list check, and
+    /// RFC 8446 §4.4.3-correct (CV must be a scheme we offered).
+    #[test]
+    fn cv_schemes_are_offered_minus_v15() {
+        for s in TLS13_CV_SCHEMES {
+            assert!(SIG_ALGS.contains(&s), "{s:#06x} gated but never offered");
+        }
+        assert!(!TLS13_CV_SCHEMES.contains(&0x0401));
+        assert!(!TLS13_CV_SCHEMES.contains(&0x0501));
+        assert_eq!(TLS13_CV_SCHEMES.len(), SIG_ALGS.len() - 2);
+    }
 }

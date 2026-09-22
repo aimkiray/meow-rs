@@ -27,6 +27,7 @@ const HS_CERTIFICATE_REQUEST: u8 = 13;
 const HS_SERVER_HELLO_DONE: u8 = 14;
 const HS_CLIENT_KEY_EXCHANGE: u8 = 16;
 const HS_NEW_SESSION_TICKET: u8 = 4;
+const HS_CERTIFICATE_STATUS: u8 = 22;
 const HS_FINISHED: u8 = 20;
 
 const TLS_ECDHE_RSA_AES128_GCM: u16 = 0xc02f;
@@ -469,6 +470,7 @@ where
     let mut certs: Vec<Vec<u8>> = Vec::new();
     let mut ske: Option<ParsedSke> = None;
     let mut cert_request = false;
+    let mut cert_status = false;
     let mut hs_buf: VecDeque<u8> = VecDeque::new();
     let mut got_done = false;
     while !got_done {
@@ -501,17 +503,43 @@ where
                     server_hello = Some(parse_server_hello(&msg.raw)?);
                 }
                 HS_CERTIFICATE => {
-                    if server_hello.is_none() || !certs.is_empty() {
+                    if server_hello.is_none()
+                        || !certs.is_empty()
+                        || ske.is_some()
+                        || cert_request
+                        || got_done
+                    {
                         return Err(TransportError::Tls(
                             "restls12: unexpected Certificate".into(),
                         ));
                     }
                     certs = parse_certificate_list12(&msg.body)?;
                 }
+                HS_CERTIFICATE_STATUS => {
+                    // RFC 6066: the staple rides between Certificate and
+                    // SKE. We offered `status_request` (mirroring the
+                    // upstream parrot), so a stapling cover legitimately
+                    // sends this — the staple itself carries nothing we
+                    // need, but it counts toward the transcript.
+                    if certs.is_empty() || ske.is_some() || cert_status || got_done {
+                        return Err(TransportError::Tls(
+                            "restls12: unexpected CertificateStatus".into(),
+                        ));
+                    }
+                    cert_status = true;
+                }
                 HS_SERVER_KEY_EXCHANGE => {
-                    let sh = server_hello.as_ref().ok_or_else(|| {
-                        TransportError::Tls("restls12: SKE before ServerHello".into())
-                    })?;
+                    if server_hello.is_none()
+                        || certs.is_empty()
+                        || ske.is_some()
+                        || cert_request
+                        || got_done
+                    {
+                        return Err(TransportError::Tls(
+                            "restls12: unexpected ServerKeyExchange".into(),
+                        ));
+                    }
+                    let sh = server_hello.as_ref().expect("checked");
                     ske = Some(parse_server_key_exchange(
                         &msg.body,
                         &client_random,
@@ -535,9 +563,16 @@ where
                     got_done = true;
                 }
                 // A ticket-issuing cover may coalesce NST into the same
-                // record as ServerHelloDone (RFC 5077 order: NST precedes
-                // CCS). It counts toward the server-Finished transcript.
-                HS_NEW_SESSION_TICKET => {}
+                // record as ServerHelloDone (RFC 5077 order: NST follows
+                // SHD and precedes CCS). It counts toward the
+                // server-Finished transcript — but only after SHD.
+                HS_NEW_SESSION_TICKET => {
+                    if !got_done {
+                        return Err(TransportError::Tls(
+                            "restls12: NST before ServerHelloDone".into(),
+                        ));
+                    }
+                }
                 _ => {
                     return Err(TransportError::Tls(format!(
                         "restls12: unexpected message {}",
@@ -794,6 +829,7 @@ where
                         tls12_gcm: true,
                         gcm_ctr_disabled,
                         gcm_next_seq,
+                        cover_hs_pending: msgs.iter().copied().collect(),
                     });
                 }
                 _ => {

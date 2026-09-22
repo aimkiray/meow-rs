@@ -205,6 +205,64 @@ fn server_conn_tickets(
     )
 }
 
+/// A cover requesting client auth (optional): rustls then emits a
+/// CertificateRequest inside the flight — the client must answer with
+/// an (empty) Certificate or the cover aborts.
+#[derive(Debug)]
+struct OptionalClientAuth;
+
+impl rustls::server::danger::ClientCertVerifier for OptionalClientAuth {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+    fn verify_client_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ECDSA_NISTP256_SHA256]
+    }
+}
+
+fn server_conn_client_auth() -> (ServerConnection, rustls::pki_types::CertificateDer<'static>) {
+    let (cert_der, key_der, _, _) = gen_cert(&["cover.example.com"]);
+    let mut cfg = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(Arc::new(OptionalClientAuth))
+        .with_single_cert(vec![cert_der.clone()], key_der)
+        .expect("server config");
+    cfg.send_tls13_tickets = 0;
+    (
+        ServerConnection::new(Arc::new(cfg)).expect("server conn"),
+        cert_der,
+    )
+}
+
 fn client_cfg(cert_der: &rustls::pki_types::CertificateDer<'static>) -> RestlsConfig {
     RestlsConfig {
         server_name: "cover.example.com".to_string(),
@@ -222,10 +280,23 @@ fn client_cfg(cert_der: &rustls::pki_types::CertificateDer<'static>) -> RestlsCo
 /// session-id tag, relays records to rustls, and masks the cover's first
 /// encrypted record. Returns when the client's Finished has been relayed.
 async fn relay_handshake(
+    tcp: TcpStream,
+    conn: &mut ServerConnection,
+    secret: &[u8; 32],
+    mask: bool,
+) -> io::Result<(TcpStream, [u8; 32], Option<Vec<u8>>)> {
+    relay_handshake_fin(tcp, conn, secret, mask, 0).await
+}
+
+/// `fin_index` selects which post-CCS client record is the Finished —
+/// a client-auth cover sends Certificate first, so Finished rides
+/// record 1 instead of record 0.
+async fn relay_handshake_fin(
     mut tcp: TcpStream,
     conn: &mut ServerConnection,
     secret: &[u8; 32],
     mask: bool,
+    fin_index: usize,
 ) -> io::Result<(TcpStream, [u8; 32], Option<Vec<u8>>)> {
     let mut server_random = [0u8; 32];
     let mut masked = false;
@@ -233,9 +304,11 @@ async fn relay_handshake(
     let mut cover_ccs = false;
     let mut saw_ccs = false;
     let mut first_ch = true;
-    // First post-CCS client record is the sealed Finished — the restls
-    // server mixes it into the first tagged record's MAC (`clientFinRaw`).
+    // Post-CCS client record `fin_index` is the sealed Finished — the
+    // restls server mixes it into the first tagged record's MAC
+    // (`clientFinRaw`).
     let mut client_fin = None;
+    let mut post_ccs = 0usize;
     loop {
         while conn.wants_write() {
             let mut produced = Vec::new();
@@ -272,8 +345,11 @@ async fn relay_handshake(
         }
         if rec[0] == 20 {
             saw_ccs = true;
-        } else if rec[0] == 23 && saw_ccs && client_fin.is_none() {
-            client_fin = Some(rec.clone());
+        } else if rec[0] == 23 && saw_ccs {
+            if post_ccs == fin_index && client_fin.is_none() {
+                client_fin = Some(rec.clone());
+            }
+            post_ccs += 1;
         }
         conn.read_tls(&mut &rec[..])?;
         conn.process_new_packets()
@@ -320,6 +396,14 @@ timed_test!(
 timed_test!(e2e_tls12_tagged, e2e_tls12_tagged_impl);
 timed_test!(e2e_tls12_p256_group, e2e_tls12_p256_group_impl);
 timed_test!(e2e_tls13_p256_keyshare, e2e_tls13_p256_keyshare_impl);
+timed_test!(
+    e2e_tls13_client_cert_request,
+    e2e_tls13_client_cert_request_impl
+);
+timed_test!(
+    e2e_tls12_client_cert_request,
+    e2e_tls12_client_cert_request_impl
+);
 timed_test!(e2e_stray_ccs_ignored, e2e_stray_ccs_ignored_impl);
 timed_test!(e2e_respond_sent_decrement, e2e_respond_sent_decrement_impl);
 timed_test!(e2e_upstream_interop, e2e_upstream_interop_impl);
@@ -852,6 +936,26 @@ fn server_conn_tls12_kx(
     )
 }
 
+/// A TLS 1.2 cover requesting client auth — CertificateRequest rides the
+/// flight between SKE and ServerHelloDone; the client answers empty.
+fn server_conn_tls12_client_auth() -> (ServerConnection, rustls::pki_types::CertificateDer<'static>)
+{
+    let (cert_der, key_der, _, _) = gen_cert(&["cover.example.com"]);
+    let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS12])
+    .expect("tls12 versions")
+    .with_client_cert_verifier(Arc::new(OptionalClientAuth))
+    .with_single_cert(vec![cert_der.clone()], key_der)
+    .expect("server config");
+    cfg.ticketer = rustls::crypto::ring::Ticketer::new().expect("ticketer");
+    (
+        ServerConnection::new(Arc::new(cfg)).expect("server conn"),
+        cert_der,
+    )
+}
+
 /// restls `version-hint=tls12` e2e: eager-key session-id tags, masked first
 /// encrypted record, tagged records with the GCM nonce slot.
 async fn e2e_tls12_tagged_impl() {
@@ -1101,4 +1205,62 @@ async fn e2e_upstream_interop_impl() {
         }
     }
     drop(child);
+}
+
+/// TLS 1.3 cover requesting client auth: the CertificateRequest lands
+/// between EE and Certificate; the client must answer with an empty
+/// Certificate (restls never carries client certs) or the cover aborts.
+async fn e2e_tls13_client_cert_request_impl() {
+    install_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (mut conn, cert) = server_conn_client_auth();
+    let secret = secret(PASSWORD);
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        // Certificate precedes Finished — the tag binds record 1.
+        let (mut tcp, server_random, client_fin) =
+            relay_handshake_fin(tcp, &mut conn, &secret, true, 1)
+                .await
+                .expect("relay handshake");
+        let rec = read_record(&mut tcp).await.unwrap();
+        let (data_len, _) = server_extract(
+            &rec,
+            &secret,
+            &server_random,
+            0,
+            client_fin.as_deref(),
+            false,
+        )
+        .expect("tagged record");
+        let reply = server_build(
+            &rec[RECORD_HDR + AUTH_HEADER_LEN..RECORD_HDR + AUTH_HEADER_LEN + data_len],
+            &secret,
+            &server_random,
+            0,
+            [0, 0],
+            false,
+        );
+        tcp.write_all(&reply).await.unwrap();
+    });
+
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let mut s = restls::dial(tcp, &client_cfg(&cert))
+        .await
+        .expect("restls dial vs client-auth cover");
+    s.write_all(b"cr").await.unwrap();
+    let mut out = [0u8; 16];
+    let n = s.read(&mut out).await.unwrap();
+    assert_eq!(&out[..n], b"cr");
+    drop(s);
+    server.await.unwrap();
+}
+
+/// TLS 1.2 cover requesting client auth: CertificateRequest is legal only
+/// between SKE and ServerHelloDone — the ordering gate plus the empty
+/// Certificate response get exercised end to end.
+async fn e2e_tls12_client_cert_request_impl() {
+    let (conn, cert) = server_conn_tls12_client_auth();
+    e2e_tls12_tagged_inner(conn, cert).await;
 }

@@ -40,16 +40,19 @@ const SEND_BUF_CAP: usize = 256 * 1024;
 /// Cap on encoded records staged in `outbox`.
 const OUTBOX_CAP: usize = 256 * 1024;
 
-/// Consecutive stray CCS records tolerated before the connection dies —
-/// upstream's `maxUselessRecords`. Post-handshake CCS is legal middlebox
-/// noise (dropped without ticking counters), but an endless CCS stream
-/// must not spin the read loop forever.
-const MAX_IGNORED_CCS: u8 = 16;
+/// Non-advancing records tolerated before the connection dies —
+/// upstream's `maxUselessRecords` (32; it counts every record that
+/// produces no data: stray CCS, consumed handshake records, empty
+/// appdata, tolerated alerts). Legal noise stays bounded instead of
+/// spinning the read loop forever.
+const MAX_USELESS_RECORDS: u8 = 32;
 
 /// Reassembly bound for post-handshake cover messages (KeyUpdate may
 /// straddle records). NSTs ride the same buffer; the cap keeps a peer
-/// from growing it with an unterminated message.
-const MAX_COVER_HS_BUF: usize = 64 * 1024;
+/// from growing it with an unterminated message. Upstream's
+/// `maxHandshake` bounds the declared *body* at 64 KiB — the buffer
+/// also carries the 4-byte message header.
+const MAX_COVER_HS_BUF: usize = 64 * 1024 + 4;
 
 /// The negotiated cover cipher — kept after the handshake for stray real
 /// records (session tickets) and, when the server never authenticated, for
@@ -95,6 +98,25 @@ pub(crate) struct RestlsUpgraded<S> {
     /// record carries nonce 2. Upstream hardcodes a fresh counter, which is
     /// only correct when Finished was the sole post-CCS record.
     pub(crate) gcm_next_seq: u64,
+    /// Plaintext handshake bytes coalesced past the server Finished — a
+    /// same-record KeyUpdate or NST rides here (already decrypted, just
+    /// unprocessed). Consumed by `RestlsStream::new`; dropping it would
+    /// desync the cover cipher.
+    pub(crate) cover_hs_pending: Vec<u8>,
+}
+
+/// What a decrypted cover record meant for the reader — the
+/// useless-record accounting differs per arm (upstream resets
+/// `retryCount` when decrypted data arrives, then ticks once per
+/// consumed handshake message; everything else just ticks).
+enum CoverOutcome {
+    /// Not a cover record at all.
+    Rejected,
+    /// Consumed `n` non-advancing units; `reset` first clears the
+    /// streak (decrypted data arrived — upstream's reset).
+    Consumed { n: u8, reset: bool },
+    /// `close_notify` — clean EOF, never counts toward the bound.
+    Eof,
 }
 
 /// Post-handshake stream speaking the tagged restls record protocol.
@@ -138,8 +160,9 @@ pub(crate) struct RestlsStream<S> {
     /// write — woken when an inbound record releases the hold (split
     /// read/write tasks need this; `poll_read` runs on the other half).
     blocked_write_waker: Option<std::task::Waker>,
-    /// Consecutive dropped CCS records — bounded by `MAX_IGNORED_CCS`.
-    ignored_ccs: u8,
+    /// Records consumed without producing data — CCS, cover handshake
+    /// drops, empty appdata. Bounded by `MAX_USELESS_RECORDS`.
+    useless_records: u8,
     /// Partial post-handshake cover message carried across records —
     /// upstream buffers these in `c.hand` the same way.
     cover_hs_buf: Vec<u8>,
@@ -151,8 +174,12 @@ fn rand_pad(buf: &mut [u8]) {
 }
 
 impl<S> RestlsStream<S> {
-    pub(crate) fn new(up: RestlsUpgraded<S>, secret: [u8; 32], script: Vec<Line>) -> Self {
-        Self {
+    pub(crate) fn new(
+        up: RestlsUpgraded<S>,
+        secret: [u8; 32],
+        script: Vec<Line>,
+    ) -> io::Result<Self> {
+        let mut s = Self {
             inner: up.inner,
             secret,
             server_random: up.server_random,
@@ -173,10 +200,15 @@ impl<S> RestlsStream<S> {
             asm: RecordAssembler::new(),
             inbox: VecDeque::new(),
             blocked_write_waker: None,
-            ignored_ccs: 0,
-            cover_hs_buf: Vec::new(),
+            useless_records: 0,
+            cover_hs_buf: up.cover_hs_pending,
             eof: false,
-        }
+        };
+        // Handshake plaintext coalesced past the server Finished is
+        // already decrypted — consume it now so a same-record KeyUpdate
+        // rekeys before the next cover record opens.
+        s.handle_cover_handshake(&[])?;
+        Ok(s)
     }
 
     /// Write side: the client always emits the 8-byte nonce slot in TLS 1.2
@@ -325,17 +357,31 @@ impl<S> RestlsStream<S> {
     /// Fallback for real cover records (post-handshake session tickets and
     /// alerts): decrypt through the negotiated cipher. Application data is
     /// dropped — upstream discards it (`data = nil`); alerts are fatal.
-    fn accept_cover_record(&mut self, record: &mut [u8]) -> io::Result<bool> {
+    /// One more record consumed without producing data — kills the
+    /// connection past upstream's `maxUselessRecords` bound. Saturating:
+    /// `poll_read` is not fused, so a post-error re-poll must not wrap.
+    fn tick_useless(&mut self) -> io::Result<()> {
+        self.useless_records = self.useless_records.saturating_add(1);
+        if self.useless_records > MAX_USELESS_RECORDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "restls: too many useless records",
+            ));
+        }
+        Ok(())
+    }
+
+    fn accept_cover_record(&mut self, record: &mut [u8]) -> io::Result<CoverOutcome> {
         let nonce_slot = self.in_nonce_slot();
         let Some(cover) = &mut self.cover_read else {
-            return Ok(false);
+            return Ok(CoverOutcome::Rejected);
         };
         if nonce_slot {
             // Upstream rewrites the nonce field with the real-record counter
             // before decrypting — the tagged-protocol nonce and the cover's
             // explicit nonce share the slot.
             if record.len() < RECORD_HDR + GCM_NONCE_LEN {
-                return Ok(false);
+                return Ok(CoverOutcome::Rejected);
             }
             record[RECORD_HDR..RECORD_HDR + GCM_NONCE_LEN]
                 .copy_from_slice(&self.gcm_read_seq.to_be_bytes());
@@ -345,10 +391,16 @@ impl<S> RestlsStream<S> {
             Some((typ, plain)) => {
                 if typ == TLS_RECORD_ALERT {
                     // close_notify ([level, 0]) is a clean EOF — upstream
-                    // maps it to `io.EOF`; other alerts are fatal.
-                    if plain.last() == Some(&0) {
+                    // maps it to `io.EOF` regardless of the streak.
+                    if plain.len() == 2 && plain[1] == 0 {
                         self.eof = true;
-                        return Ok(true);
+                        return Ok(CoverOutcome::Eof);
+                    }
+                    // TLS 1.2 permits warning alerts ([warning, desc]) —
+                    // upstream retries them (bounded); TLS 1.3 alerts
+                    // are always fatal.
+                    if self.tls12_gcm && plain.len() == 2 && plain[0] == 1 {
+                        return Ok(CoverOutcome::Consumed { n: 1, reset: false });
                     }
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
@@ -359,11 +411,17 @@ impl<S> RestlsStream<S> {
                     // Post-handshake cover messages: session tickets are
                     // dropped (no resumption), but a KeyUpdate must rekey
                     // or every later cover record desyncs.
-                    self.handle_cover_handshake(&plain)?;
+                    let n = self.handle_cover_handshake(&plain)?;
+                    return Ok(CoverOutcome::Consumed {
+                        n: n.min(MAX_USELESS_RECORDS as usize + 1) as u8,
+                        reset: true,
+                    });
                 }
-                Ok(true)
+                // Other decrypted records (empty appdata, stray cover
+                // data) advance nothing — one tick, no reset.
+                Ok(CoverOutcome::Consumed { n: 1, reset: false })
             }
-            None => Ok(false),
+            None => Ok(CoverOutcome::Rejected),
         }
     }
 
@@ -374,7 +432,8 @@ impl<S> RestlsStream<S> {
     /// never resume so tickets carry nothing we need. Messages may
     /// straddle records; the leftover tail rides `cover_hs_buf` (bounded
     /// by `MAX_COVER_HS_BUF`) exactly like upstream's `c.hand` buffer.
-    fn handle_cover_handshake(&mut self, hs: &[u8]) -> io::Result<()> {
+    /// Returns the number of complete messages consumed.
+    fn handle_cover_handshake(&mut self, hs: &[u8]) -> io::Result<usize> {
         const HS_KEY_UPDATE: u8 = 24;
         self.cover_hs_buf.extend_from_slice(hs);
         if self.cover_hs_buf.len() > MAX_COVER_HS_BUF {
@@ -385,6 +444,7 @@ impl<S> RestlsStream<S> {
         }
         let mut buf = std::mem::take(&mut self.cover_hs_buf);
         let mut off = 0;
+        let mut consumed = 0usize;
         while buf.len() - off >= 4 {
             let len = (u32::from(buf[off + 1]) << 16
                 | u32::from(buf[off + 2]) << 8
@@ -393,6 +453,16 @@ impl<S> RestlsStream<S> {
                 break;
             }
             let msg = &buf[off..off + 4 + len];
+            // A post-handshake HelloRequest (TLS 1.2 renegotiation)
+            // can't be answered — upstream alerts `no_renegotiation`
+            // and the server aborts; erroring is the same outcome
+            // without pretending the stall is progress.
+            if msg[0] == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "restls: cover renegotiation unsupported",
+                ));
+            }
             if msg[0] == HS_KEY_UPDATE && len >= 1 {
                 if let Some(read) = &mut self.cover_read {
                     read.rekey();
@@ -405,10 +475,11 @@ impl<S> RestlsStream<S> {
                     }
                 }
             }
+            consumed += 1;
             off += 4 + len;
         }
         self.cover_hs_buf = buf.split_off(off);
-        Ok(())
+        Ok(consumed)
     }
 
     /// Process one complete inbound record (tagged or cover). Fills `inbox`.
@@ -422,19 +493,11 @@ impl<S> RestlsStream<S> {
         if record.first() == Some(&TLS_RECORD_CHANGE_CIPHER_SPEC) {
             // Stray post-handshake CCS: upstream's `readRecordOrCCS`
             // consumes CCS in a separate arm before the tagged path, so
-            // neither counter ticks — drop it the same way, but bound the
-            // streak (upstream `maxUselessRecords`) so a CCS flood cannot
-            // spin the read loop forever.
-            self.ignored_ccs += 1;
-            if self.ignored_ccs > MAX_IGNORED_CCS {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "restls: too many stray CCS records",
-                ));
-            }
+            // neither counter ticks — drop it the same way, bounded by
+            // the shared useless-record cap.
+            self.tick_useless()?;
             return Ok(());
         }
-        self.ignored_ccs = 0;
         let tagged = wire::extract_tagged_record(
             &record,
             &self.secret,
@@ -451,6 +514,14 @@ impl<S> RestlsStream<S> {
                         .copied(),
                 );
                 self.to_client_ctr += 1;
+                // A record carrying no data (fakes, `Respond` replies)
+                // advances nothing — upstream ticks `retryCount`; only
+                // real payload resets the streak.
+                if decoded.data_len == 0 {
+                    self.tick_useless()?;
+                } else {
+                    self.useless_records = 0;
+                }
                 // A clean inbound record unblocks `<`-held writes.
                 let mut released = false;
                 if self.write_pending {
@@ -464,11 +535,37 @@ impl<S> RestlsStream<S> {
                 Ok(())
             }
             Err(_) => match self.accept_cover_record(&mut record) {
-                Ok(true) => {
+                // Decrypted data arrived — upstream resets the streak,
+                // then ticks once per consumed handshake message.
+                Ok(CoverOutcome::Consumed { n, reset: true }) => {
+                    self.to_client_ctr += 1;
+                    self.useless_records = n;
+                    if self.useless_records > MAX_USELESS_RECORDS {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "restls: too many useless records",
+                        ));
+                    }
+                    Ok(())
+                }
+                Ok(CoverOutcome::Consumed { n, reset: false }) => {
+                    self.to_client_ctr += 1;
+                    self.useless_records = self.useless_records.saturating_add(n);
+                    if self.useless_records > MAX_USELESS_RECORDS {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "restls: too many useless records",
+                        ));
+                    }
+                    Ok(())
+                }
+                // close_notify surfaces a clean EOF even at the streak
+                // boundary — upstream returns `io.EOF` unconditionally.
+                Ok(CoverOutcome::Eof) => {
                     self.to_client_ctr += 1;
                     Ok(())
                 }
-                Ok(false) => Err(io::Error::new(
+                Ok(CoverOutcome::Rejected) => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "restls: record failed authentication",
                 )),
@@ -548,18 +645,24 @@ where
                 // middlebox-compat) — skip them, matching the authed path,
                 // bounded by the same streak cap.
                 if record.first() == Some(&TLS_RECORD_CHANGE_CIPHER_SPEC) {
-                    this.ignored_ccs += 1;
-                    if this.ignored_ccs > MAX_IGNORED_CCS {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "restls: too many stray CCS records",
-                        )));
+                    if let Err(e) = this.tick_useless() {
+                        return Poll::Ready(Err(e));
                     }
                     continue;
                 }
-                this.ignored_ccs = 0;
                 match this.cover_read.as_mut().and_then(|c| c.open(&mut record)) {
                     Some((typ, plain)) if typ == TLS_RECORD_APPLICATION_DATA => {
+                        // Empty appdata (TLS 1.3 padding, CBC IV
+                        // randomization) produces nothing — returning an
+                        // unfilled Ready would read as EOF upstream-style
+                        // useless records just retry (bounded).
+                        if plain.is_empty() {
+                            if let Err(e) = this.tick_useless() {
+                                return Poll::Ready(Err(e));
+                            }
+                            continue;
+                        }
+                        this.useless_records = 0;
                         this.inbox.extend(plain.iter().copied());
                         serve_pending(&mut this.inbox, buf);
                         return Poll::Ready(Ok(()));
@@ -569,17 +672,35 @@ where
                     // must still honor KeyUpdate or the next cover record
                     // desyncs; NSTs are dropped (no resumption).
                     Some((typ, plain)) if typ == TLS_RECORD_HANDSHAKE => {
-                        if let Err(e) = this.handle_cover_handshake(&plain) {
-                            return Poll::Ready(Err(e));
+                        let n = match this.handle_cover_handshake(&plain) {
+                            Ok(n) => n.min(MAX_USELESS_RECORDS as usize + 1) as u8,
+                            Err(e) => return Poll::Ready(Err(e)),
+                        };
+                        // Decrypted data arrived — upstream resets the
+                        // streak, then ticks once per consumed message.
+                        this.useless_records = n;
+                        if this.useless_records > MAX_USELESS_RECORDS {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "restls: too many useless records",
+                            )));
                         }
                         continue;
                     }
-                    // close_notify ([level, 0]) is a clean EOF; other alerts
-                    // are fatal.
+                    // close_notify ([level, 0]) is a clean EOF. TLS 1.2
+                    // warning alerts ([warning, desc]) are tolerated —
+                    // upstream retries them (bounded); TLS 1.3 alerts
+                    // are always fatal.
                     Some((typ, plain)) if typ == TLS_RECORD_ALERT => {
-                        if plain.last() == Some(&0) {
+                        if plain.len() == 2 && plain[1] == 0 {
                             this.eof = true;
                             return Poll::Ready(Ok(()));
+                        }
+                        if this.tls12_gcm && plain.len() == 2 && plain[0] == 1 {
+                            if let Err(e) = this.tick_useless() {
+                                return Poll::Ready(Err(e));
+                            }
+                            continue;
                         }
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::ConnectionAborted,
@@ -613,6 +734,12 @@ where
             }
             if !this.inbox.is_empty() {
                 serve_pending(&mut this.inbox, buf);
+                return Poll::Ready(Ok(()));
+            }
+            // A cover close_notify lands via `process_record` — surface
+            // the EOF now (upstream's sticky `io.EOF`) instead of
+            // parking in `poll_fill` for a record that never comes.
+            if this.eof {
                 return Poll::Ready(Ok(()));
             }
         }
@@ -712,6 +839,7 @@ where
 mod tests {
     use super::*;
     use std::collections::VecDeque as Vdq;
+    use tokio::io::AsyncWriteExt;
 
     const CCS_RECORD: [u8; 6] = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
 
@@ -749,9 +877,22 @@ mod tests {
             self.rekeys
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        fn seal_key_update_response(&mut self) -> Option<Vec<u8>> {
+            self.rekeys
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(vec![0x16, 0x03, 0x03, 0, 5, 24, 0, 0, 1, 0])
+        }
     }
 
     fn stream(authed: bool, cover: Option<MockCover>) -> RestlsStream<tokio::io::DuplexStream> {
+        stream_full(authed, cover, None)
+    }
+
+    fn stream_full(
+        authed: bool,
+        cover: Option<MockCover>,
+        cover_write: Option<MockCover>,
+    ) -> RestlsStream<tokio::io::DuplexStream> {
         let (inner, _peer) = tokio::io::duplex(64);
         RestlsStream::new(
             RestlsUpgraded {
@@ -760,14 +901,16 @@ mod tests {
                 client_finished: None,
                 authed,
                 cover_read: cover.map(|c| Box::new(c) as _),
-                cover_write: None,
+                cover_write: cover_write.map(|c| Box::new(c) as _),
                 tls12_gcm: false,
                 gcm_ctr_disabled: false,
                 gcm_next_seq: 0,
+                cover_hs_pending: Vec::new(),
             },
             wire::derive_secret(b"pw"),
             Vec::new(),
         )
+        .unwrap()
     }
 
     /// A server→client tagged record — `build_tagged_record` is the
@@ -810,7 +953,7 @@ mod tests {
     #[test]
     fn stray_ccs_bounded() {
         let mut s = stream(true, None);
-        for i in 0..MAX_IGNORED_CCS {
+        for i in 0..MAX_USELESS_RECORDS {
             s.process_record(CCS_RECORD.to_vec())
                 .unwrap_or_else(|e| panic!("CCS {i} rejected early: {e}"));
         }
@@ -822,14 +965,86 @@ mod tests {
     #[test]
     fn ccs_streak_resets_on_real_record() {
         let mut s = stream(true, None);
-        for _ in 0..MAX_IGNORED_CCS {
+        for _ in 0..MAX_USELESS_RECORDS {
             s.process_record(CCS_RECORD.to_vec()).unwrap();
         }
         s.process_record(server_record(b"d", 0)).unwrap();
-        for _ in 0..MAX_IGNORED_CCS {
+        for _ in 0..MAX_USELESS_RECORDS {
             s.process_record(CCS_RECORD.to_vec()).unwrap();
         }
         assert!(s.process_record(CCS_RECORD.to_vec()).is_err());
+    }
+
+    /// A single cover record packed with more handshake messages than
+    /// upstream's `maxUselessRecords` bound dies — upstream's
+    /// `handlePostHandshakeMessage` ticks `retryCount` per message.
+    #[test]
+    fn cover_handshake_counts_useless() {
+        // MAX+1 complete NST-shaped messages (type 4, len 2) in one
+        // record's plaintext.
+        let mut packed = Vec::new();
+        for _ in 0..=MAX_USELESS_RECORDS {
+            packed.extend_from_slice(&[4u8, 0, 0, 2, 0, 0]);
+        }
+        let (cover, _) = MockCover::new([(TLS_RECORD_HANDSHAKE, packed)]);
+        let mut s = stream(true, Some(cover));
+        assert!(s.process_record(vec![0x17, 0x03, 0x03, 0, 6]).is_err());
+    }
+
+    /// A drip of one-message handshake records is legal: decrypted data
+    /// resets the streak, then the single message ticks it to 1 —
+    /// upstream hovers the same way and never dies on NST noise.
+    #[test]
+    fn cover_handshake_records_reset_streak() {
+        let (cover, _) = MockCover::new(std::iter::repeat_n(
+            (TLS_RECORD_HANDSHAKE, vec![4u8, 0, 0, 2, 0, 0]),
+            3 * MAX_USELESS_RECORDS as usize,
+        ));
+        let mut s = stream(true, Some(cover));
+        for _ in 0..3 * MAX_USELESS_RECORDS {
+            s.process_record(vec![0x17, 0x03, 0x03, 0, 6]).unwrap();
+            assert_eq!(s.useless_records, 1);
+        }
+    }
+
+    /// An empty tagged record (fake/`Respond` reply) ticks the streak
+    /// instead of resetting it — an endless non-advancing feed dies,
+    /// matching upstream's `retryReadRecord`.
+    #[test]
+    fn empty_tagged_record_counts_useless() {
+        let mut s = stream(true, None);
+        s.process_record(server_record(b"", 0)).unwrap();
+        assert_eq!(s.useless_records, 1);
+        // Alternating empty tagged + CCS never resets either.
+        s.process_record(CCS_RECORD.to_vec()).unwrap();
+        assert_eq!(s.useless_records, 2);
+        // A real payload resets.
+        s.process_record(server_record(b"d", 1)).unwrap();
+        assert_eq!(s.useless_records, 0);
+    }
+
+    /// A clean `close_notify` at the streak boundary still surfaces EOF —
+    /// upstream returns `io.EOF` unconditionally, it is not counted.
+    #[test]
+    fn close_notify_at_streak_boundary_is_eof() {
+        let (cover, _) = MockCover::new([(TLS_RECORD_ALERT, vec![1, 0])]);
+        let mut s = stream(true, Some(cover));
+        s.useless_records = MAX_USELESS_RECORDS;
+        s.process_record(vec![0x17, 0x03, 0x03, 0, 0]).unwrap();
+        assert!(s.eof);
+    }
+
+    /// A TLS 1.2 cover's warning alert is tolerated (bounded), not fatal.
+    #[test]
+    fn tls12_warning_alert_tolerated() {
+        let (cover, _) = MockCover::new([(TLS_RECORD_ALERT, vec![1, 90])]);
+        let mut s = stream(true, Some(cover));
+        // disableCtr drops the inbound nonce-slot rewrite so the mock's
+        // alert surfaces (the slot logic is unrelated to alert handling).
+        s.tls12_gcm = true;
+        s.gcm_ctr_disabled = true;
+        s.process_record(vec![0x17, 0x03, 0x03, 0, 0]).unwrap();
+        assert!(!s.eof);
     }
 
     /// A cover alert `close_notify` is a clean EOF, not a stream error.
@@ -873,6 +1088,23 @@ mod tests {
         assert_eq!(rekeys.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
+    /// KeyUpdate(request_update) stages our `key_update_not_requested`
+    /// response in the outbox and rekeys BOTH directions.
+    #[test]
+    fn keyupdate_request_stages_response() {
+        let (read, read_rekeys) = MockCover::new([(
+            TLS_RECORD_HANDSHAKE,
+            vec![24u8, 0, 0, 1, 1], // request_update
+        )]);
+        let (write, write_rekeys) = MockCover::new([]);
+        let mut s = stream_full(true, Some(read), Some(write));
+        s.accept_cover_record(&mut [0x17, 0x03, 0x03, 0, 5])
+            .unwrap();
+        assert_eq!(read_rekeys.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(write_rekeys.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(!s.outbox.is_empty(), "KU response not staged");
+    }
+
     /// A post-handshake message advertising a giant length wedges the
     /// buffer — bound it instead of growing forever.
     #[test]
@@ -883,7 +1115,171 @@ mod tests {
         let giant = [24u8, 0x01, 0x00, 0x00];
         s.handle_cover_handshake(&giant).unwrap();
         let chunk = vec![0u8; 32 * 1024];
+        // 4-byte header + 64 KiB body is the upstream `maxHandshake`
+        // bound — the buffer cap is the header plus that body.
+        s.handle_cover_handshake(&chunk).unwrap();
         s.handle_cover_handshake(&chunk).unwrap();
         assert!(s.handle_cover_handshake(&chunk).is_err());
+    }
+
+    /// Authed mode: a cover `close_notify` must surface EOF on the very
+    /// next `poll_read` — upstream's sticky `io.EOF` — not park waiting
+    /// for a record that never comes.
+    #[tokio::test]
+    async fn close_notify_prompt_eof() {
+        use std::future::poll_fn;
+        let (cover, _) = MockCover::new([(TLS_RECORD_ALERT, vec![1, 0])]);
+        let mut s = stream(true, Some(cover));
+        s.process_record(vec![0x17, 0x03, 0x03, 0, 0]).unwrap();
+        let mut buf_storage = [0u8; 16];
+        let mut buf = tokio::io::ReadBuf::new(&mut buf_storage);
+        poll_fn(|cx| {
+            let poll = std::pin::Pin::new(&mut s).poll_read(cx, &mut buf);
+            assert!(poll.is_ready(), "close_notify did not surface EOF");
+            poll
+        })
+        .await
+        .unwrap();
+        assert!(buf.filled().is_empty());
+    }
+
+    /// Transparent mode: an empty decrypted appdata record (padding) is
+    /// useless noise — skipping it must not read as EOF. The read pends
+    /// for the next record instead.
+    #[tokio::test]
+    async fn transparent_empty_appdata_skips() {
+        use std::future::poll_fn;
+        let (cover, _) = MockCover::new([(TLS_RECORD_APPLICATION_DATA, Vec::new())]);
+        let (inner, mut peer) = tokio::io::duplex(64);
+        let mut s = {
+            RestlsStream::new(
+                RestlsUpgraded {
+                    inner,
+                    server_random: [7u8; 32],
+                    client_finished: None,
+                    authed: false,
+                    cover_read: Some(Box::new(cover)),
+                    cover_write: None,
+                    tls12_gcm: false,
+                    gcm_ctr_disabled: false,
+                    gcm_next_seq: 0,
+                    cover_hs_pending: Vec::new(),
+                },
+                wire::derive_secret(b"pw"),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        // Feed one full record; the mock decrypts it to empty appdata.
+        tokio::io::AsyncWriteExt::write_all(&mut peer, &[0x17, 0x03, 0x03, 0, 1, 0])
+            .await
+            .unwrap();
+        let mut buf_storage = [0u8; 16];
+        let mut buf = tokio::io::ReadBuf::new(&mut buf_storage);
+        let polled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            poll_fn(|cx| std::pin::Pin::new(&mut s).poll_read(cx, &mut buf)),
+        )
+        .await;
+        assert!(
+            polled.is_err(),
+            "empty appdata read as EOF instead of being skipped"
+        );
+    }
+
+    /// Transparent mode: stray CCS records are skipped (bounded) before
+    /// real cover data — the read loop must not tick counters or die.
+    #[tokio::test]
+    async fn transparent_ccs_skipped_then_data() {
+        use std::future::poll_fn;
+        let (cover, _) = MockCover::new([(TLS_RECORD_APPLICATION_DATA, b"hi".to_vec())]);
+        let (inner, mut peer) = tokio::io::duplex(256);
+        let mut s = {
+            RestlsStream::new(
+                RestlsUpgraded {
+                    inner,
+                    server_random: [7u8; 32],
+                    client_finished: None,
+                    authed: false,
+                    cover_read: Some(Box::new(cover)),
+                    cover_write: None,
+                    tls12_gcm: false,
+                    gcm_ctr_disabled: false,
+                    gcm_next_seq: 0,
+                    cover_hs_pending: Vec::new(),
+                },
+                wire::derive_secret(b"pw"),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        for _ in 0..3 {
+            peer.write_all(&CCS_RECORD).await.unwrap();
+        }
+        peer.write_all(&[0x17, 0x03, 0x03, 0, 1, 0]).await.unwrap();
+        let mut buf_storage = [0u8; 16];
+        let mut buf = tokio::io::ReadBuf::new(&mut buf_storage);
+        poll_fn(|cx| std::pin::Pin::new(&mut s).poll_read(cx, &mut buf))
+            .await
+            .unwrap();
+        assert_eq!(buf.filled(), b"hi");
+        // The productive record reset the useless-record streak.
+        assert_eq!(s.useless_records, 0);
+    }
+
+    /// Transparent mode: a CCS flood dies at the useless-record bound —
+    /// same bound as the authed path.
+    #[tokio::test]
+    async fn transparent_ccs_bounded() {
+        use std::future::poll_fn;
+        let (cover, _) = MockCover::new([]);
+        let (inner, mut peer) = tokio::io::duplex(4096);
+        let mut s = {
+            RestlsStream::new(
+                RestlsUpgraded {
+                    inner,
+                    server_random: [7u8; 32],
+                    client_finished: None,
+                    authed: false,
+                    cover_read: Some(Box::new(cover)),
+                    cover_write: None,
+                    tls12_gcm: false,
+                    gcm_ctr_disabled: false,
+                    gcm_next_seq: 0,
+                    cover_hs_pending: Vec::new(),
+                },
+                wire::derive_secret(b"pw"),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        for _ in 0..=MAX_USELESS_RECORDS {
+            peer.write_all(&CCS_RECORD).await.unwrap();
+        }
+        let mut buf_storage = [0u8; 16];
+        let mut buf = tokio::io::ReadBuf::new(&mut buf_storage);
+        let res = poll_fn(|cx| std::pin::Pin::new(&mut s).poll_read(cx, &mut buf)).await;
+        assert!(res.is_err(), "CCS flood should die at the bound");
+    }
+
+    /// Two complete messages in one record both process; a trailing
+    /// partial stays buffered for the next record.
+    #[test]
+    fn cover_hs_multi_message_drain() {
+        let (cover, rekeys) = MockCover::new([]);
+        let mut s = stream(true, Some(cover));
+        // Two KeyUpdates + a partial third header.
+        let buf = [
+            24u8, 0, 0, 1, 0, // KU (update_not_requested)
+            24, 0, 0, 1, 0, // KU
+            24, 0, // partial
+        ];
+        s.handle_cover_handshake(&buf).unwrap();
+        assert_eq!(rekeys.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(s.cover_hs_buf, vec![24, 0]);
+        // Completing the partial triggers the third rekey.
+        s.handle_cover_handshake(&[0, 1, 0]).unwrap();
+        assert_eq!(rekeys.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert!(s.cover_hs_buf.is_empty());
     }
 }
