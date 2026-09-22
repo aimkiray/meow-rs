@@ -93,9 +93,11 @@ impl SocketIo for UdpSocket {
             // field inside the TOS byte (`dscp << 2` | ECN); IPv6 sets the
             // traffic class raw. `& 0xff` mirrors the kernel's u8 TOS store
             // for a >63 value.
-            let _ = sock
-                .set_tos(((dscp as u32) << 2) & 0xff)
-                .or_else(|_| sock.set_tclass_v6(dscp as u32));
+            let _ = sock.set_tos(((dscp as u32) << 2) & 0xff);
+            // `set_tclass_v6` is unix-only in socket2 — on Windows the
+            // IPv6 DSCP is simply not applied (best-effort like the rest).
+            #[cfg(unix)]
+            let _ = sock.set_tclass_v6(dscp as u32);
         }
     }
 }
