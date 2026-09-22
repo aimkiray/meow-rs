@@ -573,8 +573,14 @@ impl ServerFlightGuard {
                 self.cv_signature = take(&msg.body, &mut p, sig_len)?.to_vec();
             }
             HS_CERTIFICATE_REQUEST => {
-                if self.saw_certificate_request {
-                    return Err(TransportError::Tls("restls: duplicate CR".into()));
+                // Server flight order is EE → [CR] → Cert → CV → Fin —
+                // a CR outside that slot is malformed.
+                if !self.saw_encrypted_extensions
+                    || self.saw_certificate
+                    || self.saw_certificate_verify
+                    || self.saw_certificate_request
+                {
+                    return Err(TransportError::Tls("restls: unexpected CR".into()));
                 }
                 self.saw_certificate_request = true;
                 let mut p = 0;
@@ -613,6 +619,13 @@ pub(crate) fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(certs)
 }
 
+/// CV schemes legal in TLS 1.3 — `SIG_ALGS` minus PKCS#1 v1.5
+/// (`0x0401`/`0x0501`), which RFC 8446 §4.4.3 forbids in
+/// CertificateVerify even when offered in `signature_algorithms`.
+/// Anything never offered is rejected the same way — matching
+/// upstream's `isSupportedSignatureAlgorithm` gate.
+const TLS13_CV_SCHEMES: [u16; 6] = [0x0403, 0x0804, 0x0503, 0x0805, 0x0807, 0x0806];
+
 /// Verify the cover's CertificateVerify over the running transcript.
 fn verify_certificate_verify(
     cipher: CipherSuite,
@@ -621,6 +634,11 @@ fn verify_certificate_verify(
     leaf_der: &[u8],
     transcript: &[u8],
 ) -> Result<()> {
+    if !TLS13_CV_SCHEMES.contains(&scheme) {
+        return Err(TransportError::Tls(format!(
+            "restls: CV scheme 0x{scheme:04x} unoffered or illegal in TLS 1.3"
+        )));
+    }
     // TLS 1.3 CV content: 64×0x20 || "TLS 1.3, server CertificateVerify" || 0x00 || transcript_hash.
     let mut content = Vec::with_capacity(64 + 34 + 64);
     content.extend_from_slice(&[0x20u8; 64]);

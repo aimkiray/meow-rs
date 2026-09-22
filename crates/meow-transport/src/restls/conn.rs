@@ -40,6 +40,17 @@ const SEND_BUF_CAP: usize = 256 * 1024;
 /// Cap on encoded records staged in `outbox`.
 const OUTBOX_CAP: usize = 256 * 1024;
 
+/// Consecutive stray CCS records tolerated before the connection dies —
+/// upstream's `maxUselessRecords`. Post-handshake CCS is legal middlebox
+/// noise (dropped without ticking counters), but an endless CCS stream
+/// must not spin the read loop forever.
+const MAX_IGNORED_CCS: u8 = 16;
+
+/// Reassembly bound for post-handshake cover messages (KeyUpdate may
+/// straddle records). NSTs ride the same buffer; the cap keeps a peer
+/// from growing it with an unterminated message.
+const MAX_COVER_HS_BUF: usize = 64 * 1024;
+
 /// The negotiated cover cipher — kept after the handshake for stray real
 /// records (session tickets) and, when the server never authenticated, for
 /// transparent TLS passthrough.
@@ -127,6 +138,11 @@ pub(crate) struct RestlsStream<S> {
     /// write — woken when an inbound record releases the hold (split
     /// read/write tasks need this; `poll_read` runs on the other half).
     blocked_write_waker: Option<std::task::Waker>,
+    /// Consecutive dropped CCS records — bounded by `MAX_IGNORED_CCS`.
+    ignored_ccs: u8,
+    /// Partial post-handshake cover message carried across records —
+    /// upstream buffers these in `c.hand` the same way.
+    cover_hs_buf: Vec<u8>,
     eof: bool,
 }
 
@@ -157,6 +173,8 @@ impl<S> RestlsStream<S> {
             asm: RecordAssembler::new(),
             inbox: VecDeque::new(),
             blocked_write_waker: None,
+            ignored_ccs: 0,
+            cover_hs_buf: Vec::new(),
             eof: false,
         }
     }
@@ -326,6 +344,12 @@ impl<S> RestlsStream<S> {
         match cover.open(record) {
             Some((typ, plain)) => {
                 if typ == TLS_RECORD_ALERT {
+                    // close_notify ([level, 0]) is a clean EOF — upstream
+                    // maps it to `io.EOF`; other alerts are fatal.
+                    if plain.last() == Some(&0) {
+                        self.eof = true;
+                        return Ok(true);
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "restls: cover alert",
@@ -335,7 +359,7 @@ impl<S> RestlsStream<S> {
                     // Post-handshake cover messages: session tickets are
                     // dropped (no resumption), but a KeyUpdate must rekey
                     // or every later cover record desyncs.
-                    self.handle_cover_handshake(&plain);
+                    self.handle_cover_handshake(&plain)?;
                 }
                 Ok(true)
             }
@@ -347,16 +371,28 @@ impl<S> RestlsStream<S> {
     /// the inbound cipher, and `request_update` additionally queues our
     /// `key_update_not_requested` + outbound rekey. Other types (NST, …)
     /// are dropped — upstream's embedded stack would consume them, but we
-    /// never resume so tickets carry nothing we need.
-    fn handle_cover_handshake(&mut self, mut hs: &[u8]) {
+    /// never resume so tickets carry nothing we need. Messages may
+    /// straddle records; the leftover tail rides `cover_hs_buf` (bounded
+    /// by `MAX_COVER_HS_BUF`) exactly like upstream's `c.hand` buffer.
+    fn handle_cover_handshake(&mut self, hs: &[u8]) -> io::Result<()> {
         const HS_KEY_UPDATE: u8 = 24;
-        while hs.len() >= 4 {
-            let len = (u32::from(hs[1]) << 16 | u32::from(hs[2]) << 8 | u32::from(hs[3])) as usize;
-            if hs.len() < 4 + len {
+        self.cover_hs_buf.extend_from_slice(hs);
+        if self.cover_hs_buf.len() > MAX_COVER_HS_BUF {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "restls: oversized cover handshake message",
+            ));
+        }
+        let mut buf = std::mem::take(&mut self.cover_hs_buf);
+        let mut off = 0;
+        while buf.len() - off >= 4 {
+            let len = (u32::from(buf[off + 1]) << 16
+                | u32::from(buf[off + 2]) << 8
+                | u32::from(buf[off + 3])) as usize;
+            if buf.len() - off < 4 + len {
                 break;
             }
-            let msg = &hs[..4 + len];
-            hs = &hs[4 + len..];
+            let msg = &buf[off..off + 4 + len];
             if msg[0] == HS_KEY_UPDATE && len >= 1 {
                 if let Some(read) = &mut self.cover_read {
                     read.rekey();
@@ -369,7 +405,10 @@ impl<S> RestlsStream<S> {
                     }
                 }
             }
+            off += 4 + len;
         }
+        self.cover_hs_buf = buf.split_off(off);
+        Ok(())
     }
 
     /// Process one complete inbound record (tagged or cover). Fills `inbox`.
@@ -383,9 +422,19 @@ impl<S> RestlsStream<S> {
         if record.first() == Some(&TLS_RECORD_CHANGE_CIPHER_SPEC) {
             // Stray post-handshake CCS: upstream's `readRecordOrCCS`
             // consumes CCS in a separate arm before the tagged path, so
-            // neither counter ticks — drop it the same way.
+            // neither counter ticks — drop it the same way, but bound the
+            // streak (upstream `maxUselessRecords`) so a CCS flood cannot
+            // spin the read loop forever.
+            self.ignored_ccs += 1;
+            if self.ignored_ccs > MAX_IGNORED_CCS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "restls: too many stray CCS records",
+                ));
+            }
             return Ok(());
         }
+        self.ignored_ccs = 0;
         let tagged = wire::extract_tagged_record(
             &record,
             &self.secret,
@@ -496,20 +545,35 @@ where
             // Transparent mode: records go through the cover cipher.
             if !this.authed {
                 // Stray CCS records are legal post-handshake (TLS 1.3
-                // middlebox-compat) — skip them, matching the authed path.
+                // middlebox-compat) — skip them, matching the authed path,
+                // bounded by the same streak cap.
                 if record.first() == Some(&TLS_RECORD_CHANGE_CIPHER_SPEC) {
+                    this.ignored_ccs += 1;
+                    if this.ignored_ccs > MAX_IGNORED_CCS {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "restls: too many stray CCS records",
+                        )));
+                    }
                     continue;
                 }
+                this.ignored_ccs = 0;
                 match this.cover_read.as_mut().and_then(|c| c.open(&mut record)) {
                     Some((typ, plain)) if typ == TLS_RECORD_APPLICATION_DATA => {
                         this.inbox.extend(plain.iter().copied());
                         serve_pending(&mut this.inbox, buf);
                         return Poll::Ready(Ok(()));
                     }
-                    // Post-handshake handshake records (NewSessionTicket,
-                    // KeyUpdate) are consumed internally by a real TLS
-                    // stack — a fallback conn must skip them, not die.
-                    Some((typ, _)) if typ == TLS_RECORD_HANDSHAKE => continue,
+                    // Post-handshake handshake records are consumed
+                    // internally by a real TLS stack — a fallback conn
+                    // must still honor KeyUpdate or the next cover record
+                    // desyncs; NSTs are dropped (no resumption).
+                    Some((typ, plain)) if typ == TLS_RECORD_HANDSHAKE => {
+                        if let Err(e) = this.handle_cover_handshake(&plain) {
+                            return Poll::Ready(Err(e));
+                        }
+                        continue;
+                    }
                     // close_notify ([level, 0]) is a clean EOF; other alerts
                     // are fatal.
                     Some((typ, plain)) if typ == TLS_RECORD_ALERT => {
@@ -641,5 +705,185 @@ where
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque as Vdq;
+
+    const CCS_RECORD: [u8; 6] = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+
+    struct MockCover {
+        opens: Vdq<(u8, Vec<u8>)>,
+        rekeys: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl MockCover {
+        fn new(
+            opens: impl IntoIterator<Item = (u8, Vec<u8>)>,
+        ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let rekeys = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    opens: opens.into_iter().collect(),
+                    rekeys: std::sync::Arc::clone(&rekeys),
+                },
+                rekeys,
+            )
+        }
+    }
+
+    impl CoverCipher for MockCover {
+        fn open(&mut self, _record: &mut [u8]) -> Option<(u8, Vec<u8>)> {
+            self.opens.pop_front()
+        }
+        fn seal(&mut self, _body: &[u8]) -> Vec<u8> {
+            Vec::new()
+        }
+        fn seal_close_notify(&mut self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn rekey(&mut self) {
+            self.rekeys
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn stream(authed: bool, cover: Option<MockCover>) -> RestlsStream<tokio::io::DuplexStream> {
+        let (inner, _peer) = tokio::io::duplex(64);
+        RestlsStream::new(
+            RestlsUpgraded {
+                inner,
+                server_random: [7u8; 32],
+                client_finished: None,
+                authed,
+                cover_read: cover.map(|c| Box::new(c) as _),
+                cover_write: None,
+                tls12_gcm: false,
+                gcm_ctr_disabled: false,
+                gcm_next_seq: 0,
+            },
+            wire::derive_secret(b"pw"),
+            Vec::new(),
+        )
+    }
+
+    /// A server→client tagged record — `build_tagged_record` is the
+    /// client→server direction, so inbound fixtures build the MAC the
+    /// way upstream's server does (dir label `server-to-client`).
+    fn server_record(data: &[u8], ctr: u64) -> Vec<u8> {
+        let secret = wire::derive_secret(b"pw");
+        let sr = [7u8; 32];
+        let payload_len = AUTH_HEADER_LEN + data.len();
+        let mut out = Vec::with_capacity(RECORD_HDR + payload_len);
+        out.extend_from_slice(&[0x17, 0x03, 0x03]);
+        out.extend_from_slice(&(payload_len as u16).to_be_bytes());
+        out.resize(RECORD_HDR + AUTH_HEADER_LEN, 0);
+        out.extend_from_slice(data);
+        // len‖cmd masked with the data-prefix mask.
+        let mut hmask = blake3::Hasher::new_keyed(&secret);
+        hmask.update(&sr);
+        hmask.update(b"server-to-client");
+        hmask.update(&ctr.to_be_bytes());
+        hmask.update(&data[..data.len().min(32)]);
+        let mask = hmask.finalize();
+        let field = &mut out[RECORD_HDR + 8..RECORD_HDR + 12];
+        field[..2].copy_from_slice(&(data.len() as u16).to_be_bytes());
+        field[2..4].copy_from_slice(&[0, 0]);
+        for (b, m) in field.iter_mut().zip(mask.as_bytes().iter()) {
+            *b ^= m;
+        }
+        let mut hmac = blake3::Hasher::new_keyed(&secret);
+        hmac.update(&sr);
+        hmac.update(b"server-to-client");
+        hmac.update(&ctr.to_be_bytes());
+        hmac.update(&out[..RECORD_HDR]);
+        hmac.update(&out[RECORD_HDR + 8..]);
+        out[RECORD_HDR..RECORD_HDR + 8].copy_from_slice(&hmac.finalize().as_bytes()[..8]);
+        out
+    }
+
+    /// A CCS flood must die at upstream's `maxUselessRecords` bound —
+    /// stray CCS is legal noise, not an infinite read-loop spin.
+    #[test]
+    fn stray_ccs_bounded() {
+        let mut s = stream(true, None);
+        for i in 0..MAX_IGNORED_CCS {
+            s.process_record(CCS_RECORD.to_vec())
+                .unwrap_or_else(|e| panic!("CCS {i} rejected early: {e}"));
+        }
+        assert!(s.process_record(CCS_RECORD.to_vec()).is_err());
+    }
+
+    /// A valid tagged record resets the streak — interleaved CCS stays
+    /// legal middlebox noise.
+    #[test]
+    fn ccs_streak_resets_on_real_record() {
+        let mut s = stream(true, None);
+        for _ in 0..MAX_IGNORED_CCS {
+            s.process_record(CCS_RECORD.to_vec()).unwrap();
+        }
+        s.process_record(server_record(b"d", 0)).unwrap();
+        for _ in 0..MAX_IGNORED_CCS {
+            s.process_record(CCS_RECORD.to_vec()).unwrap();
+        }
+        assert!(s.process_record(CCS_RECORD.to_vec()).is_err());
+    }
+
+    /// A cover alert `close_notify` is a clean EOF, not a stream error.
+    #[test]
+    fn cover_close_notify_is_eof() {
+        let (cover, _) = MockCover::new([(TLS_RECORD_ALERT, vec![1, 0])]);
+        let mut s = stream(true, Some(cover));
+        s.process_record(vec![0x17, 0x03, 0x03, 0, 0]).unwrap();
+        assert!(s.eof);
+    }
+
+    /// Any other cover alert stays fatal.
+    #[test]
+    fn cover_alert_fatal() {
+        let (cover, _) = MockCover::new([(TLS_RECORD_ALERT, vec![2, 40])]);
+        let mut s = stream(true, Some(cover));
+        assert!(s.process_record(vec![0x17, 0x03, 0x03, 0, 0]).is_err());
+    }
+
+    /// KeyUpdate rekeys the inbound cover cipher — including when the
+    /// handshake message straddles two cover records (upstream buffers
+    /// the tail in `c.hand`; dropping it would desync the cipher).
+    #[test]
+    fn cover_keyupdate_rekeys_across_records() {
+        // KeyUpdate(24), len 1, body [0] (update_not_requested) — split
+        // after the 2nd header byte.
+        let (cover, rekeys) = MockCover::new([
+            (TLS_RECORD_HANDSHAKE, vec![24u8, 0x00]),
+            (TLS_RECORD_HANDSHAKE, vec![0x00u8, 0x01, 0x00]),
+        ]);
+        let mut s = stream(true, Some(cover));
+        s.accept_cover_record(&mut [0x17, 0x03, 0x03, 0, 2])
+            .unwrap();
+        assert_eq!(
+            rekeys.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "rekeyed on an incomplete KeyUpdate"
+        );
+        s.accept_cover_record(&mut [0x17, 0x03, 0x03, 0, 3])
+            .unwrap();
+        assert_eq!(rekeys.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// A post-handshake message advertising a giant length wedges the
+    /// buffer — bound it instead of growing forever.
+    #[test]
+    fn cover_hs_buf_bounded() {
+        let mut s = stream(true, None);
+        // Handshake header claiming a 64 KiB body — never completed, so
+        // each appended chunk stays buffered until the cap trips.
+        let giant = [24u8, 0x01, 0x00, 0x00];
+        s.handle_cover_handshake(&giant).unwrap();
+        let chunk = vec![0u8; 32 * 1024];
+        s.handle_cover_handshake(&chunk).unwrap();
+        assert!(s.handle_cover_handshake(&chunk).is_err());
     }
 }

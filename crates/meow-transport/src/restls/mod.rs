@@ -21,8 +21,16 @@
 //! parrot + TLS stack): HelloRetryRequest is rejected rather than
 //! processed — all three supported key shares are offered up front so a
 //! group-mismatch HRR cannot occur, but a cover that demands a cookie HRR
-//! (anti-DDoS) cannot complete; and the ClientHello is a fixed Chrome-like
-//! shape rather than a selectable uTLS parrot (`client-id`).
+//! (anti-DDoS) cannot complete; the ClientHello is a fixed Chrome-like
+//! shape rather than a selectable uTLS parrot (`client-id`);
+//! `version-hint=tls13` offers only TLS 1.3 in `supported_versions`, so a
+//! TLS 1.2-only cover fails where upstream's `[1.3, 1.2]` offer would
+//! degrade to transparent cover TLS; and an inbound `Respond(n)` that
+//! releases `<`-held writes emits `n−1` fakes — upstream passes its
+//! `sent` flag into `handleRestlsCommand` for exactly this, but its
+//! `Write([]byte{})` release always reports `sent=false`, making the
+//! decrement dead code upstream; we implement the evident intent
+//! (observable only as one fewer traffic-shaping record).
 
 pub(crate) mod conn;
 pub(crate) mod script;

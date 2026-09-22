@@ -518,7 +518,14 @@ where
                         &sh.random,
                     )?);
                 }
-                HS_CERTIFICATE_REQUEST => cert_request = true,
+                HS_CERTIFICATE_REQUEST => {
+                    // TLS 1.2 flight order is SH → Cert → SKE → [CR] →
+                    // SHD — a CR before SKE or after SHD is malformed.
+                    if cert_request || ske.is_none() || got_done {
+                        return Err(TransportError::Tls("restls12: unexpected CR".into()));
+                    }
+                    cert_request = true;
+                }
                 HS_SERVER_HELLO_DONE => {
                     if server_hello.is_none() || ske.is_none() || certs.is_empty() {
                         return Err(TransportError::Tls(
@@ -560,6 +567,15 @@ where
     tls13::verify_certificate_chain(&cfg.cert, name, &certs)?;
 
     // ServerKeyExchange signature over client_random || server_random || params.
+    // Only schemes we offered in `signature_algorithms` are acceptable —
+    // upstream's `isSupportedSignatureAlgorithm` gate (v1.5 stays legal
+    // here: TLS 1.2 RSA SKE needs it, unlike TLS 1.3 CV).
+    if !tls13::SIG_ALGS.contains(&ske.scheme) {
+        return Err(TransportError::Tls(format!(
+            "restls12: unoffered SKE scheme 0x{:04x}",
+            ske.scheme
+        )));
+    }
     tls13::verify_signature(ske.scheme, &ske.signature, &ske.signed_params, &certs[0])?;
 
     // ── client flight ────────────────────────────────────────────────
