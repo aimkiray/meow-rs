@@ -132,15 +132,16 @@ Field reference:
 | Field | Type | Required | Default | Meaning |
 |-------|------|:-------:|---------|---------|
 | `proxies` | `[]string` | yes | — | Ordered list of proxy or group names. Minimum 2 entries. Each entry is a server:port in the chain; the final entry connects to the real target. |
+| `include-all-proxies` | `bool` | no | `false` | Prepend every top-level `proxies:` entry as chain members. |
 
 **No `url`, `interval`, `lazy`, `tolerance`, or `expected-status`** —
 relay is a fixed chain, not a selection pool, and runs no probe loop.
 Presence of these fields is accepted and ignored (forward-compat, not a
 parse error) with a warn-once per field at parse time. Provider-member
-fields (`use`, `include-all`, `filter`, `exclude-filter`,
-`exclude-type`) warn the same way — upstream relay accepts provider
-members, ours is static-only. `strategy` is silently ignored, matching
-upstream (it is a load-balance-only option there too).
+fields (`use`, `include-all`, `include-all-providers`, `filter`,
+`exclude-filter`, `exclude-type`) warn the same way — upstream relay
+accepts provider members, ours is static-only. `strategy` is silently
+ignored, matching upstream (it is a load-balance-only option there too).
 
 **Divergences from upstream** (classified per
 [ADR-0002](../adr/0002-upstream-divergence-policy.md)):
@@ -151,7 +152,7 @@ upstream (it is a load-balance-only option there too).
 | 2 | Empty `proxies` list — upstream panics | A | Hard-error at parse time. |
 | 3 | UDP relay when any chain member lacks UDP — upstream silently returns a non-functional conn | A | We return `UdpNotSupported` immediately from `dial_udp` if any chain member's `support_udp()` is false. NOT a silent partial relay. |
 | 4 | `url`/`interval`/`lazy`/`tolerance`/`expected-status` present on relay group — upstream probes static members since `90bf158` | B | Warn-once per field at parse time. No routing change. |
-| 5 | `use`/`include-all`/`filter`/`exclude-filter`/`exclude-type` present on relay group — upstream relay accepts provider members | B | Warn-once per field at parse time. Relay is static-only. |
+| 5 | `use`/`include-all`/`include-all-providers`/`filter`/`exclude-filter`/`exclude-type` present on relay group — upstream relay accepts provider members | B | Warn-once per field at parse time. Relay is static-only. |
 
 ## Internal design
 
@@ -334,8 +335,9 @@ boundary.
    message. Not a raw inner error with no relay context.
 8. Inert health-check fields (`url`/`interval`/`lazy`/`tolerance`/
    `expected-status`) and provider-member fields (`use`/`include-all`/
-   `filter`/`exclude-filter`/`exclude-type`) on a relay group each log
-   exactly one `warn!` per field per parse. Class B per ADR-0002.
+   `include-all-providers`/`filter`/`exclude-filter`/`exclude-type`) on a
+   relay group each log exactly one `warn!` per field per parse. Class B
+   per ADR-0002.
 9. `AdapterType::Relay` serialises to `"Relay"` in JSON.
 10. Group-reference in relay chain (e.g. a Selector as proxy[0])
     resolves correctly at dial time via `unwrap_proxy` → leaf in

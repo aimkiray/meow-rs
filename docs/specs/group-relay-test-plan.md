@@ -124,8 +124,8 @@ an `AsyncRead + AsyncWrite + ProxyConn` that accepts all bytes and returns EOF.
 | B3 | `relay_url_field_warns_not_errors` | YAML with `url: https://example.com` on a relay group → a `warn!` mentioning `"url"`, captured via `capture_warns`. NOT a parse error. NOT zero warns. ADR-0002 Class B. |
 | B4 | `relay_interval_field_warns_not_errors` | YAML with `interval: 300` → a `warn!` mentioning `"interval"`. |
 | B5 | `relay_url_and_interval_warn_not_errors` **[guard-rail]** | Both `url:` and `interval:` present → two captured warns, one per field. NOT a combined single warn. NOT four warns (guards that warn-once is per-field, not per-call). |
-| B6 | `relay_lazy_and_tolerance_warn_not_errors` | `lazy`/`tolerance`/`expected-status` → one captured warn each (#555). |
-| B7 | `relay_provider_fields_warn_not_errors` | `use:`/`filter:` on a relay → one captured warn each; group still builds from `proxies:` (#555). |
+| B6 | `relay_inert_health_fields_warn_not_errors` | `lazy`/`tolerance`/`expected-status` → one captured warn each (#555). |
+| B7 | `relay_provider_fields_warn_not_errors` | `use:`/`include-all`/`include-all-providers`/`filter:`/`exclude-filter:`/`exclude-type:` on a relay → one captured warn each; group still builds from `proxies:` (#555). |
 
 ---
 
@@ -185,13 +185,12 @@ an `AsyncRead + AsyncWrite + ProxyConn` that accepts all bytes and returns EOF.
 
 ## Divergence table cross-reference
 
-All 4 spec divergence rows have test coverage:
+All 5 spec divergence rows have test coverage:
 
 | Spec row | Class | Test cases |
 |----------|:-----:|------------|
 | 1 — Single-proxy relay → hard error (not passthrough) | A | B1 |
 | 2 — Empty proxy list → hard error (not panic) | A | B2 |
 | 3 — Any chain member lacks UDP → `UdpNotSupported` (not silent) | A | C2, C3, C4 |
-| 4 — `url`/`interval` fields → warn-once (not error) | B | B3, B4, B5 |
-| 5 — `lazy`/`tolerance`/`expected-status` fields → warn-once | B | B6 |
-| 6 — provider-member fields (`use`/`filter`/…) → warn-once | B | B7 |
+| 4 — `url`/`interval`/`lazy`/`tolerance`/`expected-status` fields → warn-once (not error) | B | B3, B4, B5, B6 |
+| 5 — `use`/`include-all*`/`filter`/`exclude-*` fields → warn-once (not error) | B | B7 |

@@ -288,7 +288,7 @@ Supported: `name`, `type`, `proxies`, `url`, `interval`, `tolerance`, `expected-
 
 Missing: `disable-udp`, `hidden`, `icon`.
 
-`url`/`interval`/`lazy`/`tolerance`/`expected-status` take effect only on `url-test`/`fallback`/`load-balance` — on `select`/`relay` they are accepted but inert (warn-once per field, Class B; upstream sweeps static members of all group types since `90bf158`, tracked in #555). `lazy` defaults to `false` here vs `true` upstream (Class B, ADR-0002).
+`url`/`interval`/`lazy`/`expected-status` take effect only on `url-test`/`fallback`/`load-balance`; `tolerance` is `url-test`-only (silently inert elsewhere, matching upstream). On `select`/`relay` all five are accepted but inert (warn-once per field, Class B; upstream sweeps static members of all group types since `90bf158`, tracked in #555). `lazy` defaults to `false` here vs `true` upstream (Class B, ADR-0002).
 
 ---
 

@@ -168,7 +168,8 @@ consistent-hashing tests build on top of it.
 | F4 | `parse_load_balance_unknown_strategy_hard_errors` | `strategy: sticky` → parse error. <br/> Upstream: falls back silently to round-robin. <br/> NOT silent fallback. ADR-0002 Class A: wrong strategy means different distribution than intended. |
 | F5 | `parse_load_balance_case_insensitive_strategy` **[guard-rail]** | `strategy: Round-Robin` or `ROUND-ROBIN` → either succeeds or errors consistently. Pick one behaviour and document it; do not let it panic. |
 | F6 | `parse_load_balance_missing_proxies_errors` | YAML with no `proxies:` list → parse error. NOT an empty group. |
-| F7 | `parse_load_balance_interval_zero_no_sweep` | `interval: 0` parses without error and produces a group with `interval == Duration::ZERO`. Group still functions for manual selection; no background sweep spawned. |
+| F7 | `parse_load_balance_interval_zero_no_sweep` | `interval: 0` parses without error and produces a group with `interval == Duration::ZERO`. Group still functions for dials (LB has no manual selection); no background sweep spawned. |
+| F8 | `load_balance_expected_status_reaches_probe_loop` + `lb_expected_status_reaches_probe` | `expected-status: "204"` reaches `Proxy::expected_status()` (config → group plumbing, proxy_parser); a canned 204 against `expected_status("200")` marks the member dead through the real sweep (meow-tunnel health_check). #555 |
 
 ---
 

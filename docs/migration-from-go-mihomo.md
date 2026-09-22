@@ -291,6 +291,9 @@ otherwise:
 ### selector, url-test, fallback
 
 Fully supported. `url-test` uses real HTTP GET (not raw TCP).
+`select` accepts but ignores `url`/`interval`/`lazy`/`tolerance`/
+`expected-status` — warn-once per field; it runs no probe loop (upstream
+sweeps static members of every group type since v1.18.4).
 
 ### load-balance
 
@@ -319,18 +322,18 @@ proxy-groups:
 | Unknown `strategy` value | Falls back to round-robin silently | Hard parse error — wrong strategy means wrong distribution (ADR-0002 Class A). |
 | All proxies dead | Returns a dead proxy slot; dial fails | Returns `NoProxyAvailable` immediately — fast, named failure (Class B). |
 | `consistent-hashing` with no alive proxies | Panics (index out of bounds) | Returns `NoProxyAvailable` cleanly (Class A). |
-| `consistent-hashing` hash algorithm | FNV-1 32-bit | FNV-1a 32-bit (better distribution, same speed). Results are stable per-IP but not bit-for-bit identical to Go output (Class B). |
+| `consistent-hashing` key + hash | Destination key (`getKey`: IP-literal host → host, domain → eTLD+1) hashed with `utils.MapHash` + `jumpHash` over the **full** member list, retrying dead members up to 5× — minimal reshuffle on membership changes | Client `src_ip` bytes hashed with FNV-1a `% alive_count` over the **alive** subset — "same client → same node"; membership changes reshuffle most assignments (Class B). |
 
-**Note on "consistent-hashing":** despite the name, this is modulo-hash
-(not ring-hash). Rebalancing the proxy list reshuffles most assignments.
-"Consistent" means *stable for a given src IP given a fixed proxy list*.
-This matches upstream Go mihomo's actual implementation.
+**Note on "consistent-hashing":** despite the name, meow's variant is a
+modulo-hash keyed by *client source IP* — stable for a given client given
+a fixed alive list, but a membership change reshuffles most assignments.
+Upstream's is a jump-hash keyed by *destination* over the full member
+list. See `docs/specs/group-load-balance.md` divergence row 4.
 
 ### relay
 
 Supported in M1.C-2. Chains ≥2 outbounds in sequence:
-`client → proxy[0] → proxy[1] → … → target`. Requires M1.B-1 VMess to land
-first (introduces `connect_over` trait method on `ProxyAdapter`).
+`client → proxy[0] → proxy[1] → … → target`.
 
 ```yaml
 proxy-groups:
@@ -356,7 +359,7 @@ proxy-groups:
 | Empty `proxies` list | Panics | Hard parse error (Class A). |
 | UDP relay when any chain member lacks UDP support | Returns a non-functional conn silently | Returns `UdpNotSupported` immediately (Class A). |
 | `url:`/`interval:`/`lazy:`/`tolerance:`/`expected-status:` on a relay group | Probes static members (since `90bf158`, v1.18.4) | Warn-once per field; no probe loop runs (Class B). |
-| `use:`/`include-all:`/`filter:`/`exclude-*:` on a relay group | Relay accepts provider members | Warn-once per field; relay is static-only (Class B). |
+| `use:`/`include-all*`/`filter:`/`exclude-*:` on a relay group | Relay accepts provider members | Warn-once per field; relay is static-only (Class B). |
 
 **UDP relay:** works only when every proxy in the chain supports UDP
 (`support_udp() == true` for all hops). If any hop lacks UDP, `dial_udp()`

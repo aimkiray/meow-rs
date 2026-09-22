@@ -54,6 +54,7 @@ Periodically probes each member with an HTTP GET and auto-selects the fastest.
 | `interval` | u64 | — | Probe interval in seconds |
 | `tolerance` | u16 | `150` | Only switch if the new node is faster by more than this (ms) |
 | `lazy` | bool | `false` | Probe only when the group is in use — housekeeping traffic (provider/geodata downloads, DNS-via-proxy exchanges, probes chained through `dialer-proxy`) does not count |
+| `expected-status` | string | — | Probe success expression, e.g. `204` |
 
 ```yaml
 - name: Auto
@@ -74,6 +75,7 @@ moves to the next.
 | `url` | string | — | Health-check URL |
 | `interval` | u64 | — | Probe interval in seconds |
 | `lazy` | bool | `false` | Probe only when in use — housekeeping traffic does not count |
+| `expected-status` | string | — | Probe success expression, e.g. `204` |
 
 ```yaml
 - name: Fallback
@@ -95,8 +97,8 @@ Spreads connections across members.
 | `lazy` | bool | `false` | Probe only when in use — housekeeping traffic does not count |
 | `expected-status` | string | — | Probe success expression, e.g. `204` |
 
-`consistent-hashing` keeps the same destination on the same node (sticky). An unknown
-strategy is a hard error.
+`consistent-hashing` keeps the same client (source IP) on the same node (sticky). An
+unknown strategy is a hard error.
 
 ```yaml
 - name: Balance

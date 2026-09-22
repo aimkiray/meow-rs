@@ -98,7 +98,7 @@ migrate away from.
 | `sniffer.enable-sni: true` (deprecated alias) | — | Warn-once, synthesise new config shape | Migration window for renamed field |
 | Unknown YAML field in a protocol config | Error in strict mode | Warn, ignore | Forward-compat for new upstream fields |
 | `url`/`interval`/`lazy`/`tolerance`/`expected-status` on `select`/`relay` groups | Health-checks static members of every group type (since mihomo `90bf158`, v1.18.4) | Warn-once per inert field; only `fallback`/`url-test`/`load-balance` are swept | Missing probes change idle behaviour, never routing; warning surfaces the gap (#555) |
-| `use`/`include-all`/`filter`/`exclude-filter`/`exclude-type` on `relay` groups | Relay accepts provider members (`NewRelay` takes providers) | Warn-once per field; relay is static-only (`proxies:`/`include-all-proxies` still work) | Provider chains are a missing feature, not a misroute; warning surfaces the gap (#555) |
+| `use`/`include-all`/`include-all-providers`/`filter`/`exclude-filter`/`exclude-type` on `relay` groups | Relay accepts provider members (`NewRelay` takes providers) | Warn-once per field; relay is static-only (`proxies:`/`include-all-proxies` still work) | Provider chains are a missing feature, not a misroute; warning surfaces the gap (#555) |
 | `lazy` default on checkable groups | `true` — probe only after first use (`GroupCommonOption{Lazy: true}`) | `false` — probe every interval from startup | Eager is heavier but never wrong; a silent default flip would change idle traffic for every existing config (#555) |
 
 ### Rule of thumb

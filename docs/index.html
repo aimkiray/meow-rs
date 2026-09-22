@@ -391,7 +391,7 @@ h2.title{font-family:var(--display);font-weight:700;font-size:clamp(1.7rem,3.4vw
       <div class="tin rv"><div class="ic">📋</div><h3>Rule engine</h3><p>Domain, IP-CIDR, GeoIP, port, process, and regex rules with AND/OR/NOT logic. First match wins.</p></div>
       <div class="tin rv"><div class="ic">🛡️</div><h3>Transparent proxy</h3><p>Kernel-level interception via nftables (Linux) or pf (macOS). SNI extraction, DNS snooping, loop-safe via <code>SO_MARK</code>.</p></div>
       <div class="tin rv"><div class="ic">🔭</div><h3>DNS &amp; snooping</h3><p>Built-in UDP resolver with caching, FakeIP, and an IP→domain reverse table to recover hostnames for transparent flows.</p></div>
-      <div class="tin rv"><div class="ic">🧶</div><h3>Proxy groups</h3><p>Selector, URL-Test, Fallback, LoadBalance, and Relay groups with health checks. Dead nodes get skipped — it lands on its feet.</p></div>
+      <div class="tin rv"><div class="ic">🧶</div><h3>Proxy groups</h3><p>Selector, URL-Test, Fallback, LoadBalance, and Relay groups. Health checks keep dead nodes out of the pick space — it lands on its feet.</p></div>
       <div class="tin rv"><div class="ic">🔒</div><h3>ECH &amp; uTLS</h3><p>Encrypted Client Hello via BoringSSL, DNS-sourced ECH configs, and uTLS fingerprints for Chrome, Firefox, Safari, iOS &amp; more.</p></div>
       <div class="tin rv"><div class="ic">🖥️</div><h3>Dashboard &amp; REST API</h3><p>Axum-powered API plus a built-in web UI at <code>/ui</code> — switch proxies, edit rules, watch live traffic. Mount your own dashboard too.</p></div>
       <div class="tin rv"><div class="ic">📡</div><h3>Subscriptions</h3><p>Import Clash YAML subscriptions, cache to disk for instant startup, and refresh in the background on a schedule.</p></div>
