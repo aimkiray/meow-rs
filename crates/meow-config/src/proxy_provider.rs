@@ -328,12 +328,24 @@ impl ProxyProvider {
                     });
                 match fetched {
                     Ok(text) => {
-                        // Cache to disk for offline fallback
+                        // Cache to disk for offline fallback — atomic
+                        // write-then-rename on a unique scratch: the
+                        // manual-refresh endpoint and a detached initial
+                        // fetch can race this write unlaned, and a torn
+                        // cache would poison the next fallback read
+                        // (issue #543 review).
                         if let Some(cache_path) = cache_path {
                             if let Some(parent) = cache_path.parent() {
                                 let _ = tokio::fs::create_dir_all(parent).await;
                             }
-                            let _ = tokio::fs::write(cache_path, &text).await;
+                            let tmp = crate::unique_scratch_path(cache_path);
+                            let saved = match tokio::fs::write(&tmp, &text).await {
+                                Ok(()) => tokio::fs::rename(&tmp, cache_path).await.is_ok(),
+                                Err(_) => false,
+                            };
+                            if !saved {
+                                let _ = tokio::fs::remove_file(&tmp).await;
+                            }
                         }
                         Ok(text)
                     }

@@ -89,9 +89,26 @@ fn write_atomic(path: &Path, map: &HashMap<String, String>) -> std::io::Result<(
     }
     let json = serde_json::to_vec_pretty(map)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)
+    // Unique scratch per call — concurrent `set()`s (API handlers plus
+    // url-test/fallback auto-switch, none laned) must not share a fixed
+    // tmp or one writer's rename publishes the other's splice (issue #543
+    // review).
+    let tmp = scratch_path(path);
+    let result = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn scratch_path(path: &Path) -> PathBuf {
+    // Same unique-suffix scheme as `meow-config::unique_scratch_path`;
+    // `AtomicU` resolves to AtomicU32 where 64-bit atomics are missing.
+    static COUNTER: meow_common::atomic::AtomicU = meow_common::atomic::AtomicU::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{}.{}.tmp", std::process::id(), n));
+    PathBuf::from(name)
 }
 
 #[cfg(test)]

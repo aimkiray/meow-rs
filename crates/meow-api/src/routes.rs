@@ -1061,6 +1061,10 @@ async fn apply_raw_to_tunnel(
     raw: RawConfig,
     state: &AppState,
 ) -> Result<(Option<meow_config::DnsConfig>, Arc<meow_dns::Resolver>), (StatusCode, String)> {
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
     let expected_groups: Vec<String> = raw
         .proxy_groups
         .as_deref()
@@ -1722,6 +1726,15 @@ async fn refresh_subscription(
             .as_mut()
             .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
             .ok_or_else(|| (StatusCode::NOT_FOUND, "subscription not found".into()))?;
+        // A same-name re-add (or `PUT /configs` rewrite) with a different
+        // URL must not inherit the payload fetched from the old one
+        // (issue #543 review).
+        if sub.url != url {
+            return Err((
+                StatusCode::CONFLICT,
+                "subscription changed while refresh was in flight".into(),
+            ));
+        }
         sub.last_updated = Some(now);
 
         raw.proxies = Some(fetched.proxies);

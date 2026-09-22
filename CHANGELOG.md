@@ -286,7 +286,8 @@ the canonical, in-repo source a release is cut from.
   lane; if the subscription was deleted meanwhile, the fetched
   proxies/groups/rules were committed unconditionally. The endpoint now
   re-verifies the subscription exists inside the lane and returns 404
-  otherwise, and the loop discards the payload on the same recheck. The
+  otherwise (409 if the same-name entry was re-added with a different
+  URL), and the loop discards the payload on the same recheck. The
   loop also keeps the lane through its disk save so the file's last
   writer follows commit order (issue #543).
 - **Concurrent config saves could publish a torn file.** Every writer
@@ -294,8 +295,13 @@ the canonical, in-repo source a release is cut from.
   create+truncate could land inside another's `write_all` and the
   victim's `rename` would publish the mixed file. Saves now use a
   unique scratch name per call, and the scratch is swept when the write
-  or rename fails so repeated failures can't fill the config dir
-  (issue #543).
+  or rename fails so repeated failures can't fill the config dir.
+  The same fixed-scratch splice affected rule-provider cache writes
+  (`{name}.tmp`), proxy-provider cache writes (not even atomic),
+  selector-store persistence (`{path}.json.tmp`), fake-IP snapshots,
+  and geodata downloads (`with_extension("tmp")`, which also collided
+  for same-stem targets like `Country.mmdb`/`Country.yaml`) — all now
+  write through unique per-call scratch names (issue #543).
 
 - **AnyTLS UDP-over-TCP reads poison the conn on an incomplete frame**
   (feature `anytls`). `AnytlsPacketConn::read_packet` consumed the uot

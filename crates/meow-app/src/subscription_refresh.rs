@@ -130,14 +130,15 @@ pub async fn run_loop(
                         // payload cannot resurrect a deleted subscription
                         // (same guard the manual refresh endpoint runs,
                         // issue #543 review).
-                        let Some(sub) = c
-                            .subscriptions
-                            .as_mut()
-                            .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
-                        else {
+                        // A same-name re-add or rewrite with a different
+                        // URL is likewise stale — the fetched payload came
+                        // from the old source (issue #543 review).
+                        let Some(sub) = c.subscriptions.as_mut().and_then(|subs| {
+                            subs.iter_mut().find(|s| s.name == name && s.url == url)
+                        }) else {
                             info!(
-                                "subscription '{name}' removed while its refresh was \
-                                 in flight; discarding fetched payload"
+                                "subscription '{name}' removed or changed while its \
+                                 refresh was in flight; discarding fetched payload"
                             );
                             continue;
                         };
@@ -308,8 +309,13 @@ pub async fn run_loop(
                             // candidate's rename can land last and
                             // resurrect stale state on restart (issue #543
                             // review).
-                            let _ =
-                                meow_config::save_raw_config_async(&config_path, &candidate).await;
+                            if let Err(e) =
+                                meow_config::save_raw_config_async(&config_path, &candidate).await
+                            {
+                                // Runtime and raw committed — disk may
+                                // diverge until the next successful save.
+                                warn!("auto-save after refreshing '{name}' failed: {e}");
+                            }
                         }
                         Ok(Err(e)) => {
                             error!("Failed to rebuild after refreshing '{}': {}", name, e);

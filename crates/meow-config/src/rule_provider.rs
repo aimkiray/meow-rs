@@ -1121,14 +1121,14 @@ fn write_cache(path: &Path, bytes: &[u8]) {
     // injecting mixed-generation bytes into the commit snapshot (issue
     // #543 review).
     // `.tmp` is appended to the full name (not `with_extension`) so
-    // `live.yaml` and `live.mrs` in the same dir never share a temp file.
-    let Some(name) = path.file_name() else {
-        warn!("rule-provider cache: {} has no file name", path.display());
-        return;
-    };
-    let tmp = path.with_file_name(format!("{}.tmp", name.to_string_lossy()));
+    // `live.yaml` and `live.mrs` in the same dir never share a temp file,
+    // and the unique per-call suffix keeps two racing `refresh()` writes
+    // (supervisor tick vs `PUT /providers/rules/{name}`, neither laned)
+    // from splicing into each other (issue #543 review).
+    let tmp = crate::unique_scratch_path(path);
     let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
     if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
         warn!(
             "rule-provider cache: failed to write {}: {}",
             path.display(),

@@ -1184,6 +1184,107 @@ async fn delete_subscription_clears_data() {
     assert!(raw.rules.as_ref().unwrap().is_empty());
 }
 
+/// A `DELETE` landing while `POST /api/subscriptions/{name}/refresh` is
+/// fetching must surface 404: the endpoint re-verifies the subscription
+/// inside the `CONFIG_MUTATION` lane before committing (issue #543).
+#[tokio::test]
+async fn refresh_subscription_deleted_mid_fetch_returns_404() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // Gated origin: signals when the request head arrives, then holds the
+    // response until released — the refresh stays parked in its fetch.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (got_tx, got_rx) = tokio::sync::oneshot::channel();
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0u8; 4096];
+        let mut head = Vec::new();
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    head.extend_from_slice(&buf[..n]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = got_tx.send(());
+        let _ = go_rx.await;
+        let body =
+            "proxies:\n  - name: resurrected\n    type: http\n    server: 127.0.0.1\n    port: 9\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = sock.write_all(resp.as_bytes()).await;
+        let _ = sock.shutdown().await;
+    });
+
+    let mut raw = test_raw_config();
+    raw.subscriptions = Some(vec![RawSubscription {
+        name: "s".into(),
+        url: format!("http://{addr}/sub.yaml"),
+        interval: None,
+        last_updated: None,
+    }]);
+    let state = test_state(raw);
+    let app = create_router(Arc::clone(&state));
+
+    let refresh_app = app.clone();
+    let refresh = tokio::spawn(async move {
+        refresh_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/subscriptions/s/refresh")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+
+    // Fetch is in flight at the gated origin; the DELETE commits first.
+    tokio::time::timeout(std::time::Duration::from_secs(10), got_rx)
+        .await
+        .expect("origin must see the request within 10s")
+        .expect("origin must see the request");
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/subscriptions/s")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let _ = go_tx.send(());
+    let resp = refresh.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(
+        state
+            .raw_config
+            .read()
+            .proxies
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .all(|p| p.get("name").and_then(|n| n.as_str()) != Some("resurrected")),
+        "a deleted subscription's fetched payload must not be committed"
+    );
+}
+
 // ── Config save test ─────────────────────────────────────────────
 
 #[tokio::test]

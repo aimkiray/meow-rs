@@ -115,7 +115,11 @@ pub async fn download_and_replace(
     dest: &Path,
     proxy: Option<&Arc<dyn Proxy>>,
 ) -> Result<(), anyhow::Error> {
-    let tmp = dest.with_extension("tmp");
+    // Unique scratch, not `with_extension("tmp")` — same-stem targets
+    // (`Country.mmdb`/`Country.yaml` → `Country.tmp`) and concurrent
+    // downloaders (auto-update vs rebuild-time `ensure_geodata`) must not
+    // share it (issue #543 review).
+    let tmp = crate::unique_scratch_path(dest);
 
     if let Some(p) = proxy {
         info!(

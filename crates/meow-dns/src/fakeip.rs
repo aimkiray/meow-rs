@@ -351,7 +351,10 @@ fn load_snapshot(path: &Path) -> PersistedSnapshot {
 }
 
 fn persist_to_file(path: &Path, snap: &PersistedSnapshot) {
-    let tmp = path.with_extension("json.tmp");
+    // Unique scratch per call — the `Drop` flush can overlap the
+    // background task's in-flight persist, and a shared tmp would let one
+    // writer's rename publish the other's splice (issue #543 review).
+    let tmp = scratch_path(path);
     let result = (|| -> io::Result<()> {
         let bytes = serde_json::to_vec(snap).map_err(io::Error::other)?;
         if let Some(parent) = path.parent() {
@@ -366,8 +369,19 @@ fn persist_to_file(path: &Path, snap: &PersistedSnapshot) {
         fs::rename(&tmp, path)
     })();
     if let Err(e) = result {
+        let _ = fs::remove_file(&tmp);
         warn!("fakeip: persist {} failed: {}", path.display(), e);
     }
+}
+
+fn scratch_path(path: &Path) -> PathBuf {
+    // Same unique-suffix scheme as `meow-config::unique_scratch_path`;
+    // `AtomicU` resolves to AtomicU32 where 64-bit atomics are missing.
+    static COUNTER: meow_common::atomic::AtomicU = meow_common::atomic::AtomicU::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{}.{}.tmp", std::process::id(), n));
+    PathBuf::from(name)
 }
 
 impl Store for FileStore {

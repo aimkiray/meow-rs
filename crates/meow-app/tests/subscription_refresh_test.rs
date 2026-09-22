@@ -338,9 +338,13 @@ async fn delete_during_in_flight_refresh_discards_payload() {
     spawn_loop(&fx);
 
     // The fetch is in flight; park the loop on the mutation lane while
-    // the "DELETE" commits (entry removed + owned sections emptied,
-    // exactly what `delete_subscription` writes).
-    got_rx.await.expect("origin must see the request");
+    // the "DELETE" commits. This mirrors the endpoint's raw-config effect
+    // (entry removed + owned sections emptied); the endpoint's rebuild
+    // and save are irrelevant to the recheck under test.
+    tokio::time::timeout(std::time::Duration::from_secs(10), got_rx)
+        .await
+        .expect("origin must see the request within 10s")
+        .expect("origin must see the request");
     let lane = meow_api::routes::CONFIG_MUTATION.lock().await;
     go_tx.send(()).expect("origin must still be listening");
     // Let the loop consume the response and queue on the lane — it

@@ -501,20 +501,29 @@ fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
     Ok(serde_yaml::from_value(value)?)
 }
 
-/// Unique-per-call scratch path for the atomic save below — a shared
-/// `{path}.tmp` lets one writer's create+truncate land inside another's
-/// `write_all`, and the victim's `rename` then publishes the mixed file
-/// (issue #543).
-fn save_scratch_path(path: &str) -> String {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Unique-per-call scratch sibling for atomic write-then-rename saves —
+/// a shared `{path}.tmp` lets one writer's create+truncate land inside
+/// another's `write_all`, and the victim's `rename` then publishes the
+/// mixed file (issue #543). Names are `{path}.{pid}.{counter}.tmp`.
+pub(crate) fn unique_scratch_path(path: &Path) -> PathBuf {
+    // `AtomicU` resolves to AtomicU32 on targets without 64-bit atomics
+    // (mips32-class) — u32 wrap is unreachable at any real save rate.
+    static COUNTER: meow_common::atomic::AtomicU = meow_common::atomic::AtomicU::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{path}.{}.{}.tmp", std::process::id(), n)
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{}.{}.tmp", std::process::id(), n));
+    PathBuf::from(name)
 }
 
 /// Save a RawConfig back to disk with atomic write (.tmp → rename) and .bak backup.
+///
+/// Unique scratch names keep concurrent saves from tearing, but file
+/// *order* is only guaranteed when callers serialize under the
+/// `CONFIG_MUTATION` lane (meow-api) — an unsynchronized pair can still
+/// land an older document's rename last (issue #543).
 pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_yaml::to_string(raw)?;
-    let tmp_path = save_scratch_path(path);
+    let tmp_path = unique_scratch_path(Path::new(path));
     let bak_path = format!("{path}.bak");
     // Unique scratch names would accumulate on repeated failures — sweep
     // the scratch on each fallible step so a chronic error (ENOSPC, a
@@ -536,9 +545,11 @@ pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::E
 }
 
 /// Async counterpart to [`save_raw_config`] for Tokio request/background paths.
+/// Same ordering contract: callers persisting a committed config should hold
+/// the `CONFIG_MUTATION` lane so file order follows commit order (issue #543).
 pub async fn save_raw_config_async(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_yaml::to_string(raw)?;
-    let tmp_path = save_scratch_path(path);
+    let tmp_path = unique_scratch_path(Path::new(path));
     let bak_path = format!("{path}.bak");
     if let Err(e) = tokio::fs::write(&tmp_path, &yaml).await {
         let _ = tokio::fs::remove_file(&tmp_path).await;
@@ -634,8 +645,14 @@ mod save_scratch_tests {
 
     #[cfg(unix)]
     #[test]
-    fn failed_write_leaves_no_scratch() {
+    fn unwritable_dir_leaves_no_scratch() {
         use std::os::unix::fs::PermissionsExt as _;
+        // Root bypasses permission checks (CAP_DAC_OVERRIDE), so the write
+        // would succeed and the assertion below would fail vacuously.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let ro = dir.path().join("ro");
         std::fs::create_dir(&ro).unwrap();
