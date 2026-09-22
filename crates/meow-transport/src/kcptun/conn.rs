@@ -934,7 +934,7 @@ mod tests {
         let _s = KcpStream::connect(
             Box::new(Spy {
                 inner: udp().await,
-                seen: seen.clone(),
+                seen: std::sync::Arc::clone(&seen),
             }),
             1,
             &cfg,
