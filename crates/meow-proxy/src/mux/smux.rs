@@ -1810,35 +1810,41 @@ mod tests {
     /// delivering garbage.
     #[tokio::test]
     async fn malformed_control_frame_kills_the_session() {
-        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
-        let session = Arc::new(Session::client(client_io).unwrap());
-        let mut stream = session.open_stream().await.unwrap();
+        async fn assert_killed(cmd: u8) {
+            let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+            let session = Arc::new(Session::client(client_io).unwrap());
+            let mut stream = session.open_stream().await.unwrap();
 
-        let mut wire = Vec::new();
-        wire.extend_from_slice(&encode_frame(CMD_NOP, 0, b"junk"));
-        wire.extend_from_slice(&encode_frame(CMD_PSH, stream.id, b"alive"));
-        server_io.write_all(&wire).await.unwrap();
+            let mut wire = Vec::new();
+            wire.extend_from_slice(&encode_frame(cmd, stream.id, b"junk"));
+            wire.extend_from_slice(&encode_frame(CMD_PSH, stream.id, b"alive"));
+            server_io.write_all(&wire).await.unwrap();
 
-        let mut buf = [0u8; 5];
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            stream.read_exact(&mut buf),
-        )
-        .await;
-        match result {
-            // The payload-bearing NOP desyncs the session before the
-            // queued data can dispatch — upstream behavior.
-            Err(_) | Ok(Err(_)) => {}
-            Ok(Ok(n)) => panic!("malformed control frame must kill the session, read {n}"),
-        }
-        // Give the reader task a moment to land mark_dead.
-        for _ in 0..50 {
-            if session.is_dead() {
-                break;
+            let mut buf = [0u8; 5];
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_exact(&mut buf),
+            )
+            .await;
+            match result {
+                // The payload-bearing control frame desyncs the session
+                // before the queued data can dispatch — upstream behavior.
+                Err(_) | Ok(Err(_)) => {}
+                Ok(Ok(n)) => panic!("malformed control frame must kill the session, read {n}"),
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // Give the reader task a moment to land mark_dead.
+            for _ in 0..50 {
+                if session.is_dead() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(session.is_dead());
         }
-        assert!(session.is_dead());
+
+        assert_killed(CMD_NOP).await;
+        // FIN carrying a payload hits the same upstream arm.
+        assert_killed(CMD_FIN).await;
     }
 
     /// Regression: when both outbound queues are full, `queue_fin` drops one

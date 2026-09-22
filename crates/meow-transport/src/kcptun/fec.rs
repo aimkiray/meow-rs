@@ -361,6 +361,10 @@ impl FecDecoder {
             if let (Some(ds), Some(ps)) = (auto_ds, auto_ps) {
                 // Same RS ceiling as the encoder (<=256) — a peer at
                 // exactly 256 total shards is legal and must still tune.
+                // Upstream's autotune gate is `< 256` while its own
+                // `newFECDecoder` accepts `<= 256` — we follow the
+                // constructor bound (refusing to tune to a legal config
+                // would wedge FEC for the session).
                 if ds > 0 && ps > 0 && ds + ps <= 256 {
                     if ds != self.data_shards || ps != self.parity_shards {
                         self.data_shards = ds;

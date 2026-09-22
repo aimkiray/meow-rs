@@ -125,19 +125,25 @@ enum FlushType {
 
 /// Read `conv` from raw buffer
 pub fn get_conv(mut buf: &[u8]) -> u32 {
-    assert!(buf.len() >= KCP_OVERHEAD);
+    if buf.len() < KCP_OVERHEAD {
+        return 0;
+    }
     buf.get_u32_le()
 }
 
 /// Set `conv` to raw buffer
 pub fn set_conv(mut buf: &mut [u8], conv: u32) {
-    assert!(buf.len() >= KCP_OVERHEAD);
+    if buf.len() < KCP_OVERHEAD {
+        return;
+    }
     buf.put_u32_le(conv);
 }
 
 /// Get `sn` from raw buffer
 pub fn get_sn(buf: &[u8]) -> u32 {
-    assert!(buf.len() >= KCP_OVERHEAD);
+    if buf.len() < KCP_OVERHEAD {
+        return 0;
+    }
     (&buf[12..]).get_u32_le()
 }
 
@@ -235,7 +241,11 @@ impl<O: Write> Write for KcpOutput<O> {
 }
 
 /// KCP control
-#[derive(Default)]
+///
+/// `self.current` is only refreshed by [`Kcp::update`]: callers must
+/// `update(now)` before `input`, `flush`, or `flush_ack` — otherwise
+/// `ts`/`resendts` are stamped with a stale clock and the peer sees an
+/// inflated RTT. `conn.rs` honors this on every call site.
 pub struct Kcp<Output> {
     /// Conversation ID
     conv: u32,
@@ -499,8 +509,11 @@ impl<Output> Kcp<Output> {
                     return Ok(segment.data.len());
                 }
 
-                // `frg` is wire-controlled u8 — `frg + 1` overflows at
-                // 255 (debug panic; release wraps and defeats the guard).
+                // Deliberately stricter than upstream: Go's `seg.frg+1`
+                // wraps to 0 at frg=255, skipping the guard and merging
+                // a truncated message; we require the full 256 fragments
+                // instead (unreachable from a `Send`-compliant peer —
+                // the 255-fragment cap means legitimate `frg <= 254`).
                 if self.rcv_queue.len() < segment.frg as usize + 1 {
                     return Err(KcpError::ExpectingFragment);
                 }
@@ -607,7 +620,10 @@ impl<Output> Kcp<Output> {
             let mut delta = rtt.wrapping_sub(self.rx_srtt);
             self.rx_srtt = self.rx_srtt.wrapping_add(delta >> 3);
             if delta < 0 {
-                delta = -delta;
+                // wrapping_neg mirrors Go's silent i32 wrap at MIN —
+                // unreachable in practice (rtt >= 0, rx_srtt >= 0) but
+                // keeps the port bulletproof under debug builds.
+                delta = delta.wrapping_neg();
             }
             if rtt < self.rx_srtt.wrapping_sub(self.rx_rttval) {
                 self.rx_rttval = self
@@ -930,7 +946,7 @@ impl<Output> Kcp<Output> {
     }
 
     /// Set `wndsize`
-    /// set maximum window size: `sndwnd=32`, `rcvwnd=128` by default.
+    /// set maximum window size: `sndwnd=32`, `rcvwnd=32` by default.
     /// Upstream `WndSize` — no floor on `rcvwnd` (the classic 128 floor
     /// silently inflated `rcv_wnd=1` configs).
     pub fn set_wndsize(&mut self, sndwnd: u32, rcvwnd: u32) {
@@ -1943,5 +1959,234 @@ mod tests {
         let wire = wire_cmds(&k);
         let pushes = wire.iter().filter(|&&(c, _)| c == KCP_CMD_PUSH).count();
         assert_eq!(pushes, 1, "two sends merge into one segment");
+    }
+
+    /// RFC 6298-variant estimator: the first sample seeds srtt/rttval,
+    /// a below-floor sample takes the damped `>>5` branch, a normal one
+    /// `>>2`, and `rx_minrto` clamps tiny RTTs (upstream `update_ack`).
+    #[test]
+    fn rtt_estimator_tracks_upstream() {
+        let mut k = fast3(); // nodelay → rx_minrto = 30, interval = 10
+        k.update(0).unwrap();
+        k.send(b"a").unwrap();
+        k.send(b"b").unwrap();
+        k.send(b"c").unwrap();
+        k.update(10).unwrap(); // PUSH 0,1,2 stamped ts=10
+
+        // First sample (rtt=90) seeds the estimator.
+        k.update(100).unwrap();
+        k.input(&ack(1, 32, 10, 0, 1), true, false).unwrap();
+        assert_eq!(k.rx_srtt, 90);
+        assert_eq!(k.rx_rttval, 45);
+        assert_eq!(k.rx_rto, 90 + cmp::max(10, 4 * 45));
+
+        // Normal sample (rtt=110): srtt += delta>>3, rttval >>2 branch.
+        k.update(120).unwrap();
+        k.input(&ack(1, 32, 10, 1, 2), true, false).unwrap();
+        // delta=20 → srtt=92; 110 !< 92-45 → rttval += (20-45)>>2 = -7
+        assert_eq!(k.rx_srtt, 92);
+        assert_eq!(k.rx_rttval, 38);
+        assert_eq!(k.rx_rto, 92 + cmp::max(10, 4 * 38));
+
+        // Below-floor sample (forged ts=100 → rtt=30 < srtt-rttvar)
+        // takes the damped >>5 branch.
+        k.update(130).unwrap();
+        k.input(&ack(1, 32, 100, 2, 3), true, false).unwrap();
+        // delta=-62 → srtt=84; 30 < 84-38 → rttval += (62-38)>>5 = 0
+        assert_eq!(k.rx_srtt, 84);
+        assert_eq!(k.rx_rttval, 38);
+        assert_eq!(k.rx_rto, 84 + cmp::max(10, 4 * 38));
+    }
+
+    /// A sub-interval first sample must still clamp `rx_rto` up to
+    /// `rx_minrto` (30 under nodelay) — upstream `bound()` at the end
+    /// of `update_ack`.
+    #[test]
+    fn rtt_estimator_minrto_floor() {
+        let mut k = fast3();
+        k.update(0).unwrap();
+        k.send(b"a").unwrap();
+        k.update(10).unwrap();
+        k.update(11).unwrap();
+        // rtt=1 → srtt=1, rttval=0 → rto = 1 + max(10, 0) = 11, clamped.
+        k.input(&ack(1, 32, 10, 0, 1), true, false).unwrap();
+        assert_eq!(k.rx_rto, 30);
+    }
+
+    /// Upstream Reno state machine under `nc=0` (reachable via
+    /// `mode=manual`): `cwnd` bootstraps 0→1 at the first flush tail,
+    /// slow-start grows it one packet per UNA-advancing input, AIMD
+    /// accumulates `incr` bytes past `ssthresh`, fast retransmit halves
+    /// and RTO collapses to one packet.
+    #[test]
+    fn cwnd_reno_state_machine() {
+        let mut k = Kcp::new(1, Sink::default());
+        k.set_nodelay(true, 10, 2, false); // nc=0 → congestion control on
+        let mss = k.mss as u32; // 1376 at the default MTU
+
+        k.update(0).unwrap(); // first flush tail bootstraps cwnd 0→1
+        assert_eq!((k.cwnd, k.incr), (1, mss));
+
+        for _ in 0..10 {
+            k.send(b"payload").unwrap();
+        }
+        k.update(10).unwrap(); // effective window min(32, 32, cwnd=1)
+        assert_eq!(wire_cmds(&k), vec![(KCP_CMD_PUSH, 0)]);
+
+        // UNA slide → slow start: cwnd 1→2, incr += mss.
+        k.input(&ack(1, 32, 10, 0, 1), true, false).unwrap();
+        assert_eq!((k.cwnd, k.incr), (2, 2 * mss));
+        assert_eq!(
+            wire_cmds(&k),
+            vec![(KCP_CMD_PUSH, 0), (KCP_CMD_PUSH, 1), (KCP_CMD_PUSH, 2)]
+        );
+
+        // cwnd reached ssthresh=2 → AIMD: incr += mss*mss/incr + mss/16,
+        // cwnd restamps only when (cwnd+1)*mss <= incr.
+        k.input(&ack(1, 32, 10, 2, 3), true, false).unwrap();
+        let incr = 2 * mss + mss * mss / (2 * mss) + mss / 16;
+        assert_eq!(k.incr, incr);
+        assert_eq!(k.cwnd, 2, "3*mss not yet accumulated");
+
+        k.input(&ack(1, 32, 10, 4, 5), true, false).unwrap();
+        let incr = incr + mss * mss / incr + mss / 16;
+        assert_eq!(k.incr, incr);
+        assert_eq!(k.cwnd, incr.div_ceil(mss), "AIMD restamp");
+        assert_eq!(k.cwnd, 4);
+
+        // ACK sn=6 with una=5: marks 6, bumps seg5's fastack — but does
+        // not advance una, so no cwnd growth.
+        k.input(&ack(1, 32, 10, 6, 5), true, false).unwrap();
+        k.input(&ack(1, 32, 10, 6, 5), true, false).unwrap();
+        // second dup → fastack hits resent=2 → retransmit + halving:
+        // ssthresh = max(inflight/2, 2), cwnd = ssthresh + resent.
+        assert!(
+            wire_cmds(&k)
+                .iter()
+                .any(|&(c, s)| c == KCP_CMD_PUSH && s == 5),
+            "seg5 fast-retransmitted"
+        );
+        assert_eq!(k.ssthresh, cmp::max((9 - 5) / 2, 2));
+        assert_eq!(k.cwnd, k.ssthresh + 2);
+        assert_eq!(k.incr, k.cwnd * mss);
+
+        // RTO on seg5 → collapse to slow start.
+        let t1 = k.snd_buf[0].resendts + 1;
+        k.update(t1).unwrap();
+        assert_eq!((k.cwnd, k.incr), (1, mss));
+        assert_eq!(k.ssthresh, cmp::max(4 / 2, 2));
+    }
+
+    /// Emitted wire fields, not just (cmd, sn): ACKs echo the PUSH `ts`
+    /// and stamp live `una`/`wnd`; retransmits restamp all three.
+    #[test]
+    fn emitted_headers_carry_echoed_ts_and_live_wnd_una() {
+        let mut k = fast3();
+        k.update(0).unwrap();
+        k.input(&push(1, 32, 1234, 0, 0, b"hi"), true, false)
+            .unwrap();
+        k.update(10).unwrap(); // maintenance flush emits the queued ACK
+
+        let mut cur = Cursor::new(&k.output.0 .0[0][..]);
+        assert_eq!(cur.get_u32_le(), 1); // conv
+        assert_eq!(cur.get_u8(), KCP_CMD_ACK);
+        let _frg = cur.get_u8();
+        assert_eq!(cur.get_u16_le(), 31, "wnd = wnd_unused = 32 - 1");
+        assert_eq!(cur.get_u32_le(), 1234, "ACK echoes the PUSH ts");
+        let _sn = cur.get_u32_le();
+        assert_eq!(cur.get_u32_le(), 1, "una = rcv_nxt after sn=0");
+
+        // Retransmit restamps ts/wnd/una on the PUSH itself.
+        k.send(b"x").unwrap();
+        k.update(20).unwrap(); // PUSH sn=0, ts=20
+        let t1 = k.snd_buf[0].resendts + 1;
+        k.update(t1).unwrap(); // RTO → re-PUSH
+        let last = k.output.0 .0.last().unwrap();
+        let mut cur = Cursor::new(&last[..]);
+        let _conv = cur.get_u32_le();
+        assert_eq!(cur.get_u8(), KCP_CMD_PUSH);
+        let _frg = cur.get_u8();
+        assert_eq!(cur.get_u16_le(), 31);
+        assert_eq!(cur.get_u32_le(), t1, "retransmit stamps fresh ts");
+        let _sn = cur.get_u32_le();
+        assert_eq!(cur.get_u32_le(), 1, "una still rcv_nxt");
+    }
+
+    /// `parse_data` ingress: out-of-window segments are neither ACKed
+    /// nor buffered, duplicates dedup, out-of-order PUSHes reorder.
+    #[test]
+    fn parse_data_bounds_dedup_and_reorders() {
+        let mut k = fast3();
+        k.update(0).unwrap();
+        // sn = rcv_nxt + rcv_wnd → outside the window entirely.
+        k.input(&push(1, 32, 0, 32, 0, b"far"), true, false)
+            .unwrap();
+        assert!(k.rcv_buf.is_empty());
+        assert!(k.acklist.is_empty(), "out-of-window gets no ACK");
+
+        for (sn, p) in [(2u32, &b"c"[..]), (1, &b"b"[..]), (0, &b"a"[..])] {
+            k.input(&push(1, 32, 0, sn, 0, p), true, false).unwrap();
+        }
+        k.input(&push(1, 32, 0, 1, 0, b"b"), true, false).unwrap(); // dup
+
+        let mut buf = [0u8; 8];
+        for &expected in b"abc" {
+            assert_eq!(k.recv(&mut buf).unwrap(), 1);
+            assert_eq!(buf[0], expected);
+        }
+        assert_eq!(k.rcv_nxt, 3);
+    }
+
+    /// Early retransmit is gated on `new_segs == 0`: a dup-ack while
+    /// fresh data is queued slides and sends the new data instead —
+    /// only an empty queue spends the resend.
+    #[test]
+    fn early_retransmit_waits_for_empty_queue() {
+        let mut k = Kcp::new(1, Sink::default());
+        k.set_nodelay(true, 10, 0, true); // resend=0 → early-retransmit only
+        k.update(0).unwrap();
+        k.send(b"a").unwrap();
+        k.send(b"b").unwrap();
+        k.update(10).unwrap(); // PUSH 0,1
+        k.send(b"c").unwrap(); // queued, unsent
+
+        // Dup-ack sn=1/una=0: marks 1 acked, bumps seg0's fastack, but
+        // the queued "c" must slide first — no resend of sn=0.
+        k.input(&ack(1, 32, 10, 1, 0), true, false).unwrap();
+        let pushes: Vec<u32> = wire_cmds(&k)
+            .iter()
+            .filter(|&&(c, _)| c == KCP_CMD_PUSH)
+            .map(|&(_, s)| s)
+            .collect();
+        assert_eq!(pushes, vec![0, 1, 2]);
+
+        // Same dup-ack with an empty queue → early retransmit fires.
+        k.input(&ack(1, 32, 10, 1, 0), true, false).unwrap();
+        let pushes: Vec<u32> = wire_cmds(&k)
+            .iter()
+            .filter(|&&(c, _)| c == KCP_CMD_PUSH)
+            .map(|&(_, s)| s)
+            .collect();
+        assert_eq!(pushes, vec![0, 1, 2, 0]);
+    }
+
+    /// Pin the anti-spin divergence: `check()` skips `acked` segments
+    /// (stale `resendts` never re-arms) and `xmit == 0` segments (the
+    /// next FULL flush covers them via `tm_flush`). Without the skips
+    /// a poll-driven caller re-arms a 0ms timer forever.
+    #[test]
+    fn check_ignores_acked_and_unsent_segments() {
+        let mut k = fast3();
+        k.update(0).unwrap();
+        k.send(b"a").unwrap();
+        k.update(10).unwrap(); // PUSH sn=0; ts_flush=20
+        k.input(&ack(1, 32, 10, 0, 0), true, false).unwrap(); // acked, retained
+        k.snd_buf[0].resendts = 5; // stale — due "now"
+        assert_eq!(k.check(15), 5, "acked seg must not report due-now");
+
+        k.snd_buf[0].acked = false;
+        k.snd_buf[0].xmit = 0; // slid in by an AckOnly flush
+        k.snd_buf[0].resendts = 0;
+        assert_eq!(k.check(15), 5, "xmit==0 seg defers to tm_flush");
     }
 }
