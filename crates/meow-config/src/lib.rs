@@ -531,8 +531,9 @@ pub async fn save_raw_config_async(path: &str, raw: &raw::RawConfig) -> Result<(
 }
 
 /// The result of rebuilding proxies and rules from a RawConfig: the proxy
-/// map, the rule list, and the [`meow_proxy::dialer::ProxyRegistry`] the
-/// build published into.
+/// map, the rule list, the [`meow_proxy::dialer::ProxyRegistry`] the
+/// build published into, this generation's provider sets, and the
+/// prefetched rule-provider payload snapshot a DNS rebuild should reuse.
 ///
 /// The registry must reach every long-lived owner of this build's adapters
 /// (`Tunnel::update_routing` / `reload_routing` take it for the route table;
@@ -620,6 +621,12 @@ pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::E
 /// under `strict: true` every `use:` reference then fails the build
 /// (there is nothing to resolve against), so background refresh callers
 /// must pass the live map, not a placeholder.
+///
+/// `shared_rule_providers` also skips payload prefetch: bound providers
+/// are never re-parsed, so the result's
+/// [`RebuildResult::prefetched_payloads`] comes back empty and must not
+/// be forwarded to `parse_dns_from_raw` as a shared snapshot (the DNS
+/// pass does its own private load for rules-only rebuilds).
 pub fn rebuild_from_raw_with_resolver(
     raw: &raw::RawConfig,
     resolver: Option<&meow_dns::ResolverSlot>,
@@ -6148,7 +6155,7 @@ mod dns_provider_sharing_tests {
     /// needs providers) plus a file-backed `p` provider.
     fn dns_raw_with_file_provider(path: &std::path::Path, behavior: &str) -> raw::RawConfig {
         let yaml = format!(
-            "dns:\n  enable: true\n  nameserver:\n    - 127.0.0.1\n  nameserver-policy:\n    rule-set:p: 127.0.0.1\nrule-providers:\n  p:\n    type: file\n    behavior: {behavior}\n    path: \"{}\"\nrules:\n  - MATCH,DIRECT\n",
+            "dns:\n  enable: true\n  nameserver:\n    - 127.0.0.1\n  nameserver-policy:\n    rule-set:p: 127.0.0.1\nrule-providers:\n  p:\n    type: file\n    behavior: {behavior}\n    path: '{}'\nrules:\n  - MATCH,DIRECT\n",
             path.display()
         );
         serde_yaml::from_str(&yaml).unwrap()
@@ -6203,12 +6210,14 @@ mod dns_provider_sharing_tests {
 
         // And with the file gone, a valid shared payload still satisfies
         // the load — the bytes the routing rebuild fetched are the ones
-        // the DNS rebuild parses.
+        // the DNS rebuild parses. `Ok` alone is too weak: a missing file
+        // is an acquisition failure that registers the provider *empty*,
+        // so assert the policy actually matches the payload's domain.
         let mut payloads = rule_provider::PrefetchedPayloads::new();
         payloads.insert("p".to_string(), std::fs::read(&file).unwrap());
         let payloads = Arc::new(payloads);
         std::fs::remove_file(&file).unwrap();
-        parse_dns_from_raw(
+        let dns = parse_dns_from_raw(
             &raw,
             Some(dir.path()),
             &proxies,
@@ -6219,6 +6228,15 @@ mod dns_provider_sharing_tests {
         )
         .await
         .expect("shared payloads must satisfy the private provider load");
+        let policy = dns
+            .resolver
+            .nameserver_policy()
+            .expect("rule-set:p policy must be built");
+        assert!(
+            policy.lookup("x.example.com").is_some(),
+            "the shared payload's domain must reach the nameserver policy"
+        );
+        assert!(policy.lookup("unrelated.test").is_none());
     }
 
     /// Issue #543 — the DNS rebuild's geo scan must see `GEOSITE`/`GEOIP`/
@@ -6263,14 +6281,55 @@ mod dns_provider_sharing_tests {
 
         // The payload-blind call never attempts the mmdb load — the scan
         // saw no geo reference (the provider's GEOIP rule is itself
-        // warn-skipped by the classical ruleset builder with no ctx).
-        if let Err(err) =
-            parse_dns_from_raw(&raw, Some(dir.path()), &proxies, None, None, None, None).await
-        {
-            assert!(
-                !format!("{err}").contains("/nonexistent-543/Country.mmdb"),
-                "without shared payloads the scan must stay payload-blind: {err}"
-            );
-        }
+        // warn-skipped by the classical ruleset builder with no ctx), so
+        // the build succeeds on the on-disk file.
+        parse_dns_from_raw(&raw, Some(dir.path()), &proxies, None, None, None, None)
+            .await
+            .expect("the payload-blind call must not attempt the mmdb load");
+    }
+
+    /// `shared_providers` rebuilds bind live provider objects — nothing
+    /// re-parses payloads, so prefetching would only re-fetch every http
+    /// provider per geodata tick for bytes nothing reads. Pin the
+    /// early-out: a shared rebuild over an http provider whose URL is
+    /// served by a counting listener must open zero connections and carry
+    /// an empty snapshot.
+    #[tokio::test]
+    async fn shared_providers_rebuild_never_prefetches() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+            "rule-providers:\n  p:\n    type: http\n    behavior: domain\n    url: http://127.0.0.1:{port}/p.yaml\nrules:\n  - RULE-SET,p,DIRECT\n"
+        ))
+        .unwrap();
+        let mut shared: HashMap<String, Arc<rule_provider::RuleProvider>> = HashMap::new();
+        shared.insert(
+            "p".to_string(),
+            rule_provider::test_provider("p", rule_provider::ProviderType::Http, 0),
+        );
+
+        let result =
+            rebuild_from_raw_with_resolver(&raw, None, None, &HashMap::new(), Some(shared))
+                .expect("a shared rebuild must not need the network");
+        // Any would-be fetch attempt gets a beat to reach the listener.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a shared rebuild must not prefetch provider payloads"
+        );
+        assert!(
+            result.prefetched_payloads.is_empty(),
+            "a shared rebuild carries no payload snapshot"
+        );
     }
 }

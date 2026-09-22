@@ -1115,7 +1115,20 @@ fn write_cache(path: &Path, bytes: &[u8]) {
             return;
         }
     }
-    if let Err(e) = std::fs::write(path, bytes) {
+    // Write-then-rename (the same pattern `save_config` uses): a
+    // `refresh()` and a commit's `prefer_cache` read can race outside the
+    // config lane — a truncate-in-place write could be torn mid-read,
+    // injecting mixed-generation bytes into the commit snapshot (issue
+    // #543 review).
+    // `.tmp` is appended to the full name (not `with_extension`) so
+    // `live.yaml` and `live.mrs` in the same dir never share a temp file.
+    let Some(name) = path.file_name() else {
+        warn!("rule-provider cache: {} has no file name", path.display());
+        return;
+    };
+    let tmp = path.with_file_name(format!("{}.tmp", name.to_string_lossy()));
+    let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = result {
         warn!(
             "rule-provider cache: failed to write {}: {}",
             path.display(),

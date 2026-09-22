@@ -2472,7 +2472,10 @@ async fn put_configs(
             if force {
                 // `force` overrides `strict`: retry the rebuild leniently so
                 // a strict-only defect doesn't wipe routing with an empty
-                // `Default` result (issue #533 review).
+                // `Default` result (issue #533 review). The retry prefetches
+                // rule-provider payloads a second time — the failed build's
+                // snapshot is discarded with it, so "one fetch per commit"
+                // holds per *build*, not per request (issue #543 review).
                 tracing::error!(
                     "config reload: rebuild failed ({e}); retrying leniently under force"
                 );

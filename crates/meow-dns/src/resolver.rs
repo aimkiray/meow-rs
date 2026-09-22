@@ -898,6 +898,13 @@ impl Resolver {
         self.ipv6
     }
 
+    /// The nameserver-policy matcher built from `dns.nameserver-policy`,
+    /// `None` when the section was absent. Read-only — policy entries are
+    /// immutable for the resolver's lifetime.
+    pub fn nameserver_policy(&self) -> Option<&NameserverPolicy> {
+        self.policy.as_ref()
+    }
+
     /// Build a single `DnsClient` for one `NameServerUrl`, using `resolved`
     /// to substitute hostnames that needed bootstrap. Pass an empty map for
     /// IP-literal URLs (no hostname substitution needed).

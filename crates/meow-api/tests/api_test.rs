@@ -3858,8 +3858,13 @@ async fn put_configs_fetches_rule_provider_payload_once() {
                     Ok((mut stream, _)) => {
                         hits.fetch_add(1, Ordering::SeqCst);
                         // The accepted stream can inherit the listener's
-                        // nonblocking flag; force blocking for read/write.
+                        // nonblocking flag; force blocking for read/write,
+                        // with a timeout so a connect-but-silent client
+                        // can't park this thread past the loop deadline.
                         stream.set_nonblocking(false).unwrap();
+                        let rw_timeout = Duration::from_secs(2);
+                        let _ = stream.set_read_timeout(Some(rw_timeout));
+                        let _ = stream.set_write_timeout(Some(rw_timeout));
                         let mut buf = [0_u8; 2048];
                         let _ = stream.read(&mut buf);
                         let body = "payload:\n  - '+.example.com'\n";
