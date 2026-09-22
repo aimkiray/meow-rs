@@ -17,6 +17,10 @@ use crate::socks5_client::socks5_connect;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IdleConnsResult {
+    /// Idle connections requested — consumers gate on `live_connections`
+    /// vs this before trusting `bytes_per_idle_conn` (ephemeral-port
+    /// budget can collapse establishment on constrained hosts).
+    pub requested_connections: usize,
     /// Number of idle connections successfully established.
     pub live_connections: usize,
     /// Peak RSS (bytes) observed while holding idle connections.
@@ -33,6 +37,21 @@ pub async fn bench_idle_conns(
     proxy_pid: u32,
 ) -> anyhow::Result<IdleConnsResult> {
     eprintln!("  idle-conns: establishing {n_conns} connections...");
+
+    // Warm the datapath so first-conn lazy init (resolver/rule caches,
+    // adapter warm paths) is excluded from the per-conn delta below.
+    for _ in 0..8 {
+        if let Ok(mut s) = socks5_connect(proxy, echo).await {
+            use tokio::io::AsyncReadExt;
+            let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                s.write_all(&[0x42]).await?;
+                let mut b = [0u8; 1];
+                s.read_exact(&mut b).await?;
+                Ok::<_, std::io::Error>(())
+            })
+            .await;
+        }
+    }
 
     // Record idle RSS before opening connections.
     let rss_before = measure_rss(proxy_pid)?;
@@ -61,16 +80,30 @@ pub async fn bench_idle_conns(
     }
     let live = streams.len();
     eprintln!("  idle-conns: {live}/{n_conns} connections live — holding {hold_secs}s");
+    if live < n_conns / 2 {
+        eprintln!(
+            "  idle-conns: WARN only {live}/{n_conns} established — \
+             ephemeral-port budget or fd cap collapsed the sample"
+        );
+    }
 
     // Sample peak RSS over the hold window.
     let mut peak_rss = rss_before;
+    let mut sampled = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(hold_secs);
     while tokio::time::Instant::now() < deadline {
         if let Ok(rss) = measure_rss(proxy_pid) {
             peak_rss = peak_rss.max(rss);
+            sampled = true;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+    // Total sampling failure silently yields delta=0 — a fake "0 bytes per
+    // conn" trend point is worse than a failed leg.
+    anyhow::ensure!(
+        sampled,
+        "idle-conns: no RSS samples collected during the hold window"
+    );
 
     // Drain streams — shut them down cleanly so the proxy can free them.
     for mut s in streams {
@@ -93,6 +126,7 @@ pub async fn bench_idle_conns(
     );
 
     Ok(IdleConnsResult {
+        requested_connections: n_conns,
         live_connections: live,
         peak_rss_bytes: peak_rss,
         bytes_per_idle_conn: bytes_per_conn,

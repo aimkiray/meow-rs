@@ -55,7 +55,9 @@ pub fn measure_rss(pid: u32) -> anyhow::Result<u64> {
     }
 }
 
-/// Sample RSS repeatedly over a duration, return peak.
+/// Sample RSS repeatedly over a duration, return peak.  Errors when
+/// every sample failed — a silent `0` would serialize as a -100 % RSS
+/// "improvement" in the compare tooling.
 pub async fn measure_peak_rss(pid: u32, duration_secs: u64) -> anyhow::Result<u64> {
     let mut peak = 0u64;
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(duration_secs);
@@ -67,5 +69,9 @@ pub async fn measure_peak_rss(pid: u32, duration_secs: u64) -> anyhow::Result<u6
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 
+    anyhow::ensure!(
+        peak > 0,
+        "measure_peak_rss: every RSS sample failed for pid {pid}"
+    );
     Ok(peak)
 }

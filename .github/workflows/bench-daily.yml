@@ -7,9 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       duration:
-        description: "Steady-state duration per workload (seconds)"
+        description: "Steady-state duration per workload (seconds, >= 3)"
         required: false
-        default: "30"
+        type: number
+        default: 30
 
 permissions:
   contents: read
@@ -56,7 +57,7 @@ jobs:
         run: |
           set -euo pipefail
           SINGBOX_VERSION=1.14.0
-          curl -fsSL -o /tmp/sing-box.tar.gz \
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/sing-box.tar.gz \
             "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
           tar -xzf /tmp/sing-box.tar.gz -C /tmp
           sudo install -m 755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
@@ -81,7 +82,11 @@ jobs:
       # hot paths. Short measurement windows — these feed day-over-day
       # trend signal, not absolute numbers.  Targets are named explicitly:
       # `cargo bench --workspace` alone would pass the criterion args to
-      # every lib/bin test harness, which rejects them and aborts.
+      # every lib/bin test harness, which rejects them and aborts.  Note
+      # `--bench rules_bench` intentionally matches BOTH
+      # meow-rules/benches/rules_bench.rs and meow-tunnel/benches/rules_bench.rs
+      # (9 binaries total) — the name-pin means a future new bench target
+      # must be added to this list deliberately.
       - name: Run criterion micro-benches
         run: |
           cargo bench --workspace \
@@ -120,19 +125,22 @@ jobs:
           gh run list --workflow "Daily Benchmark" --repo "$GITHUB_REPOSITORY" \
             --branch "$GITHUB_REF_NAME" --status success --limit 5 \
             --json databaseId --jq '.[].databaseId' | while read -r id; do
+            # -p glob, not -n: artifact names carry a run-attempt suffix.
             gh run download "$id" --repo "$GITHUB_REPOSITORY" \
-              -n "bench-daily-$id" -D "$PREV/$id" </dev/null 2>/dev/null || true
+              -p "bench-daily-$id-*" -D "$PREV/$id" </dev/null 2>/dev/null || true
           done
 
       - name: Check regression vs baseline
         # Non-blocking: the checked-in baseline was measured on the dedicated
         # bench box (docs/benchmarks/hardware.md); GitHub-hosted runners are
-        # slower and noisier, so absolute deltas are informational only.
+        # slower and noisier, so absolute deltas are informational only —
+        # same wide 20% threshold as the day-over-day check below, or this
+        # step would flag nearly every run and train people to ignore it.
         if: hashFiles('docs/benchmarks/baseline-*.json') != ''
         continue-on-error: true
         run: |
           BASELINE=$(ls docs/benchmarks/baseline-*.json | sort | tail -1)
-          python3 bench/compare.py "$BASELINE" target/bench/results.json
+          python3 bench/compare.py "$BASELINE" target/bench/results.json --threshold 0.20
 
       - name: Check regression vs recent daily runs
         # Day-over-day signal: per-metric median of up to 5 previous
@@ -141,7 +149,9 @@ jobs:
         # Emits a workflow annotation rather than failing the job.
         continue-on-error: true
         run: |
-          if find "$RUNNER_TEMP/bench-prev" -name '*.json' -print -quit 2>/dev/null | grep -q .; then
+          if [ ! -f target/bench/results.json ]; then
+            echo "no results.json (bench run failed upstream); skipping compare"
+          elif find "$RUNNER_TEMP/bench-prev" -name '*.json' -print -quit 2>/dev/null | grep -q .; then
             python3 bench/compare.py "$RUNNER_TEMP/bench-prev" target/bench/results.json --threshold 0.20 \
               || echo "::warning::benchmark regressed >20% vs recent-run median — see compare output"
           else
@@ -152,7 +162,10 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: bench-daily-${{ github.run_id }}
+          # run_attempt in the name: artifact names are immutable and this
+          # step runs `if: always()`, so a re-run of failed jobs would
+          # otherwise 409 on "artifact already exists".
+          name: bench-daily-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/bench/results.json
             target/bench/results.md

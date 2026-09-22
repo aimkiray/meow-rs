@@ -41,6 +41,10 @@ Deliverables:
    - Runs `bench.sh`
    - Uploads `target/bench/results.json` as a workflow artifact
 
+   > Shipped as `.github/workflows/bench-daily.yml` (#558): same job
+   > shape plus a **daily schedule**, day-over-day median compare, and
+   > the #558 standalone legs (idle/steady/reload) as extra artifacts.
+
 The baseline numbers are the M2 starting point. If meow-rs is already faster, record
 it and note the delta. If Go mihomo is faster, record it as the target.
 

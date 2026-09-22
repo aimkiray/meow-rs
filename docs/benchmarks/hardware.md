@@ -44,7 +44,8 @@ in the commit that changes it, and record the new allocator here.
 - Both implementations run as foreground processes; no other significant workloads.
 - CPU frequency scaling: note governor setting above.
 - Warmup: `bench.sh` runs a 5-second warmup before measurement (if applicable).
-- Repetitions: single run per baseline commit; use `--duration` env var to extend.
+- Repetitions: single run per baseline commit; extend with the `DURATION`
+  env var for `bench.sh` (or `--duration` when invoking `meow-bench` directly).
 - Network: loopback only (both upstream proxy and load generator on same host).
 
 ## Per-run fields (captured in baseline JSON, not this file)

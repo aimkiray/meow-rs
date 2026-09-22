@@ -65,8 +65,23 @@ pub async fn socks5_connect(proxy: SocketAddr, target: SocketAddr) -> std::io::R
 }
 
 /// SOCKS5 CONNECT via domain name (ATYP 0x03). Returns a stream tunneled to
-/// `host:port` through `proxy`.
+/// `host:port` through `proxy`. Bounded by `CONNECT_TIMEOUT` like
+/// `socks5_connect` — the memleak leg dials real external hosts, so a
+/// stalled handshake must not wedge the run forever.
 pub async fn socks5_connect_domain(
+    proxy: SocketAddr,
+    host: &str,
+    port: u16,
+) -> std::io::Result<TcpStream> {
+    tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        socks5_connect_domain_inner(proxy, host, port),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "socks5 connect timed out"))?
+}
+
+async fn socks5_connect_domain_inner(
     proxy: SocketAddr,
     host: &str,
     port: u16,

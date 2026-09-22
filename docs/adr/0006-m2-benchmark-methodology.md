@@ -185,6 +185,15 @@ qa Task #26 sets up the guardrail. Shape:
 - M2 exit tagging is the single gate that **fails** on any §5 threshold
   miss. Tagging workflow owns the go/no-go.
 
+> **Shipped form (#558):** the guardrail landed as
+> `.github/workflows/bench-daily.yml` — a **daily cron** on
+> GitHub-hosted runners (plus `workflow_dispatch`), emitting `::warning`
+> annotations rather than PR comments, and diffing against
+> `docs/benchmarks/baseline-*.json` and the median of recent run
+> artifacts at a wide 20% threshold. The self-hosted reference host and
+> PR-comment shape remain the target when a dedicated bench box exists;
+> until then the hosted-runner trend is informational only.
+
 No soak-test style continuous benchmarking in M2. See `roadmap.md` §M1
 exit rationale: synthetic load is a poor proxy for real load; we trust the
 per-release re-baseline.

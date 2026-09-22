@@ -39,6 +39,10 @@ pub async fn bench_conn_rate(
         handles.push(tokio::spawn(async move {
             while Instant::now() < deadline {
                 let Ok(mut stream) = socks5_connect(proxy, echo).await else {
+                    // Backoff on failure — a dead listener would otherwise
+                    // spin every worker hot for the rest of the window
+                    // (same pattern as bench_reload's spawn_load).
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 };
                 let timed_out = tokio::time::timeout(ECHO_TIMEOUT, async {
@@ -100,7 +104,7 @@ pub struct SteadyStateResult {
 /// Steady-state bytes-per-connection measurement (ADR-0011 §2 M-steady).
 ///
 /// Runs a `bench_conn_rate`-style workload for `duration_secs`, then samples
-/// the proxy's RSS at 1 Hz over the **middle** `sample_secs` window.
+/// the proxy's RSS at 4 Hz over the **middle** `sample_secs` window.
 /// Returns the median and p95 of `(rss - idle_rss) / live_conn_count` — the
 /// *delta* over the idle baseline captured before workers spawn, matching
 /// the ~35 KB/conn figure in `docs/benchmarks/footprint-rss-baseline.md`
@@ -124,9 +128,26 @@ pub async fn bench_connrate_steady_state(
         duration_secs >= 3,
         "steady-state needs --duration >= 3 (middle-third sample window)"
     );
+    // Warm the datapath before the baseline: first-conn lazy init
+    // (resolver/rule caches, adapter warm paths) would otherwise land in
+    // the per-conn delta.
+    for _ in 0..8 {
+        if let Ok(mut s) = socks5_connect(proxy, echo).await {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let _ = tokio::time::timeout(ECHO_TIMEOUT, async {
+                s.write_all(&[0x42]).await?;
+                let mut b = [0u8; 1];
+                s.read_exact(&mut b).await?;
+                Ok::<_, std::io::Error>(())
+            })
+            .await;
+        }
+    }
     // Idle baseline: the proxy is already up but no load has run — the
-    // delta against the loaded samples is the per-conn footprint.
-    let idle_rss = measure_rss(proxy_pid).unwrap_or(0);
+    // delta against the loaded samples is the per-conn footprint.  A
+    // failed `ps` must fail the leg: `unwrap_or(0)` would silently turn
+    // the delta metric into absolute RSS/conn.
+    let idle_rss = measure_rss(proxy_pid)?;
     let counter = Arc::new(AtomicU64::new(0));
     let deadline = Instant::now() + Duration::from_secs(duration_secs);
 
@@ -137,6 +158,7 @@ pub async fn bench_connrate_steady_state(
         handles.push(tokio::spawn(async move {
             while Instant::now() < deadline {
                 let Ok(mut stream) = socks5_connect(proxy, echo).await else {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 };
                 let _ = tokio::time::timeout(ECHO_TIMEOUT, async {
@@ -162,7 +184,9 @@ pub async fn bench_connrate_steady_state(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // Sample at 1 Hz over the middle third.
+    // Sample at 4 Hz over the middle third — at the default
+    // `--duration 10` the window is only ~3 s, and single-digit n makes
+    // p95 pure noise.
     let mut samples: Vec<f64> = Vec::new();
     let mut rss_samples: Vec<u64> = Vec::new();
     while start.elapsed().as_secs() < sample_end {
@@ -174,13 +198,21 @@ pub async fn bench_connrate_steady_state(
             samples.push(bytes_per_conn);
             rss_samples.push(rss);
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
     // Wait for workers.
     for h in handles {
         let _ = h.await;
     }
+
+    // Zero samples means every `ps` call failed — serializing a zeroed
+    // result would poison the trend with a plausible-looking garbage
+    // point; fail the leg instead.
+    anyhow::ensure!(
+        !samples.is_empty(),
+        "steady-state: no RSS samples collected (every measure_rss call failed)"
+    );
 
     // Compute median + p95.
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));

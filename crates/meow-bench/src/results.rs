@@ -243,7 +243,7 @@ pub fn render_markdown(report: &ComparisonReport) -> String {
         out.push_str(&render_leg(
             r,
             report.go.as_ref(),
-            "### Direct (`mode: direct`, SOCKS5 listener)",
+            "### Direct (`mode: direct`, mixed listener)",
         ));
     }
     if let Some(r) = &report.rust_proxied {

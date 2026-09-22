@@ -1,18 +1,23 @@
 /// Config-reload workload (#558): `PUT /configs` in a loop while a steady
 /// connection-rate load runs through the proxy, with a datapath-rate
 /// probe before and after, plus a committed-config verification.
-/// Exercises the rebuild/publish chain end-to-end — semantic rebuild,
-/// DNS reconcile, health-check reconcile, fake-IP carry — under the
-/// mutation lane, against a live mixed listener.
+/// Exercises the rebuild/publish chain end-to-end — YAML parse, semantic
+/// proxy/rule rebuild, `reload_routing` route swap + tracked-conn kill —
+/// under the mutation lane, against a live mixed listener.  (The A/B
+/// configs differ only in the probe rule, so DNS and health-check
+/// reconcile are no-ops here — those paths are covered by the config-
+/// mutation tests, not this workload.)
 ///
 /// PUTs alternate between two config files that differ in exactly one
 /// probeable rule: `config_path` routes `DST-PORT <probe>` to a working
-/// outbound, `alt_config_path` routes it to REJECT.  Alternation keeps
-/// every PUT a real config change (a "skip rebuild when unchanged"
-/// optimization cannot void the measurement) and makes the final
-/// committed generation observable through the datapath: after the
-/// window, a B commit must refuse the probe and an A commit must echo.
-/// Anything else means a reload was accepted but never applied.
+/// outbound, `alt_config_path` routes it to REJECT.  The proxy starts on
+/// `config_path` and the first PUT is the REJECT variant, so every PUT is
+/// a real config change (a "skip rebuild when unchanged" optimization
+/// cannot void the measurement) and every committed generation is
+/// observable through the datapath: each successful PUT is followed by a
+/// datapath probe, and after the window a B commit must refuse the probe
+/// and an A commit must echo.  Anything else means a reload was accepted
+/// but never applied.
 ///
 /// Note: `PUT /configs` is a *cold* reload — `reload_routing` closes
 /// every tracked connection by design.  `load_conns_failed` therefore
@@ -52,8 +57,8 @@ pub struct ReloadResult {
     /// Echo failures in the post-reload probe.
     pub post_reload_errors: u64,
     /// Datapath probes that observed the wrong committed config after a
-    /// verification PUT (0–2): a 204 whose routing never reached the
-    /// listener shows up here even when every probe conn succeeds.
+    /// PUT (0–reloads+2): a 204 whose routing never reached the listener
+    /// shows up here even when every probe conn succeeds.
     pub datapath_verify_failures: u64,
 }
 
@@ -138,8 +143,21 @@ fn spawn_load(
         let (ok, failed, stop) = (Arc::clone(&ok), Arc::clone(&failed), Arc::clone(stop));
         handles.push(tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) && Instant::now() < until {
-                match socks5_connect(proxy, echo).await {
-                    Ok(mut stream) => {
+                // Bound the connect by the window end: an in-flight
+                // socks5 handshake can otherwise stretch the measured
+                // window ~10 s past `until`, skewing the probe-rate
+                // denominator with a stall tail.
+                let remaining = until.saturating_duration_since(Instant::now());
+                let connect = tokio::time::timeout(remaining, socks5_connect(proxy, echo)).await;
+                match connect {
+                    Err(_) => break, // window ended mid-connect — neutral, like Ok(Ok(0)) below
+                    Ok(Err(_)) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        // Backoff on failure: without it a dead listener
+                        // spins workers into ephemeral-port exhaustion.
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Ok(Ok(mut stream)) => {
                         // Echo until the conn ages out or drops.  A PUT
                         // commit kills every live conn by design (cold
                         // reload), so mid-conn drops land in `failed`.
@@ -165,12 +183,6 @@ fn spawn_load(
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
                         };
-                    }
-                    Err(_) => {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        // Backoff on failure: without it a dead listener
-                        // spins workers into ephemeral-port exhaustion.
-                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }
             }
@@ -203,16 +215,20 @@ async fn probe_rate(proxy: SocketAddr, echo: SocketAddr, concurrency: usize) -> 
 
 /// One datapath probe through the proxy to `probe_addr`.  `expect_echo`
 /// is `true` when the probe rule should route to a working outbound
-/// (config A), `false` when it should be REJECTed (config B).
+/// (config A), `false` when it should be REJECTed (config B).  The whole
+/// probe is bounded: a committed config that leaves the datapath
+/// half-wedged (SOCKS5 handshake completes, echo never returns) must
+/// surface as a verification failure, not hang the suite.
 async fn datapath_probe(proxy: SocketAddr, probe_addr: SocketAddr, expect_echo: bool) -> bool {
-    let ok = async {
+    let ok = tokio::time::timeout(Duration::from_secs(10), async {
         let mut stream = socks5_connect(proxy, probe_addr).await?;
         stream.write_all(&[0x42]).await?;
         let mut b = [0u8; 1];
         stream.read_exact(&mut b).await?;
         Ok::<_, std::io::Error>(b[0] == 0x42)
-    }
+    })
     .await
+    .unwrap_or(Ok(false))
     .unwrap_or(false);
     ok == expect_echo
 }
@@ -265,8 +281,9 @@ pub async fn bench_reload(
     eprintln!("  reload: pre-reload probe (3 s)...");
     let (pre_rate, pre_err) = probe_rate(proxy, echo, concurrency).await;
     anyhow::ensure!(
-        pre_rate > 0.0 || pre_err == 0,
-        "datapath already dead before the first reload ({pre_err} errors in pre-probe)"
+        pre_rate > 0.0,
+        "datapath not delivering before the first reload \
+         ({pre_err} errors, 0 successful conns in pre-probe)"
     );
 
     // PUTs land at ~spacing intervals.  The load window is driven by the
@@ -284,14 +301,34 @@ pub async fn bench_reload(
 
     let mut latencies = Vec::with_capacity(reloads);
     let mut reloads_ok = 0usize;
+    let mut datapath_verify_failures = 0u64;
+    // The proxy starts on config A, so the first PUT is the B (REJECT)
+    // variant — every measured PUT is a real config transition, and the
+    // final PUT leaves A committed, so both verification PUTs below are
+    // real transitions too.
     for i in 0..reloads {
         tokio::time::sleep(spacing).await;
         let t = Instant::now();
-        let body = if i % 2 == 0 { &body_a } else { &body_b };
+        let (body, expect_echo) = if i % 2 == 0 {
+            (&body_b, false)
+        } else {
+            (&body_a, true)
+        };
         match http_put_json(api, "/configs", body.as_bytes()).await {
             Ok(status) if (200..300).contains(&status) => {
                 reloads_ok += 1;
                 latencies.push(t.elapsed().as_secs_f64() * 1000.0);
+                // `PUT /configs` commits synchronously before responding,
+                // so the probe observes the just-committed generation — a
+                // 204 whose routing never landed fails here instead of
+                // being masked by the next commit.
+                if !datapath_probe(proxy, probe_addr, expect_echo).await {
+                    datapath_verify_failures += 1;
+                    eprintln!(
+                        "  reload: VERIFY FAILED — PUT {i} committed {} but the datapath disagrees",
+                        if expect_echo { "A" } else { "B" }
+                    );
+                }
             }
             Ok(status) => eprintln!("  reload: PUT /configs → HTTP {status}"),
             Err(e) => eprintln!("  reload: PUT /configs failed: {e}"),
@@ -315,11 +352,12 @@ pub async fn bench_reload(
         0.0
     };
 
-    // Datapath verification: commit B (probe rule → REJECT) then A
-    // (probe rule → outbound), checking the listener observes each.  A
-    // commit that never reaches the datapath shows up here even if the
-    // echo probes above all passed on the stale table.
-    let mut datapath_verify_failures = 0u64;
+    // End-state verification: commit B (probe rule → REJECT) then A
+    // (probe rule → outbound), checking the listener observes each.  With
+    // the default even `--reloads` the loop above ends on A, so both of
+    // these are real transitions too; either way a commit that never
+    // reaches the datapath shows up here even if the echo probes passed
+    // on a stale table.
     for (body, expect_echo, label) in [
         (&body_b, false, "B (probe → REJECT)"),
         (&body_a, true, "A (probe → outbound)"),

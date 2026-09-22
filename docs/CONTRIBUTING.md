@@ -360,11 +360,21 @@ gh pr create --reviewer @username
 ### Q: 如何跟踪性能影响？
 
 ```bash
-# 运行基准测试
+# 运行单个基准测试
 cargo run -p meow-bench --release -- --only throughput
+
+# 完整套件（含 Go mihomo 对比、footprint 与 reload legs）：
+DURATION=30 bash bench.sh
 
 # 对比基线（见 docs/benchmarks/）
 ```
+
+`bench.sh` 按顺序跑 W1–W4 对比、idle/steady footprint、config-reload
+负载。可用 `--only` 单独运行某条 leg（`throughput`、`latency`、
+`connrate`、`dns`、`memleak`、`reload`、`idle`、`steady`、`proxied`）。
+`proxied` leg 需要 sing-box 作为 VLESS 服务端：`SINGBOX_BINARY`（或
+`SINGBOX_BIN`）指向二进制即可自动启用；未安装时该 leg 跳过。
+`DURATION` 控制持续型 leg 的时长（默认 10s，CI 用 30s）。
 
 ---
 

@@ -157,6 +157,7 @@ fn start_singbox_server(bin: &Path) -> anyhow::Result<(std::process::Child, temp
         .arg("run")
         .arg("-c")
         .arg(&config_path)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -191,22 +192,20 @@ fn collect_meta(args: &Args) -> results::BenchMeta {
     }
 }
 
-async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("timeout waiting for {addr} to become reachable");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+/// One connect attempt inside `wait_for_port*` — bounded so a filtered
+/// or black-holed address cannot overshoot the outer deadline.
+async fn probe_tcp(addr: SocketAddr) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .is_ok_and(|r| r.is_ok())
 }
 
-/// `wait_for_port` that also fails fast when the child already exited —
-/// otherwise a config-rejected spawn reports "timeout waiting" after the
-/// full deadline instead of "exited early" on the first poll.
+/// Port-readiness wait that also fails fast when the child already
+/// exited — otherwise a config-rejected spawn reports "timeout waiting"
+/// after the full deadline instead of "exited early" on the first poll.
 async fn wait_for_port_guarded(
     addr: SocketAddr,
     timeout: Duration,
@@ -216,7 +215,7 @@ async fn wait_for_port_guarded(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         child.ensure_alive(what)?;
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+        if probe_tcp(addr).await {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -244,13 +243,31 @@ fn raise_nofile_limit() {
                 lim.rlim_cur = target;
                 if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
                     eprintln!(
-                        "[warn] setrlimit(RLIMIT_NOFILE, {target}) failed — conn-heavy legs may hit the low cap"
+                        "[warn] setrlimit(RLIMIT_NOFILE, {target}) failed ({}) — conn-heavy legs may hit the low cap",
+                        std::io::Error::last_os_error()
                     );
+                } else {
+                    // XNU can *silently clamp* rlim_cur to
+                    // kern.maxfilesperproc and still return 0 — re-read
+                    // to confirm the raise actually landed.
+                    let mut after = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut after) == 0
+                        && after.rlim_cur < target
+                    {
+                        eprintln!(
+                            "[warn] RLIMIT_NOFILE clamped to {} (wanted {target}) — conn-heavy legs may hit the low cap",
+                            after.rlim_cur
+                        );
+                    }
                 }
             }
         } else {
             eprintln!(
-                "[warn] getrlimit(RLIMIT_NOFILE) failed — conn-heavy legs may hit the low cap"
+                "[warn] getrlimit(RLIMIT_NOFILE) failed ({}) — conn-heavy legs may hit the low cap",
+                std::io::Error::last_os_error()
             );
         }
     }
@@ -272,6 +289,21 @@ fn ensure_port_free(addr: SocketAddr, what: &str) -> anyhow::Result<()> {
     }
 }
 
+/// UDP variant of `ensure_port_free` — the DNS leg's probe would
+/// otherwise happily measure a stale DNS responder still holding the
+/// port (any datagram answer looks "ready").
+fn ensure_udp_port_free(addr: SocketAddr, what: &str) -> anyhow::Result<()> {
+    match std::net::UdpSocket::bind(addr) {
+        Ok(sock) => {
+            drop(sock);
+            Ok(())
+        }
+        Err(e) => {
+            anyhow::bail!("{what}: {addr}/udp already bound ({e}) — stale process squats the port")
+        }
+    }
+}
+
 /// Spawn the proxy under test with bench-standard stdio (quiet stdout,
 /// inherited stderr so config rejection is never silent).
 fn spawn_meow(
@@ -282,16 +314,22 @@ fn spawn_meow(
     Command::new(binary)
         .arg(binary_arg)
         .arg(config.as_os_str())
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to start {}: {e}", binary.display()))
 }
 
-async fn wait_for_udp_port(addr: SocketAddr, timeout: Duration) -> anyhow::Result<()> {
+async fn wait_for_udp_port_guarded(
+    addr: SocketAddr,
+    timeout: Duration,
+    child: &mut ChildGuard,
+    what: &str,
+) -> anyhow::Result<()> {
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RecordType};
-    use hickory_proto::serialize::binary::BinEncodable;
+    use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
     use tokio::net::UdpSocket;
 
     let deadline = tokio::time::Instant::now() + timeout;
@@ -306,12 +344,20 @@ async fn wait_for_udp_port(addr: SocketAddr, timeout: Duration) -> anyhow::Resul
     let probe = msg.to_bytes()?;
 
     loop {
+        // Fail fast on a config-rejected child instead of spinning the
+        // full deadline — same contract as `wait_for_port_guarded`.
+        child.ensure_alive(what)?;
         let _ = sock.send_to(&probe, addr).await;
         let mut buf = [0u8; 512];
-        let ready =
-            tokio::time::timeout(Duration::from_millis(200), sock.recv_from(&mut buf)).await;
-        if ready.is_ok() {
-            return Ok(());
+        // Ready only when the answer parses as a DNS *response* — any
+        // datagram (or a recv io error) is not a readiness signal.
+        if let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(200), sock.recv_from(&mut buf)).await
+        {
+            if Message::from_bytes(&buf[..n]).is_ok_and(|m| m.message_type == MessageType::Response)
+            {
+                return Ok(());
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!("timeout waiting for DNS port {addr} to become reachable");
@@ -379,10 +425,11 @@ impl ChildGuard {
         self.0.as_ref().map_or(0, std::process::Child::id)
     }
 
-    /// Bail if the child already exited — e.g. it failed to bind the
-    /// benchmark port because a stale process squats there.  Without
-    /// this check `wait_for_port` happily reports the squatter's port
-    /// and the workload measures the wrong process.
+    /// Bail if the child already exited — e.g. it rejected the config.
+    /// Note this does NOT detect the squatter case: meow treats listener
+    /// bind failure as non-fatal and stays alive, so a port squatter is
+    /// caught by `ensure_port_free` before spawn (with an inherent small
+    /// TOCTOU window), not by this check.
     fn ensure_alive(&mut self, target_name: &str) -> anyhow::Result<()> {
         if let Some(child) = self.0.as_mut() {
             match child.try_wait() {
@@ -451,9 +498,9 @@ async fn benchmark_target(
     let pid = child.id();
 
     // Wait for SOCKS5 port to be ready (the guard reaps the child if
-    // this or any later step fails).
-    wait_for_port(proxy_addr, Duration::from_secs(10)).await?;
-    child.ensure_alive(target_name)?;
+    // this or any later step fails).  The guarded wait also fails fast
+    // on a config-rejected early exit instead of burning the deadline.
+    wait_for_port_guarded(proxy_addr, Duration::from_secs(10), &mut child, target_name).await?;
     eprintln!("[{target_name}] proxy ready on port {PROXY_PORT}");
 
     // Settle time
@@ -529,7 +576,9 @@ async fn benchmark_target(
         let cr =
             bench_connrate::bench_conn_rate(proxy_addr, echo_addr, args.duration, args.concurrency)
                 .await?;
-        let peak_rss = rss_handle.await?.unwrap_or(0);
+        // Propagate rather than `unwrap_or(0)` — a zero here serializes
+        // as a fake -100 % RSS "improvement" in compare.py.
+        let peak_rss = rss_handle.await??;
         (Some(cr), peak_rss)
     } else {
         // Skipped: `rss_load` stays the idle reading — rendering shows
@@ -560,29 +609,45 @@ async fn benchmark_target(
             // DNS config is rejected (e.g. mihomo chokes on a field) the
             // failure must be visible, not a silent `dns: null` in the
             // results.
-            let dns_child = ChildGuard::new(spawn_meow(binary, &args.binary_arg, dns_config)?);
-
             let dns_addr: SocketAddr = format!("127.0.0.1:{}", args.dns_port).parse()?;
 
-            let ready = wait_for_udp_port(dns_addr, Duration::from_secs(10)).await;
-            if let Err(e) = ready {
-                eprintln!("[{target_name}] DNS port not ready: {e} — skipping W4");
+            // A stale responder still bound on the DNS port answers the
+            // probe and W4 would measure IT, not the spawned child —
+            // the UDP squatter check has to run before spawn (meow
+            // survives a failed bind, so ensure_alive cannot catch it).
+            if let Err(e) = ensure_udp_port_free(dns_addr, "DNS proxy") {
+                eprintln!("[{target_name}] {e} — skipping W4");
                 None
             } else {
-                eprintln!("[{target_name}] DNS proxy ready on {dns_addr}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut dns_child =
+                    ChildGuard::new(spawn_meow(binary, &args.binary_arg, dns_config)?);
 
-                eprintln!("[{target_name}] benchmarking DNS QPS...");
-                let dns_result = bench_dns::bench_dns(dns_addr, args.duration).await;
+                let ready = wait_for_udp_port_guarded(
+                    dns_addr,
+                    Duration::from_secs(10),
+                    &mut dns_child,
+                    "DNS proxy",
+                )
+                .await;
+                if let Err(e) = ready {
+                    eprintln!("[{target_name}] DNS port not ready: {e} — skipping W4");
+                    None
+                } else {
+                    eprintln!("[{target_name}] DNS proxy ready on {dns_addr}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
 
-                // Graceful stop (SIGTERM + grace on Unix), no Child leak.
-                dns_child.shutdown().await;
+                    eprintln!("[{target_name}] benchmarking DNS QPS...");
+                    let dns_result = bench_dns::bench_dns(dns_addr, args.duration).await;
 
-                match dns_result {
-                    Ok(r) => Some(r),
-                    Err(e) => {
-                        eprintln!("[{target_name}] DNS bench error: {e}");
-                        None
+                    // Graceful stop (SIGTERM + grace on Unix), no Child leak.
+                    dns_child.shutdown().await;
+
+                    match dns_result {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            eprintln!("[{target_name}] DNS bench error: {e}");
+                            None
+                        }
                     }
                 }
             }
@@ -672,8 +737,7 @@ async fn main() -> anyhow::Result<()> {
         ensure_port_free(vless_addr, "sing-box")?;
         let (child, dir) = start_singbox_server(bin)?;
         let mut guard = ChildGuard::new(child);
-        wait_for_port(vless_addr, Duration::from_secs(10)).await?;
-        guard.ensure_alive("sing-box")?;
+        wait_for_port_guarded(vless_addr, Duration::from_secs(10), &mut guard, "sing-box").await?;
         eprintln!("[proxied] sing-box ready on {vless_addr}");
         Some((guard, dir))
     } else {
@@ -692,6 +756,10 @@ async fn main() -> anyhow::Result<()> {
         Some(benchmark_target(&args.rust_binary, &args.config, "rust", &args, only, dns).await?)
     };
 
+    // No TIME_WAIT cooldown between the direct and proxied legs: the
+    // residual sockets are client-side on loopback ephemeral ports and
+    // the same asymmetry applies to the go legs below, so the rust-vs-go
+    // proxied comparison stays symmetric.
     let rust_proxied = if want_proxied {
         Some(
             benchmark_target(
@@ -802,8 +870,13 @@ async fn run_memleak_test(args: &Args) -> anyhow::Result<()> {
 
     let pid = child.id();
 
-    wait_for_port(proxy_addr, Duration::from_secs(15)).await?;
-    child.ensure_alive("memleak proxy")?;
+    wait_for_port_guarded(
+        proxy_addr,
+        Duration::from_secs(15),
+        &mut child,
+        "memleak proxy",
+    )
+    .await?;
     eprintln!(
         "[memleak] proxy ready (pid {pid}) on port {}",
         args.memleak_port
@@ -862,8 +935,7 @@ async fn run_footprint_test(args: &Args) -> anyhow::Result<()> {
         &args.config,
     )?);
     let pid = child.id();
-    wait_for_port(proxy_addr, Duration::from_secs(10)).await?;
-    child.ensure_alive("proxy")?;
+    wait_for_port_guarded(proxy_addr, Duration::from_secs(10), &mut child, "proxy").await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let result = match args.only.as_deref() {
@@ -907,9 +979,11 @@ async fn run_footprint_test(args: &Args) -> anyhow::Result<()> {
 /// verifies a committed config actually reached the datapath.
 const RELOAD_PROBE_PORT: u16 = 17895;
 
-/// The probe-rule line `config-bench-reload.yaml` carries; the B variant
-/// is generated by swapping its target to REJECT.
-const RELOAD_PROBE_RULE: &str = "DST-PORT,17895,bench-direct";
+/// The probe-rule list item `config-bench-reload.yaml` carries; the B
+/// variant is generated by swapping its target to REJECT.  Matched as a
+/// full trimmed line — a comment quoting the rule or a longer rule like
+/// `DST-PORT,17895,bench-direct-foo` must not count as the probe rule.
+const RELOAD_PROBE_RULE: &str = "- DST-PORT,17895,bench-direct";
 
 /// Standalone config-reload workload (`--only reload`, #558): steady echo
 /// load while `PUT /configs` runs `args.reloads` times, alternating
@@ -938,21 +1012,52 @@ async fn run_reload_test(args: &Args) -> anyhow::Result<()> {
     // look verified.
     let config_text = std::fs::read_to_string(&args.reload_config)?;
     anyhow::ensure!(
-        config_text.matches(RELOAD_PROBE_RULE).count() == 1,
-        "reload config {} must contain exactly one '{RELOAD_PROBE_RULE}' rule \
+        config_text
+            .lines()
+            .filter(|l| l.trim() == RELOAD_PROBE_RULE)
+            .count()
+            == 1,
+        "reload config {} must contain exactly one '{RELOAD_PROBE_RULE}' list item \
          (see config-bench-reload.yaml)",
         args.reload_config.display()
     );
-    let alt_text = config_text.replace(RELOAD_PROBE_RULE, "DST-PORT,17895,REJECT");
+    // Cheap contract check while the text is in hand: a config whose
+    // external-controller doesn't bind --api-port otherwise surfaces
+    // only as a 10 s port-wait timeout.
+    anyhow::ensure!(
+        config_text.contains("external-controller")
+            && config_text.contains(&format!(":{}", args.api_port)),
+        "reload config {} must set 'external-controller' bound to --api-port {}",
+        args.reload_config.display(),
+        args.api_port
+    );
+    // Swap the target on the one matching list-item line (line-anchored,
+    // so a comment quoting the rule is never rewritten).
+    let mut alt_text = String::with_capacity(config_text.len());
+    let mut swapped = false;
+    for line in config_text.lines() {
+        if !swapped && line.trim() == RELOAD_PROBE_RULE {
+            alt_text.push_str(&line.replacen("bench-direct", "REJECT", 1));
+            swapped = true;
+        } else {
+            alt_text.push_str(line);
+        }
+        alt_text.push('\n');
+    }
+    debug_assert!(swapped, "probe rule line guaranteed by the check above");
     let alt_dir = tempfile::tempdir()?;
     let alt_path = alt_dir.path().join("config-bench-reload-b.yaml");
     std::fs::write(&alt_path, alt_text)?;
 
+    // Free-port checks before binding anything — a squatter on the
+    // probe port otherwise surfaces as a bare "Address already in use"
+    // with no context.
+    ensure_port_free(proxy_addr, "reload proxy")?;
+    ensure_port_free(api_addr, "reload API")?;
+    ensure_port_free(probe_addr, "reload probe echo")?;
     let (echo_addr, echo_handle) = echo_server::start_echo_server().await?;
     let (_probe_echo_addr, probe_echo_handle) =
         echo_server::start_echo_server_on(probe_addr).await?;
-    ensure_port_free(proxy_addr, "reload proxy")?;
-    ensure_port_free(api_addr, "reload API")?;
     let mut child = ChildGuard::new(spawn_meow(
         &args.rust_binary,
         &args.binary_arg,
@@ -988,6 +1093,9 @@ async fn run_reload_test(args: &Args) -> anyhow::Result<()> {
     child.shutdown().await;
     echo_handle.abort();
     probe_echo_handle.abort();
+    // Free the tempdir explicitly: `std::process::exit` below skips
+    // destructors and would leak it into /tmp.
+    drop(alt_dir);
 
     let json = serde_json::to_string_pretty(&result)?;
     if let Some(output_path) = &args.output {

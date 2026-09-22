@@ -1,8 +1,13 @@
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::socks5_client::socks5_connect;
+
+/// Per-iteration deadline: the connect itself is bounded inside
+/// `socks5_connect`, but the post-connect echo IO is not — a wedged
+/// datapath must fail the leg, not hang it forever.
+const ITER_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LatencyResult {
@@ -24,15 +29,19 @@ pub async fn bench_latency(
 
     for _ in 0..iterations {
         let start = Instant::now();
-        let mut stream = socks5_connect(proxy, echo).await?;
-        stream.write_all(&[0x42]).await?;
-        let mut buf = [0u8; 1];
-        stream.read_exact(&mut buf).await?;
-        drop(stream);
+        tokio::time::timeout(ITER_TIMEOUT, async {
+            let mut stream = socks5_connect(proxy, echo).await?;
+            stream.write_all(&[0x42]).await?;
+            let mut buf = [0u8; 1];
+            stream.read_exact(&mut buf).await?;
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("latency iteration timed out after {ITER_TIMEOUT:?}"))??;
         latencies.push(start.elapsed().as_secs_f64() * 1e6); // microseconds
     }
 
-    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let percentile = |p: f64| -> f64 {
         let idx = ((p / 100.0) * (latencies.len() - 1) as f64).round() as usize;

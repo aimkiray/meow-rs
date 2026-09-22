@@ -1,9 +1,16 @@
 use anyhow::Context;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::socks5_client::socks5_connect;
+
+/// Stall bound on post-connect IO: a datapath that accepts but never
+/// echoes must fail the leg, not hang the suite.  Generous — a healthy
+/// 64 MB loopback transfer finishes in well under a second.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+/// Per-round-trip bound for the small-message loop.
+const MSG_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ThroughputResult {
@@ -52,7 +59,11 @@ async fn run_large_transfer(
         Ok::<_, std::io::Error>(received)
     });
 
-    let received = read_task.await??;
+    let received = tokio::time::timeout(TRANSFER_TIMEOUT, read_task)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("large transfer read stalled after {TRANSFER_TIMEOUT:?}")
+        })???;
     let _wr = write_task.await??;
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -76,14 +87,13 @@ async fn run_small_messages(
 
     let start = Instant::now();
     for _ in 0..count {
-        stream
-            .write_all(&msg)
-            .await
-            .with_context(|| "small message write")?;
-        stream
-            .read_exact(&mut buf)
-            .await
-            .with_context(|| "small message read")?;
+        tokio::time::timeout(MSG_TIMEOUT, async {
+            stream.write_all(&msg).await?;
+            stream.read_exact(&mut buf).await?;
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("small message round-trip stalled after {MSG_TIMEOUT:?}"))??;
         total_bytes += (msg_size * 2) as u64;
     }
     let elapsed = start.elapsed().as_secs_f64();

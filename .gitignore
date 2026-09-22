@@ -5,7 +5,8 @@ config.yaml.tmp
 config.yaml.*.tmp
 config-*.yaml
 # benchmark configs are tracked sources, not local runtime config
-!config-bench*.yaml
+!config-bench.yaml
+!config-bench-*.yaml
 config-*.yaml.bak
 config-*.yaml.tmp
 config-*.yaml.*.tmp
