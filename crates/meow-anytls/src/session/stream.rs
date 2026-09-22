@@ -82,6 +82,8 @@ impl Stream {
         )
     }
 
+    /// Resolve the stream's synack-waiter once; subsequent calls no-op
+    /// (the first notify wins — e.g. a SynAck already landed).
     pub async fn notify_synack(&self, result: Result<()>) {
         if let Some(tx) = self.synack_tx.lock().await.take() {
             let _ = tx.send(result);
@@ -92,6 +94,9 @@ impl Stream {
         self.id
     }
 
+    /// Mark the stream closed locally without emitting a `Fin` —
+    /// upstream `closeLocally` semantics: the peer already ended the
+    /// stream, so no reply is owed.
     pub async fn close_with_error(&self, err: AnyTlsError) {
         self.mark_closed(false);
         *self.close_error.lock().await = Some(err);

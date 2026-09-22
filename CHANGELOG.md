@@ -281,7 +281,10 @@ the canonical, in-repo source a release is cut from.
   producing a clean dial error (issue #543). The outbound-Fin eviction
   in `process_stream_data` now notifies symmetrically — `open_stream`
   is pub, so an out-of-tree caller can hold a live waiter across a
-  local close.
+  local close — and runs after the writer's `select!` so a racing
+  session close can no longer drop it mid-eviction. A `SynAck` carrying
+  an error payload now evicts and closes the stream too, so callers
+  that dropped the receiver no longer leak map entries.
 
 - **Scheduled subscription refreshes no longer reset `select` group
   choices or drop provider-backed group members.** The refresh loop
