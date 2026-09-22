@@ -32,7 +32,7 @@ These always exist and need no definition:
 | --- | --- | --- | --- |
 | `name` | string | — | **Required.** Unique identity |
 | `type` | string | — | **Required.** Protocol (below) |
-| `dialer-proxy` | string | — | Reach this server *through* another proxy/group (chained dialing). UDP-capable transports (e.g. kcptun's KCP sessions) tunnel their datagrams over the front proxy's UDP association too. Cycles are detected and ignored |
+| `dialer-proxy` | string | — | Reach this server *through* another proxy/group (chained dialing). UDP-capable transports (e.g. kcptun's KCP sessions) tunnel their datagrams over the front proxy's UDP association too. Cycles are rejected at load |
 
 Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vmess`,
 `hysteria2`, `snell`, `anytls`). Default builds enable the common set.

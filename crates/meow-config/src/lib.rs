@@ -4430,7 +4430,7 @@ mod dialer_proxy_tests {
     /// Issue #554 — a `dialer-proxy` member must share ONE health handle
     /// with its registry adapter. `apply_dialer_proxies` runs before group
     /// construction (issue #513), so the adapter a group captured is the
-    /// same object `route.proxies` and `group.member_handles()` serve the
+    /// same object `route.proxies` and `group.member_proxies()` serve the
     /// sweep and API probes. Marking the registry adapter dead must move
     /// the group's selection — a second `ProxyHealth` minted after group
     /// capture would leave the group reading a default-alive private
@@ -4470,9 +4470,18 @@ rules:
 
         assert_eq!(group.current().as_deref(), Some("member"));
         // The API's delay endpoints probe `route.proxies["member"]` and
-        // the periodic sweep resolves `group.member_handles()` — both
+        // the periodic sweep resolves `group.member_proxies()` — both
         // must land on the same `ProxyHealth`, so marking the registry
         // adapter dead must move the group's selection either way.
+        // Identity first: the group must have captured the registry's
+        // entry itself, not a twin sharing a health handle by accident.
+        assert!(
+            Arc::ptr_eq(
+                &proxies["member"],
+                &group.member_proxies().expect("fallback exposes members")[0]
+            ),
+            "the group member and the registry adapter must be one Arc"
+        );
         member.health().set_alive(false);
         assert_eq!(
             group.current().as_deref(),
