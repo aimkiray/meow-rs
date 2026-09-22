@@ -5032,7 +5032,7 @@ rules:
         assert_eq!(result.rules.len(), 2);
 
         // `rebuild_from_raw_runtime` — used by meow-api's `PUT /configs`
-        // family via `rebuild_from_raw_with_resolver_async`.
+        // family via `rebuild_from_raw_runtime_async`.
         let result = rebuild_from_raw_runtime(&raw, None, &HashMap::new(), Some(dir.path()))
             .expect(
             "trusted runtime rebuild with the real cache dir must not hard-fail on a file provider",
