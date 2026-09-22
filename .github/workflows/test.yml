@@ -143,6 +143,19 @@ jobs:
           sudo install -m 755 /tmp/gost /usr/local/bin/gost
           command -v gost
 
+      # The restls upstream-interop leg runs against a real
+      # metacubex/restls-client-go server built from the committed Go
+      # harness; RESTLS_SERVER_BIN on the test step tells the suite where
+      # it lives (the test fails when the env is unset — no silent skip).
+      - name: Set up Go (restls interop harness)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/meow-transport/tests/support/restls-server/go.mod
+          cache: false
+
+      - name: Build restls-server harness
+        run: go build -C crates/meow-transport/tests/support/restls-server -o "$RUNNER_TEMP/restls-server" .
+
       - name: Build
         run: cargo build --tests
 
@@ -153,6 +166,10 @@ jobs:
       # step. `cargo test -p meow-dns --lib` was folded in: `--lib` already
       # runs every crate's lib tests, meow-dns included.
       - name: Unit + integration tests (default features)
+        env:
+          # Points restls_e2e's upstream-interop leg at the Go harness
+          # built above — without it that leg fails (never silently skips).
+          RESTLS_SERVER_BIN: ${{ runner.temp }}/restls-server
         run: |
           cargo nextest run --lib --bin meow \
             --test common_test \

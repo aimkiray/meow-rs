@@ -38,7 +38,7 @@ proxy-groups:
 | `exclude-type` | string \| list | `[]` | Drop proxy types, e.g. `[ss]` |
 | `health-check` | block | — | Periodic probing (below) |
 | `header` | map | `{}` | Extra HTTP request headers (`http` only) |
-| `allow-external-plugin` | bool | `false` | Permit `ss` nodes to launch external SIP003 plugin executables. **Security-sensitive opt-in**: provider content is remote-controlled and the plugin name reaches `Command::new`, so off means such nodes are rejected. Built-in plugins (`obfs`, `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `ech-tls-tunnel`) are always allowed. meow-rs extension; absent in mihomo |
+| `allow-external-plugin` | bool | `false` | Permit `ss` nodes to launch external SIP003 plugin executables. **Security-sensitive opt-in**: provider content is remote-controlled and the plugin name reaches `Command::new`, so off means such nodes are rejected. Built-in plugins (`obfs`, `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `ech-tls-tunnel`) are always allowed. meow-rs extension; absent in mihomo |
 
 ### `type: http`
 

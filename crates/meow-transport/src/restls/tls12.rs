@@ -538,6 +538,14 @@ where
                     )))
                 }
             }
+            // NST spam keeps `hs_buf` small (each message pops complete)
+            // while the transcript would grow without bound — cap it at
+            // the same bar tls13 applies (`MAX_PRE_AUTH_TRANSCRIPT_LEN`).
+            if transcript.len() + msg.raw.len() > MAX_SERVER_FLIGHT {
+                return Err(TransportError::Tls(
+                    "restls12: oversized server transcript".into(),
+                ));
+            }
             transcript.extend_from_slice(&msg.raw);
         }
     }
@@ -673,6 +681,11 @@ where
                 return Err(TransportError::Tls("restls12: record before CCS".into()));
             }
             msgs.extend(record.payload.iter().copied());
+            if msgs.len() > MAX_SERVER_FLIGHT {
+                return Err(TransportError::Tls(
+                    "restls12: oversized pre-CCS message".into(),
+                ));
+            }
             while let Some(msg) = tls13::pop_handshake_message(&mut msgs) {
                 if msg.typ != HS_NEW_SESSION_TICKET {
                     return Err(TransportError::Tls(format!(
@@ -681,6 +694,11 @@ where
                     )));
                 }
                 // NST precedes the server Finished in the transcript.
+                if transcript.len() + msg.raw.len() > MAX_SERVER_FLIGHT {
+                    return Err(TransportError::Tls(
+                        "restls12: oversized server transcript".into(),
+                    ));
+                }
                 transcript.extend_from_slice(&msg.raw);
             }
             continue;
@@ -717,11 +735,21 @@ where
         }
         // The decrypted record may carry NewSessionTicket(4) and/or Finished.
         msgs.extend(post_buf.iter().copied());
+        if msgs.len() > MAX_SERVER_FLIGHT {
+            return Err(TransportError::Tls(
+                "restls12: oversized post-CCS message".into(),
+            ));
+        }
         while let Some(msg) = tls13::pop_handshake_message(&mut msgs) {
             match msg.typ {
                 HS_NEW_SESSION_TICKET => {
                     // Transcript: NST counts toward the *server* Finished
                     // hash — and it precedes it.
+                    if transcript.len() + msg.raw.len() > MAX_SERVER_FLIGHT {
+                        return Err(TransportError::Tls(
+                            "restls12: oversized server transcript".into(),
+                        ));
+                    }
                     transcript.extend_from_slice(&msg.raw);
                 }
                 HS_FINISHED => {

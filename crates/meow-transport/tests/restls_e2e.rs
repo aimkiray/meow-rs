@@ -318,6 +318,8 @@ timed_test!(
     e2e_cert_pin_mismatch_fails_impl
 );
 timed_test!(e2e_tls12_tagged, e2e_tls12_tagged_impl);
+timed_test!(e2e_tls12_p256_group, e2e_tls12_p256_group_impl);
+timed_test!(e2e_tls13_p256_keyshare, e2e_tls13_p256_keyshare_impl);
 timed_test!(e2e_stray_ccs_ignored, e2e_stray_ccs_ignored_impl);
 timed_test!(e2e_respond_sent_decrement, e2e_respond_sent_decrement_impl);
 timed_test!(e2e_upstream_interop, e2e_upstream_interop_impl);
@@ -390,6 +392,64 @@ async fn e2e_tagged_data_path_impl() {
     let mut out = [0u8; 64];
     let n = s.read(&mut out).await.unwrap();
     assert_eq!(&out[..n], b"ping");
+    drop(s);
+    server.await.unwrap();
+}
+
+/// TLS 1.3 cover restricted to P-256 — the client must derive the shared
+/// secret from the *P-256* keyshare it offered (selecting the offered
+/// keypair by the server's chosen group, not `keys[0]`).
+async fn e2e_tls13_p256_keyshare_impl() {
+    install_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (cert_der, key_der, _, _) = gen_cert(&["cover.example.com"]);
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.kx_groups = vec![rustls::crypto::ring::kx_group::SECP256R1];
+    let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("tls13 versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key_der)
+        .expect("server config");
+    cfg.send_tls13_tickets = 0;
+    let mut conn = ServerConnection::new(Arc::new(cfg)).expect("server conn");
+    let secret = secret(PASSWORD);
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let (mut tcp, server_random, client_fin) = relay_handshake(tcp, &mut conn, &secret, true)
+            .await
+            .expect("relay handshake");
+        let rec = read_record(&mut tcp).await.unwrap();
+        let (data_len, _) = server_extract(
+            &rec,
+            &secret,
+            &server_random,
+            0,
+            client_fin.as_deref(),
+            false,
+        )
+        .expect("tagged record");
+        let reply = server_build(
+            &rec[RECORD_HDR + AUTH_HEADER_LEN..RECORD_HDR + AUTH_HEADER_LEN + data_len],
+            &secret,
+            &server_random,
+            0,
+            [0, 0],
+            false,
+        );
+        tcp.write_all(&reply).await.unwrap();
+    });
+
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let mut s = restls::dial(tcp, &client_cfg(&cert_der))
+        .await
+        .expect("restls dial vs P-256 cover");
+    s.write_all(b"p256").await.unwrap();
+    let mut out = [0u8; 16];
+    let n = s.read(&mut out).await.unwrap();
+    assert_eq!(&out[..n], b"p256");
     drop(s);
     server.await.unwrap();
 }
@@ -742,21 +802,43 @@ async fn e2e_cert_pin_mismatch_fails_impl() {
 // ── TLS 1.2 ───────────────────────────────────────────────────────────────
 
 /// Extract the CKE pubkey from a plaintext client record and check the
-/// layout3 session-id tag (server-side `restls` verification).
+/// layout3 session-id tag (server-side `restls` verification). Upstream
+/// reads the segment for the *negotiated* curve
+/// (`sessionId[layout[curveIndex]]`) — inferred here from the CKE pubkey
+/// length: X25519 → 32 B → segment 0, P-256 → 65 B → segment 1,
+/// P-384 → 97 B → segment 2.
 fn verify_tls12_tag(ch: &[u8], cke_pub: &[u8], secret: &[u8; 32]) -> bool {
     let (sid, _shares) = parse_client_hello(ch);
     assert_eq!(sid.len(), 32);
     let layout3 = [0usize, 11, 22, 32];
+    let seg = match cke_pub.len() {
+        32 => 0,
+        65 => 1,
+        97 => 2,
+        other => panic!("unexpected CKE pubkey length {other}"),
+    };
     let mut h = blake3::Hasher::new_keyed(secret);
     h.update(cke_pub);
     let tag = h.finalize();
-    // The tag lands in the segment for the server-chosen curve — try all 3.
-    (0..3).any(|i| tag.as_bytes()[..layout3[i + 1] - layout3[i]] == sid[layout3[i]..layout3[i + 1]])
+    tag.as_bytes()[..layout3[seg + 1] - layout3[seg]] == sid[layout3[seg]..layout3[seg + 1]]
 }
 
 fn server_conn_tls12() -> (ServerConnection, rustls::pki_types::CertificateDer<'static>) {
+    server_conn_tls12_kx(rustls::crypto::ring::default_provider().kx_groups)
+}
+
+/// A TLS 1.2 cover restricted to `kx` groups — a P-256-only cover forces
+/// the client to select its P-256 eager key (a `keys[0]`-style bug would
+/// send an X25519 pubkey and fail the ECDHE).
+fn server_conn_tls12_kx(
+    kx: Vec<&'static dyn rustls::crypto::SupportedKxGroup>,
+) -> (ServerConnection, rustls::pki_types::CertificateDer<'static>) {
     let (cert_der, key_der, _, _) = gen_cert(&["cover.example.com"]);
-    let mut cfg = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.kx_groups = kx;
+    let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .expect("tls12 versions")
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.clone()], key_der)
         .expect("server config");
@@ -773,10 +855,24 @@ fn server_conn_tls12() -> (ServerConnection, rustls::pki_types::CertificateDer<'
 /// restls `version-hint=tls12` e2e: eager-key session-id tags, masked first
 /// encrypted record, tagged records with the GCM nonce slot.
 async fn e2e_tls12_tagged_impl() {
+    let (conn, cert) = server_conn_tls12();
+    e2e_tls12_tagged_inner(conn, cert).await;
+}
+
+/// Same tagged-path flow against a P-256-only cover — the CKE must carry
+/// the P-256 eager key's pubkey (tag then verifies at layout3 segment 1).
+async fn e2e_tls12_p256_group_impl() {
+    let (conn, cert) = server_conn_tls12_kx(vec![rustls::crypto::ring::kx_group::SECP256R1]);
+    e2e_tls12_tagged_inner(conn, cert).await;
+}
+
+async fn e2e_tls12_tagged_inner(
+    mut conn: ServerConnection,
+    cert: rustls::pki_types::CertificateDer<'static>,
+) {
     install_crypto_provider();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let (mut conn, cert) = server_conn_tls12();
     let secret = secret(PASSWORD);
 
     let server = tokio::spawn(async move {
@@ -932,16 +1028,30 @@ async fn e2e_tls12_tagged_impl() {
 /// unmasks our records, and echoes plaintext — a green round trip proves
 /// both directions against code we did not write, not self-consistency.
 ///
-/// Gated on `$RESTLS_SERVER_BIN`; loud-skips when unset. Build the harness
-/// from `tests/support/restls-server/`:
+/// The suite **fails** when `$RESTLS_SERVER_BIN` is unset — a green CI run
+/// must exercise the real-peer leg. Build the harness from
+/// `tests/support/restls-server/`:
 /// `(cd tests/support/restls-server && go build -o restls-server .)`
+/// `MEOW_RESTLS_E2E_ALLOW_SKIP=1` prints a loud explicit skip for local
+/// runs only — CI builds the harness via `actions/setup-go` and never
+/// sets it.
 async fn e2e_upstream_interop_impl() {
     use std::process::Stdio;
     let Some(bin) = std::env::var_os("RESTLS_SERVER_BIN") else {
-        eprintln!(
-            "SKIP: RESTLS_SERVER_BIN unset — point it at a built restls-server harness binary"
+        if std::env::var_os("MEOW_RESTLS_E2E_ALLOW_SKIP").is_some() {
+            eprintln!(
+                "SKIP: RESTLS_SERVER_BIN unset and MEOW_RESTLS_E2E_ALLOW_SKIP \
+                 is set — upstream interop NOT exercised"
+            );
+            return;
+        }
+        panic!(
+            "RESTLS_SERVER_BIN is required for the upstream-interop leg \
+             (build tests/support/restls-server and point it at the binary). \
+             A green run must exercise real-peer interop, so this test \
+             refuses to silently skip — set MEOW_RESTLS_E2E_ALLOW_SKIP=1 \
+             only for a loud local skip."
         );
-        return;
     };
     let mut child = tokio::process::Command::new(&bin)
         .args(["-listen", "127.0.0.1:0", "-password", PASSWORD])

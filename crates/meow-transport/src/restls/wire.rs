@@ -354,6 +354,29 @@ mod tests {
         assert!(extract_tagged_record_dir(&record, &secret, &sr, 1, false, false, false).is_err());
     }
 
+    /// Corrupting only the 8-byte MAC field must reject — the masked
+    /// len/cmd field stays intact, so nothing else could catch the
+    /// tamper. (Pins the ct_eq gate itself, not just downstream bounds.)
+    #[test]
+    fn record_bad_mac_rejected() {
+        let secret = derive_secret(b"hunter2");
+        let sr = [1u8; 32];
+        let data = b"payload";
+        let s = spec(data, 60, data.len(), 60 - AUTH_HEADER_LEN - data.len());
+        let mut record = build_tagged_record(&secret, &sr, &s, pad_zero);
+        for i in 0..APP_MAC_LEN {
+            let mut r = record.clone();
+            r[RECORD_HDR + i] ^= 1;
+            assert!(
+                extract_tagged_record_dir(&r, &secret, &sr, 0, false, false, false).is_err(),
+                "MAC byte {i} corrupted"
+            );
+        }
+        // And a structurally valid record with a zeroed MAC.
+        record[RECORD_HDR..RECORD_HDR + APP_MAC_LEN].fill(0);
+        assert!(extract_tagged_record_dir(&record, &secret, &sr, 0, false, false, false).is_err());
+    }
+
     #[test]
     fn command_embedded_in_record() {
         let secret = derive_secret(b"x");

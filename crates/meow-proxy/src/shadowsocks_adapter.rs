@@ -23,7 +23,7 @@ use shadowsocks::ProxyClientStream;
 use smol_str::SmolStr;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Built-in (native, no external process) simple-obfs configuration.
 #[derive(Debug, Clone)]
@@ -189,7 +189,7 @@ impl ShadowsocksAdapter {
                 // `client-fingerprint` selects a uTLS profile upstream; our
                 // record-level client crafts a fixed-shape ClientHello.
                 if client_fingerprint.is_some() {
-                    debug!("SS '{name}': client-fingerprint has no effect on restls");
+                    warn!("SS '{name}': client-fingerprint has no effect on restls");
                 }
                 PluginKind::Restls(cfg)
             }

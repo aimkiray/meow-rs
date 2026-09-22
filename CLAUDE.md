@@ -164,6 +164,15 @@ version from https://github.com/SagerNet/sing-box/releases or point
 `SINGBOX_BIN` at it. `MEOW_SMUX_E2E_ALLOW_SKIP=1` prints a loud explicit
 skip for local runs only — CI must never set it.
 
+`restls_e2e`'s upstream-interop leg drives the tagged-record wire protocol
+against a real upstream peer (`metacubex/restls-client-go`'s
+`RestlsServer`) and likewise **fails** when `RESTLS_SERVER_BIN` is unset —
+build the harness from
+`crates/meow-transport/tests/support/restls-server` (`go build -o
+restls-server .`); `MEOW_RESTLS_E2E_ALLOW_SKIP=1` prints a loud explicit
+skip for local runs only — CI builds the harness via `actions/setup-go`
+and never sets it.
+
 Keep the target list in sync with `.github/workflows/test.yml`; a new `tests/`
 file that CI runs but this list omits is invisible to the local bar.
 

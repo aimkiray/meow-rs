@@ -48,7 +48,7 @@ Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vme
 | `password` | string | ✓ | — | |
 | `cipher` | string | ✓ | — | e.g. `aes-256-gcm`, `chacha20-ietf-poly1305` |
 | `udp` | bool | | `false` | Enable UDP relay |
-| `plugin` | string | | — | `obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `ech-tls-tunnel` (built-in, no external binary) |
+| `plugin` | string | | — | `obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `ech-tls-tunnel` (built-in, no external binary) |
 | `plugin-opts` | string \| map | | — | Plugin options |
 
 ```yaml
@@ -109,6 +109,28 @@ three upstream protocol versions. `host` (cover SNI) and `version`
     # strict-mode: false      # v3: fail unless the cover negotiates TLS 1.3
     # skip-cert-verify: false
     # fingerprint: "AA:BB:…"  # SHA-256 cert pin, not uTLS
+```
+
+`restls` authenticates the relay inside the TLS `session_id` — the cover
+handshake itself is real TLS (tls12 or tls13):
+
+```yaml
+- name: ss-restls
+  type: ss
+  server: 1.2.3.4
+  port: 8388
+  cipher: aes-256-gcm
+  password: "•••"
+  plugin: restls
+  plugin-opts:
+    host: cover.example.com    # required — cover server name (TLS SNI)
+    password: "psk"            # required
+    version-hint: tls13        # required — tls12 or tls13
+    # restls-script: "150?0<1" # optional behavior script (validated at parse)
+    # force-tls12: false       # upstream test knob — overrides version-hint to tls12
+    # skip-cert-verify: false
+    # name-cert-verify: ""     # verify the cert for this name instead of host
+    # fingerprint: "AA:BB:…"   # SHA-256 cert pin, not uTLS
 ```
 
 ---
