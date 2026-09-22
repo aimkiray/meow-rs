@@ -456,8 +456,8 @@ struct AnytlsPacketConn {
     stream: Arc<AnytlsStream>,
     // See `AnytlsConn::session`.
     _session: Arc<Session>,
-    /// Set once a frame read is torn by cancellation — the stream's
-    /// framing is then unrecoverable, so every later packet op must fail
+    /// Set once a frame read is torn by cancellation or error — the
+    /// stream's framing is then unrecoverable, so every later packet op must fail
     /// fast rather than misdeliver (issue #514).
     poisoned: std::sync::atomic::AtomicBool,
 }
@@ -487,6 +487,10 @@ impl ProxyPacketConn for AnytlsPacketConn {
         // Re-check post-lock: a read parked behind a cancelled mid-frame
         // read must not consume the torn remainder.
         crate::check_not_desynced(&self.poisoned)?;
+        // `guard` must be declared AFTER `reader`: locals drop in reverse
+        // order, so the guard's poison store runs while the mutex is still
+        // held — the unlock then gives the parked reader's re-check the
+        // happens-before edge it needs.
         let mut guard = crate::PoisonOnIncomplete::new(&self.poisoned);
 
         let addr = read_uot_addr(&mut *reader).await?;
@@ -543,7 +547,7 @@ impl ProxyPacketConn for AnytlsPacketConn {
         self.stream
             .send_data(Bytes::from(frame))
             .await
-            .map_err(|_| MeowError::Proxy("anytls udp write: session writer closed".to_string()))?;
+            .map_err(|e| MeowError::Proxy(format!("anytls udp write: {e}")))?;
         Ok(buf.len())
     }
 
@@ -896,7 +900,11 @@ mod tests {
             &[UOT_ATYP_IPV4, 9, 9, 9, 9, 0, 53, 0, 1, b'x'],
         )
         .await;
-        let err = queued.await.unwrap().unwrap_err();
+        let err = tokio::time::timeout(Duration::from_secs(2), queued)
+            .await
+            .expect("queued read must resolve, not hang")
+            .unwrap()
+            .unwrap_err();
         assert!(
             err.to_string().contains("desynced"),
             "queued read must fail fast after the poisoned first read, got {err:?}"
@@ -935,7 +943,11 @@ mod tests {
         // read1's datagram completes cleanly once the rest lands, and the
         // conn still serves the following datagram — no poison.
         push_frame(&mut peer, id, &[9, 9, 9, 9, 0, 53, 0, 1, b'a']).await;
-        first.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("read1 must resolve, not hang")
+            .unwrap()
+            .unwrap();
         push_frame(
             &mut peer,
             id,
@@ -943,7 +955,10 @@ mod tests {
         )
         .await;
         let mut buf = [0u8; 2048];
-        conn.read_packet(&mut buf).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), conn.read_packet(&mut buf))
+            .await
+            .expect("read after parked-cancel must resolve")
+            .unwrap();
         session.close().await.unwrap();
     }
 
@@ -959,7 +974,10 @@ mod tests {
         let mut buf = [0u8; 2048];
 
         push_frame(&mut peer, id, &[0x7f]).await;
-        let err = conn.read_packet(&mut buf).await.unwrap_err();
+        let err = tokio::time::timeout(Duration::from_secs(2), conn.read_packet(&mut buf))
+            .await
+            .expect("errored read must resolve")
+            .unwrap_err();
         assert!(err.to_string().contains("address type"), "got {err:?}");
 
         // The peer then sends a valid datagram — the conn must not
@@ -970,11 +988,58 @@ mod tests {
             &[UOT_ATYP_IPV4, 9, 9, 9, 9, 0, 53, 0, 1, b'x'],
         )
         .await;
-        let err = conn.read_packet(&mut buf).await.unwrap_err();
+        let err = tokio::time::timeout(Duration::from_secs(2), conn.read_packet(&mut buf))
+            .await
+            .expect("poisoned read must fail fast")
+            .unwrap_err();
         assert!(
             err.to_string().contains("desynced"),
             "second read must fail fast on poisoned conn, got {err:?}"
         );
+        session.close().await.unwrap();
+    }
+
+    /// A datagram larger than the caller buffer is truncated, not torn:
+    /// the sink-drain keeps the stream aligned so the next datagram
+    /// still parses (anytls_adapter.rs:510-513).
+    #[tokio::test]
+    async fn udp_undersized_buffer_truncates_without_desync() {
+        let (session, mut peer) = test_session().await;
+        let (stream, _) = session.open_stream().await.unwrap();
+        let id = stream.id();
+        assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
+        let src: SocketAddr = "192.0.2.9:53".parse().unwrap();
+
+        // 4-byte payload into a 2-byte buffer — 2 bytes must drain.
+        let mut datagram = Vec::new();
+        encode_uot_addr(&mut datagram, &src);
+        datagram.extend_from_slice(&4u16.to_be_bytes());
+        datagram.extend_from_slice(&[1, 2, 3, 4]);
+        push_frame(&mut peer, id, &datagram).await;
+
+        let mut buf = [0u8; 2];
+        let (n, addr) = tokio::time::timeout(Duration::from_secs(2), conn.read_packet(&mut buf))
+            .await
+            .expect("truncated read must resolve")
+            .unwrap();
+        assert_eq!(addr, src);
+        assert_eq!(&buf[..n], &[1, 2]);
+
+        // The following datagram still parses — the drain kept framing.
+        let mut datagram2 = Vec::new();
+        encode_uot_addr(&mut datagram2, &src);
+        datagram2.extend_from_slice(&1u16.to_be_bytes());
+        datagram2.extend_from_slice(&[9]);
+        push_frame(&mut peer, id, &datagram2).await;
+
+        let mut buf2 = [0u8; 2048];
+        let (n2, addr2) = tokio::time::timeout(Duration::from_secs(2), conn.read_packet(&mut buf2))
+            .await
+            .expect("post-truncation read must resolve")
+            .unwrap();
+        assert_eq!(addr2, src);
+        assert_eq!(&buf2[..n2], &[9]);
         session.close().await.unwrap();
     }
 
@@ -997,7 +1062,11 @@ mod tests {
             datagram.extend_from_slice(&[i, i, i]);
             push_frame(&mut peer, id, &datagram).await;
 
-            let (n, addr) = conn.read_packet(&mut buf).await.unwrap();
+            let (n, addr) =
+                tokio::time::timeout(Duration::from_secs(2), conn.read_packet(&mut buf))
+                    .await
+                    .expect("completed read must resolve")
+                    .unwrap();
             assert_eq!(addr, src);
             assert_eq!(&buf[..n], &[i, i, i]);
         }
