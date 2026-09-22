@@ -2629,8 +2629,9 @@ async fn put_configs(
     // A `tun:` section the listener cannot parse must be rejected before
     // commit (issue #543): admitted unchecked, the reconcile's restart
     // would tear down a healthy listener and only then fail the spawn-side
-    // parse — leaving TUN down on a 204. `force` degrades to warn like the
-    // dns arm; the restart's rollback still prevents a false `enable`.
+    // parse — leaving TUN down on a 204. `force` degrades to an error log
+    // like the dns arm; the restart's rollback still prevents a false
+    // `enable`.
     // Checked before `reconcile_dns_config` so a doomed PUT cannot trigger
     // that path's provider-registry side effects.
     if let Err(e) =

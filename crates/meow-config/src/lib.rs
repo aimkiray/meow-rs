@@ -295,7 +295,13 @@ pub fn parse_tun_config(
     global_max_connections: Option<usize>,
 ) -> Result<TunConfig, anyhow::Error> {
     let Some(r) = raw else {
-        return Ok(TunConfig::default());
+        // Keep the global-cap folding symmetric with the `Some` arm: an
+        // absent section still inherits `max-connections`, so callers
+        // diffing parsed configs see the same value either way.
+        return Ok(TunConfig {
+            max_connections: global_max_connections.unwrap_or(256),
+            ..TunConfig::default()
+        });
     };
 
     // Warn on upstream-only fields (Class B per ADR-0002; policy of #328:
