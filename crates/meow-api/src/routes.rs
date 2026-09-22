@@ -3407,12 +3407,20 @@ async fn get_listeners(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         .listeners
         .iter()
         .map(|l| {
-            serde_json::json!({
+            let mut item = serde_json::json!({
                 "name": l.name,
                 "type": l.spec.type_name(),
                 "port": l.port,
                 "listen": l.listen,
-            })
+            });
+            // TProxy listeners disclose who owns the redirect rules — a
+            // deployer checking whether the table/anchor they installed is
+            // supposed to coexist with a meow-managed one reads this field
+            // (issue #563).
+            if let meow_config::ListenerSpec::TProxy { firewall, .. } = &l.spec {
+                item["firewall"] = serde_json::json!(firewall);
+            }
+            item
         })
         .collect();
     Json(serde_json::json!(items))

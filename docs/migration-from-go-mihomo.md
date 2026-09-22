@@ -625,6 +625,15 @@ Most common format from public providers. Typical issues:
 2. **`redir-port`** — not supported. Use `tproxy-port`.
 3. **PROCESS-NAME / PROCESS-PATH rules** — platform lookup wired (Linux netlink,
    macOS libproc) via M1.D-1.
+4. **Firewall-management polarity is reversed.** In Go mihomo the `listeners:`
+   tproxy entry's `iptables:` key defaults **off** (the deployer owns redirect
+   rules unless they opt in); in meow-rs the equivalent `firewall:` key on a
+   `listeners:` tproxy entry defaults **on** (managed nftables/pf table), and
+   the `tproxy-port` shorthand is always managed. A config that ran
+   externally-managed rules upstream must set `firewall: false` explicitly on
+   the listener, or meow will install its own `inet meow_tproxy` / pf anchor
+   alongside yours. A stray top-level `firewall:` key warns and is ignored —
+   it is not the upstream top-level `iptables:` equivalent.
 
 ### Type 4: Proxy provider subscription (`proxy-providers:`)
 

@@ -81,13 +81,38 @@ listeners:
 ```
 
 With `firewall: false` meow installs no anchor and removes none on exit — you
-own the `rdr` rules, the UID loop-prevention bypass, and the anchor's
-lifecycle. The listener still accepts redirected TCP and recovers the original
+own the whole ruleset and its lifecycle. A working pf ruleset needs ALL of
+these; skipping any one wedges or loops intercepted traffic:
+
+- **`no rdr` ephemeral exemption first.** Translation rules are first-match:
+  `no rdr on lo0 proto tcp from any to any port <ephemeral_first>:65535`
+  must precede your `rdr` — otherwise the listener's own replies re-match
+  the `rdr` on their second `lo0` traversal and every intercepted handshake
+  wedges (issue #354).
+- **`rdr` to the listener's bind address.** `DIOCNATLOOK` is queried with
+  the listener's *bound* address as the lookup key, so `listen:
+  127.0.0.1:7893` pairs with `rdr … -> 127.0.0.1 port 7893`. A `listen:
+  0.0.0.0` listener whose `rdr` targets `127.0.0.1` accepts connections and
+  then silently fails orig-dst recovery — keep the two addresses equal.
+- **UID bypass** (`pass out quick on lo0 … user <meow-uid>`) so meow's own
+  outbound connections are not re-intercepted.
+- **Loopback bypass** (`pass out quick on lo0 proto tcp from any to
+  127.0.0.0/8`) — otherwise the host's own loopback TCP gets redirected into
+  the listener.
+- **An evaluated anchor/ruleset.** A `pfctl -a` anchor only runs if the
+  active ruleset references it — the stock `/etc/pf.conf` evaluates only
+  `com.apple/*` children (meow's managed anchor is `com.apple/com.meow.
+  tproxy` for exactly this reason), so either nest your anchor under
+  `com.apple/` or wire an `rdr-anchor`/`load anchor` reference yourself.
+  pf must also be enabled (`pfctl -e`) for the `DIOCNATLOOK` lookup to find
+  NAT state.
+
+The listener still accepts redirected TCP and recovers the original
 destination via the pf state-table lookup (`DIOCNATLOOK` on `/dev/pf`), so
 your rules must use `rdr` — a plain `pass` + connect leaves no NAT state to
 look up. See
 [tproxy-gateway.md](tproxy-gateway.md#firewall-false--fully-external-rule-management)
-for the full contract.
+for the Linux/nft side of the same contract.
 
 ## Intercepting real outbound traffic (`route-to lo0`)
 

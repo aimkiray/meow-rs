@@ -2573,6 +2573,7 @@ dependencies = [
  "smallvec",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "tun-rs",
 ]
 

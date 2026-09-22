@@ -173,6 +173,9 @@ fi
 echo ""
 echo "=== External-firewall phase (firewall: false) ==="
 
+# The ruleset below mirrors the managed table's shape — keep the magic
+# numbers in sync with meow-tproxy-ext.yaml (mark 0x2537 = routing-mark
+# 9527, redirect port :7894, proxy-IP bypass 10.99.0.1 = the upstream).
 nft -f - <<'NFT'
 table inet meow_ext_fw {
   chain output {
@@ -185,6 +188,14 @@ table inet meow_ext_fw {
   }
 }
 NFT
+
+# A failed ruleset install must fail loudly here — otherwise the relay
+# checks below fail indirectly and hide the deployer-side cause.
+if nft list table inet meow_ext_fw >/dev/null 2>&1; then
+    pass "ext_fw_installed"
+else
+    fail "ext_fw_installed"
+fi
 
 meow -f /etc/meow-tproxy-ext.yaml > /tmp/meow-ext.log 2>&1 &
 EXT_MEOW_PID=$!
@@ -255,9 +266,6 @@ else
     fail "ext_fw_persists"
 fi
 
-# The harness owns the external table — remove it explicitly.
-nft delete table inet meow_ext_fw 2>/dev/null || true
-
 # --- Debug output ---
 echo ""
 echo "=== meow log ==="
@@ -272,6 +280,10 @@ echo ""
 echo "=== nftables state ==="
 nft list ruleset 2>/dev/null || echo "(empty)"
 echo "=== end nftables ==="
+
+# The harness owns the external table — remove it explicitly, but only
+# AFTER the ruleset dump so the debug output still shows what was live.
+nft delete table inet meow_ext_fw 2>/dev/null || true
 
 # Cleanup
 kill "$ECHO_PID" 2>/dev/null || true

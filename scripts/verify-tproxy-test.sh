@@ -33,8 +33,11 @@ echo "== meow local-outbound tproxy test ($OS) =="
 # 1. listener up
 if grep -qE "TProxy listener.*started" "$LOG"; then pass "tproxy_listener_started"; else fail "tproxy_listener_started"; fi
 
-# 2. firewall rules installed
-if [ "$OS" = Darwin ]; then
+# 2. firewall rules installed — skipped when the log shows `firewall: false`
+# external management (issue #563), where meow intentionally installs nothing.
+if grep -q "external firewall management" "$LOG" 2>/dev/null; then
+  echo "  SKIP: firewall_loaded (external management — deployer owns rules)"
+elif [ "$OS" = Darwin ]; then
   if asroot pfctl -a com.apple/com.meow.tproxy -sn 2>/dev/null | grep -q rdr; then pass "pf_anchor_loaded"; else fail "pf_anchor_loaded"; fi
 else
   if asroot nft list table inet meow_tproxy >/dev/null 2>&1; then pass "nft_table_loaded"; else fail "nft_table_loaded"; fi

@@ -3180,6 +3180,13 @@ fn build_named_listeners(
             global_max_conns,
         )?;
     }
+    if raw.firewall.is_some() {
+        warn!(
+            "firewall: only meaningful under a `listeners:` tproxy entry; \
+             the top-level key is ignored — the `tproxy-port` shorthand \
+             always stays managed (issue #563)"
+        );
+    }
     if let Some(port) = raw.tproxy_port.filter(|p| *p != 0) {
         add(
             "tproxy",

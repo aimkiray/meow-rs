@@ -121,5 +121,7 @@ rules:
 ## Inspecting listeners
 
 `GET /listeners` returns the active listeners with their name, type, port, and bind
-address. For [ephemeral listeners](#ephemeral-ports) the reported port is the actual
-OS-assigned one, not the configured `0`. See the [REST API reference](../reference/rest-api).
+address; `tproxy` entries additionally report `firewall` (whether meow manages
+the redirect rules or they are externally owned). For [ephemeral listeners](#ephemeral-ports)
+the reported port is the actual OS-assigned one, not the configured `0`. See the
+[REST API reference](../reference/rest-api).

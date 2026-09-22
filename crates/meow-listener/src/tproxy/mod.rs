@@ -661,44 +661,87 @@ mod tests {
     /// environment does not have, so this test pins the externally-managed
     /// contract: no early error return from `FirewallGuard::setup`, and
     /// client connects still reach the accept loop.
+    ///
+    /// Also pins the startup-log disclosure ("external firewall management")
+    /// that the QEMU harness greps for (`tests/tproxy-qemu/guest-init.sh`).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn run_on_external_firewall_accepts_without_setup() {
-        let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
-            vec![],
-            vec![],
-            meow_common::DnsMode::Normal,
-            meow_trie::DomainTrie::new(),
-            false,
-            true,
-        ));
-        let tunnel = meow_tunnel::Tunnel::new(resolver);
-
-        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-
-        let listener = TProxyListener::new(tunnel, addr, false, None, "ext-fw".to_string())
-            .with_firewall(false);
-        let mut task = tokio::spawn(listener.run_on(socket));
-
-        // A client connect must be accepted — the accept loop runs without
-        // any firewall tooling being invoked. The connection itself is then
-        // closed by the handler (no REDIRECT metadata to recover), which is
-        // irrelevant here.
-        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr))
-            .await
-            .expect("connect timed out")
-            .expect("connect failed");
-
-        // The listener must still be running — if firewall setup had been
-        // attempted it would have returned an error on this unprivileged
-        // host before the accept loop started. Waiting out the timeout means
-        // the task stayed alive; finishing means an early error return.
-        match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
-            Err(_) => {}
-            Ok(res) => panic!("firewall: false listener exited early: {res:?}"),
+    #[test]
+    fn run_on_external_firewall_accepts_without_setup() {
+        #[derive(Clone)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
-        task.abort();
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let sink = Sink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+                        vec![],
+                        vec![],
+                        meow_common::DnsMode::Normal,
+                        meow_trie::DomainTrie::new(),
+                        false,
+                        true,
+                    ));
+                    let tunnel = meow_tunnel::Tunnel::new(resolver);
+
+                    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = socket.local_addr().unwrap();
+
+                    let listener =
+                        TProxyListener::new(tunnel, addr, false, None, "ext-fw".to_string())
+                            .with_firewall(false);
+                    let mut task = tokio::spawn(listener.run_on(socket));
+
+                    // A client connect must be accepted — the accept loop runs
+                    // without any firewall tooling being invoked. The
+                    // connection itself is then closed by the handler (no
+                    // REDIRECT metadata to recover), which is irrelevant here.
+                    tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr))
+                        .await
+                        .expect("connect timed out")
+                        .expect("connect failed");
+
+                    // The listener must still be running — if firewall setup
+                    // had been attempted it would have returned an error on
+                    // this unprivileged host before the accept loop started.
+                    // Waiting out the timeout means the task stayed alive;
+                    // finishing means an early error return.
+                    match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
+                        Err(_) => {}
+                        Ok(res) => panic!("firewall: false listener exited early: {res:?}"),
+                    }
+                    task.abort();
+                });
+        });
+
+        let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        assert!(
+            logs.contains("external firewall management"),
+            "external mode must disclose itself in the startup log, got: {logs}"
+        );
     }
 
     /// The inverse contract on platforms without orig-dest recovery:
@@ -726,8 +769,11 @@ mod tests {
             .run_on(socket)
             .await
             .expect_err("external management must refuse on this platform");
+        // "is not supported" pins the early gate — the managed-mode setup
+        // path would instead fail with "firewall not supported", which
+        // lacks the "is" and would mean `firewall: false` was ignored.
         assert!(
-            err.to_string().contains("not supported"),
+            err.to_string().contains("is not supported"),
             "unexpected error: {err}"
         );
     }

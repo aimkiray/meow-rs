@@ -107,11 +107,17 @@ The deployer's responsibilities, all of them:
   backend you prefer (iptables, nftables, pf, an external firewall manager);
 - provide the loop-prevention bypass (a `routing-mark`/UID exemption for meow's
   own outbound and upstream server IPs), or meow's outbound will be re-captured;
-- own startup/shutdown ordering — rules installed before meow binds are silently
-  blackholed or fail-open depending on your design; meow cleans up nothing;
+- own startup/shutdown ordering — rules installed before meow binds refuse or
+  fail-open depending on your design; meow cleans up nothing;
 - pick a **fixed** port. `port: 0` resolves after external rules would already
   need to exist, so it only works if you discover the bound port via
   `GET /listeners` and install rules afterwards.
+
+On macOS the `DIOCNATLOOK` lookup is keyed on the listener's **bound** address:
+`listen: 0.0.0.0` pairs badly with `rdr` rules targeting `127.0.0.1` (the lookup
+misses and connections drop after accept). Keep the `rdr` target equal to the
+`listen` address — see [tproxy-macos.md](https://github.com/meow-rs/meow-rs/blob/main/docs/tproxy-macos.md)
+for the full pf contract.
 
 Out of scope: `firewall: false` does **not** add an iptables backend, does not
 enable UDP or true Linux `TPROXY` (the listener remains TCP `REDIRECT`), and

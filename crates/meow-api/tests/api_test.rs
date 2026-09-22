@@ -173,6 +173,51 @@ async fn ui_serves_html() {
     assert!(body.contains("meow-rs"));
 }
 
+/// Issue #563: `GET /listeners` discloses the tproxy firewall mode so a
+/// deployer can tell whether redirect rules are meow-managed or their own.
+#[tokio::test]
+async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
+    use meow_config::{ListenerSpec, NamedListener};
+
+    let mut state = test_state_default();
+    Arc::get_mut(&mut state).unwrap().listeners = vec![
+        NamedListener {
+            name: "ext-tproxy".into(),
+            spec: ListenerSpec::TProxy {
+                sni: false,
+                firewall: false,
+            },
+            port: 7894,
+            listen: "127.0.0.1".into(),
+            max_connections: 256,
+        },
+        NamedListener {
+            name: "mixed".into(),
+            spec: ListenerSpec::Mixed,
+            port: 7890,
+            listen: "127.0.0.1".into(),
+            max_connections: 256,
+        },
+    ];
+
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/listeners")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body[0]["name"], "ext-tproxy");
+    assert_eq!(body[0]["firewall"], false);
+    // Non-tproxy listeners carry no `firewall` key at all.
+    assert_eq!(body[1]["name"], "mixed");
+    assert!(body[1].get("firewall").is_none());
+}
+
 #[tokio::test]
 async fn ui_wildcard_serves_same_html() {
     let state = test_state_default();

@@ -64,6 +64,7 @@ meow-trie = { workspace = true }
 ipnet = { workspace = true }
 shadowsocks = { workspace = true }
 async-trait = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[test]]
 name = "ss_listener_integration"

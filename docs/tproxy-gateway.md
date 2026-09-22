@@ -28,12 +28,12 @@ Understand this before configuring — it explains every step below.
   `getsockopt(SO_ORIGINAL_DST)`. This works for both locally-generated and
   forwarded traffic, but only for **TCP**.
 - **The built-in firewall is `output`-chain only.** When you set a tproxy
-  listener, meow auto-creates an nftables table (`inet meow_tproxy`) with a
-  `nat` hook on `output` that redirects the **host's own** outbound TCP to the
-  listener. It is torn down automatically on shutdown (RAII guard). It includes
-  loop-avoidance: a `meta mark` bypass for `DIRECT`-marked sockets
-  (`routing-mark`), loopback bypass, and per-IP bypass for your upstream proxy
-  servers.
+  listener with managed firewall (the default), meow auto-creates an nftables
+  table (`inet meow_tproxy`) with a `nat` hook on `output` that redirects the
+  **host's own** outbound TCP to the listener. It is torn down automatically
+  on shutdown (RAII guard). It includes loop-avoidance: a `meta mark` bypass
+  for `DIRECT`-marked sockets (`routing-mark`), loopback bypass, and per-IP
+  bypass for your upstream proxy servers.
 - **It does NOT touch forwarded traffic.** Traffic from *other* LAN devices
   passes through the `prerouting`/`forward` path, which meow's built-in table
   never hooks. **You must add those rules yourself** (this guide's `meow_gateway`
@@ -81,17 +81,30 @@ listeners:
 
 Under external management meow installs nothing, probes nothing, and removes
 nothing on exit — including the `meta mark` bypass and upstream proxy-IP bypass
-list (they are not even collected). You must reproduce the loop-prevention
-rules yourself or meow's own outbound will be re-captured, and you own the
-boot-ordering/fail-open story: rules pointing at the listener port before meow
-binds will blackhole or pass through depending on your ruleset. Use a fixed
-port — `port: 0` is only viable if you read the bound port back via
-`GET /listeners` and install rules afterwards. Changes need a restart; there
-is no listener hot-reload.
+list (they are not even collected). You must reproduce every rule the managed
+table carried, or the loop-prevention story breaks:
+
+1. **`meta mark` bypass** — `meta mark <routing-mark> accept` so meow's own
+   outbound (which keeps setting `SO_MARK` via `routing-mark` regardless of
+   firewall mode) is not re-captured. Keep `routing-mark` configured; a
+   deployer bypass that matches nothing still loops.
+2. **Loopback exemption** — `ip daddr 127.0.0.0/8 accept` (+ `ip6 daddr ::1
+   accept`) or the host's own loopback TCP is redirected into the listener.
+3. **Upstream proxy-IP bypasses** — one `ip daddr <proxy-server> accept` per
+   upstream, or meow's connections to your proxies re-enter the listener.
+4. **The catch-all redirect** — `tcp dport 1-65535 redirect to :<port>` last.
+
+`tests/tproxy-qemu/meow-tproxy-ext.yaml` + `guest-init.sh` phase 2 contain a
+complete reference table. You also own the boot-ordering/fail-open story:
+rules pointing at the listener port before meow binds will refuse or pass
+through depending on your ruleset. Use a fixed port — `port: 0` is only
+viable if you read the bound port back via `GET /listeners` (requires
+`external-controller`) or the startup log, and install rules afterwards.
+Changes need a restart; there is no listener hot-reload.
 
 The `tproxy-port:` shorthand always keeps the managed firewall — a top-level
-`firewall:` key does not exist and is silently ignored, so external management
-requires declaring the listener under `listeners:` as above.
+`firewall:` key does not exist (it warns and is ignored), so external
+management requires declaring the listener under `listeners:` as above.
 
 This is the mode to reach for when nftables is unavailable, when another
 privileged service (or iptables) owns redirect policy, or when you want custom
@@ -215,8 +228,10 @@ can switch with a one-line `enhanced-mode` change and a restart.
 > [`scripts/tproxy-gateway-macos.sh`](../scripts/tproxy-gateway-macos.sh). The
 > manual rules below are the reference the scripts implement.
 
-meow creates the `output`-chain table for its own traffic. Add this table for
-**forwarded** LAN traffic. Save as `/etc/meow/gateway.nft`:
+meow creates the `output`-chain table for its own traffic (unless the
+listener runs `firewall: false` — then the host's own traffic is also
+yours to cover). Add this table for **forwarded** LAN traffic. Save as
+`/etc/meow/gateway.nft`:
 
 ```nft
 #!/usr/sbin/nft -f
@@ -353,7 +368,8 @@ On the gateway:
 ```bash
 # Listener is up on a NON-loopback address (::/0.0.0.0, not 127.0.0.1):
 ss -lntp | grep 7893
-# Both tables present:
+# Both tables present (with managed firewall — `inet meow_tproxy` does not
+# exist under `firewall: false`, where your own table plays its role):
 nft list table inet meow_tproxy   # meow-managed, output chain
 nft list table inet meow_gateway  # this guide, prerouting chain
 ```

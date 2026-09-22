@@ -2183,6 +2183,71 @@ listeners:
     assert_eq!(mixed.spec, ListenerSpec::Mixed);
 }
 
+/// Issue #563: `firewall:` is a `listeners:`-entry key — there is no top-level
+/// equivalent. A stray top-level `firewall: false` must warn rather than
+/// silently keep the managed firewall, and it must not disable the
+/// `tproxy-port` shorthand's managed mode.
+#[test]
+fn test_top_level_firewall_warns_and_is_ignored() {
+    let yaml = r#"
+firewall: false
+tproxy-port: 7893
+"#;
+    #[derive(Clone)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+    let sink = Sink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let config = tracing::subscriber::with_default(subscriber, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(load_config_from_str(yaml))
+            .unwrap()
+    });
+    let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+    assert!(
+        logs.contains("top-level key is ignored"),
+        "expected a top-level `firewall:` warning, got: {logs}"
+    );
+
+    // The shorthand listener stays managed (firewall: true).
+    let tproxy = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "tproxy")
+        .expect("tproxy shorthand listener must exist");
+    match &tproxy.spec {
+        ListenerSpec::TProxy { firewall, .. } => {
+            assert!(
+                *firewall,
+                "top-level `firewall:` must not reach the shorthand"
+            );
+        }
+        other => panic!("expected a tproxy listener, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_tproxy_named_listener_falls_back_to_global_sni() {
     let yaml = r#"

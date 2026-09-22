@@ -228,6 +228,10 @@ pub struct RawConfig {
     /// listener. The default is 256; explicit `0` disables the cap. Individual `listeners:`
     /// entries can override this with their own `max-connections` field.
     pub max_connections: Option<usize>,
+    /// No top-level `firewall` key exists — captured only to warn on the
+    /// plausible mistake (`firewall:` belongs on a `listeners:` tproxy
+    /// entry, issue #563).
+    pub firewall: Option<serde_yaml::Value>,
 }
 
 /// A `hosts:` map value: one IP/domain alias or a list of IP addresses.
