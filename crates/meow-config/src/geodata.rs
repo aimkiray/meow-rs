@@ -70,6 +70,18 @@ pub fn parse_geodata(raw: Option<&RawGeoDataConfig>) -> Result<GeoDataConfig, an
             "geodata.auto-update-interval must be at least 1 hour (got 0)"
         ));
     }
+    // Same ceiling as the rule-provider refresh supervisor
+    // (`MAX_REFRESH_INTERVAL_SECS`, ~10 years): `Instant + Duration`
+    // overflows — and `tokio::time::interval` panics — on absurd values.
+    const MAX_AUTO_UPDATE_INTERVAL_HOURS: u32 = 10 * 365 * 24;
+    let interval = interval.min(MAX_AUTO_UPDATE_INTERVAL_HOURS);
+    if interval != r.auto_update_interval.unwrap_or(24) {
+        warn!(
+            "geodata.auto-update-interval {}h exceeds the {}h ceiling; clamped",
+            r.auto_update_interval.unwrap_or(24),
+            MAX_AUTO_UPDATE_INTERVAL_HOURS
+        );
+    }
 
     let urls = r.url.as_ref();
     Ok(GeoDataConfig {

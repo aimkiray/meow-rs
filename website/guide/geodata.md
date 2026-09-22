@@ -37,11 +37,11 @@ The `-d` / home directory flag also influences where resources are looked up.
 ## Auto-update
 
 On startup meow-rs downloads any missing database. With `auto-update: true`, a background
-task re-checks every `auto-update-interval` hours, using conditional requests
-(`If-Modified-Since` / 304) to avoid needless downloads, and hot-reloads new data into
-memory — routing rules are rebuilt and the DNS resolver is republished so
-`geosite:`/`rule-set:` nameserver-policy entries follow the new generation. Failures are
-logged and retried next interval — they never crash the process.
+task re-downloads the configured databases every `auto-update-interval` hours and
+hot-reloads new data into memory — routing rules are rebuilt and the DNS resolver is
+republished so `geosite:`/`rule-set:` nameserver-policy entries follow the new
+generation. Failures are logged and retried next interval — they never crash the
+process.
 
 ```yaml
 geodata:

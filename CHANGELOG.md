@@ -272,15 +272,15 @@ the canonical, in-repo source a release is cut from.
 
 - **Geodata DB refreshes now republish the resolver.** When the
   ASN/geosite DB files were replaced on disk, the geodata paths rebuilt
-  routing but left the running resolver's `geosite:`/`rule-set:`
-  nameserver-policy matchers bound to the generation captured at DNS
-  publish time — a `geosite:`-only policy was never republished at all
-  (the PUT-vs-candidate input diff does not count geosite keys), and a
-  `rule-set:` policy only refreshed when an unrelated `PUT /configs`
-  happened to republish. Both geodata commit paths (startup-fetch and
-  the periodic auto-update loop) now reparse and republish the resolver
-  inside the mutation lane, reusing the same routing rebuild's provider
-  map and prefetched payload bytes (issue #543). The FFI-visible
+  routing but left the running resolver's `geosite:` nameserver-policy
+  matchers bound to the DB generation captured at DNS publish time — a
+  `geosite:`-only policy was never republished at all (the
+  PUT-vs-candidate input diff does not count geosite keys), and a
+  `rule-set:` policy only republished when an unrelated `PUT /configs`
+  triggered it. Both geodata commit paths (startup-fetch and the
+  periodic auto-update loop) now reparse and republish the resolver
+  inside the mutation lane, binding the same live rule-provider map the
+  rebuilt rules use (issue #543). The FFI-visible
   `geodata_fetch::run_on_startup` / `auto_update_loop` signatures gain a
   `dns_server` handle parameter for this.
 

@@ -1,4 +1,5 @@
-//! Integration tests for [`meow_app::geodata_fetch::fetch_missing`].
+//! Integration tests for [`meow_app::geodata_fetch::fetch_missing`] and
+//! `run_on_startup`'s download → rebuild → DNS-republish sequence.
 //!
 //! Stands up a hand-rolled HTTP/1.1 server on `127.0.0.1:0` that serves
 //! canned bytes per path, then asserts the helper writes the expected
@@ -28,9 +29,24 @@ async fn spawn_origin(routes: HashMap<&'static str, &'static [u8]>) -> std::net:
             };
             let routes = Arc::clone(&routes);
             tokio::spawn(async move {
-                let mut buf = [0u8; 2048];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
+                // Read until the header terminator — a request split into
+                // two TCP segments would otherwise misroute to 404.
+                let mut buf = Vec::with_capacity(2048);
+                let mut chunk = [0u8; 2048];
+                loop {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if buf.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf);
                 let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
                 let (status, body): (&str, &[u8]) = match routes.get(path.as_str()) {
                     Some(b) => ("200 OK", b),
@@ -266,7 +282,7 @@ async fn run_on_startup_republishes_resolver_with_downloaded_geosite() {
     std::fs::write(dir.path().join("asn.mmdb"), b"dummy").unwrap();
 
     let raw: RawConfig = serde_yaml::from_str(&format!(
-        "geodata:\n  geosite-path: \"{}\"\n\
+        "geodata:\n  geosite-path: '{}'\n\
          dns:\n  enable: true\n  nameserver:\n    - rcode://success\n  \
          nameserver-policy:\n    \"geosite:testcat\": rcode://name_error\n\
          rules:\n  - MATCH,DIRECT\n",

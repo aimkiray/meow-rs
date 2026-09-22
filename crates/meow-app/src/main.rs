@@ -868,7 +868,8 @@ async fn run(
 
     // Fetch any missing geodata DBs on startup (unconditional — independent of
     // geodata.auto-update). Runs in the background so listener startup is not
-    // blocked; rules are rebuilt afterward if anything was downloaded.
+    // blocked; rules are rebuilt and the DNS resolver republished afterward
+    // if anything was downloaded.
     {
         let geodata = config.geodata.clone();
         let tunnel = tunnel.clone();
