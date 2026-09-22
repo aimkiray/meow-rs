@@ -1000,8 +1000,8 @@ mod tests {
     }
 
     /// A datagram larger than the caller buffer is truncated, not torn:
-    /// the sink-drain keeps the stream aligned so the next datagram
-    /// still parses (anytls_adapter.rs:510-513).
+    /// `read_packet`'s `length > to_copy` sink-drain keeps the stream
+    /// aligned so the next datagram still parses.
     #[tokio::test]
     async fn udp_undersized_buffer_truncates_without_desync() {
         let (session, mut peer) = test_session().await;

@@ -144,6 +144,9 @@ cargo test -p meow-listener --all-features --lib udp_port_53
 # the SS listener tests, so they need their own feature-gated runs.
 cargo test -p meow-listener --features listener-shadowsocks --lib shadowsocks
 cargo test -p meow-listener --features listener-shadowsocks --test ss_listener_integration
+# Same class: the `anytls` feature is opt-in too — the adapter's uot/desync
+# tests never compile under default features.
+cargo test -p meow-proxy --features anytls --lib
 
 # Mirrors the "Unit + integration tests (default features)" CI step. `--lib`
 # alone is not enough: it skips every `--test` target, so a broken integration
