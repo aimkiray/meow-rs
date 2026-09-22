@@ -1444,18 +1444,17 @@ where
             // CCS records). Probe unconditionally: a cover emitting zero
             // or several compat CCS records must not skip it.
             let (unmasked, _) = wire::unmask_server_auth(&full, secret, &server_random, false);
-            let (typ, body) = match server_hs
-                .open(&unmasked[..5].try_into().expect("header"), &unmasked[5..])
-            {
-                Ok((typ, body)) => {
-                    authed = Some(true);
-                    (typ, body)
-                }
-                Err(_) => {
-                    authed = Some(false);
-                    server_hs.open(&record.header, &record.payload)?
-                }
-            };
+            let (typ, body) =
+                match server_hs.open(&unmasked[..5].try_into().expect("header"), &unmasked[5..]) {
+                    Ok((typ, body)) => {
+                        authed = Some(true);
+                        (typ, body)
+                    }
+                    Err(_) => {
+                        authed = Some(false);
+                        server_hs.open(&record.header, &record.payload)?
+                    }
+                };
             if typ != wire::TLS_RECORD_HANDSHAKE {
                 return Err(TransportError::Tls(if authed == Some(true) {
                     "tls13: masked record was not handshake data".into()
