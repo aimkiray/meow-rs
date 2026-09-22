@@ -92,7 +92,10 @@ jobs:
           # leading whitespace and prints nothing on no match, so a
           # malformed toml fails here instead of installing "".
           tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
-          test -n "$tc"
+          if [ -z "$tc" ]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
           rustup toolchain install "$tc" --profile minimal --no-self-update
           rustup target add --toolchain "$tc" "${{ matrix.target }}"
 

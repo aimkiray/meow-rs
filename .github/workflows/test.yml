@@ -15,6 +15,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# No step needs write: dashboard's artifact upload works under read.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -50,12 +54,10 @@ jobs:
 
       # This gate runs on the rust-toolchain.toml pin via rustup's
       # toolchain-file resolution (the file beats `rustup default`; the
-      # @stable step just provides rustup + a fallback toolchain).
-      # Mirrored on floating stable by toolchain-drift.yml — keep the step
-      # set in sync.
+      # @stable step just provides rustup + a fallback toolchain — no
+      # `components:`, the pin declares its own). Mirrored on floating
+      # stable by toolchain-drift.yml — keep the step set in sync.
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -496,7 +498,10 @@ jobs:
         # keeps a malformed toml fail-loud instead of writing `channel=`.
         run: |
           tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
-          test -n "$tc"
+          if [ -z "$tc" ]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
           echo "channel=$tc" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@master

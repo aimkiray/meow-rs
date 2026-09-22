@@ -43,6 +43,9 @@ jobs:
   powerset:
     name: Powerset — ${{ matrix.crate }}
     runs-on: ubuntu-latest
+    # Scheduled workflows also fire on forks that enable Actions — the
+    # powerset is the heaviest job in the repo; skip it on forks.
+    if: github.event.repository.fork == false
     # Generous per-crate cap; the leg budgets above target well under this.
     timeout-minutes: 180
     strategy:

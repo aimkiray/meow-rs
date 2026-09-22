@@ -32,7 +32,10 @@ jobs:
         # keeps a malformed toml fail-loud instead of writing `channel=`.
         run: |
           tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
-          test -n "$tc"
+          if [ -z "$tc" ]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
           echo "channel=$tc" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@master

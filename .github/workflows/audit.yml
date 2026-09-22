@@ -24,6 +24,9 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
+    # Scheduled workflows also fire on forks that enable Actions — don't
+    # file advisory issues in forks.
+    if: github.event.repository.fork == false
     steps:
       - uses: actions/checkout@v5
 

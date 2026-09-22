@@ -24,6 +24,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # rust-toolchain.toml resolves the pin in the checkout — assert the
+      # self-hosted rustup honours toolchain files (pre-1.25 or the 1.28.0
+      # auto-install regression would silently bench floating stable).
+      - name: Assert the pin is active
+        run: |
+          tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          test -n "$tc"
+          rustup show active-toolchain | grep -q "^${tc}-"
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:

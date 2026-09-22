@@ -1,6 +1,6 @@
 # CI Status Report
 
-Last updated: 2026-06-19 (owner: qa)
+Last updated: 2026-09-18 (owner: qa)
 
 ## Current CI Pipelines
 
@@ -59,9 +59,9 @@ Runs on Ubuntu after `lint`:
   for `meow-transport`, `meow-proxy`, `meow-listener`, and `meow-dns`: the
   empty set, every single feature, and every pair — capped at depth 2 so the
   leg count stays ~n^2 instead of ~2^n per PR.
-- Excludes `boring-tls` from the `meow-transport` powerset because that backend
-  needs a C++/BoringSSL toolchain; the broader transport matrix still covers
-  the normal feature combinations.
+- Excludes `boring-tls` from the `meow-transport` powerset because it is a
+  no-op alias of `tls` — the duplicate leg is skipped; the broader transport
+  matrix still covers the normal feature combinations.
 - Deeper combinations run nightly in
   `.github/workflows/feature-powerset-daily.yml` instead of on every PR: up to
   4-feature combos for `meow-proxy` and `meow-transport`, and fully
@@ -73,7 +73,9 @@ Runs on Ubuntu after `lint`:
 Runs on Ubuntu after `lint`:
 
 - Reads the workspace `rust-version` from `Cargo.toml`.
-- Installs that exact toolchain.
+- Installs that exact toolchain, then sets a directory `rustup override` —
+  the checkout's `rust-toolchain.toml` pin would otherwise outrank
+  `rustup default` and the check would silently run on the pin.
 - Runs `cargo check --workspace --all-targets`.
 
 ### `macos`

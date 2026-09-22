@@ -22,7 +22,7 @@ why hardware documentation is mandatory for reproducible comparison.
 
 | Field | Value |
 |-------|-------|
-| Rust toolchain | *(e.g., stable 1.88.0 x86_64-unknown-linux-gnu)* |
+| Rust toolchain | *(e.g., `1.98.1-x86_64-unknown-linux-gnu` — the checkout's `rust-toolchain.toml` pin)* |
 | zig version | *(e.g., 0.13.0 — used by cargo-zigbuild for musl targets)* |
 | meow-rs commit SHA | *(filled in per-run; also captured in results JSON)* |
 | meow-rs build flags | `cargo build --release --locked` |
