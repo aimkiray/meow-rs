@@ -11,6 +11,7 @@ use parking_lot::RwLock;
 use smallvec::smallvec;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower::ServiceExt;
@@ -4011,6 +4012,33 @@ async fn put_configs_fetches_rule_provider_payload_once() {
     );
 }
 
+/// A stand-in live TUN listener whose pending task holds a drop flag:
+/// `stop_tun`'s abort drops the future, so `stopped` flips iff the
+/// handle was actually reaped — a spawn-independent "was restarted"
+/// probe (a *successful* respawn leaves `has_tun()` true either way,
+/// so post-state alone can't distinguish a no-op from a working
+/// restart under a privileged listener-tun build).
+fn fake_tun_handle() -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBool>) {
+    struct Flag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = meow_tunnel::TunHandle {
+        task: tokio::spawn({
+            let flag = Arc::clone(&flag);
+            async move {
+                let _flag = Flag(flag);
+                std::future::pending::<()>().await;
+            }
+        }),
+        core_done: None,
+    };
+    (handle, flag)
+}
+
 /// Issue #543: a `tun:` parameter change while `enable` stays true must
 /// restart the listener — previously only enable transitions (and, after
 /// #544, fake-IP input changes) reconciled, so committed `mtu`/
@@ -4030,13 +4058,8 @@ async fn put_configs_tun_param_change_reconciles_running_listener() {
     let mut raw = test_raw_config();
     raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
-    state
-        .tunnel
-        .set_tun_handle(meow_tunnel::TunHandle {
-            task: tokio::spawn(std::future::pending::<()>()),
-            core_done: None,
-        })
-        .await;
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
     assert!(state.tunnel.has_tun());
 
     let yaml = concat!(
@@ -4074,9 +4097,17 @@ async fn put_configs_tun_param_change_reconciles_running_listener() {
          it true"
     );
     assert!(
+        stopped.load(Ordering::SeqCst),
+        "the restart must reap the old listener handle"
+    );
+    assert!(
         !state.tunnel.has_tun(),
         "stop_tun must have reaped the listener slot, not just the flag"
     );
+    // Committed-state contract: the new params persist — only `enable`
+    // rolls back (routes.rs doc).
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert_eq!(tun.mtu, Some(9000));
 }
 
 /// Companion invariant: a semantically identical `tun:` section must NOT
@@ -4089,13 +4120,8 @@ async fn put_configs_tun_unchanged_does_not_reconcile() {
     let mut raw = test_raw_config();
     raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
-    state
-        .tunnel
-        .set_tun_handle(meow_tunnel::TunHandle {
-            task: tokio::spawn(std::future::pending::<()>()),
-            core_done: None,
-        })
-        .await;
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
 
     let yaml = concat!(
         "mode: rule\n",
@@ -4129,6 +4155,10 @@ async fn put_configs_tun_unchanged_does_not_reconcile() {
         "an unchanged tun: section must not touch the listener"
     );
     assert!(
+        !stopped.load(Ordering::SeqCst),
+        "the old handle must not be reaped — spawn-independent no-restart proof"
+    );
+    assert!(
         state.tunnel.has_tun(),
         "the fake handle must still be running"
     );
@@ -4143,13 +4173,8 @@ async fn put_configs_invalid_tun_rejected_before_commit() {
     let mut raw = test_raw_config();
     raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
-    state
-        .tunnel
-        .set_tun_handle(meow_tunnel::TunHandle {
-            task: tokio::spawn(std::future::pending::<()>()),
-            core_done: None,
-        })
-        .await;
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
 
     // mtu below the IPv6 floor (1280) fails `parse_tun_config`.
     let yaml = concat!(
@@ -4188,7 +4213,62 @@ async fn put_configs_invalid_tun_rejected_before_commit() {
         (true, Some(1500)),
         "the invalid section must not have been committed"
     );
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "the running listener must survive untouched"
+    );
     assert!(state.tunnel.has_tun(), "the running listener must survive");
+}
+
+/// `?force` degrades the `tun:` admission check to a warn: the unparsable
+/// section commits, the reconcile restart hits the spawn-side parse
+/// error, and `enable` rolls back — a 204 that still tears the healthy
+/// listener down (deliberate force semantics, issue #543 review).
+/// Deterministic under both feature sets: `mtu: 100` fails
+/// `parse_tun_config` at spawn regardless of privileges.
+#[tokio::test]
+async fn put_configs_force_invalid_tun_commits_and_rolls_back() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: true\n",
+        "  mtu: 100\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs?force=true")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert_eq!(
+        (tun.enable, tun.mtu),
+        (false, Some(100)),
+        "the forced commit persists; only `enable` rolls back"
+    );
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the restart must reap the old handle"
+    );
+    assert!(!state.tunnel.has_tun());
 }
 
 /// Top-level `max-connections` is inherited into `TunConfig`, so changing
@@ -4200,13 +4280,8 @@ async fn put_configs_max_connections_change_reconciles_tun() {
     let mut raw = test_raw_config();
     raw.tun = Some(serde_yaml::from_str("enable: true").unwrap());
     let state = test_state(raw);
-    state
-        .tunnel
-        .set_tun_handle(meow_tunnel::TunHandle {
-            task: tokio::spawn(std::future::pending::<()>()),
-            core_done: None,
-        })
-        .await;
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
 
     let yaml = concat!(
         "mode: rule\n",
@@ -4240,6 +4315,10 @@ async fn put_configs_max_connections_change_reconciles_tun() {
             .is_some_and(|t| t.enable),
         "the max-connections restart must have fired and rolled `enable` \
          back after the spawn failure"
+    );
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the restart must reap the old listener handle"
     );
 }
 
@@ -4298,13 +4377,8 @@ async fn put_configs_tun_enable_off_stops_listener() {
     let mut raw = test_raw_config();
     raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
-    state
-        .tunnel
-        .set_tun_handle(meow_tunnel::TunHandle {
-            task: tokio::spawn(std::future::pending::<()>()),
-            core_done: None,
-        })
-        .await;
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
 
     let yaml = "mode: rule\nrules:\n  - MATCH,DIRECT\n";
     let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
@@ -4323,6 +4397,10 @@ async fn put_configs_tun_enable_off_stops_listener() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert!(state.raw_config.read().tun.is_none());
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the stop arm must reap the old listener handle"
+    );
     assert!(
         !state.tunnel.has_tun(),
         "dropping the tun: section must stop the listener"
@@ -4388,13 +4466,8 @@ async fn put_configs_tun_disabled_param_change_no_restart() {
     let mut raw = test_raw_config();
     raw.tun = Some(serde_yaml::from_str("enable: false\nmtu: 1500").unwrap());
     let state = test_state(raw);
-    state
-        .tunnel
-        .set_tun_handle(meow_tunnel::TunHandle {
-            task: tokio::spawn(std::future::pending::<()>()),
-            core_done: None,
-        })
-        .await;
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
 
     let yaml = concat!(
         "mode: rule\n",
@@ -4420,6 +4493,10 @@ async fn put_configs_tun_disabled_param_change_no_restart() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert!(
+        !stopped.load(Ordering::SeqCst),
+        "a disabled-section param change must not reap the handle"
+    );
+    assert!(
         state.tunnel.has_tun(),
         "a disabled-section param change must not reach the listener"
     );
@@ -4435,13 +4512,8 @@ async fn put_configs_tun_fake_ip_change_restarts_listener() {
     let mut raw = test_raw_config();
     raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
-    state
-        .tunnel
-        .set_tun_handle(meow_tunnel::TunHandle {
-            task: tokio::spawn(std::future::pending::<()>()),
-            core_done: None,
-        })
-        .await;
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
 
     let yaml = concat!(
         "mode: rule\n",
@@ -4479,6 +4551,10 @@ async fn put_configs_tun_fake_ip_change_restarts_listener() {
             .as_ref()
             .is_some_and(|t| !t.enable),
         "the fake-IP restart must have fired and rolled `enable` back"
+    );
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the restart must reap the old listener handle"
     );
     assert!(
         !state.tunnel.has_tun(),

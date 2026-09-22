@@ -35,7 +35,10 @@ use tracing::{info, warn};
 /// Trade-off to be aware of: the config-reload path awaits this inside the
 /// `CONFIG_MUTATION` lane, so a hung startup blocks every config-mutation
 /// API call for the full duration — including `POST /api/config/save`,
-/// which queues behind the same lane (issue #543).
+/// which queues behind the same lane (issue #543). The stop/restart side
+/// adds its own lane-held wait: `DnsGuard::drop` runs the Windows
+/// PowerShell DNS restore synchronously on the listener task before
+/// `stop_tun`'s 10 s reap bound even applies.
 pub const TUN_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Map a parsed `TunConfig` onto a `TunListenerConfig`. Shared between the

@@ -30,7 +30,7 @@ Use it as a pre-flight check.
 | `external-ui-url` | string | — | URL the UI archive can be fetched from (recorded only) |
 | `tproxy-sni` | bool | `true` | SNI sniffing on the TProxy listener (deprecated — use `sniffer`) |
 | `routing-mark` | u32 | — | Linux `SO_MARK` for transparent-proxy loop avoidance |
-| `max-connections` | usize | `0` | Global cap on concurrent inbound connections (`0` = unlimited) |
+| `max-connections` | usize | `256` | Global cap on concurrent inbound connections (`0` = unlimited); inherited by the TUN listener |
 | `authentication` | list | `[]` | Inbound `user:pass` credentials for HTTP/SOCKS5 |
 | `skip-auth-prefixes` | list | `[]` | CIDRs exempt from inbound auth |
 | `hosts` | map | — | Static host → IP(s) mappings |

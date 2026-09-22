@@ -160,6 +160,7 @@ ip route | grep -c '/1 dev' # → 0
 | `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in `global` mode. Ignored otherwise. |
 | `dns-hijack` | off | List of targets; any `:53` entry turns on in-process answering of UDP :53 flows entering the device. Non-`:53` entries warn and are ignored. |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
+| `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); a change while TUN runs restarts the listener. |
 
 mihomo fields meow does not implement (`stack`, `strict-route`,
 `auto-detect-interface`, `inet6-address`, `endpoint-independent-nat`,
@@ -171,7 +172,10 @@ committed `tun:` section — an `enable` transition starts/stops it, and
 any other semantic parameter change (or changed fake-IP inputs)
 restarts it so the running stack matches the stored config (#543).
 No-op respellings and the warn-only fields above do not bounce the
-device; a failed (re)start rolls `tun.enable` back to `false`.
+device; a failed (re)start rolls `tun.enable` back to `false`. The PUT
+still returns 204 — the failure is logged, not surfaced — and a
+re-PUT of an *unchanged* config will not revive a dead listener
+(revival needs an `enable` flip or a parameter change).
 
 ## Relationship to the tproxy inbound
 
