@@ -12,7 +12,7 @@ use crate::tasked_duplex::TaskedDuplex;
 /// body records and decrypts reads from body records on the underlying stream.
 ///
 /// The body ciphers are built here — each relay half touches only its own
-/// direction, so the read task gets a `new_reader` (response schedule) and
+/// direction, so the read task gets `from_response_keys` (response schedule) and
 /// the write task a `new_writer` (request schedule): one AEAD key expansion
 /// per direction, and the response SHA-256 hop is shared with the header
 /// decode (issue #533). Constructing both inside also makes a swapped

@@ -14,8 +14,8 @@ const MAX_PLAINTEXT: usize = 16384 - 16;
 /// Body keys/IVs derived from the per-connection req_key and req_iv. The IVs
 /// are the full 16-byte seeds; each record nonce is `count(2 BE) || iv[2..12]`.
 /// Both directions' material at once — test-only; production builds each
-/// direction separately (`new_writer`/`new_reader`) so no key schedule is
-/// paid for twice (issue #533).
+/// direction separately (`new_writer`/`from_response_keys`) so no key
+/// schedule is paid for twice (issue #533).
 #[cfg(test)]
 struct DerivedKeys {
     write_key: Vec<u8>,
@@ -303,7 +303,8 @@ impl BodyCipher {
 
         let nonce = self.write_nonce()?;
         let ct = self.write.seal(&nonce, plaintext)?;
-        let len = ct.len() as u16;
+        let len = u16::try_from(ct.len())
+            .map_err(|_| std::io::Error::other("vmess body record too large"))?;
         writer.write_all(&len.to_be_bytes()).await?;
         writer.write_all(&ct).await?;
         writer.flush().await
@@ -382,10 +383,12 @@ mod tests {
     }
 
     /// Directional constructors (issue #533): each half must derive exactly
-    /// the same key schedule and IV as `BodyCipher::new` — whose derivation
-    /// is pinned to the wire spec by `body_key_derivation_matches_protocol`
-    /// and `read_record_decrypts_independently_encoded_response` — and the
-    /// unbuilt halves must hard-error rather than emit or accept anything.
+    /// the same key schedule and IV as `BodyCipher::new`, and the unbuilt
+    /// halves must hard-error rather than emit or accept anything. Each
+    /// direction is independently anchored to the wire spec by
+    /// `read_record_decrypts_independently_encoded_response` (read) and
+    /// `write_record_decrypts_under_independently_derived_request_keys`
+    /// (write) — the equivalence legs here are cross-checks, not the anchor.
     async fn directional_ciphers_round_trip_and_unbuilt_halves_error() {
         let (req_key, req_iv) = test_keys();
         let plaintext = b"directional body cipher";
@@ -465,6 +468,14 @@ mod tests {
         assert!(sink.is_empty());
         let mut empty = std::io::Cursor::new(Vec::new());
         assert!(writer.read_record(&mut empty).await.is_err());
+        // The Unbuilt guard precedes the terminator/EOF fast paths too.
+        let mut terminator = std::io::Cursor::new(vec![0x00, 0x00]);
+        assert!(writer.read_record(&mut terminator).await.is_err());
+
+        // The Unbuilt codec itself fails closed on seal/open — defense in
+        // depth behind the read_record/write_record guards.
+        assert!(RecordCipher::Unbuilt.seal(&[0; 12], b"x").is_err());
+        assert!(RecordCipher::Unbuilt.open(&[0; 12], b"x").is_err());
     }
 
     async fn body_modes_round_trip_with_protocol_framing() {
@@ -602,6 +613,45 @@ mod tests {
         assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
     }
 
+    /// Write-direction interop, mirroring the read-side test above: emit a
+    /// record through `new_writer` and decrypt it in-test with a bare AEAD
+    /// keyed by the raw request material per the wire spec. This is the only
+    /// check that catches a systematic wrong-key or key/IV-swap bug inside
+    /// `new_writer` — every mirror-based round-trip stays self-consistent
+    /// even when both sides are wrong the same way (issue #533 review).
+    async fn write_record_decrypts_under_independently_derived_request_keys() {
+        use aes_gcm::aead::Aead;
+
+        let (req_key, req_iv) = test_keys();
+        let plaintext = b"request payload to server";
+
+        // AES-128-GCM: the raw 16-byte req_key, nonce = count(0) || iv[2..12].
+        let mut writer = BodyCipher::new_writer(Security::Aes128Gcm, &req_key, &req_iv);
+        let mut wire = Vec::new();
+        writer.write_record(&mut wire, plaintext).await.unwrap();
+        let len = u16::from_be_bytes([wire[0], wire[1]]) as usize;
+        assert_eq!(wire.len(), 2 + len);
+        let cipher = Aes128Gcm::new_from_slice(&req_key).unwrap();
+        let nonce = super::record_nonce(&req_iv, 0);
+        let pt = cipher
+            .decrypt(Nonce::from_slice(&nonce), &wire[2..])
+            .unwrap();
+        assert_eq!(pt, plaintext);
+
+        // ChaCha20-Poly1305: key = MD5(req_key) || MD5(MD5(req_key)).
+        let mut writer = BodyCipher::new_writer(Security::ChaCha20Poly1305, &req_key, &req_iv);
+        let mut wire = Vec::new();
+        writer.write_record(&mut wire, plaintext).await.unwrap();
+        let md5_1: [u8; 16] = Md5::digest(req_key).into();
+        let md5_2: [u8; 16] = Md5::digest(md5_1).into();
+        let cipher = ChaCha20Poly1305::new_from_slice(&[md5_1, md5_2].concat()).unwrap();
+        let nonce = super::record_nonce(&req_iv, 0);
+        let pt = cipher
+            .decrypt(Nonce::from_slice(&nonce), &wire[2..])
+            .unwrap();
+        assert_eq!(pt, plaintext);
+    }
+
     /// EOF classification contract: `Ok(None)` only for a FIN exactly at a
     /// record boundary or the zero-length terminator; every mid-record EOF
     /// is an `Err` — the relay treats it as a corrupt session, not a
@@ -668,6 +718,7 @@ mod tests {
         body_key_derivation_matches_protocol();
         record_nonce_overwrites_iv_prefix_and_increments();
         read_record_decrypts_independently_encoded_response().await;
+        write_record_decrypts_under_independently_derived_request_keys().await;
         read_record_eof_classification().await;
         nonce_budget_retires_instead_of_reusing().await;
     }
