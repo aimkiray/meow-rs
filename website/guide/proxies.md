@@ -1,8 +1,10 @@
 # Proxies
 
-The `proxies` list defines outbound connections. Every entry needs a unique `name` and a
+The `proxies` list defines outbound connections. Every entry needs a `name` and a
 `type`; the remaining fields depend on the protocol. Names are referenced from
-[proxy groups](./proxy-groups) and [rules](./rules).
+[proxy groups](./proxy-groups) and [rules](./rules). A name may not shadow a
+built-in (`DIRECT`/`REJECT`/`REJECT-DROP`/`COMPATIBLE`/`PASS`/`PASS-RULE`); a
+repeated leaf name is tolerated and the last declaration wins.
 
 ```yaml
 proxies:

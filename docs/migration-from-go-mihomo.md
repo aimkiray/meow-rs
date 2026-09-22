@@ -288,6 +288,12 @@ otherwise:
 
 ## Proxy groups
 
+Duplicate group names — including a group colliding with a `proxies:` entry
+or a built-in — are a hard error at load time, same as upstream
+(`proxy group %s: the duplicate name`). Duplicate `proxies:` leaf names are
+more permissive than upstream: the last declaration wins instead of
+erroring.
+
 ### selector, url-test, fallback
 
 Fully supported. `url-test` uses real HTTP GET (not raw TCP).

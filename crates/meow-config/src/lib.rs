@@ -1374,6 +1374,12 @@ fn insert_parsed_leaves(
                     continue;
                 }
                 static_proxy_names.insert(key.clone());
+                // A repeated leaf name silently last-wins here — a
+                // deliberate divergence from upstream's
+                // `proxy %s is the duplicate name` hard error. Leaf
+                // duplicates are safe to keep: all leaves settle before
+                // any group captures members, so they cannot split the
+                // registry the way group duplicates did (#561).
                 proxies.insert(key, proxy);
             }
             Err(e) if strict => {
@@ -6084,13 +6090,13 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let err = expect_strict_failure(yaml, "a group shadowing a proxies: leaf");
-        assert!(err.to_string().contains("dup"), "unexpected: {err}");
+        assert!(err.to_string().contains("'dup'"), "unexpected: {err}");
 
         // Lenient rejects too since #561 — a group shadowing a leaf makes
         // every reference resolve ambiguously in both modes.
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
         match rebuild_from_raw(&raw) {
-            Err(err) => assert!(err.to_string().contains("dup"), "unexpected: {err}"),
+            Err(err) => assert!(err.to_string().contains("'dup'"), "unexpected: {err}"),
             Ok(_) => panic!("lenient also rejects a group shadowing a leaf"),
         }
     }
@@ -6135,14 +6141,14 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let err = expect_strict_failure(yaml, "duplicate group names");
-        assert!(err.to_string().contains("dup"), "unexpected: {err}");
+        assert!(err.to_string().contains("'dup'"), "unexpected: {err}");
 
         // Lenient rejects too — upstream has no lenient mode for this and
         // the multi-pass capture makes duplicates ambiguous in both modes
         // (a parent may hold a different instance than the registry).
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
         match rebuild_from_raw(&raw) {
-            Err(err) => assert!(err.to_string().contains("dup"), "unexpected: {err}"),
+            Err(err) => assert!(err.to_string().contains("'dup'"), "unexpected: {err}"),
             Ok(_) => panic!("lenient also rejects duplicates"),
         }
     }
@@ -6265,7 +6271,9 @@ rules:
 /// extract their probe specs from the raw group list (issue #514). Last
 /// duplicate name wins — production paths reject duplicate group names
 /// before construction (issue #561), but this function takes raw
-/// declarations, so it keeps the last-wins resolution defensively:
+/// declarations (including `?force=true` commits whose candidate failed
+/// the build but was persisted), so it keeps the last-wins resolution
+/// defensively:
 /// a checkable declaration followed by a same-named non-checkable one
 /// must NOT emit a spec.
 pub fn extract_health_check_specs(

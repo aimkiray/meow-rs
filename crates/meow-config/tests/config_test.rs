@@ -175,6 +175,63 @@ proxy-groups:
     );
 }
 
+/// The mirror ordering fails too: an unbuildable *first* declaration does
+/// not hide the duplicate — the check scans declarations, not
+/// successfully-built groups.
+#[tokio::test]
+async fn test_duplicate_group_name_rejected_even_when_first_block_is_invalid() {
+    let yaml = r#"
+proxy-groups:
+  - name: child
+    type: not-a-real-type
+  - name: child
+    type: select
+    proxies: [DIRECT]
+"#;
+
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("a duplicate whose first block cannot build is still a duplicate");
+    assert!(
+        err.to_string().contains("duplicate name"),
+        "unexpected error: {err}"
+    );
+}
+
+/// `proxies:` leaf duplicates keep the documented last-wins behavior —
+/// every leaf settles before any group captures members, so a same-named
+/// leaf cannot split the registry the way group duplicates did. This is a
+/// deliberate divergence from upstream, which hard-errors on leaf
+/// duplicates (`proxy %s is the duplicate name`).
+#[tokio::test]
+async fn test_duplicate_leaf_proxy_names_still_last_wins() {
+    let yaml = r#"
+proxies:
+  - name: node
+    type: socks5
+    server: 127.0.0.1
+    port: 10001
+  - name: node
+    type: direct
+proxy-groups:
+  - name: g
+    type: select
+    proxies: [node]
+rules:
+  - MATCH,g
+"#;
+
+    let config = load_config_from_str(yaml)
+        .await
+        .expect("duplicate proxies: entries stay last-wins");
+    assert_eq!(
+        config.proxies["node"].adapter_type(),
+        meow_common::AdapterType::Direct,
+        "the last-declared block wins the registry slot"
+    );
+}
+
 /// A group may not shadow a built-in either — every built-in is a
 /// registry entry, so a same-named group would split parents that
 /// captured the built-in from rules resolving the name.
@@ -206,6 +263,18 @@ proxy-groups:
             "{name}: unexpected error: {err}"
         );
     }
+
+    // Registry keys are case-sensitive (byte-exact, like upstream's
+    // map[string]): a lowercase `direct` group is a distinct name.
+    let yaml = r#"
+proxy-groups:
+  - name: direct
+    type: select
+    proxies: [DIRECT]
+"#;
+    load_config_from_str(yaml)
+        .await
+        .expect("names are matched byte-exactly — 'direct' is not 'DIRECT'");
 }
 
 #[tokio::test]

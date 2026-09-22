@@ -351,8 +351,9 @@ mod tests {
     /// Duplicate group names: last spec wins. Production rejects
     /// duplicate names at config build (issue #561), so this is the
     /// defensive contract for callers that hand `reconcile` raw
-    /// declarations — a duplicate must not churn the task on every
-    /// reconcile.
+    /// declarations — including `PUT /configs?force=true` commits whose
+    /// candidate failed the build but was persisted. A duplicate must
+    /// not churn the task on every reconcile.
     #[tokio::test]
     async fn reconcile_dedups_duplicate_names_last_wins() {
         let tunnel = stub_tunnel();
