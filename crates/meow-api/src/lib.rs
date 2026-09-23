@@ -87,7 +87,12 @@ pub struct ApiServer {
 }
 
 impl ApiServer {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "startup wiring funnel: every arg is an independently owned \
+                  runtime handle assembled in main; bundling them into a \
+                  params struct would only rename the same arity"
+    )]
     pub fn new(
         tunnel: Tunnel,
         listen_addr: SocketAddr,

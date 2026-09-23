@@ -1247,12 +1247,16 @@ mod tests {
             "a removed name must stop resolving after republish"
         );
 
+        // Discriminating check: clobber the registry with a foreign map
+        // first — `update_rules` must actively republish, not merely leave
+        // the previous publish untouched.
+        registry.publish(std::sync::Arc::new(HashMap::new()));
         tunnel.update_rules(vec![]);
         assert!(
             meow_proxy::dialer::DialerTarget::new("RENAMED", &registry)
                 .resolve()
                 .is_some(),
-            "update_rules must keep the proxies map published"
+            "update_rules must republish the proxies map, not leave a foreign map"
         );
 
         tunnel.reload_routing(
@@ -1267,5 +1271,298 @@ mod tests {
                 .is_some(),
             "reload_routing must republish through install_routing"
         );
+    }
+
+    /// Issue #533: the built-in proxies map registers PASS / PASS-RULE /
+    /// COMPATIBLE, and a rule targeting PASS skips silently to the next
+    /// rule — upstream `continue GetRules` in `match()`.
+    #[test]
+    fn pass_builtin_skips_matched_rule() {
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+
+        let tunnel = test_tunnel();
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        for name in ["PASS", "PASS-RULE", "COMPATIBLE"] {
+            assert!(
+                proxies.contains_key(name),
+                "built-in {name} must be registered"
+            );
+        }
+        assert_eq!(proxies["PASS"].adapter_type(), AdapterType::Pass);
+        assert_eq!(
+            proxies["COMPATIBLE"].adapter_type(),
+            AdapterType::Compatible
+        );
+
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("example.com", "PASS")),
+                Box::new(FinalRule::new("REJECT")),
+            ],
+            Default::default(),
+        );
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        assert_eq!(
+            adapter.name(),
+            "REJECT",
+            "PASS-targeted rule must be skipped"
+        );
+    }
+
+    /// A rule targeting a group whose selected member is PASS also skips —
+    /// the match loop walks `unwrap_proxy(metadata, false)` for the type
+    /// tag without committing selection side effects.
+    #[test]
+    fn pass_inside_group_unwrap_skips_rule() {
+        use meow_proxy::SelectorGroup;
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+
+        let tunnel = test_tunnel();
+        let mut proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        let pass_member: Arc<dyn Proxy> = Arc::new(meow_config::proxy_parser::WrappedProxy::new(
+            Box::new(meow_proxy::RejectAdapter::pass()),
+        ));
+        proxies.insert(
+            "SEL".into(),
+            Arc::new(SelectorGroup::new("SEL", vec![pass_member])),
+        );
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("example.com", "SEL")),
+                Box::new(FinalRule::new("DIRECT")),
+            ],
+            Default::default(),
+        );
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        assert_eq!(
+            adapter.name(),
+            "DIRECT",
+            "rule matching a PASS-bearing group must fall through"
+        );
+    }
+
+    /// PASS-RULE targeted at the top level behaves like REJECT — the match
+    /// returns it and dialing yields immediate EOF, same as upstream's
+    /// nop adapter.
+    #[test]
+    fn pass_rule_at_top_level_rejects() {
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+
+        let tunnel = test_tunnel();
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("example.com", "PASS-RULE")),
+                Box::new(FinalRule::new("DIRECT")),
+            ],
+            Default::default(),
+        );
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        assert_eq!(
+            adapter.adapter_type(),
+            AdapterType::PassRule,
+            "top-level PASS-RULE must materialize as its own adapter"
+        );
+    }
+
+    /// COMPATIBLE resolves like any real target and buckets its stats as
+    /// `"DIRECT"` — it is a direct dialer, not a signal adapter.
+    #[test]
+    fn compatible_resolves_and_buckets_direct() {
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+
+        let tunnel = test_tunnel();
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("example.com", "COMPATIBLE")),
+                Box::new(FinalRule::new("REJECT")),
+            ],
+            Default::default(),
+        );
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        assert_eq!(
+            adapter.adapter_type(),
+            AdapterType::Compatible,
+            "COMPATIBLE must materialize, not be skipped"
+        );
+        let stats = tunnel.inner().stats.rule_match.snapshot();
+        assert!(
+            stats
+                .iter()
+                .any(|((_, action), n)| *action == "DIRECT" && *n == 1),
+            "COMPATIBLE match must bucket as DIRECT, got: {stats:?}"
+        );
+    }
+
+    /// Front-hop mock for the provider-dialer e2e: records every
+    /// `dial_tcp`'s metadata and refuses the connection — observing the
+    /// dial proves the provider node's `dialer-proxy` chain resolved.
+    struct RecordingFront {
+        seen: std::sync::Mutex<Vec<Metadata>>,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for RecordingFront {
+        fn name(&self) -> &str {
+            "front"
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Socks5
+        }
+        fn addr(&self) -> &str {
+            "127.0.0.1:1080"
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            self.seen.lock().unwrap().push(metadata.clone());
+            Err(meow_common::MeowError::NotSupported(
+                "recording front refuses connections".to_string(),
+            ))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            unimplemented!("test mock has no UDP")
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            static H: std::sync::OnceLock<meow_common::ProxyHealth> = std::sync::OnceLock::new();
+            H.get_or_init(meow_common::ProxyHealth::new)
+        }
+    }
+
+    impl Proxy for RecordingFront {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// Issue #489 end-to-end: a provider node's `dialer-proxy` must resolve
+    /// through the *same* registry cell the tunnel republishes — the one
+    /// `set_dialer_registry` installs. Any break in the
+    /// `load_proxy_providers → Config::provider_dialer_registry →
+    /// set_dialer_registry → update_routing` chain leaves the provider
+    /// node's dialer pointing at a dead cell and the dial fails closed
+    /// without ever reaching `front`.
+    #[tokio::test]
+    async fn provider_dialer_proxy_dials_through_published_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - {name: n1, type: socks5, server: 127.0.0.1, \
+             port: 1, dialer-proxy: front}\n",
+        )
+        .unwrap();
+
+        let provider_registry = meow_proxy::dialer::ProxyRegistry::default();
+        let raw: meow_config::raw::RawConfig = serde_yaml::from_str(
+            "proxy-providers:\n  prov:\n    type: file\n    path: nodes.yaml\n",
+        )
+        .unwrap();
+        let providers = meow_config::proxy_provider::load_proxy_providers(
+            raw.proxy_providers.as_ref().unwrap(),
+            Some(dir.path()),
+            false,
+            false,
+            &provider_registry,
+        )
+        .await
+        .unwrap();
+        let provider = Arc::clone(&providers["prov"]);
+        assert_eq!(provider.proxies().len(), 1, "file provider must load n1");
+
+        // A group over the provider slot puts the provider node into the
+        // route map's reachable set, exactly like `use: [prov]` does.
+        let front = Arc::new(RecordingFront {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let group: Arc<dyn Proxy> = Arc::new(meow_proxy::SelectorGroup::new_with_providers(
+            "g",
+            vec![],
+            vec![Arc::clone(&provider.slot)],
+        ));
+
+        let tunnel = test_tunnel();
+        tunnel.set_dialer_registry(provider_registry.clone());
+        tunnel.update_routing(
+            HashMap::from([
+                ("front".into(), Arc::clone(&front) as Arc<dyn Proxy>),
+                ("g".into(), group),
+            ]),
+            vec![Box::new(meow_rules::final_rule::FinalRule::new("g"))],
+            Default::default(),
+        );
+
+        let meta = Metadata {
+            host: "example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let adapter = tunnel.inner().resolve_proxy(&meta).unwrap().adapter;
+        assert_eq!(adapter.name(), "g");
+        // The group selects n1, whose socks5 adapter dials 127.0.0.1:1
+        // through the injected `front` hop; the front records the dial and
+        // refuses, so the observable signal is the recorded metadata.
+        adapter
+            .dial_tcp(&meta)
+            .await
+            .err()
+            .expect("the recording front refuses");
+        let seen = front.seen.lock().unwrap();
+        let [dial] = seen.as_slice() else {
+            panic!("the provider node's chained dial must reach the front hop: {seen:?}")
+        };
+        assert_eq!(dial.dst_ip, Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(dial.dst_port, 1);
     }
 }

@@ -245,23 +245,31 @@ impl ProxyProvider {
             .map(crate::raw::flatten_header_map)
             .unwrap_or_default();
 
-        if raw.proxy.is_some() && vehicle_type == "HTTP" {
+        // Warn for every vehicle type — `proxy:` on a `file` provider is
+        // just as much a mistaken expectation (there is no fetch to chain).
+        if raw.proxy.is_some() {
             warn!(
                 provider = %name,
                 "proxy-provider 'proxy' (fetch-through-proxy) is not supported; \
-                 fetching direct"
+                 ignoring it"
             );
         }
 
         // mihomo `dialer-proxy:` — chain every node through the named front
         // hop. Upstream applies it unconditionally (overriding node-level
-        // fields); empty = unset.
-        let provider_dialer = raw
-            .dialer_proxy
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        // fields). `""` = unset (upstream's `len > 0` check); whitespace-only
+        // is not a usable name — reject rather than silently dial direct.
+        let provider_dialer = match raw.dialer_proxy.as_deref() {
+            Some(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            // `""` = unset (upstream's `len > 0` check); `None` = absent.
+            Some("") | None => None,
+            Some(_) => {
+                return Err(format!(
+                    "proxy-provider '{name}': malformed dialer-proxy — \
+                     expected a proxy/group name"
+                ));
+            }
+        };
 
         // mihomo `override:` — provider-level node defaults. Only
         // `dialer-proxy` is honoured; every other key warns so a config
@@ -276,18 +284,29 @@ impl ProxyProvider {
                 }
             }
             match over.get("dialer-proxy") {
+                // `""` is the upstream "clear the chain" knob:
+                // `OverrideSchema.Apply` writes the string unconditionally,
+                // so an empty override strips node- and provider-level
+                // `dialer-proxy` and the node dials direct.
+                Some(serde_yaml::Value::String(s)) if s.is_empty() => {
+                    override_dialer = Some(String::new());
+                }
                 Some(serde_yaml::Value::String(s)) if !s.trim().is_empty() => {
                     override_dialer = Some(s.trim().to_string());
                 }
+                // `null` unmarshals to a nil `*string` upstream — no write
+                // happens, so the provider/node levels still apply.
+                Some(serde_yaml::Value::Null) | None => {}
                 // A malformed override must not silently drop the operator's
-                // enforced chain — fail the provider build.
+                // enforced chain — fail the provider build. Whitespace-only
+                // lands here too: almost surely a typo rather than a
+                // deliberate clear, same treatment as the other two levels.
                 Some(_) => {
                     return Err(format!(
                         "proxy-provider '{name}': malformed override.dialer-proxy — \
                          expected a proxy/group name"
                     ));
                 }
-                None => {}
             }
         }
 
@@ -438,10 +457,11 @@ impl ProxyProvider {
     /// unparseable node; the lenient path warns and skips instead.
     async fn parse_proxies(&self, content: &str) -> Result<Vec<Arc<dyn Proxy>>, String> {
         let strict = self.strict.load(Ordering::Relaxed);
-        // Cleared up front: every early return below still empties the
-        // previous generation's declarations, so the list always describes
-        // the slot's current payload (issue #489 review).
-        self.declared_dialers.write().clear();
+        // `declared_dialers` is rewritten only where the parsed result will
+        // be committed: the lenient `Ok(vec![])` early returns empty the
+        // slot, so they clear the list; a strict `Err` keeps the last-good
+        // slot running, so it must keep that generation's declarations too
+        // (issue #489 review).
         if !crate::yaml_within_depth(content) {
             if strict {
                 return Err(
@@ -449,6 +469,7 @@ impl ProxyProvider {
                 );
             }
             warn!(provider = %self.name, "provider YAML exceeds the nesting-depth limit");
+            self.declared_dialers.write().clear();
             return Ok(Vec::new());
         }
         let mut doc: serde_yaml::Value = match serde_yaml::from_str(content) {
@@ -458,6 +479,7 @@ impl ProxyProvider {
                     return Err(format!("provider YAML is malformed (strict mode): {e}"));
                 }
                 warn!(provider = %self.name, error = %e, "failed to parse provider YAML");
+                self.declared_dialers.write().clear();
                 return Ok(Vec::new());
             }
         };
@@ -476,6 +498,7 @@ impl ProxyProvider {
                 ));
             }
             warn!(provider = %self.name, error = %e, "failed to expand YAML merge keys");
+            self.declared_dialers.write().clear();
             return Ok(Vec::new());
         }
 
@@ -500,6 +523,7 @@ impl ProxyProvider {
                     ));
                 }
                 warn!(provider = %self.name, error = %e, "provider content is not a proxy list");
+                self.declared_dialers.write().clear();
                 return Ok(Vec::new());
             }
         };
@@ -588,7 +612,10 @@ impl ProxyProvider {
     /// A node whose adapter type cannot carry an injected dialer (anytls,
     /// hysteria2, an `ss` node with an external SIP003 plugin) falls back to
     /// the relay-based [`meow_proxy::DialerProxyAdapter`] — the same
-    /// treatment `apply_dialer_proxies` gives static `proxies:` entries.
+    /// treatment `apply_dialer_proxies` gives static `proxies:` entries,
+    /// except that provider payloads keep the fallback under `strict` too:
+    /// the remote-declared chain still holds, where erroring would drop
+    /// every sibling node with it.
     /// A malformed `dialer-proxy` value or a self-reference rejects the node
     /// outright: warn-skipping just the edge would leave the node dialling
     /// direct, a silent misroute on remote-controlled content (ADR-0002
@@ -606,10 +633,12 @@ impl ProxyProvider {
                 Some(s) if !s.trim().is_empty() => Some(s.trim()),
                 // An explicit-but-empty or null `dialer-proxy:` counts as
                 // unset — the provider-level `override` still applies
-                // (mihomo's OverrideSchema treats empty as unset).
-                Some(_) => None,
+                // (mihomo's `len > 0` check treats `""` as unset). A
+                // whitespace-only value is remote-controlled garbage, not a
+                // usable name — reject the node rather than dial direct.
+                Some("") => None,
                 None if value.is_null() => None,
-                None => {
+                _ => {
                     return Err(
                         "malformed `dialer-proxy` value — expected a proxy/group name".to_string(),
                     );
@@ -634,6 +663,17 @@ impl ProxyProvider {
                 &direct,
             );
         };
+        // `override.dialer-proxy: ""` is the upstream "clear the chain"
+        // knob — the override wrote over both lower levels, so the node
+        // dials direct by operator intent, not by a missing field.
+        if dialer_name.is_empty() {
+            return proxy_parser::parse_proxy_provider_node(
+                raw_map,
+                self.ipv6,
+                self.allow_external_plugin,
+                &direct,
+            );
+        }
         if dialer_name == raw_name {
             return Err("`dialer-proxy` points to the node itself".to_string());
         }
@@ -1334,8 +1374,11 @@ header:
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("nodes.yaml"),
-            "proxies:\n  - {name: n1, type: socks5, server: 203.0.113.9, \
-             port: 1081, dialer-proxy: front}\n",
+            // Loopback + port 1: if the chain is ever dropped the direct
+            // dial refuses instantly instead of hanging on a connect
+            // timeout to an unreachable TEST-NET address.
+            "proxies:\n  - {name: n1, type: socks5, server: 127.0.0.1, \
+             port: 1, dialer-proxy: front}\n",
         )
         .unwrap();
         let registry = meow_proxy::dialer::ProxyRegistry::default();
@@ -1375,8 +1418,8 @@ header:
         };
         // The socks5 adapter dials its server through the chain — the front
         // sees the *server* as the target, not the user destination.
-        assert_eq!(dial.dst_ip, Some("203.0.113.9".parse().unwrap()));
-        assert_eq!(dial.dst_port, 1081);
+        assert_eq!(dial.dst_ip, Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(dial.dst_port, 1);
         assert_eq!(dial.conn_type, meow_common::ConnType::Inner);
     }
 
@@ -1505,8 +1548,8 @@ header:
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("nodes.yaml"),
-            "proxies:\n  - {name: n1, type: socks5, server: 203.0.113.9, \
-             port: 1081, dialer-proxy: g}\n",
+            "proxies:\n  - {name: n1, type: socks5, server: 127.0.0.1, \
+             port: 1, dialer-proxy: g}\n",
         )
         .unwrap();
         let registry = meow_proxy::dialer::ProxyRegistry::default();
@@ -1544,7 +1587,7 @@ header:
         let [dial] = seen.as_slice() else {
             panic!("the chain must resolve the group's selected member: {seen:?}")
         };
-        assert_eq!(dial.dst_ip, Some("203.0.113.9".parse().unwrap()));
+        assert_eq!(dial.dst_ip, Some("127.0.0.1".parse().unwrap()));
     }
 
     /// `override.dialer-proxy` applies unconditionally — it outranks even a
@@ -1613,6 +1656,252 @@ header:
             p.declared_dialer_names(),
             ["front"],
             "provider-level dialer-proxy must override node-level fields"
+        );
+    }
+
+    /// The top of the precedence stack: `override.dialer-proxy` must beat a
+    /// provider-level `dialer-proxy` too — `OverrideSchema.Apply` writes
+    /// last upstream, and swapping the `or` arms would silently invert it.
+    #[tokio::test]
+    async fn provider_override_dialer_proxy_beats_provider_level() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - {name: n1, type: socks5, server: 127.0.0.1, port: 1}\n",
+        )
+        .unwrap();
+        let mut raw = raw_file_provider("nodes.yaml");
+        raw.dialer_proxy = Some("p-hop".to_string());
+        raw.override_ = Some(HashMap::from([(
+            "dialer-proxy".to_string(),
+            serde_yaml::Value::String("o-hop".to_string()),
+        )]));
+        let registry = meow_proxy::dialer::ProxyRegistry::default();
+        let p = ProxyProvider::new(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            registry.clone(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(
+            p.declared_dialer_names(),
+            ["o-hop"],
+            "override must outrank the provider-level field"
+        );
+
+        // Observable dial: only the o-hop front is published, so reaching
+        // it proves the winner propagates to the node's injected dialer.
+        let front = Arc::new(RecordingFront {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut map: HashMap<smol_str::SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        map.insert("o-hop".into(), Arc::clone(&front) as Arc<dyn Proxy>);
+        registry.publish(Arc::new(map));
+        let node = p.proxies().into_iter().next().expect("node must parse");
+        let meta = meow_common::Metadata {
+            host: "example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        assert!(node.dial_tcp(&meta).await.is_err());
+        assert_eq!(
+            front.seen.lock().unwrap().len(),
+            1,
+            "the dial must reach the override-named front hop"
+        );
+    }
+
+    /// `override.dialer-proxy: ""` is upstream's "clear the chain" knob:
+    /// `Apply` writes the empty string unconditionally, stripping both the
+    /// provider-level field and the node's own — the node must dial
+    /// *direct*, not chain to either lower-level name.
+    #[tokio::test]
+    async fn provider_override_empty_dialer_proxy_clears_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - {name: n1, type: socks5, server: 127.0.0.1, \
+             port: 1, dialer-proxy: node-hop}\n",
+        )
+        .unwrap();
+        let mut raw = raw_file_provider("nodes.yaml");
+        raw.dialer_proxy = Some("provider-hop".to_string());
+        raw.override_ = Some(HashMap::from([(
+            "dialer-proxy".to_string(),
+            serde_yaml::Value::String(String::new()),
+        )]));
+        let p = ProxyProvider::new(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(
+            p.declared_dialer_names(),
+            Vec::<String>::new(),
+            "a cleared chain declares no dialer names"
+        );
+
+        // The dial must go direct: refusal from 127.0.0.1:1, not a
+        // registry miss naming either lower-level hop.
+        let node = p.proxies().into_iter().next().expect("node must parse");
+        let meta = meow_common::Metadata {
+            host: "example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let err = node
+            .dial_tcp(&meta)
+            .await
+            .err()
+            .expect("127.0.0.1:1 refuses");
+        assert!(
+            !err.to_string().contains("hop"),
+            "cleared chain must not resolve any dialer name: {err}"
+        );
+    }
+
+    /// A whitespace-only `dialer-proxy` is remote garbage, not an unset
+    /// marker — treat it as malformed (reject the node) rather than
+    /// silently dialling direct. `""` and `~` stay unset (upstream's
+    /// `len > 0` check).
+    #[tokio::test]
+    async fn provider_node_whitespace_dialer_proxy_rejects_node() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n\
+             \x20 - {name: blank, type: socks5, server: 127.0.0.1, port: 1, dialer-proxy: ' '}\n\
+             \x20 - {name: empty, type: socks5, server: 127.0.0.1, port: 1, dialer-proxy: ''}\n",
+        )
+        .unwrap();
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        let names: Vec<String> = p.proxies().iter().map(|n| n.name().to_string()).collect();
+        assert_eq!(
+            names,
+            ["empty"],
+            "whitespace dialer-proxy must reject the node; empty stays unset"
+        );
+    }
+
+    /// A refresh that *changes* the `dialer-proxy` name must retarget the
+    /// chain — not just re-apply or drop it.
+    #[tokio::test]
+    async fn provider_refresh_dialer_name_change_retargets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.yaml");
+        std::fs::write(
+            &path,
+            "proxies:\n  - {name: n1, type: socks5, server: 127.0.0.1, \
+             port: 1, dialer-proxy: first}\n",
+        )
+        .unwrap();
+        let registry = meow_proxy::dialer::ProxyRegistry::default();
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            registry.clone(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(p.declared_dialer_names(), ["first"]);
+
+        std::fs::write(
+            &path,
+            "proxies:\n  - {name: n1, type: socks5, server: 127.0.0.1, \
+             port: 1, dialer-proxy: second}\n",
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(
+            p.declared_dialer_names(),
+            ["second"],
+            "refresh must retarget the chain to the new name"
+        );
+
+        // The dial must resolve the NEW name — `first` stays unresolvable.
+        let front = Arc::new(RecordingFront {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut map: HashMap<smol_str::SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        map.insert("second".into(), Arc::clone(&front) as Arc<dyn Proxy>);
+        registry.publish(Arc::new(map));
+        let node = p.proxies().into_iter().next().expect("node must parse");
+        let meta = meow_common::Metadata {
+            host: "example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        assert!(node.dial_tcp(&meta).await.is_err());
+        assert_eq!(front.seen.lock().unwrap().len(), 1);
+    }
+
+    /// Under `strict` a malformed `dialer-proxy` fails the refresh — and the
+    /// last-good generation (slot *and* declared names) must stay live,
+    /// not clear to nothing.
+    #[tokio::test]
+    async fn provider_strict_refresh_keeps_last_good_on_bad_dialer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.yaml");
+        std::fs::write(
+            &path,
+            "proxies:\n  - {name: n1, type: socks5, server: 127.0.0.1, \
+             port: 1, dialer-proxy: front}\n",
+        )
+        .unwrap();
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(p.declared_dialer_names(), ["front"]);
+
+        std::fs::write(
+            &path,
+            "proxies:\n  - {name: bad, type: socks5, server: 127.0.0.1, \
+             port: 1, dialer-proxy: 7}\n",
+        )
+        .unwrap();
+        p.refresh()
+            .await
+            .expect_err("strict refresh must fail on a malformed dialer-proxy");
+        assert_eq!(
+            p.proxies().len(),
+            1,
+            "the last-good slot must survive a strict parse failure"
+        );
+        assert_eq!(
+            p.declared_dialer_names(),
+            ["front"],
+            "declared names must describe the still-live generation"
         );
     }
 

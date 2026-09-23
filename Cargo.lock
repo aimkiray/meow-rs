@@ -2741,6 +2741,7 @@ dependencies = [
  "serde_yaml",
  "smallvec",
  "smol_str",
+ "tempfile",
  "time",
  "tokio",
  "tracing",

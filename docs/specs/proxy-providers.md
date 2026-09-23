@@ -78,7 +78,9 @@ Out of scope:
 - **`proxy-providers` as the source for `RULE-SET` rules** — not a
   thing; they are separate concepts.
 - **Provider UDP disable** (`disable-udp: true` inside the provider's
-  override map) — covered by `override:`, no special handling needed.
+  override map) — not implemented: `override:` honours only
+  `dialer-proxy`; every other key logs a warning so the gap is visible
+  rather than silently diverging (issue #489).
 
 ## Non-goals
 

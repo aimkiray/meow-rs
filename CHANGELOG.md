@@ -606,7 +606,13 @@ the canonical, in-repo source a release is cut from.
   `OverrideSchema`) are honoured with upstream precedence — `override` >
   provider > node, the stronger levels writing unconditionally — and a
   malformed `dialer-proxy` value or `override.dialer-proxy` rejects the
-  node/provider instead of silently dialling direct. Payload YAML merge keys
+  node/provider instead of silently dialling direct. The same discipline
+  now covers static `proxies:` entries: values are trimmed (`" front "`
+  resolves `front`), `""`/`~` unset the chain and
+  `override.dialer-proxy: ""` clears the lower-level chain (mihomo parity),
+  and a malformed value under lenient binds a never-resolving target so
+  the node fails its dials loudly instead of warn-skipping to direct.
+  Payload YAML merge keys
   are expanded so a merged `dialer-proxy` is honoured too. Dialer names resolve against
   the *live* route map at dial time (mihomo's by-name model: top-level
   `proxies:`/`proxy-groups:` entries, not sibling provider nodes) via a
@@ -616,10 +622,20 @@ the canonical, in-repo source a release is cut from.
   overflowing the native stack; the same bound now also guards the
   `DialerProxyAdapter` relay path.
 
-  Breaking for crate consumers: `Config` gains a `dialer_registry` field;
-  `ProxyProvider::new`, `load_proxy_providers`, and
-  `parse_proxy_provider_node` take the registry/dialer arguments; and
-  `subscription_refresh::run_loop` takes the provider map.
+  Breaking for crate consumers: `Config` gains a
+  `provider_dialer_registry` field (distinct from the existing
+  `dialer_registry` generation cell — this one is the persistent registry
+  provider nodes resolve through); `ProxyProvider::new`,
+  `load_proxy_providers`, and `parse_proxy_provider_node` take the
+  registry/dialer arguments; `rebuild_from_raw_runtime` and
+  `subscription_refresh::run_loop` take the registry; `ApiServer::new`
+  gains a `provider_dialer_registry` parameter and `routes::AppState` the
+  same public field; and `RouteTable::proxies` changes type from
+  `HashMap<SmolStr, Arc<dyn Proxy>>` to `Arc<HashMap<…>>` so installs can
+  republish by Arc bump. Embedders must additionally wire
+  `Tunnel::set_dialer_registry(config.provider_dialer_registry.clone())`
+  once at startup — skipping it leaves every provider-sourced `dialer-proxy`
+  chain failing closed at dial time.
 
 - **TLS handshakes no longer fail on multiplexed transports whose
   `poll_flush` pends.** Every TLS-over-mux handshake — AnyTLS, smux, and any

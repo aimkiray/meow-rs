@@ -757,6 +757,13 @@ pub struct RebuildResult {
 ///
 /// Does not resolve rule-provider cache paths; use
 /// [`rebuild_from_raw_with_cache_dir`] when a working directory is available.
+///
+/// Provider caution: any [`RebuildResult::proxy_providers`] built here bind
+/// their nodes' `dialer-proxy` targets to a throwaway registry cell that
+/// nothing ever publishes — committing them leaves every chained dial
+/// failing closed. Committing callers must use
+/// [`rebuild_from_raw_runtime`], which takes the live
+/// `Config::provider_dialer_registry` (issue #489).
 pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::Error> {
     rebuild_from_raw_impl(
         raw,
@@ -811,6 +818,11 @@ pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::E
 /// [`RebuildResult::prefetched_payloads`] comes back empty and must not
 /// be forwarded to `parse_dns_from_raw` as a shared snapshot (the DNS
 /// pass does its own private load for rules-only rebuilds).
+///
+/// Provider caution: like [`rebuild_from_raw`], this variant binds new
+/// providers to a throwaway dialer registry — do not commit
+/// [`RebuildResult::proxy_providers`] from it; use
+/// [`rebuild_from_raw_runtime`] for committing rebuilds (issue #489).
 pub fn rebuild_from_raw_with_resolver(
     raw: &raw::RawConfig,
     resolver: Option<&meow_dns::ResolverSlot>,
@@ -876,6 +888,9 @@ pub fn rebuild_from_raw_runtime(
 /// relative rule-provider paths and to cache fetched HTTP payloads, and an
 /// optional DNS `resolver` slot injected into the built-in DIRECT and
 /// COMPATIBLE adapters.
+///
+/// Same provider caveat as [`rebuild_from_raw`]: committed providers need
+/// [`rebuild_from_raw_runtime`]'s live registry (issue #489).
 pub fn rebuild_from_raw_with_cache_dir(
     raw: &raw::RawConfig,
     cache_dir: Option<&Path>,
@@ -981,6 +996,14 @@ pub async fn parse_dns_from_raw(
     Ok(dns)
 }
 
+/// Prefix of the sentinel dialer target [`apply_dialer_proxies`] binds to a
+/// node whose `dialer-proxy` value is malformed in lenient mode. It is never
+/// registered in the proxy map, so the node's dials fail loudly ("not in the
+/// proxy registry", naming the node via the suffix) instead of silently
+/// dialling direct — the same "node loads, dial fails" shape mihomo gives a
+/// dialer name that resolves to nothing.
+const MALFORMED_DIALER_PREFIX: &str = "__malformed_dialer_proxy__";
+
 /// Apply per-outbound `dialer-proxy` in place (issue #210).
 ///
 /// For every proxy that declares `dialer-proxy: <name>`, its registry entry is
@@ -1020,6 +1043,13 @@ pub async fn parse_dns_from_raw(
 /// checked separately by [`reject_group_membership_cycles`], which runs after
 /// the group build where the real membership is known.
 ///
+/// A malformed (non-string, non-null) `dialer-proxy` value rejects the whole
+/// config under strict; lenient mode instead binds the node to a
+/// [`MALFORMED_DIALER_PREFIX`]-prefixed sentinel target so its dials fail
+/// loudly naming the node — the same "node loads, dial fails" shape mihomo
+/// gives a dialer name that resolves to nothing — rather than silently
+/// egressing direct.
+///
 /// Returns the applied `(proxy, dialer)` edges so the caller can re-validate
 /// dialer targets once groups have been built (a *declared* group that failed
 /// to build satisfies `dialable` but never enters the registry) and run
@@ -1055,23 +1085,35 @@ fn apply_dialer_proxies(
         if BUILTIN_ADAPTER_NAMES.contains(&name) {
             continue;
         }
-        let dialer = match raw_proxy.get("dialer-proxy") {
+        let dialer: SmolStr = match raw_proxy.get("dialer-proxy") {
             None => continue,
             Some(v) => match v.as_str() {
-                Some(s) if !s.is_empty() => s,
+                // Trimmed like the provider-node path so
+                // `dialer-proxy: " front "` resolves `front` identically
+                // on statics instead of missing the `dialable` check below.
+                Some(s) if !s.trim().is_empty() => SmolStr::from(s.trim()),
+                // `""` and `~` unset the chain in mihomo — not malformed.
+                Some("") => continue,
+                _ if v.is_null() => continue,
                 _ if strict => {
                     anyhow::bail!("proxy '{name}': malformed dialer-proxy value (strict mode)");
                 }
+                // Lenient keeps the node but binds it to a target that
+                // never resolves, so its dials fail loudly naming the node
+                // instead of silently dialling direct past the chain the
+                // operator asked for. The sentinel is exempt from the
+                // `dialable` check below and never collides with a real
+                // name by construction.
                 _ => {
-                    warn!("proxy '{name}': ignoring malformed dialer-proxy value");
-                    continue;
+                    warn!("proxy '{name}': malformed dialer-proxy value; the node will fail its dials");
+                    SmolStr::from(format!("{MALFORMED_DIALER_PREFIX}{name}"))
                 }
             },
         };
-        if dialer == name {
+        if dialer.as_str() == name {
             anyhow::bail!("proxy '{name}': dialer-proxy points to itself");
         }
-        edges.push((SmolStr::from(name), SmolStr::from(dialer)));
+        edges.push((SmolStr::from(name), dialer));
     }
     if edges.is_empty() {
         return Ok(edges);
@@ -1087,7 +1129,7 @@ fn apply_dialer_proxies(
         .chain(std::iter::once("GLOBAL"))
         .collect();
     for (name, dialer) in &edges {
-        if !dialable.contains(dialer.as_str()) {
+        if !dialable.contains(dialer.as_str()) && !dialer.starts_with(MALFORMED_DIALER_PREFIX) {
             anyhow::bail!("proxy '{name}': dialer-proxy '{dialer}' not found");
         }
     }
@@ -2017,9 +2059,11 @@ fn build_proxy_layer(
     // `dialable` admitted *declared* group names before the group build ran;
     // a group that failed to build never entered the registry, so re-check
     // every dialer target against the finished map instead of letting the
-    // first dial report it late.
+    // first dial report it late. Lenient-mode malformed-value sentinels are
+    // exempt: they are deliberately unresolvable so the node's dials fail
+    // loudly at dial time rather than here at load.
     for (name, dialer) in &dialer_edges {
-        if !proxies.contains_key(dialer.as_str()) {
+        if !proxies.contains_key(dialer.as_str()) && !dialer.starts_with(MALFORMED_DIALER_PREFIX) {
             anyhow::bail!(
                 "proxy '{name}': dialer-proxy '{dialer}' is declared but did \
                  not build into a registry entry"
@@ -4341,8 +4385,8 @@ mod dialer_proxy_tests {
             serde_yaml::Value::Number(serde_yaml::Number::from(42)),
         );
         // Malformed values are a hard error under `strict` — the lenient
-        // warn-and-skip arm is covered by `strict_mode_tests` at the rebuild
-        // level. `apply_chains` runs the lenient path.
+        // fail-at-dial sentinel arm is covered by `strict_mode_tests` at the
+        // rebuild level. `apply_chains` runs the lenient path.
         let err = apply_dialer_proxies(
             &mut proxies,
             &[raw],
@@ -4356,6 +4400,59 @@ mod dialer_proxy_tests {
         assert!(
             err.to_string().contains("malformed dialer-proxy"),
             "error must name the field: {err}"
+        );
+    }
+
+    /// A padded `dialer-proxy` name resolves after trimming — the provider
+    /// path trims too, so statics must not hard-fail on the same input
+    /// (issue #489 review).
+    #[test]
+    fn padded_dialer_proxy_name_is_trimmed() {
+        let mut proxies = registry(&["A", "B"]);
+        let before = proxies.clone();
+        let mut raw = raw_proxy("A", None);
+        raw.insert(
+            "dialer-proxy".to_string(),
+            serde_yaml::Value::String(" B ".to_string()),
+        );
+        apply_chains(&mut proxies, &[raw]).expect("a padded name resolves after trim");
+        assert!(was_wrapped(&before, &proxies, "A"));
+    }
+
+    /// `dialer-proxy: ""` / `~` unset the chain (mihomo parity), while a
+    /// whitespace-only value is malformed — under lenient it binds the
+    /// never-resolving sentinel instead of silently dialling direct.
+    #[test]
+    fn empty_dialer_proxy_unsets_but_whitespace_poisons() {
+        let mut proxies = registry(&["A", "B", "C"]);
+        let before = proxies.clone();
+
+        let mut empty = raw_proxy("A", None);
+        empty.insert(
+            "dialer-proxy".to_string(),
+            serde_yaml::Value::String(String::new()),
+        );
+        let mut null = raw_proxy("B", None);
+        null.insert("dialer-proxy".to_string(), serde_yaml::Value::Null);
+        let mut ws = raw_proxy("C", None);
+        ws.insert(
+            "dialer-proxy".to_string(),
+            serde_yaml::Value::String(" ".to_string()),
+        );
+
+        apply_chains(&mut proxies, &[empty, null, ws])
+            .expect("lenient tolerates empty/null and poisons whitespace");
+        assert!(
+            !was_wrapped(&before, &proxies, "A"),
+            "`dialer-proxy: \"\"` unsets the chain"
+        );
+        assert!(
+            !was_wrapped(&before, &proxies, "B"),
+            "`dialer-proxy: ~` unsets the chain"
+        );
+        assert!(
+            was_wrapped(&before, &proxies, "C"),
+            "a whitespace-only value binds the fail-at-dial sentinel"
         );
     }
 
@@ -5985,8 +6082,8 @@ rules:
         );
     }
 
-    #[test]
-    fn strict_rejects_malformed_dialer_proxy() {
+    #[tokio::test]
+    async fn strict_rejects_malformed_dialer_proxy() {
         let yaml = r#"
 strict: {STRICT}
 proxies:
@@ -6001,11 +6098,23 @@ rules:
             "unexpected: {err}"
         );
 
-        // Lenient drops the malformed chain and the leaf dials direct.
+        // Lenient keeps the node but binds it to a sentinel target that
+        // never resolves — the malformed edge can no longer silently
+        // degrade the leaf to a direct dial (mihomo's shape too: the node
+        // loads and its dial fails "not found").
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
         let RebuildResult { proxies, .. } =
             rebuild_from_raw(&raw).expect("lenient mode must tolerate a malformed dialer-proxy");
-        assert!(proxies.contains_key("leaf"));
+        let leaf = proxies
+            .get("leaf")
+            .expect("node must be kept in lenient mode");
+        let Err(err) = leaf.dial_tcp(&meow_common::Metadata::default()).await else {
+            panic!("a malformed dialer-proxy must fail at dial time, not dial direct");
+        };
+        assert!(
+            err.to_string().contains("__malformed_dialer_proxy__leaf"),
+            "unexpected: {err}"
+        );
     }
 
     /// A `dialer-proxy` on an adapter that cannot carry an injected dialer
