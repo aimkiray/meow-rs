@@ -631,7 +631,9 @@ mod linux {
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.as_mut_ptr().cast::<libc::c_void>();
-        msg.msg_controllen = mem::size_of_val(&cbuf);
+        // `msg_controllen` is `usize` on glibc but `u32` on musl — `as _`
+        // adapts to whichever the target libc declares.
+        msg.msg_controllen = mem::size_of_val(&cbuf) as _;
 
         let n = libc::recvmsg(fd, &mut msg, 0);
         if n < 0 {
@@ -651,7 +653,7 @@ mod linux {
         // Byte view over the aligned control buffer — no copy.
         let cbuf_bytes =
             std::slice::from_raw_parts(cbuf.as_ptr().cast::<u8>(), mem::size_of_val(&cbuf));
-        let Some(orig_dst) = extract_orig_dst(cbuf_bytes, msg.msg_controllen) else {
+        let Some(orig_dst) = extract_orig_dst(cbuf_bytes, msg.msg_controllen as _) else {
             debug!("tproxy UDP: dropping datagram without IP_ORIGDSTADDR cmsg");
             return Ok(None);
         };
@@ -664,18 +666,22 @@ mod linux {
     /// never reads out of bounds.
     fn extract_orig_dst(cbuf: &[u8], controllen: usize) -> Option<SocketAddr> {
         let controllen = controllen.min(cbuf.len());
+        // `msg_controllen`/`cmsg_len` are `usize` on glibc but `u32` on
+        // musl — `as _` casts adapt to whichever type the target libc
+        // declares (a concrete `as usize` would trip clippy on the
+        // same-type side). Field assignment (not `..zeroed()` in the
+        // literal) because musl's `msghdr` has private padding fields.
+        let mut hdr0: libc::msghdr = unsafe { mem::zeroed() };
+        hdr0.msg_control = cbuf.as_ptr() as *mut libc::c_void;
+        hdr0.msg_controllen = controllen as _;
+        let fake_msghdr = || hdr0;
         unsafe {
-            let mut cmsg = libc::CMSG_FIRSTHDR(&libc::msghdr {
-                msg_control: cbuf.as_ptr() as *mut libc::c_void,
-                msg_controllen: controllen,
-                ..mem::zeroed()
-            });
+            let mut cmsg = libc::CMSG_FIRSTHDR(&fake_msghdr());
             while !cmsg.is_null() {
                 let hdr = &*cmsg;
                 if hdr.cmsg_level == libc::SOL_IP
                     && hdr.cmsg_type == IP_ORIGDSTADDR
-                    && hdr.cmsg_len
-                        >= libc::CMSG_LEN(mem::size_of::<libc::sockaddr_in>() as _) as usize
+                    && hdr.cmsg_len >= libc::CMSG_LEN(mem::size_of::<libc::sockaddr_in>() as _) as _
                 {
                     let sa = &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in);
                     if sa.sin_family as i32 == libc::AF_INET {
@@ -684,14 +690,7 @@ mod linux {
                     // Right level/type but wrong family — malformed.
                     return None;
                 }
-                cmsg = libc::CMSG_NXTHDR(
-                    &libc::msghdr {
-                        msg_control: cbuf.as_ptr() as *mut libc::c_void,
-                        msg_controllen: controllen,
-                        ..mem::zeroed()
-                    },
-                    cmsg,
-                );
+                cmsg = libc::CMSG_NXTHDR(&fake_msghdr(), cmsg);
             }
             None
         }
@@ -890,7 +889,7 @@ mod linux {
             port: u16,
         ) -> Vec<u64> {
             let sa_len = mem::size_of::<libc::sockaddr_in>();
-            let space = unsafe { libc::CMSG_SPACE(sa_len as _) } as usize;
+            let space: usize = unsafe { libc::CMSG_SPACE(sa_len as _) } as _;
             let mut words = vec![0u64; space.div_ceil(8)];
             let mut sa: libc::sockaddr_in = unsafe { mem::zeroed() };
             sa.sin_family = family;
@@ -929,8 +928,8 @@ mod linux {
             let sa_len = mem::size_of::<libc::sockaddr_in>();
             let (len, space) = unsafe {
                 (
-                    libc::CMSG_LEN(sa_len as _) as usize,
-                    libc::CMSG_SPACE(sa_len as _) as usize,
+                    libc::CMSG_LEN(sa_len as _) as _,
+                    libc::CMSG_SPACE(sa_len as _) as _,
                 )
             };
             let words = build_cmsg(
@@ -954,8 +953,8 @@ mod linux {
             let sa_len = mem::size_of::<libc::sockaddr_in>();
             let (good_len, space) = unsafe {
                 (
-                    libc::CMSG_LEN(sa_len as _) as usize,
-                    libc::CMSG_SPACE(sa_len as _) as usize,
+                    libc::CMSG_LEN(sa_len as _) as _,
+                    libc::CMSG_SPACE(sa_len as _) as _,
                 )
             };
 
