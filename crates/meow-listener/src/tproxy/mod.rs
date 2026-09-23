@@ -883,7 +883,14 @@ mod tests {
             .run_on(socket)
             .await
             .expect_err("udp: true must fail off Linux");
-        assert!(err.to_string().contains("Linux"), "unexpected error: {err}");
+        // macOS reaches the `udp` gate ("Linux-only"); Windows hits the
+        // earlier platform gate for `firewall: false`. Either way the
+        // listener must never silently degrade to TCP-only.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Linux") || msg.contains("not supported on this platform"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

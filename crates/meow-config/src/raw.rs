@@ -232,6 +232,11 @@ pub struct RawConfig {
     /// plausible mistake (`firewall:` belongs on a `listeners:` tproxy
     /// entry, issue #563).
     pub firewall: Option<serde_yaml::Value>,
+    /// No top-level `udp`/`udp-timeout` keys exist — captured only to
+    /// warn on the plausible mistake (`udp:` belongs on a `listeners:`
+    /// tproxy entry; `udp-timeout` on `listeners:`/`tun:`, issue #564).
+    pub udp: Option<serde_yaml::Value>,
+    pub udp_timeout: Option<serde_yaml::Value>,
 }
 
 /// A `hosts:` map value: one IP/domain alias or a list of IP addresses.

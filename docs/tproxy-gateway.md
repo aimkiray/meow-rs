@@ -155,19 +155,39 @@ ip route add local 0.0.0.0/0 dev lo table 100
 
 nft -f - <<'NFT'
 table ip meow_udp {
+  # Same bypass set as `meow_gateway` below — keep them in sync.
+  set reserved4 {
+    type ipv4_addr; flags interval;
+    elements = { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16,
+                 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }
+  }
   chain pre {
     type filter hook prerouting priority mangle; policy accept;
+    iifname "eth0" fib daddr type local return        # gateway's own services (incl. DNS to LAN_IP)
+    iifname "eth0" udp dport 53 return                # let the nat-chain DNS hijack handle DNS
+    iifname "eth0" ip daddr @reserved4 return         # never proxy LAN/VPN-internal ranges
     iifname "eth0" meta l4proto udp tproxy ip to 127.0.0.1:7893 meta mark set 0x1 accept
   }
 }
 NFT
 ```
 
+**The exemptions matter — a bare `meta l4proto udp` catch-all breaks your own
+gateway.** `prerouting` also sees packets destined to the gateway itself:
+without `fib daddr type local return`, a LAN client's DNS to `LAN_IP:53` gets
+TPROXY'd with `orig_dst = LAN_IP:53` and routed by meow to a destination where
+nothing listens. Ordering bites too: this chain runs at `priority mangle`
+(-150), *before* the `nat`/`dstnat` (-100) `meow_gateway` chain, so once a
+datagram is TPROXY'd the :53→:1053 DNAT hijack never sees it — `udp dport 53
+return` keeps forwarded DNS on the hijack path (clients pointed at `LAN_IP`
+are covered by the `fib local` rule instead). The `@reserved4` bypass mirrors
+the TCP chain's `meow_gateway` behaviour.
+
 **Scope the rule to your LAN interface** (`iifname "eth0"` above — substitute
-yours). As a bare `meta l4proto udp` it steers *every* forwarded UDP datagram,
-including the LAN's DNS on :53 (which follows routing rules — there is no
-implicit hijack). Keep host-originated packets out of the TPROXY path: do not
-add a matching `output` rule for UDP.
+yours). Keep host-originated packets out of the TPROXY path: do not add a
+matching `output` rule for UDP. If the fwmark you pick collides with meow's
+`routing-mark`, meow's own outbound gets steered into the local table — keep
+the two mark values distinct.
 
 Replies are sent with the **original destination** as source address and port
 (via an `IP_TRANSPARENT` socket bound per destination on first use), so
@@ -181,6 +201,13 @@ notes:
   `CAP_NET_ADMIN` does not imply. Reply sockets also do **not** carry
   `routing-mark`/SO_MARK — mark-based policy rules must not steer reply
   packets (whose source is the forged destination) toward the local table.
+- A `0.0.0.0`-bound listener conservatively drops any flow whose recovered
+  `orig_dst` shares the listener port (self-reinjection guard) — remote UDP
+  services on that same port number are unreachable through it. Bind a
+  specific address, or pick a listener port that doesn't collide.
+- The sniffer is TCP-only: UDP flows carry no recovered SNI, so under
+  redir-host they route by IP. Point LAN clients at fake-ip (or the snoop
+  table) if UDP domains matter.
 
 ---
 
@@ -421,6 +448,17 @@ systemctl enable --now meow meow-gateway
 
 `PartOf=meow.service` makes the gateway rules reload whenever meow restarts, so
 the two never drift.
+
+For a `udp: true` listener the same unit must also persist the policy-routing
+half — `nft -f` does not cover `ip rule`/`ip route … table 100`, so UDP would
+silently die on reboot without them:
+
+```ini
+ExecStart=/sbin/ip rule add fwmark 0x1 lookup 100
+ExecStart=/sbin/ip route add local 0.0.0.0/0 dev lo table 100
+ExecStop=/sbin/ip rule del fwmark 0x1 lookup 100
+ExecStop=/sbin/ip route del local 0.0.0.0/0 dev lo table 100
+```
 
 ---
 

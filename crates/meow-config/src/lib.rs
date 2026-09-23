@@ -3142,6 +3142,32 @@ fn build_ss_listener_spec(raw_l: &raw::RawListener) -> Result<SsListenerConfig, 
     })
 }
 
+/// Derive the `(default_bind, global_tproxy_sni)` inputs the listener
+/// builder needs — single source so `validate_named_listeners` checks
+/// exactly what `load_config` will enforce.
+fn listener_bind_inputs(raw: &raw::RawConfig) -> (String, bool) {
+    let bind_address = match raw.bind_address.as_deref() {
+        None => "127.0.0.1".to_string(),
+        Some("*" | "") => "0.0.0.0".to_string(),
+        Some(addr) => addr.to_string(),
+    };
+    let bind_addr = if raw.allow_lan.unwrap_or(false) {
+        bind_address
+    } else {
+        "127.0.0.1".to_string()
+    };
+    (bind_addr, raw.tproxy_sni.unwrap_or(true))
+}
+
+/// Validate `listeners:` exactly as `load_config` would, without
+/// constructing anything — `PUT /configs` uses this to reject a section
+/// that would otherwise persist silently and hard-error on next boot.
+pub fn validate_named_listeners(raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
+    let (bind_addr, global_tproxy_sni) = listener_bind_inputs(raw);
+    build_named_listeners(raw, &bind_addr, global_tproxy_sni)?;
+    Ok(())
+}
+
 /// Build the authoritative list of named listeners from the raw config.
 /// Merges shorthand fields with the `listeners:` array and validates:
 ///   - No duplicate ports (Class A per ADR-0002)
@@ -3225,6 +3251,18 @@ fn build_named_listeners(
              always stays managed (issue #563)"
         );
     }
+    if raw.udp.is_some() {
+        warn!(
+            "udp: only meaningful under a `listeners:` entry (`tproxy`/`ss`); \
+             the top-level key is ignored (issue #564)"
+        );
+    }
+    if raw.udp_timeout.is_some() {
+        warn!(
+            "udp-timeout: only meaningful under a `listeners:`/`tun:` entry; \
+             the top-level key is ignored (issue #564)"
+        );
+    }
     if let Some(port) = raw.tproxy_port.filter(|p| *p != 0) {
         add(
             "tproxy",
@@ -3249,6 +3287,13 @@ fn build_named_listeners(
         if raw_l.firewall.is_some() && !matches!(spec, ListenerSpec::TProxy { .. }) {
             warn!(
                 "listeners[{}].firewall: only meaningful on `type: tproxy`, ignored; \
+                 remove it to suppress this warning",
+                raw_l.name
+            );
+        }
+        if raw_l.tproxy_sni.is_some() && !matches!(spec, ListenerSpec::TProxy { .. }) {
+            warn!(
+                "listeners[{}].tproxy-sni: only meaningful on `type: tproxy`, ignored; \
                  remove it to suppress this warning",
                 raw_l.name
             );
@@ -3523,12 +3568,7 @@ async fn build_config(
     };
 
     // Listener config
-    let bind_addr = if general.allow_lan {
-        general.bind_address.clone()
-    } else {
-        "127.0.0.1".to_string()
-    };
-    let global_tproxy_sni = raw.tproxy_sni.unwrap_or(true);
+    let (bind_addr, global_tproxy_sni) = listener_bind_inputs(&raw);
 
     // Build the named-listener list, checking for duplicate ports/names.
     let named_listeners = build_named_listeners(&raw, &bind_addr, global_tproxy_sni)?;

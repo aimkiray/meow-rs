@@ -2648,6 +2648,23 @@ async fn put_configs(
         }
     }
 
+    // Same contract for `listeners:` — an entry the startup parser rejects
+    // (bad type, duplicate port, `udp: true` + managed firewall, IPv6 UDP
+    // bind, …) must not be committed into `raw_config`: the next
+    // `load_config` would hard-error on boot. Listeners are still a
+    // startup snapshot (no hot-reload), this only gates persistence.
+    if let Err(e) = meow_config::validate_named_listeners(&raw_config) {
+        if force {
+            tracing::error!("config reload forced despite listeners config error: {e}");
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"message": format!("listeners config error: {e}")})),
+            )
+                .into_response();
+        }
+    }
+
     // Issue #514: rebuild the DNS runtime too when its inputs changed —
     // failing here rejects the PUT before `reload_routing` publishes
     // anything (under `force` a broken dns section degrades to warn +
@@ -3416,9 +3433,19 @@ async fn get_listeners(State(state): State<Arc<AppState>>) -> Json<serde_json::V
             // TProxy listeners disclose who owns the redirect rules — a
             // deployer checking whether the table/anchor they installed is
             // supposed to coexist with a meow-managed one reads this field
-            // (issue #563).
-            if let meow_config::ListenerSpec::TProxy { firewall, .. } = &l.spec {
+            // (issue #563). `udp`/`udp-timeout` are disclosed for the same
+            // reason: external TPROXY rules are only useful if the UDP
+            // path is actually enabled (issue #564).
+            if let meow_config::ListenerSpec::TProxy {
+                firewall,
+                udp,
+                udp_timeout,
+                ..
+            } = &l.spec
+            {
                 item["firewall"] = serde_json::json!(firewall);
+                item["udp"] = serde_json::json!(udp);
+                item["udp-timeout"] = serde_json::json!(udp_timeout);
             }
             item
         })

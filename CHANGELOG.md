@@ -183,7 +183,11 @@ the canonical, in-repo source a release is cut from.
   prevent unbounded FD/memory growth. `udp: true` with managed firewall
   or a non-IPv4 `listen` is a config error, and on a non-Linux platform
   the listener fails at startup — no silent TCP-only degrade; an omitted
-  `udp` changes nothing (no extra socket, no extra privileges).
+  `udp` changes nothing (no extra socket, no extra privileges). The
+  `GET /listeners` API discloses `firewall`, `udp`, and `udp-timeout` on
+  tproxy entries, and `PUT /configs` now validates `listeners:` the same
+  way startup does — an entry the boot parser would reject returns 400
+  instead of persisting a config that hard-errors on next launch.
 
 - **External firewall management for TProxy listeners (#563).** A named
   `listeners:` entry accepts `firewall: false`, which makes meow skip every

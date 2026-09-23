@@ -540,7 +540,7 @@ using them will produce a clear error at startup.
 | Feature | Reason | Alternative |
 |---------|--------|-------------|
 | TUIC, WireGuard, SSH protocols | Protocol scope and dependency budget | Revisit in M2+ if users need them |
-| TUN inbound | Out of scope for this kernel | Use `tproxy-port` with nftables/pf |
+| TUN inbound | L3-device transparent proxy (issue #326) | `tun:` section with the `listener-tun` Cargo feature |
 
 ---
 
@@ -620,20 +620,32 @@ Most common format from public providers. Typical issues:
 
 ### Type 3: Transparent proxy (tproxy, Linux)
 
-1. **TUN users** — switch to `tproxy-port`. TUN inbound is a non-goal. Use
-   nftables `TPROXY` target instead of `REDIRECT`.
+1. **TUN users** — meow-rs has a `tun:` section (feature `listener-tun`,
+   fake-ip-scoped; see `docs/tun.md`), or use `tproxy-port` with nftables
+   `TPROXY`/`REDIRECT` rules.
 2. **`redir-port`** — not supported. Use `tproxy-port`.
 3. **PROCESS-NAME / PROCESS-PATH rules** — platform lookup wired (Linux netlink,
    macOS libproc) via M1.D-1.
-4. **Firewall-management polarity is reversed.** In Go mihomo the `listeners:`
-   tproxy entry's `iptables:` key defaults **off** (the deployer owns redirect
-   rules unless they opt in); in meow-rs the equivalent `firewall:` key on a
-   `listeners:` tproxy entry defaults **on** (managed nftables/pf table), and
-   the `tproxy-port` shorthand is always managed. A config that ran
+4. **Firewall-management polarity is reversed.** In Go mihomo the top-level
+   `iptables:` block defaults **off** (the deployer owns redirect rules
+   unless they opt in); in meow-rs the equivalent `firewall:` key lives on a
+   `listeners:` tproxy entry and defaults **on** (managed nftables/pf table),
+   and the `tproxy-port` shorthand is always managed. A config that ran
    externally-managed rules upstream must set `firewall: false` explicitly on
    the listener, or meow will install its own `inet meow_tproxy` / pf anchor
    alongside yours. A stray top-level `firewall:` key warns and is ignored —
-   it is not the upstream top-level `iptables:` equivalent.
+   it is not the upstream top-level `iptables:` equivalent; the upstream
+   `iptables:` block itself (`enable`/`inbound-interface`/`bypass`/
+   `dns-redirect`) is likewise ignored.
+5. **UDP TPROXY is opt-in and narrower than upstream.** Upstream's
+   `tproxy-port` intercepts TCP **and** UDP; meow-rs's shorthand is TCP-only —
+   a migrated deployer steering UDP at it silently blackholes the datagrams
+   (they never reach a socket meow owns). To serve UDP, declare a
+   `listeners:` tproxy entry with `udp: true`, which requires
+   `firewall: false` (the managed firewall only covers host output-chain TCP
+   REDIRECT) — upstream's `udp: true` + managed `iptables` combination has no
+   direct equivalent. UDP is also IPv4-only (upstream does v6), Linux-only,
+   and `prerouting`-scoped; see `docs/tproxy-gateway.md`.
 
 ### Type 4: Proxy provider subscription (`proxy-providers:`)
 

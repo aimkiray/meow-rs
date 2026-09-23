@@ -186,8 +186,8 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
             spec: ListenerSpec::TProxy {
                 sni: false,
                 firewall: false,
-                udp: false,
-                udp_timeout: 60,
+                udp: true,
+                udp_timeout: 30,
             },
             port: 7894,
             listen: "127.0.0.1".into(),
@@ -215,9 +215,15 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
     let body = body_json(resp).await;
     assert_eq!(body[0]["name"], "ext-tproxy");
     assert_eq!(body[0]["firewall"], false);
-    // Non-tproxy listeners carry no `firewall` key at all.
+    // `udp`/`udp-timeout` disclose whether the external-TPROXY UDP path is
+    // actually enabled — the deployer's rules are useless without it (#564).
+    assert_eq!(body[0]["udp"], true);
+    assert_eq!(body[0]["udp-timeout"], 30);
+    // Non-tproxy listeners carry none of the tproxy keys at all.
     assert_eq!(body[1]["name"], "mixed");
     assert!(body[1].get("firewall").is_none());
+    assert!(body[1].get("udp").is_none());
+    assert!(body[1].get("udp-timeout").is_none());
 }
 
 #[tokio::test]
@@ -4431,6 +4437,53 @@ async fn put_configs_invalid_tun_rejected_before_commit() {
         "the running listener must survive untouched"
     );
     assert!(state.tunnel.has_tun(), "the running listener must survive");
+}
+
+/// Same admission contract for `listeners:` — an entry the startup parser
+/// would reject must not be committed into `raw_config`, where the next
+/// `load_config` would hard-error on boot (issue #564 review).
+#[tokio::test]
+async fn put_configs_invalid_listeners_rejected_before_commit() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    // `udp: true` without `firewall: false` fails `build_named_listeners`.
+    let yaml = concat!(
+        "mode: rule\n",
+        "listeners:\n",
+        "  - name: tp\n",
+        "    type: tproxy\n",
+        "    port: 7895\n",
+        "    udp: true\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("listeners config error")),
+        "the 400 must come from the listeners admission check, got: {body}"
+    );
+    assert!(
+        state.raw_config.read().listeners.is_none(),
+        "the invalid section must not have been committed"
+    );
 }
 
 /// `?force` degrades the `tun:` admission check to a warn: the unparsable

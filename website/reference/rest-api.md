@@ -126,7 +126,7 @@ static files instead.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/listeners` | Active listeners (`name`, `type`, `port`, `listen`) |
+| `GET` | `/listeners` | Active listeners (`name`, `type`, `port`, `listen`; tproxy entries also report `firewall`, `udp`, `udp-timeout`) |
 
 ## WebSocket streams
 

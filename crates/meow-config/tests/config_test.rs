@@ -2137,6 +2137,26 @@ fn test_tproxy_spec_deserialization_defaults_firewall_true() {
     );
 }
 
+/// A spec carrying the new `udp`/`udp_timeout` fields round-trips through
+/// serde with the values intact — the kebab-case config key (`udp-timeout`)
+/// and the snake_case spec field (`udp_timeout`) are different documents.
+#[test]
+fn test_tproxy_spec_deserialization_round_trips_udp() {
+    let spec: ListenerSpec =
+        serde_yaml::from_str("!tproxy\nsni: false\nfirewall: false\nudp: true\nudp_timeout: 30\n")
+            .unwrap();
+    assert_eq!(
+        spec,
+        ListenerSpec::TProxy {
+            sni: false,
+            firewall: false,
+            udp: true,
+            udp_timeout: 30,
+        },
+        "spec with `udp`/`udp_timeout` must deserialize"
+    );
+}
+
 /// `firewall:` on a non-tproxy listener is inert — parsed with a warning
 /// rather than silently changing that listener's behaviour. The warning is
 /// captured via a scoped subscriber; the config build is driven on a
@@ -2259,6 +2279,71 @@ tproxy-port: 7893
             );
         }
         other => panic!("expected a tproxy listener, got {other:?}"),
+    }
+}
+
+/// Issue #564 review: misplaced UDP/tproxy-sni keys warn rather than being
+/// silently ignored — top-level `udp:`/`udp-timeout:`, `udp:` on a
+/// non-tproxy/non-ss listener, `udp-timeout:` on ss, and `tproxy-sni:` on a
+/// non-tproxy entry.
+#[test]
+fn test_misplaced_udp_and_sni_keys_warn() {
+    let yaml = r#"
+udp: true
+udp-timeout: 30
+listeners:
+  - name: my-http
+    type: http
+    listen: 127.0.0.1:7890
+    udp: true
+    tproxy-sni: true
+  - name: my-ss
+    type: shadowsocks
+    listen: 127.0.0.1:8388
+    cipher: aes-128-gcm
+    password: pw
+    udp-timeout: 30
+"#;
+    #[derive(Clone)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+    let sink = Sink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(load_config_from_str(yaml))
+            .unwrap()
+    });
+    let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+    for needle in [
+        "udp: only meaningful under a `listeners:` entry",
+        "udp-timeout: only meaningful under a `listeners:`/`tun:` entry",
+        "my-http].udp: only meaningful on `type: tproxy`/`shadowsocks`",
+        "my-ss].udp-timeout: only meaningful on `type: tproxy`",
+        "my-http].tproxy-sni: only meaningful on `type: tproxy`",
+    ] {
+        assert!(logs.contains(needle), "missing warning '{needle}': {logs}");
     }
 }
 
@@ -2386,7 +2471,7 @@ listeners:
 /// silently accept v6 datagrams it cannot handle.
 #[tokio::test]
 async fn test_tproxy_udp_rejects_ipv6_listen() {
-    for listen in ["[::1]:5332", "[::]:5332"] {
+    for listen in ["[::1]:5332", "[::]:5332", "[::ffff:1.2.3.4]:5332"] {
         let yaml = format!(
             r#"
 listeners:

@@ -154,6 +154,11 @@ pub(super) mod flow {
                 .await
                 .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?,
         );
+        // `_route` exists to pin the route-table generation across the
+        // dial only — a long-lived flow must not keep its dial-time
+        // generation alive across config reloads (same contract as the
+        // TCP path).
+        drop(_route);
 
         // Dedicated reader task holding one persistent buffer — reads are
         // never cancelled, so a stream-framed conn (e.g. Trojan UoT) cannot
@@ -270,6 +275,13 @@ mod linux {
     /// Reply sockets idle longer than this are evicted — long-running
     /// gateways see unbounded distinct destinations otherwise.
     const REPLY_SOCKET_IDLE: Duration = Duration::from_secs(300);
+    /// Sweep idle reply sockets / stale bind-failure entries every this
+    /// many replies — the cap-only sweep would let a quiet gateway pin
+    /// every FD it ever bound.
+    const REPLY_SWEEP_INTERVAL: u32 = 256;
+    /// Hard bound on the bind-failure backoff map — a spray of failing
+    /// destinations must not grow it at inbound rate.
+    const MAX_REPLY_BIND_FAILURES: usize = 256;
 
     /// Flow-table entry. `queued_bytes` is shared with the flow task so the
     /// byte cap survives across channel enqueues (decremented on dequeue).
@@ -333,6 +345,13 @@ mod linux {
             }
 
             if let Some(entry) = self.flows.get(&key) {
+                // A dead flow keeps its last byte count — check liveness
+                // first or a saturated dead entry blackholes the tuple
+                // until the periodic sweep.
+                if entry.tx.is_closed() {
+                    self.flows.remove(&key);
+                    return self.dispatch_new(tunnel, data, key);
+                }
                 let len = data.len();
                 // Both bounds are explicit: datagram count AND queued bytes.
                 if entry.queued_bytes.load(Ordering::Relaxed) + len > FLOW_QUEUE_BYTES {
@@ -438,7 +457,16 @@ mod linux {
         // gateway doesn't pin one FD per historical destination forever.
         let mut sockets: HashMap<SocketAddr, (Arc<UdpSocket>, Instant)> = HashMap::new();
         let mut failed: HashMap<SocketAddr, Instant> = HashMap::new();
+        let mut sweep_countdown = REPLY_SWEEP_INTERVAL;
         while let Some((data, orig_dst, client)) = rx.recv().await {
+            // Periodic idle sweep — otherwise a gateway that never reaches
+            // the socket cap would pin every FD it ever bound forever.
+            sweep_countdown -= 1;
+            if sweep_countdown == 0 {
+                sweep_countdown = REPLY_SWEEP_INTERVAL;
+                sockets.retain(|_, (_, t)| t.elapsed() < REPLY_SOCKET_IDLE);
+                failed.retain(|_, t| t.elapsed() < REPLY_BIND_BACKOFF * 4);
+            }
             let sock = match sockets.get_mut(&orig_dst) {
                 Some(entry) => {
                     entry.1 = Instant::now();
@@ -476,10 +504,12 @@ mod linux {
                                         "tproxy UDP: cannot bind transparent reply socket to \
                                          {orig_dst} (replies to {client} dropped): {e}"
                                     );
-                                    failed.insert(orig_dst, Instant::now());
-                                    // Keep the backoff map bounded — entries
-                                    // past their backoff are dead weight.
-                                    failed.retain(|_, t| t.elapsed() < REPLY_BIND_BACKOFF * 4);
+                                    // Keep the backoff map bounded — a
+                                    // spray of failing destinations must
+                                    // not grow it at inbound rate.
+                                    if failed.len() < MAX_REPLY_BIND_FAILURES {
+                                        failed.insert(orig_dst, Instant::now());
+                                    }
                                     None
                                 }
                             }
@@ -682,6 +712,7 @@ mod linux {
                 if hdr.cmsg_level == libc::SOL_IP
                     && hdr.cmsg_type == IP_ORIGDSTADDR
                     && hdr.cmsg_len >= libc::CMSG_LEN(mem::size_of::<libc::sockaddr_in>() as _) as _
+                    && hdr.cmsg_len <= controllen as _
                 {
                     let sa = &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in);
                     if sa.sin_family as i32 == libc::AF_INET {
@@ -718,6 +749,30 @@ mod linux {
         SocketAddr::new(IpAddr::V4(ip), u16::from_be(sa.sin_port))
     }
 
+    /// Whether a kernel-recovered `orig_dst` is a plausible client
+    /// destination. Self-targeting: a datagram aimed at the listener's
+    /// own endpoint (stray direct traffic, or a deployer who also
+    /// steers OUTPUT) would otherwise self-reinject — the outbound
+    /// write lands back in this socket and each round spawns a fresh
+    /// flow until the cap. On a wildcard listen we cannot enumerate
+    /// local addresses, so ANY orig_dst sharing the listener port is
+    /// treated as self — a conservative over-block: a remote UDP
+    /// service on the same port number is unreachable through a
+    /// `0.0.0.0`-bound `udp: true` listener. Port 0, unspecified,
+    /// loopback, multicast, and broadcast can never be a real
+    /// LAN-client destination either.
+    fn is_safe_orig_dst(orig_dst: SocketAddr, local_addr: SocketAddr) -> bool {
+        let dst_ip = orig_dst.ip();
+        let self_target = orig_dst.port() == local_addr.port()
+            && (orig_dst == local_addr || local_addr.ip().is_unspecified());
+        !(orig_dst.port() == 0
+            || self_target
+            || dst_ip.is_unspecified()
+            || dst_ip.is_loopback()
+            || dst_ip.is_multicast()
+            || dst_ip == IpAddr::V4(Ipv4Addr::BROADCAST))
+    }
+
     /// The UDP receive loop: socket → flow dispatch. Exits on socket
     /// errors; idle-flow eviction is lazy (channel-close observed on the
     /// next datagram, or the periodic sweep).
@@ -732,36 +787,28 @@ mod linux {
         let (reply_tx, reply_rx) = mpsc::channel::<ReplyMsg>(REPLY_QUEUE);
         tokio::spawn(reply_dispatch(reply_rx));
 
-        let mut dispatch = FlowDispatch::new(reply_tx, max_flows, udp_timeout, in_name, in_port);
+        let mut dispatch =
+            FlowDispatch::new(reply_tx, max_flows, udp_timeout, in_name.clone(), in_port);
         let mut buf = vec![0u8; DATAGRAM_BUF];
         let local_addr = socket
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), in_port));
 
         loop {
-            let Some((n, client, orig_dst)) = recv_dgram(&socket, &mut buf).await? else {
-                continue;
+            let (n, client, orig_dst) = match recv_dgram(&socket, &mut buf).await {
+                Ok(Some(v)) => v,
+                Ok(None) => continue,
+                // A persistent socket error ends the UDP path while the
+                // TCP listener keeps running — never leave that degrade
+                // silent (the spawn discards the JoinHandle).
+                Err(e) => {
+                    warn!("tproxy UDP '{in_name}': recv loop terminating on error: {e}");
+                    return Err(e);
+                }
             };
             // Sanity-guard the recovered destination before it ever reaches
-            // a flow. Self-targeting: a datagram aimed at the listener's own
-            // endpoint (stray direct traffic, or a deployer who also steers
-            // OUTPUT) would otherwise self-reinject — the outbound write
-            // lands back in this socket and each round spawns a fresh flow
-            // until the cap. On a wildcard listen we cannot enumerate local
-            // addresses, so ANY orig_dst sharing the listener port is treated
-            // as self — a conservative over-block: a remote UDP service on
-            // the same port number is unreachable through a `0.0.0.0`-bound
-            // `udp: true` listener. Unspecified/loopback/multicast/broadcast
-            // can never be a real LAN-client destination either.
-            let dst_ip = orig_dst.ip();
-            let self_target = orig_dst.port() == local_addr.port()
-                && (orig_dst == local_addr || local_addr.ip().is_unspecified());
-            if self_target
-                || dst_ip.is_unspecified()
-                || dst_ip.is_loopback()
-                || dst_ip.is_multicast()
-                || dst_ip == IpAddr::V4(Ipv4Addr::BROADCAST)
-            {
+            // a flow — see `is_safe_orig_dst`.
+            if !is_safe_orig_dst(orig_dst, local_addr) {
                 debug!("tproxy UDP: dropping datagram to unsafe orig_dst {orig_dst}");
                 continue;
             }
@@ -1005,6 +1052,32 @@ mod linux {
                 extract_orig_dst(buf, mem::size_of::<libc::cmsghdr>() - 1),
                 None
             );
+        }
+
+        /// The recovered-destination sanity filter: plausible LAN targets
+        /// pass; self-target, port 0, and non-unicast addresses are rejected.
+        #[test]
+        fn is_safe_orig_dst_filters() {
+            let local = "127.0.0.1:7895".parse::<SocketAddr>().unwrap();
+            let wild = "0.0.0.0:7895".parse::<SocketAddr>().unwrap();
+            let ok = "203.0.113.9:443".parse::<SocketAddr>().unwrap();
+            assert!(is_safe_orig_dst(ok, local));
+            assert!(is_safe_orig_dst(ok, wild));
+            // Self-target: exact endpoint, and any same-port dst on wildcard.
+            assert!(!is_safe_orig_dst(local, local));
+            assert!(!is_safe_orig_dst("203.0.113.9:7895".parse().unwrap(), wild));
+            // Different-port dst on a specific bind is NOT self (but this
+            // particular dst is loopback, so still filtered overall).
+            assert!(!is_safe_orig_dst("127.0.0.1:80".parse().unwrap(), local));
+            // Port 0 / unspecified / multicast / broadcast.
+            for bad in [
+                "203.0.113.9:0",
+                "0.0.0.0:53",
+                "224.0.0.1:53",
+                "255.255.255.255:53",
+            ] {
+                assert!(!is_safe_orig_dst(bad.parse().unwrap(), wild), "{bad}");
+            }
         }
     }
 }

@@ -270,6 +270,10 @@ fi
 # UDP phase: the inet catch-all redirect would race phase 3's ip-family
 # nat output chain on host TCP traffic.
 nft delete table inet meow_ext_fw 2>/dev/null || true
+if nft list table inet meow_ext_fw >/dev/null 2>&1; then
+    echo "SETUP FAILURE: meow_ext_fw delete failed — phase 3 same-port test would race"
+    fail "ext_fw_cleanup"
+fi
 
 # ═══ Phase 3: `udp: true` — external UDP TPROXY (issue #564) ═══
 #
@@ -306,6 +310,9 @@ ip netns exec srv ip link set veth-dest up
 ip netns exec srv ip route add default via 10.89.0.254
 
 # fwmark → local delivery table (the deployer's policy-routing half).
+# `ip_forward` is deliberately NOT set: the fwmark→local-table route
+# converts intercepted packets to local delivery, so the data plane
+# never takes the forward path — don't "fix" this by enabling it.
 ip rule add fwmark 0x1 lookup 100
 ip route add local 0.0.0.0/0 dev lo table 100
 
@@ -333,7 +340,9 @@ done
 
 # External rules: TPROXY steers LAN UDP datagrams for 10.89.0.1:9998 to
 # meow's :7895, while an output-chain REDIRECT sends host TCP :9999 to the
-# SAME port — the issue's TCP/UDP same-port requirement.
+# SAME port — the issue's TCP/UDP same-port requirement. The nat chain
+# also pulls in nf_conntrack, which IP_ORIGDSTADDR depends on — removing
+# it would silently empty every cmsg and drop all UDP flows.
 nft -f - <<'NFT'
 table ip meow_udp_tproxy {
   chain pre {
@@ -354,7 +363,7 @@ NFT
 # fails for the wrong reason — surface it explicitly.
 if ! nft list table ip meow_udp_tproxy >/dev/null 2>&1; then
     echo "SETUP FAILURE: meow_udp_tproxy nft table not installed"
-    fail "udp_tproxy_ready"
+    fail "udp_nft_installed"
 fi
 
 meow -f /etc/meow-tproxy-udp.yaml > /tmp/meow-udp.log 2>&1 &
@@ -392,8 +401,10 @@ fi
 
 # Test 18: udp_flow_relay — a LAN client's datagram reaches the echo
 # server through the tunnel AND the reply returns. `nc -u` connect()s the
-# socket, so a reply only registers when its source is 10.89.0.1:9998 —
-# a correct echo is therefore also the transparent-source-identity proof.
+# socket, so a reply only registers when its source is 10.89.0.1:9998.
+# Caveat: an un-intercepted forward path would echo too — the source-
+# identity proof holds only given meow-transit, which udp_flow_logged
+# below establishes.
 UDP_RESPONSE=""
 UDP_RESPONSE=$(ip netns exec lan sh -c \
     'echo PING | timeout 5 nc -u -w3 10.89.0.1 9998' 2>/dev/null) || true
@@ -443,7 +454,17 @@ else
     fail "udp_rules_persist"
 fi
 
-# The harness owns everything external — tear it down explicitly.
+# Dump the live ruleset BEFORE teardown — a failure above needs the
+# evidence, not an empty table.
+echo ""
+echo "=== nftables state (pre-teardown) ==="
+nft list ruleset 2>/dev/null || echo "(empty)"
+echo "=== end nftables ==="
+
+# The harness owns everything external — tear it down explicitly. Kill
+# the echo loops first so a respawning `ip netns exec` can't busy-spin
+# against a vanishing namespace.
+kill "$UDP_ECHO_PID" "$TCP_SRV_ECHO_PID" 2>/dev/null || true
 nft delete table ip meow_udp_tproxy 2>/dev/null || true
 ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
 ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
@@ -451,7 +472,6 @@ ip netns del lan 2>/dev/null || true
 ip netns del srv 2>/dev/null || true
 ip link del veth-host 2>/dev/null || true
 ip link del veth-srv 2>/dev/null || true
-kill "$UDP_ECHO_PID" "$TCP_SRV_ECHO_PID" 2>/dev/null || true
 
 # --- Debug output ---
 echo ""
@@ -466,11 +486,6 @@ echo ""
 echo "=== meow log (udp tproxy) ==="
 cat /tmp/meow-udp.log 2>/dev/null || echo "(no log)"
 echo "=== end log ==="
-
-echo ""
-echo "=== nftables state ==="
-nft list ruleset 2>/dev/null || echo "(empty)"
-echo "=== end nftables ==="
 
 # Cleanup
 kill "$ECHO_PID" 2>/dev/null || true

@@ -59,9 +59,11 @@ routing-mark: 9527     # Linux: SO_MARK for loop avoidance
 
 ## How tproxy works
 
-- **REDIRECT-based, TCP only.** Traffic is redirected to the TProxy listener, and the
-  original destination is recovered via `SO_ORIGINAL_DST` (Linux) or a pf
-  state-table lookup (`DIOCNATLOOK`, macOS). UDP is not intercepted.
+- **REDIRECT-based; TCP only under the managed firewall.** Traffic is redirected to
+  the TProxy listener, and the original destination is recovered via
+  `SO_ORIGINAL_DST` (Linux) or a pf state-table lookup (`DIOCNATLOOK`, macOS).
+  With `firewall: false` + `udp: true`, Linux/IPv4 UDP TPROXY is an opt-in
+  (see below); otherwise UDP is not intercepted.
 - **Loop avoidance.** meow-rs's own outbound (the `DIRECT` adapter) is marked so the
   firewall skips it — on Linux via `SO_MARK` (`routing-mark`), on macOS via a UID bypass.
 - **Proxy-server bypass.** The IPs of your configured upstream proxy servers are

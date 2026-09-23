@@ -14,7 +14,7 @@ mixed-port: 7890
 # A named `listeners:` tproxy entry also accepts `firewall: false` to leave
 # all rule management to an external system (no nft/pfctl calls from meow).
 # The tproxy-port shorthand always stays managed — a top-level `firewall:`
-# key does not exist and would be silently ignored. Linux only: `udp: true`
+# key does not exist and is ignored (with a warning). Linux only: `udp: true`
 # enables UDP TPROXY on the same port (requires `firewall: false`, an IPv4
 # listen, and deployer-owned fwmark/policy routing). See docs/tproxy-gateway.md.
 #

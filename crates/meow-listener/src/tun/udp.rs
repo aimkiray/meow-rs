@@ -222,6 +222,10 @@ async fn relay_flow(
             .await
             .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?,
     );
+    // `_route` exists to pin the route-table generation across the dial
+    // only — a long-lived flow must not keep its dial-time generation
+    // alive across config reloads.
+    drop(_route);
 
     // Upstream replies are pumped by a dedicated reader task holding one
     // persistent buffer: reads are never cancelled, so a stream-framed
