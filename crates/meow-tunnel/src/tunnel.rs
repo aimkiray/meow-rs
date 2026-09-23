@@ -10,6 +10,7 @@ use meow_proxy::DirectAdapter;
 use parking_lot::{Mutex, RwLock};
 use smol_str::SmolStr;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use tracing::{debug, info, warn};
@@ -176,22 +177,48 @@ impl TunnelInner {
 
     /// Rewrite a fake-IP destination back to its real hostname before rule
     /// matching. Mirrors upstream `preHandleMetadata` in
-    /// `tunnel/tunnel.go`. Always called from `handle_tcp` / `handle_udp`
-    /// before [`Self::pre_resolve`]; outside fake-IP mode this is a no-op
-    /// except for the snooping-cache hostname fill-in.
+    /// `tunnel/tunnel.go`. Every inbound that can dial calls this before
+    /// [`Self::pre_resolve`]; outside fake-IP mode it is a no-op except
+    /// for the snooping-cache hostname fill-in.
     ///
     /// After a fake-IP rewrite the metadata has:
     /// - `metadata.host` ← real domain recovered from the pool reverse map
     /// - `metadata.dst_ip` ← `None`, so `pre_resolve` (or the adapter)
     ///   re-resolves to a real address via the configured DNS path
     ///
-    /// Returns [`PreHandleVerdict::Drop`] when `dst_ip` is inside the
+    /// Returns [`PreHandleVerdict::Drop`] when the destination is inside a
     /// fake-IP range with no live allocation and no recoverable hostname —
-    /// every caller must honour it (issue #618).
+    /// dialing the stale literal loops back into the TUN device and
+    /// self-saturates `max-connections`; every caller must honour the
+    /// verdict (issue #618, mihomo's "fake DNS record missing").
+    ///
+    /// Deliberate divergences from upstream `preHandleMetadata`:
+    /// - an IP literal in `host` is folded into `dst_ip` first
+    ///   (`fixMetadata` parity), so a domain-typed literal (SOCKS5
+    ///   `ATYP_DOMAIN "198.18.0.9"`) cannot slip past the range check;
+    /// - the range check includes the pool gateway/broadcast — upstream
+    ///   excludes them because its TUN device *is* the gateway, while
+    ///   ours is a separate subnet and a gateway dial loops the same;
+    /// - a sniffed name (`sniff_host`) rescues a stale flow — upstream
+    ///   re-runs `TCPSniff` on exactly this failure; promoting the
+    ///   observed name matches that rescue and additionally clears the
+    ///   stale `dst_ip` upstream would keep.
     pub fn pre_handle_metadata(&self, metadata: &mut Metadata) -> PreHandleVerdict {
-        let Some(ip) = metadata.dst_ip else {
+        // `fixMetadata` parity: an IP literal in `host` IS the
+        // destination, not a name — fold it into `dst_ip` so a
+        // domain-typed literal cannot slip past the range check below.
+        if metadata.dst_ip.is_none() {
+            if let Some(ip) = metadata_ip_literal(&metadata.host) {
+                metadata.dst_ip = Some(ip);
+                metadata.host = SmolStr::default();
+            }
+        }
+        // Unmap `::ffff:a.b.c.d` so a mapped literal still hits the
+        // fake-IP range check and v4 rules (`fixMetadata` parity).
+        let Some(ip) = metadata.dst_ip.map(|ip| ip.to_canonical()) else {
             return PreHandleVerdict::Continue;
         };
+        metadata.dst_ip = Some(ip);
         let resolver = self.resolver();
         if resolver.in_fake_ip_range(ip) {
             match resolver.reverse_lookup(ip) {
@@ -200,22 +227,28 @@ impl TunnelInner {
                     metadata.host = host;
                     metadata.dst_ip = None;
                 }
-                // In range with no live allocation — a stale or
-                // never-mapped fake IP (restart wiped the pool, wrap
-                // evicted the row, a literal connect into the range, or
-                // the allocation raced out mid-lookup). Dialing the
-                // literal loops the packet back into a fake-IP-routed
-                // inbound (TUN `auto-route`) and self-saturates
-                // `max-connections` (issue #618); mihomo drops the same
-                // class in `preHandleMetadata`.
-                None if metadata.host.is_empty() => {
-                    debug!("pre_handle_metadata: drop unmapped fake-ip {ip}");
-                    return PreHandleVerdict::Drop;
+                None => {
+                    // In range with no live allocation — a stale pool row
+                    // (expired, wrap-evicted, wiped by restart) or a
+                    // literal dial into the range. Rescue only via a real
+                    // name — listener-supplied `host`, else a sniffed one
+                    // (upstream re-runs `TCPSniff` on exactly this
+                    // failure). An IP literal is the stale address in
+                    // disguise: `CONNECT 198.18.0.9` leaves it in `host`.
+                    if metadata_ip_literal(&metadata.host).is_some() {
+                        metadata.host = SmolStr::default();
+                    }
+                    if metadata.host.is_empty()
+                        && metadata_ip_literal(&metadata.sniff_host).is_none()
+                    {
+                        metadata.host = metadata.sniff_host.clone();
+                    }
+                    if metadata.host.is_empty() {
+                        debug!("pre_handle_metadata: drop unmapped fake-ip {ip}");
+                        return PreHandleVerdict::Drop;
+                    }
+                    metadata.dst_ip = None;
                 }
-                // Stale literal but a name survived (e.g. sniffed SNI) —
-                // clear the fake IP so the adapter resolves the real
-                // name instead of looping it.
-                None => metadata.dst_ip = None,
             }
             return PreHandleVerdict::Continue;
         }
@@ -489,6 +522,7 @@ pub struct ResolvedTarget {
 
 /// Verdict from [`TunnelInner::pre_handle_metadata`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a Drop verdict must abort the flow — ignoring it dials a stale fake IP (issue #618)"]
 pub enum PreHandleVerdict {
     /// Proceed to rule matching and dispatch.
     Continue,
@@ -498,6 +532,17 @@ pub enum PreHandleVerdict {
     /// inbound (TUN `auto-route`) and self-saturates `max-connections`
     /// (issue #618); mihomo drops the same class in `preHandleMetadata`.
     Drop,
+}
+
+/// Parse a metadata `host`/`sniff_host` as an IP literal, tolerating the
+/// `[v6]` brackets HTTP listeners retain in `host` (`host_to_ip` strips
+/// them for `dst_ip` only, e.g. `CONNECT [fc00::5]:443`).
+fn metadata_ip_literal(s: &str) -> Option<IpAddr> {
+    s.parse::<IpAddr>().ok().or_else(|| {
+        s.strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .and_then(|s| s.parse::<IpAddr>().ok())
+    })
 }
 
 /// Route-table-backed [`TargetProbe`] for the match engines.

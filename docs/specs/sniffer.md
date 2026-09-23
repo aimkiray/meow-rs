@@ -129,7 +129,7 @@ Field semantics (ordered by spec impact, not alphabetically):
 | `override-destination` | bool | `false` | When `true`, a successful sniff overwrites `Metadata.host` in addition to `sniff_host`. Affects outbound TLS SNI / HTTP Host rewrites. See **Trojan cert-validation gotcha** below. |
 | `force-domain` | list<glob> | empty | Domains in this list bypass `parse-pure-ip`'s "skip if already a hostname" short-circuit. Useful for domains whose Happy-Eyeballs DNS resolved locally but you still want routed by the *real* SNI seen on the wire. |
 | `skip-domain` | list<glob> | empty | Domains in this list are never sniffed even if eligible. Applied *after* extraction — if the sniffed SNI matches a `skip-domain` entry, the result is discarded and `sniff_host` is left empty. |
-| `force-dns-mapping` | bool | `false` | **Accepted and ignored.** Upstream uses it to reuse fake-ip reverse mappings when sniffing. meow-rs implements fake-ip, but the sniffer never consults its reverse table — `Tunnel::pre_handle_metadata` already rewrites fake IPs back to their hostnames before sniffing — so the flag is inert; parser warns once on `true` and proceeds. Divergence documented here so config compat stays. |
+| `force-dns-mapping` | bool | `false` | **Accepted and ignored.** Upstream uses it to reuse fake-ip reverse mappings when sniffing. meow-rs implements fake-ip, but the sniffer never consults its reverse table — `TunnelInner::pre_handle_metadata` already rewrites fake IPs back to their hostnames after sniffing, before the dial — so the flag is inert; parser warns once on `true` and proceeds. Divergence documented here so config compat stays. |
 
 Glob matcher: reuse `meow-trie::DomainTrie` for `skip-domain` and
 `force-domain`. The existing trie already handles `+.example.com`,
@@ -184,9 +184,9 @@ warn-and-ignore vs hard-error on an unimplemented upstream knob.
 1. **`force-dns-mapping` accepted-and-ignored.** Upstream uses this to
    patch back fake-ip reverse lookups into the sniff result. meow-rs
    implements fake-ip (re-added in PR #64), but the sniffer has nothing
-   to patch back: `Tunnel::pre_handle_metadata` rewrites fake IPs to
-   their hostnames before the sniffer runs, so the reverse table is
-   already applied upstream of sniffing.
+   to patch back: `TunnelInner::pre_handle_metadata` rewrites fake IPs to
+   their hostnames downstream of sniffing, before rule matching and the
+   dial — so the reverse table is applied regardless of the sniff result.
    Parser emits a single `tracing::warn!` at load time and continues.
 2. **No `QUIC` sniffer.** Upstream ships one; we do not. Parser warns
    and ignores `sniff.QUIC.ports` if present.

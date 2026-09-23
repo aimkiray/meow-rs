@@ -199,3 +199,132 @@ async fn route_inbound_tcp_prefix_counts_as_upload() {
         prefix.len()
     );
 }
+
+/// Issue #618 caller-level pin: `route_inbound_tcp` must honour the
+/// `PreHandleVerdict::Drop` and return **before** rule matching or the
+/// adapter dial. A counting GLOBAL adapter proves the dial never runs —
+/// the stale fake IP under TUN `auto-route` would otherwise re-enter the
+/// device and self-saturate `max-connections`.
+#[tokio::test]
+async fn route_inbound_tcp_drop_verdict_never_dials() {
+    use meow_common::{
+        AdapterType, DnsMode, MeowError, Proxy, ProxyAdapter, ProxyConn, ProxyPacketConn,
+    };
+    use meow_dns::fakeip::{MemoryStore, Pool};
+    use meow_proxy::dialer::ProxyRegistry;
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingProxy {
+        dials: Arc<AtomicUsize>,
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyAdapter for CountingProxy {
+        fn name(&self) -> &str {
+            "counting"
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            "counting://local"
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(&self, _m: &Metadata) -> meow_common::Result<Box<dyn ProxyConn>> {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            Err(MeowError::Other("counting proxy dial".into()))
+        }
+        async fn dial_udp(&self, _m: &Metadata) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+            Err(MeowError::UdpNotSupported)
+        }
+    }
+
+    impl Proxy for CountingProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            vec![]
+        }
+    }
+
+    // Fake-IP resolver: 198.18.0.0/16 pool, nothing allocated.
+    let mut resolver = Resolver::new(
+        vec![],
+        vec![],
+        DnsMode::FakeIp,
+        DomainTrie::new(),
+        true,
+        true,
+    );
+    resolver.set_fakeip_v4(Arc::new(
+        Pool::new(
+            "198.18.0.0/16".parse().unwrap(),
+            Arc::new(MemoryStore::new(1024)),
+        )
+        .unwrap(),
+    ));
+    let tunnel = Tunnel::new(Arc::new(resolver));
+    tunnel.set_mode(meow_common::TunnelMode::Global);
+    let counter = Arc::new(AtomicUsize::new(0));
+    tunnel.update_proxies(
+        HashMap::from([(
+            "GLOBAL".into(),
+            Arc::new(CountingProxy {
+                dials: Arc::clone(&counter),
+                health: meow_common::ProxyHealth::default(),
+            }) as Arc<dyn Proxy>,
+        )]),
+        ProxyRegistry::default(),
+    );
+    let inner = Arc::clone(tunnel.inner());
+
+    // Stale fake IP — in range, never allocated → Drop → no dial.
+    let (mut s, _c) = loopback_pair().await;
+    let md = Metadata {
+        network: Network::Tcp,
+        conn_type: ConnType::Socks5,
+        dst_ip: Some(IpAddr::from([198, 18, 0, 9])),
+        dst_port: 443,
+        ..Default::default()
+    };
+    route_inbound_tcp(&inner, &mut s, md, &[]).await;
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "a Drop verdict must return before the adapter dial"
+    );
+
+    // Control: a real destination still reaches the dialer.
+    let (mut s, _c) = loopback_pair().await;
+    let md = Metadata {
+        network: Network::Tcp,
+        conn_type: ConnType::Socks5,
+        dst_ip: Some(IpAddr::from([127, 0, 0, 1])),
+        dst_port: 1,
+        ..Default::default()
+    };
+    route_inbound_tcp(&inner, &mut s, md, &[]).await;
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "a routable destination must still reach GLOBAL's dial_tcp"
+    );
+}

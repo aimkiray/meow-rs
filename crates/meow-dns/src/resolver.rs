@@ -1377,11 +1377,18 @@ impl Resolver {
             .is_some_and(|s| s.should_skip(host))
     }
 
+    /// Keep only addresses a dial can actually use: the enabled address
+    /// family, and never an address inside our own fake-IP ranges. An
+    /// upstream answer that lands inside a local pool range (a chained
+    /// fake-IP resolver sharing the range, or a poisoned answer) is not a
+    /// dialable target — handing it out re-enters fake-IP-routed inbounds
+    /// and re-sustains the #618 self-dial loop.
     fn filter_enabled_ips(&self, ips: &[IpAddr]) -> Option<Vec<IpAddr>> {
         let ips: Vec<_> = ips
             .iter()
             .copied()
             .filter(|ip| self.ipv6 || ip.is_ipv4())
+            .filter(|ip| !self.in_fake_ip_range(*ip))
             .collect();
         (!ips.is_empty()).then_some(ips)
     }
@@ -1682,6 +1689,9 @@ impl Resolver {
     }
 
     /// True if `ip` is an active fake-IP allocation (either family).
+    /// Stale or never-mapped addresses inside the range return `false` —
+    /// for range membership regardless of allocation state (e.g. deciding
+    /// whether a destination is dialable) see [`Self::in_fake_ip_range`].
     pub fn is_fake_ip(&self, ip: IpAddr) -> bool {
         if let Some(pool) = &self.fakeip_v4 {
             if pool.is_fake_ip(ip) {
@@ -2732,6 +2742,98 @@ mod tests {
             .expect("fake-IP synthesis");
         assert!(resolver.is_fake_ip(ip));
         assert_eq!(ttl, DEFAULT_FAKE_IP_TTL);
+    }
+
+    /// `in_fake_ip_range` vs `is_fake_ip`: range membership ignores
+    /// allocation state — the distinction issue #618's drop relies on.
+    #[tokio::test]
+    async fn in_fake_ip_range_covers_unallocated_addresses() {
+        use crate::fakeip::MemoryStore;
+        let mut resolver = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::FakeIp,
+            DomainTrie::new(),
+            true,
+            true,
+        );
+        resolver.set_fakeip_v4(Arc::new(
+            Pool::new(
+                "198.18.0.0/16".parse().unwrap(),
+                Arc::new(MemoryStore::new(1024)),
+            )
+            .unwrap(),
+        ));
+        resolver.set_fakeip_v6(Arc::new(
+            Pool::new(
+                "fc00::/64".parse().unwrap(),
+                Arc::new(MemoryStore::new(1024)),
+            )
+            .unwrap(),
+        ));
+
+        let live = resolver.lookup_ipv4("example.com").await.unwrap();
+        assert!(resolver.is_fake_ip(live));
+        assert!(resolver.in_fake_ip_range(live));
+
+        // In range, never allocated — is_fake_ip false, in_range true.
+        for stale in ["198.18.0.0", "198.18.0.1", "198.18.255.255"] {
+            let ip: IpAddr = stale.parse().unwrap();
+            assert!(!resolver.is_fake_ip(ip), "{stale} is not allocated");
+            assert!(resolver.in_fake_ip_range(ip), "{stale} is in range");
+        }
+
+        // v6 pool arm, and out-of-range literals.
+        assert!(resolver.in_fake_ip_range("fc00::9".parse().unwrap()));
+        assert!(!resolver.in_fake_ip_range("8.8.8.8".parse().unwrap()));
+        assert!(!resolver.in_fake_ip_range("fd00::1".parse().unwrap()));
+    }
+
+    /// An upstream answer inside a local fake-IP range is not a dialable
+    /// target — `resolve_ips`/`resolve_ips_local` filter it via
+    /// `filter_enabled_ips`, so a rescued or poisoned name can never
+    /// resolve back into the range and re-sustain the #618 loop.
+    #[tokio::test]
+    async fn resolve_ips_filters_in_range_answers() {
+        use crate::fakeip::MemoryStore;
+        let mut resolver = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::FakeIp,
+            DomainTrie::new(),
+            true,
+            true,
+        );
+        resolver.set_fakeip_v4(Arc::new(
+            Pool::new(
+                "198.18.0.0/16".parse().unwrap(),
+                Arc::new(MemoryStore::new(1024)),
+            )
+            .unwrap(),
+        ));
+
+        let fake = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 9));
+        let real = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+
+        // Mixed answer: the in-range address is stripped, the real one
+        // survives — both on the cache-only and the full resolve path.
+        resolver
+            .cache
+            .put("mixed.test", &[fake, real], Duration::from_secs(300));
+        assert_eq!(
+            resolver.resolve_ips_local("mixed.test"),
+            Some(vec![real]),
+            "in-range answer must be filtered, not dialed"
+        );
+        assert_eq!(resolver.resolve_ips("mixed.test").await, Some(vec![real]));
+
+        // All-filtered: report unresolvable rather than hand out the
+        // fake IP the dial would loop on.
+        resolver
+            .cache
+            .put("poisoned.test", &[fake], Duration::from_secs(300));
+        assert_eq!(resolver.resolve_ips_local("poisoned.test"), None);
+        assert_eq!(resolver.resolve_ips("poisoned.test").await, None);
     }
 
     #[test]

@@ -209,7 +209,7 @@ fn handle_client_datagram(
     if dst_ip.is_none() && host.is_empty() {
         return Err("UDP request with neither IP nor domain".into());
     }
-    let metadata = Metadata {
+    let mut metadata = Metadata {
         network: Network::Udp,
         conn_type: ConnType::Socks5,
         src_ip: Some(client.ip()),
@@ -223,6 +223,19 @@ fn handle_client_datagram(
         ..Default::default()
     };
 
+    // Drop an unmapped fake-IP destination before it spawns a session —
+    // a stale-datagram flood would otherwise churn a spawn+evict per
+    // packet (issue #618). The call also folds a domain-typed literal
+    // (`ATYP_DOMAIN "198.18.0.9"`) into `dst_ip` and rescues via a
+    // surviving name; it is idempotent, and the session task re-checks.
+    if matches!(
+        inner.pre_handle_metadata(&mut metadata),
+        meow_tunnel::PreHandleVerdict::Drop
+    ) {
+        debug!("socks5 udp: drop datagram to unmapped fake-ip {dst_ip:?}:{dst_port}");
+        return Ok(());
+    }
+
     // Domain-form destinations key the session by `host:port`: resolution
     // happens inside the session task, so a slow lookup cannot stall the
     // read loop, and the session pins the resolved address for its life
@@ -232,7 +245,7 @@ fn handle_client_datagram(
     // slightly finer dedup granularity. The key is built from the
     // lowercased `metadata.host` so `EXAMPLE.com` and `example.com` share
     // one session.
-    let key = match dst_ip {
+    let key = match metadata.dst_ip {
         Some(ip) => SessionKey::Addr(SocketAddr::new(ip, dst_port)),
         None => SessionKey::Host(metadata.host.clone(), dst_port),
     };
