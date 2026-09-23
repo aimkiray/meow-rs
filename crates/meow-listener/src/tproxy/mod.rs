@@ -460,6 +460,15 @@ async fn handle_tproxy_conn(
     );
 
     let inner = tunnel.inner();
+    // Fake-IP → host rewrite / unmapped-fake-IP drop (issue #618). Runs
+    // after the sniffer + snoop recovery above so a still-known host
+    // rescues the flow instead of dropping it.
+    if matches!(
+        inner.pre_handle_metadata(&mut metadata),
+        meow_tunnel::PreHandleVerdict::Drop
+    ) {
+        return Err("unmapped fake-ip destination".into());
+    }
     let admission = inner.tcp_admission();
     let Some(ResolvedTarget {
         adapter: proxy,
