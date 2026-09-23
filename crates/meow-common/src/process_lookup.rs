@@ -87,10 +87,13 @@ mod platform {
         map: std::sync::Arc<SockTable>,
     }
 
+    /// inode → (cached at, lookup result) — `None` caches a miss so a
+    /// short-lived socket's vanished inode isn't re-scanned every TTL.
+    type InodeCache = HashMap<u64, (Instant, Option<(u32, String, String)>)>;
+
     /// Slots indexed `[network as usize][is_ipv6 as usize]`.
     static SOCK_TABLES: OnceLock<Mutex<[[Option<CachedTable>; 2]; 2]>> = OnceLock::new();
-    static INODE_MAP: OnceLock<Mutex<HashMap<u64, (Instant, Option<(u32, String, String)>)>>> =
-        OnceLock::new();
+    static INODE_MAP: OnceLock<Mutex<InodeCache>> = OnceLock::new();
 
     pub fn find_process(network: Network, local: SocketAddr) -> Option<ProcessInfo> {
         let (table_idx, path, ipv6) = match (network, local.is_ipv4()) {
