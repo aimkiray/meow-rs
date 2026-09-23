@@ -261,7 +261,7 @@ cargo test --lib --bin meow \
   --test config_persistence_test --test systemd_config_test \
   --test trojan_integration --test vless_config_test --test vless_integration \
   --test v2ray_plugin_integration --test pre_resolve_test \
-  --test tls_test --test ws_test --test crate_invariants_test \
+  --test tls_test --test boring_tls_test --test ws_test \
   --test crate_invariants_test
 
 echo "✅ 所有检查通过！"

@@ -13,6 +13,11 @@ Team-lead chose **Option A**: use `boring` + `tokio-boring` (BoringSSL Rust bind
 primary TLS backend for any connection that has `client-fingerprint` or `ech-opts` set.
 `tokio-rustls` remains for all other connections (the common case).
 
+> **As-built note:** the design below predates the v1 cutover — BoringSSL is now the *only*
+> TLS backend (the rustls path and the `boring-tls` dispatch gate were removed), and the
+> "deferred" DNS-ECH / retry-config items below have since shipped. See
+> `ech-utls-status.md` for the authoritative current state.
+
 ---
 
 ## 2. Crate / dependency changes
@@ -21,8 +26,8 @@ primary TLS backend for any connection that has `client-fingerprint` or `ech-opt
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `boring` | `5.0.2` | BoringSSL bindings — `SslConnectorBuilder`, cipher/curve/extension APIs |
-| `tokio-boring` | `5.0.0` | Tokio async wrapper around boring — `SslConnector`, `SslStream` |
+| `boring` | `5.2` | BoringSSL bindings — `SslConnectorBuilder`, cipher/curve/extension APIs |
+| `tokio-boring` | `5.2` | Tokio async wrapper around boring — `SslConnector`, `SslStream` |
 
 Both are Cloudflare-maintained. License: OpenSSL License + ISC (permissive; compatible with
 the workspace's MIT license).
@@ -44,8 +49,8 @@ rustls path with no code changes.
 boring-tls = ["dep:boring", "dep:tokio-boring"]
 
 [dependencies]
-boring     = { version = "5.0.2", optional = true }
-tokio-boring = { version = "5.0.0", optional = true }
+boring     = { version = "5.2", optional = true }
+tokio-boring = { version = "5.2", optional = true }
 ```
 
 ---
@@ -65,7 +70,8 @@ pub ech: Option<EchOpts>,
 ### New enum
 
 ```rust
-/// Source of the ECH config list. DNS sourcing is deferred (see §9).
+/// Source of the ECH config list. DNS sourcing is resolved upstream of
+/// this layer (see §9), so the enum only ever carries an inline list.
 pub enum EchOpts {
     /// Inline base64-decoded ECH config list bytes.
     /// YAML key: `ech-opts.config` (base64 string, decoded by meow-config before
@@ -74,17 +80,18 @@ pub enum EchOpts {
 }
 ```
 
-DNS-sourced ECH (`ech-opts.enable = true` without `ech-opts.config`) is **deferred** until
-`meow-dns` gains SVCB/HTTPS record query support. The enum is defined now so the config schema
-is stable.
+DNS-sourced ECH (`ech-opts.enable = true` without `ech-opts.config`) is **implemented** at the
+config layer: `meow_config::ech_dns::preresolve_ech` queries the HTTPS (RR 65) record via
+`hickory-resolver` and writes the wire-format `ECHConfigList` back as base64, keeping the enum
+single-variant so the `TlsConfig` schema stays stable.
 
 ### YAML keys (mirror Go upstream)
 
 | YAML key | TlsConfig field | Notes |
 |----------|----------------|-------|
-| `ech-opts.enable` | triggers `ech: Some(EchOpts::Config(...))` when `config` also set | `enable: true` alone (DNS path) is a parse error in v1 |
+| `ech-opts.enable` | triggers `ech: Some(EchOpts::Config(...))` when `config` also set | `enable: true` alone triggers the DNS HTTPS-record fetch |
 | `ech-opts.config` | `EchOpts::Config(base64_decoded_bytes)` | decoded by meow-config |
-| `ech-opts.query-server-name` | deferred | reserved, parse-and-ignore in v1 |
+| `ech-opts.query-server-name` | DNS lookup name override | honored by `meow_config::ech_dns` |
 | `client-fingerprint` | `fingerprint: Option<String>` | existing field, same YAML key |
 
 ---
@@ -296,7 +303,7 @@ Rationale:
   `rustls-tls` / `native-tls` split).
 
 Behaviour when `boring-tls` is **not** enabled and `fingerprint` or `ech` is set:
-- `fingerprint`: existing `warn_fingerprint_once` stub continues to run (no regression).
+- `fingerprint`: the deferred-profile warn in `build_connector` continues to run (no regression).
 - `ech`: `TlsLayer::new` returns `Err(TransportError::Config("ech-opts requires the boring-tls
   feature"))`.
 
@@ -313,4 +320,3 @@ profile or via a workspace feature.
 | `randomized` custom profiles | Requires per-connection weight-sampled extension list; deferred until boring extension-level API is better understood |
 | Deprecated fingerprints (`chrome_psk`, etc.) | Actively discouraged upstream; not implemented |
 | `360`, `qq` fingerprints | Low demand outside China-specific deployments; deferred |
-| Windows CI build verification | boring-sys Windows support exists but untested in this repo |

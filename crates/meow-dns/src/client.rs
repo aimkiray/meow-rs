@@ -1179,11 +1179,11 @@ fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// Build the TLS layer for one DoT/DoH exchange.
 ///
 /// Goes through `meow_transport::tls::TlsLayer`, so DNS uses the same
-/// backend as every proxy handshake in the binary (BoringSSL by default,
-/// rustls when `boring-tls` is not compiled in).  Both backends memoise
-/// their per-process TLS context keyed on `(alpn, skip_cert_verify)`, so
-/// this is a hash lookup plus a refcount bump per query — negligible next
-/// to the fresh TCP + TLS handshake each exchange performs.
+/// BoringSSL backend as every proxy handshake in the binary.  The backend
+/// memoises its per-process TLS context keyed on
+/// `(fingerprint, curves, alpn, skip_cert_verify)`, so this is a hash
+/// lookup plus a refcount bump per query — negligible next to the fresh
+/// TCP + TLS handshake each exchange performs.
 #[cfg(feature = "encrypted")]
 fn tls_layer(sni: &str, alpn: &str) -> Result<TlsLayer, ClientError> {
     let config = TlsConfig {

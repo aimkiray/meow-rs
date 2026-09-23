@@ -128,34 +128,47 @@ impl OutAssembler {
     }
 }
 
-/// Whether the ClientHello's `supported_groups` extension offers the
-/// hybrid-PQ `X25519MLKEM768` key share (group id 0x11ec).  v2 asserts
-/// `false` (upstream strips it — `BuildRemovedX25519MLKEM768HandshakeState`,
-/// a hybrid-PQ share breaks v2 servers; the vendored BoringSSL offers it
-/// by default via boring-sys's boring-pq.patch, so the production pin in
-/// `tls_config_for` is what keeps this green), while v3 asserts `true` to
-/// keep the v2 check non-vacuous: a boring default flip shows up in the
-/// *positive* v3 assertion as well.
-fn ch_offers_mlkem(record: &[u8]) -> bool {
+/// Group ids for the hybrid-PQ key shares the vendored BoringSSL offers by
+/// default via boring-sys's boring-pq.patch (`X25519MLKEM768`,
+/// `P256Kyber768Draft00`).  The v2 pin must strip both; the ML-KEM one is
+/// the load-bearing assert (upstream's strip targets it by name).
+const GROUP_X25519_MLKEM768: u16 = 0x11ec;
+const GROUP_P256_KYBER768_DRAFT00: u16 = 0xfe32;
+
+/// Whether the ClientHello's `supported_groups` extension offers `group`.
+/// v2 asserts `false` for the hybrid-PQ groups (upstream strips them —
+/// `BuildRemovedX25519MLKEM768HandshakeState`; a hybrid-PQ share breaks
+/// v2 servers, and the production pin in `tls_config_for` is what keeps
+/// this green), while v3 asserts `true` for ML-KEM to keep the v2 check
+/// non-vacuous: a boring default flip shows up in the *positive* v3
+/// assertion as well.
+fn ch_offers_group(record: &[u8], group: u16) -> bool {
+    assert!(record.len() >= 6, "record too short for a handshake header");
     assert_eq!(record[0], 22, "expected a TLS handshake record");
     assert_eq!(record[5], 1, "expected a ClientHello handshake message");
     let sid_len_index = SERVER_RANDOM_INDEX + 32;
+    assert!(
+        record.len() > sid_len_index,
+        "record too short for session-id length"
+    );
     let mut i = sid_len_index + 1 + record[sid_len_index] as usize;
+    assert!(record.len() >= i + 2, "record too short for cipher-suites");
     let cs_len = u16::from_be_bytes([record[i], record[i + 1]]) as usize;
     i += 2 + cs_len;
+    assert!(record.len() > i, "record too short for compression methods");
     i += 1 + record[i] as usize; // compression methods
+    assert!(record.len() >= i + 2, "record too short for extensions");
     let ext_len = u16::from_be_bytes([record[i], record[i + 1]]) as usize;
     let ext_end = i + 2 + ext_len;
     i += 2;
-    while i + 4 <= ext_end {
+    while i + 4 <= ext_end && i + 4 <= record.len() {
         let ty = u16::from_be_bytes([record[i], record[i + 1]]);
         let el = u16::from_be_bytes([record[i + 2], record[i + 3]]) as usize;
         if ty == 0x000a {
             // supported_groups
-            return record[i + 4..i + 4 + el]
-                .as_chunks::<2>()
-                .0
-                .contains(&[0x11, 0xec]);
+            let end = (i + 4 + el).min(record.len());
+            let [hi, lo] = group.to_be_bytes();
+            return record[i + 4..end].as_chunks::<2>().0.contains(&[hi, lo]);
         }
         i += 4 + el;
     }
@@ -284,11 +297,11 @@ async fn v3_relay_server(mut tcp: TcpStream, conn: &mut ServerConnection, passwo
     // First client record must be the tagged ClientHello.
     let ch = read_record(&mut tcp).await.unwrap();
     // v3 carries no curves pin — the default BoringSSL hello must still
-    // offer ML-KEM, which keeps the v2 `!ch_offers_mlkem` assertion
+    // offer ML-KEM, which keeps the v2 `!ch_offers_group` assertion
     // meaningful (it would also pass vacuously if the default stopped
     // offering it).
     assert!(
-        ch_offers_mlkem(&ch),
+        ch_offers_group(&ch, GROUP_X25519_MLKEM768),
         "unpinned v3 ClientHello should offer X25519MLKEM768 by default"
     );
     verify_ch_tag(&ch, password);
@@ -415,8 +428,12 @@ async fn v2_end_to_end() {
             let rec = read_record(&mut tcp).await.unwrap();
             if first_rec.take().is_some() {
                 assert!(
-                    !ch_offers_mlkem(&rec),
+                    !ch_offers_group(&rec, GROUP_X25519_MLKEM768),
                     "v2 ClientHello must not offer X25519MLKEM768"
+                );
+                assert!(
+                    !ch_offers_group(&rec, GROUP_P256_KYBER768_DRAFT00),
+                    "v2 ClientHello must not offer P256Kyber768Draft00"
                 );
             }
             conn.read_tls(&mut &rec[..]).unwrap();

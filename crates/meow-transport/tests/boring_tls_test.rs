@@ -1169,6 +1169,104 @@ async fn c17_non_ech_failure_preserves_stored_ech_config() {
     );
 }
 
+// ─── C18: an SSL-code non-ECH failure must not poison the stored ECH config ──
+//
+// Sibling of C17 covering the gate's *discriminating* conjunct.  The C17
+// reset driver produces `code() == SYSCALL`, so a gate regressed to
+// `ssl().is_some() && code() == SSL` (dropping the `ECH_REJECTED` reason
+// match) would still pass C17.  A certificate-verify failure is the common
+// real-world failure that produces `code() == SSL` *without* `ECH_REJECTED`
+// (`SSL_R_CERTIFICATE_VERIFY_FAILED`):
+//   1. `skip_cert_verify: false` + stored ECH config → self-signed server:
+//      mid-handshake `Failure`, `code() == SSL`, no `ECH_REJECTED` in the
+//      reason — the retry-configs read must NOT run.
+//   2. A second connect through the same `TlsLayer` must still reach the
+//      handshake (and fail on cert verify again).  A poisoned `self.ech`
+//      would instead fail earlier at `set_ech_config_list` and surface
+//      `ConnectTypedError::Transport`.
+#[tokio::test]
+async fn c18_cert_verify_failure_preserves_stored_ech_config() {
+    install_crypto_provider();
+
+    let (server_config_list, server_keys) =
+        support::loopback::EchKeyPairGenerator::generate().expect("ECH keypair");
+    let (cert_der, key_der, _, _) = gen_cert(&["loopback.test"]);
+
+    // A plain (non-ECH) BoringSSL server presenting a self-signed cert —
+    // cert verification fails with `SSL_R_CERTIFICATE_VERIFY_FAILED`, an
+    // `ErrorCode::SSL` failure that is not an ECH rejection.
+    let (addr1, _info1) =
+        support::loopback::spawn_boring_server(support::loopback::BoringServerOptions {
+            cert_der: cert_der.clone(),
+            key_der: key_der.clone_key(),
+            server_alpn: vec![],
+            require_client_cert_ca: None,
+            ech_config: None,
+        })
+        .await;
+    let (addr2, _info2) =
+        support::loopback::spawn_boring_server(support::loopback::BoringServerOptions {
+            cert_der,
+            key_der,
+            server_alpn: vec![],
+            require_client_cert_ca: None,
+            ech_config: None,
+        })
+        .await;
+    drop(server_keys); // the client never reaches a real ECH handshake here
+
+    let config = TlsConfig {
+        skip_cert_verify: false,
+        sni: Some("loopback.test".into()),
+        ech: Some(EchOpts::Config(server_config_list)),
+        ..TlsConfig::new("loopback.test")
+    };
+    let layer = TlsLayer::new(&config).expect("TlsLayer::new");
+
+    // Attempt 1 — cert verify fails mid-handshake: `Handshake` variant,
+    // `ssl().is_some()`, and — the arm C17 cannot produce —
+    // `code() == SSL` without `ECH_REJECTED`.
+    let tcp1 = tokio::net::TcpStream::connect(addr1)
+        .await
+        .expect("TCP to server 1");
+    let Err(ConnectTypedError::Handshake(e1)) = layer.connect_typed(tcp1).await else {
+        panic!("cert-verify failure must surface as a Handshake error");
+    };
+    assert!(
+        e1.ssl().is_some(),
+        "expected a mid-handshake Failure carrying the aborted Ssl"
+    );
+    assert_eq!(
+        e1.code(),
+        Some(boring::ssl::ErrorCode::SSL),
+        "cert-verify failure must carry SSL_ERROR_SSL — the gate's \
+         discriminating conjunct; a SYSCALL failure (as in C17) cannot \
+         detect a missing ECH_REJECTED reason check"
+    );
+    assert!(
+        !e1.to_string().contains("ECH_REJECTED"),
+        "test premise: cert-verify failure must not be an ECH rejection"
+    );
+
+    // Attempt 2 — reaching the handshake proves `set_ech_config_list`
+    // still parses the stored config: a poisoned `self.ech` fails earlier
+    // with `ConnectTypedError::Transport`.
+    let tcp2 = tokio::net::TcpStream::connect(addr2)
+        .await
+        .expect("TCP to server 2");
+    let Err(ConnectTypedError::Handshake(e2)) = layer.connect_typed(tcp2).await else {
+        panic!(
+            "stored ECH config must still parse — connect must reach the \
+                handshake and fail on cert verify, not on set_ech_config_list"
+        );
+    };
+    assert!(
+        e2.ssl().is_some(),
+        "second connect must reach the handshake — a poisoned stored ECH \
+         config would fail at setup before any handshake"
+    );
+}
+
 // ─── D1: TLS handshake over a flush-pending stream ────────────────────────────
 //
 // Regression test for the boring 4.22.0 `BIO_CTRL_FLUSH` retry-flag bug

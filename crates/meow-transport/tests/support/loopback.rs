@@ -1069,8 +1069,9 @@ fn rustls_key_to_boring(
 /// 4. Sends [`BoringConnInfo`] through the oneshot channel.
 /// 5. Drains the connection until EOF.
 ///
-/// Used for fingerprint (C1–C7) and non-ECH tests. For ECH-capable servers
-/// (C12–C15), use [`spawn_ech_server`] instead.
+/// Used for fingerprint (C1–C7) and non-ECH tests (C18 included — it only
+/// needs a plain TLS server to fail cert verification against).  For
+/// ECH-capable servers (C12–C17), use [`spawn_ech_server`] instead.
 ///
 /// # Panics
 ///
@@ -1190,7 +1191,7 @@ pub async fn spawn_ech_server(
     std::net::SocketAddr,
     tokio::sync::oneshot::Receiver<BoringConnInfo>,
 ) {
-    // Expect ech_config to be present; C13–C15 tests always provide it.
+    // Expect ech_config to be present; ECH tests always provide it.
     let ech_cfg = opts
         .ech_config
         .expect("spawn_ech_server: ech_config must be present for ECH tests");

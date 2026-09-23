@@ -57,7 +57,9 @@ use boring_backend::{BoringInner, LazyBoringInner};
 /// Source of the ECH config list.
 ///
 /// DNS-sourced ECH (`ech-opts.enable = true` without `ech-opts.config`) is
-/// deferred until `meow-dns` gains SVCB/HTTPS record support.
+/// resolved by `meow_config::ech_dns` before this layer is built — the DNS
+/// HTTPS-record answer lands here as `Config` bytes, so the enum only ever
+/// carries an inline list.
 #[derive(Debug, Clone)]
 pub enum EchOpts {
     /// Inline ECH config list bytes, base64-decoded by `meow-config` before
@@ -156,7 +158,7 @@ pub struct TlsConfig {
     /// ECH config source.
     ///
     /// `Some(EchOpts::Config(bytes))` → inline ECH config list.
-    /// DNS-sourced ECH is deferred; see [`EchOpts`].
+    /// DNS-sourced ECH arrives here already resolved; see [`EchOpts`].
     ///
     /// Applied per connection by BoringSSL; a server `ech_required`
     /// rejection rotates the stored config to the supplied `retry_configs`.

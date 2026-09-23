@@ -30,6 +30,12 @@ struct FingerprintParams {
     /// not controlled by this string.
     cipher_list: &'static str,
     /// OpenSSL curve-list string (e.g. `"X25519:P-256:P-384"`).
+    /// Invariant: every shipped profile must stay hybrid-PQ-free — the
+    /// shadow-tls v2 pin lifts for *known* fingerprints on the assumption
+    /// that a resolved profile never offers `X25519MLKEM768` /
+    /// `P256Kyber768Draft00` (upstream strips them surgically; we have no
+    /// per-group strip).  A future ML-KEM-carrying parrot would need the
+    /// pin decision in `tls_config_for` revisited.
     curves_list: &'static str,
     /// Inject GREASE values in ciphers, extensions, and named groups.
     /// Also enables ECH GREASE automatically.
@@ -240,9 +246,8 @@ const EDGE: FingerprintParams = FingerprintParams {
 
 /// Resolve a fingerprint string to its `FingerprintParams`.
 ///
-/// Returns `None` for deferred/unknown profiles — caller should fall through
-/// to `warn_fingerprint_once` (not applicable in the boring path, but kept
-/// for exhaustiveness).
+/// Returns `None` for deferred/unknown profiles — `build_connector` warns
+/// and falls back to BoringSSL defaults for those.
 fn resolve_fingerprint(fp: &str) -> Option<&'static FingerprintParams> {
     if fp == "random" {
         // Weighted random at construction: chrome(6) safari(3) ios(2) firefox(1).
@@ -409,10 +414,11 @@ impl BoringInner {
     /// Everything that can make [`Self::build_connector`] fail is checked
     /// here so `TlsLayer::new` reports it at startup: `sni`, ALPN entry lengths (the wire format
     /// carries a one-byte length prefix), and — for the rare configs that
-    /// carry `additional_roots` / `client_cert` — a full dry-run build, since
-    /// DER/PEM parse errors are only discoverable by parsing.  Those configs
-    /// bypass the connector cache anyway, so the dry run costs one extra
-    /// `SSL_CTX` at startup and nothing on the dial path.
+    /// carry `additional_roots` / `client_cert` / `curves` — a full dry-run
+    /// build, since DER/PEM parse errors and an unparsable curve list are
+    /// only discoverable by building.  The first two bypass the connector
+    /// cache anyway; `curves` configs pay one extra `SSL_CTX` at startup
+    /// and nothing on the dial path.
     pub(super) fn validate(config: &TlsConfig) -> Result<()> {
         if config.sni.is_none() {
             return Err(TransportError::Config(
@@ -461,7 +467,10 @@ impl BoringInner {
                 "ech requires TLS 1.3 but max_version caps at TLS 1.2".into(),
             ));
         }
-        if !config.additional_roots.is_empty() || config.client_cert.is_some() {
+        if !config.additional_roots.is_empty()
+            || config.client_cert.is_some()
+            || config.curves.is_some()
+        {
             Self::build_connector(config)?;
         }
         Ok(())
@@ -1085,6 +1094,43 @@ mod tests {
         // Re-asking for an existing key hits the cache.
         let a2 = shared_connector(&TlsConfig::new("i.example")).expect("build a2");
         assert!(same_ctx(&a, &a2));
+    }
+
+    /// The shadow-tls v2 pin lifts for *known* fingerprints on the
+    /// assumption that every shipped profile is hybrid-PQ-free — upstream
+    /// strips `X25519MLKEM768`/`P256Kyber768Draft00` surgically after uTLS
+    /// shaping, which our whole-list `curves` override cannot express.  If
+    /// a future parrot adds a PQ group, this test fails loudly and the pin
+    /// decision in `meow-proxy`'s `tls_config_for` must be revisited.
+    #[test]
+    fn all_named_profiles_are_hybrid_pq_free() {
+        for name in [
+            "chrome",
+            "chrome120",
+            "firefox",
+            "firefox120",
+            "safari",
+            "safari16",
+            "ios",
+            "android",
+            "edge",
+        ] {
+            let p = resolve_named_fingerprint(name).expect("named profile");
+            assert!(
+                !p.curves_list.contains("MLKEM") && !p.curves_list.contains("KYBER"),
+                "profile {name} carries a hybrid-PQ group ({}) — the \
+                 shadow-tls v2 conditional pin would lift and leak it",
+                p.curves_list
+            );
+        }
+        // The `random` pool must be covered by the same invariant.
+        for p in [&CHROME, &SAFARI, &IOS, &FIREFOX] {
+            assert!(
+                !p.curves_list.contains("MLKEM") && !p.curves_list.contains("KYBER"),
+                "random-pool profile carries a hybrid-PQ group ({})",
+                p.curves_list
+            );
+        }
     }
 
     /// Knobs for `make_cert` — keep the common leaf case terse.
