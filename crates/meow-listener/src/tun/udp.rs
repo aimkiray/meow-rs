@@ -185,7 +185,7 @@ pub(super) async fn run_udp(
         }
 
         let key = (src, dst);
-        let data = match flows.get_mut(&key) {
+        let data = match flows.get(&key) {
             Some(entry) => {
                 entry.last_activity.store(activity_ms(), Ordering::Relaxed);
                 match entry.tx.try_send(data) {
@@ -500,15 +500,22 @@ mod tests {
         );
         // A live flow whose shared stamp is refreshed by an upstream reply
         // must outrank a stale one (issue #515: reply-side activity counts).
-        let (mut flows, _keepers) = seeded_table(2, 0);
+        // At cap with the OLDEST entry stamped fresh, the victim must move
+        // to the next-oldest — below cap this assertion would be vacuous.
+        let (mut flows, _keepers) = seeded_table(MAX_FLOWS, 0);
+        let next_oldest_key: super::FlowKey =
+            (([10, 0, 0, 1], 10001).into(), ([8, 8, 8, 8], 53).into());
         flows
-            .values_mut()
-            .next()
+            .get(&oldest_key)
             .unwrap()
             .last_activity
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         evict_for_admission(&mut flows);
-        assert_eq!(flows.len(), 2, "below cap: refreshed flow untouched");
+        assert!(flows.contains_key(&oldest_key), "refreshed flow survives");
+        assert!(
+            !flows.contains_key(&next_oldest_key),
+            "the new least-recently-active flow is evicted instead"
+        );
     }
 
     #[test]

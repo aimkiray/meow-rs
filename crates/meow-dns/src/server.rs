@@ -665,8 +665,9 @@ pub struct BoundDnsServer {
 
 impl BoundDnsServer {
     /// Wrap an externally bound socket so embedders reuse this hardened serve
-    /// loop (bounded worker pool, backpressure, panic-guarded workers)
-    /// instead of hand-rolling their own — e.g. the TUN loopback DNS servers
+    /// loop (locally-decidable answers inline, upstream-bound queries under a
+    /// bounded in-flight semaphore, counted drops) instead of hand-rolling
+    /// their own — e.g. the TUN loopback DNS servers
     /// on Windows, which must bind `127.0.0.1:53`/`[::1]:53` *before* the OS
     /// resolver is repointed at them.
     /// The resolver is captured as a fixed `Arc` — it does NOT track a later
@@ -691,9 +692,10 @@ impl BoundDnsServer {
         }
     }
 
-    /// Queries dropped without a response since this server started — for
-    /// want of an in-flight slot or a full local-answer send buffer
-    /// (issue #515 — a drop was previously invisible).
+    /// Queries dropped at admission since this server started — for want of
+    /// an in-flight slot or a full local-answer send buffer (issue #515 — a
+    /// drop was previously invisible). A query lost mid-task (e.g. a panic)
+    /// is not counted here.
     pub fn dropped_queries(&self) -> u64 {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -1593,12 +1595,56 @@ mod tests {
         for (label, q) in [
             ("hosts A", query_named(0x1111, "myhost.test", 1)),
             ("cache hit", sample_query(0x2222, 1)),
+            // A hosts entry holding only a v4 address answers AAAA with
+            // NOERROR-empty — decided by the hosts arm, not the ipv6 gate.
+            (
+                "hosts v4-only under AAAA",
+                query_named(0x3333, "myhost.test", 28),
+            ),
         ] {
             let local = answered(DnsServer::try_answer_local(&q, &resolver));
             let full = DnsServer::handle_query(&q, &resolver)
                 .await
                 .expect("handle_query must succeed");
             assert_eq!(local, full, "{label}: local answer diverged");
+        }
+    }
+
+    /// The fake-IP synthesis branch — the dominant `Decided` path under
+    /// TUN — must produce byte-identical responses to `handle_query`.
+    #[tokio::test]
+    async fn try_answer_local_matches_handle_query_bytes_fakeip() {
+        use crate::fakeip::MemoryStore;
+
+        let mut resolver = crate::resolver::Resolver::new(
+            Vec::new(),
+            Vec::new(),
+            DnsMode::FakeIp,
+            meow_trie::DomainTrie::new(),
+            true,
+            true,
+        );
+        resolver.set_fakeip_v4(Arc::new(
+            crate::fakeip::Pool::new(
+                "198.18.0.0/16".parse().unwrap(),
+                Arc::new(MemoryStore::new(1024)),
+            )
+            .unwrap(),
+        ));
+
+        for (label, q, want_ancount) in [
+            ("fake-IP A synthesis", sample_query(0x4444, 1), 1u8),
+            // v4-only pool: AAAA is suppressed to NOERROR-empty so a
+            // dual-stack client falls back to the v4 fake.
+            ("fake-IP AAAA suppression", sample_query(0x5555, 28), 0u8),
+        ] {
+            let local = answered(DnsServer::try_answer_local(&q, &resolver));
+            let full = DnsServer::handle_query(&q, &resolver)
+                .await
+                .expect("handle_query must succeed");
+            assert_eq!(local, full, "{label}: local answer diverged");
+            assert_eq!(local[3] & 0x0f, 0, "{label}: NOERROR");
+            assert_eq!(local[7], want_ancount, "{label}: ANCOUNT");
         }
     }
 
@@ -1672,20 +1718,27 @@ mod tests {
         let serve = tokio::spawn(bound.run());
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        // Blast well past the test cap; the kernel may absorb a few, so keep
-        // sending until the counter moves (bounded by a deadline).
+        // Exact accounting: the receive loop is serial and loopback
+        // preserves order, so the first MAX_IN_FLIGHT queries park on
+        // permits and the next OVER are each dropped once — no more, no
+        // fewer.
+        const OVER: u16 = 3;
+        for i in 0..MAX_IN_FLIGHT as u16 + OVER {
+            client.send_to(&sample_query(i, 1), addr).await.unwrap();
+        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut sent = 0u16;
-        while dropped.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            client.send_to(&sample_query(sent, 1), addr).await.unwrap();
-            sent += 1;
+        loop {
+            let n = dropped.load(std::sync::atomic::Ordering::Relaxed);
+            if n == u64::from(OVER) {
+                break;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
-                "drop counter never moved after {sent} queries"
+                "expected exactly {OVER} drops, got {n}"
             );
+            assert!(n < u64::from(OVER), "over-counted drops: {n} > {OVER}");
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        assert!(sent > MAX_IN_FLIGHT as u16);
         serve.abort();
     }
 

@@ -368,6 +368,9 @@ mod tests {
         let mut meta = base_metadata("127.0.0.1:1".parse().unwrap());
         meta.src_ip = None;
         assert!(maybe_enrich_with_process_async(&meta).await.is_none());
+        // src_port == 0 must bail on its own — a fresh meta keeps src_ip
+        // set so the `src_ip?` guard can't shadow the port check.
+        let mut meta = base_metadata("127.0.0.1:1".parse().unwrap());
         meta.src_port = 0;
         assert!(maybe_enrich_with_process_async(&meta).await.is_none());
     }

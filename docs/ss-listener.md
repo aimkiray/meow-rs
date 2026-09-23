@@ -175,5 +175,6 @@ explicit `--features listener-shadowsocks`. Enabling it pulls in the
   the TLS/HTTP sniffer — the SS header already carries a domain when the
   client sends one, which the routing engine uses directly.
 - **UDP flow cap**: the `(peer, target)` flow table shares the listener's
-  `max-connections` cap (see above); the SOCKS5 UDP relay's table, by
-  contrast, lives and dies with its TCP control connection.
+  `max-connections` cap (see above); the SOCKS5 UDP relay's table instead
+  lives and dies with its TCP control connection and is hard-bounded at
+  1024 sessions with least-recently-active eviction (issue #515).

@@ -66,12 +66,14 @@ mod platform {
     ///   per inode for `INODE_TTL`.
     ///
     /// Staleness contract: a hit reports the owner of the endpoint as of at
-    /// most TTL ago. `TABLE_TTL` bounds the window in which a reused
-    /// ephemeral port could misattribute a process; `INODE_TTL` is longer
-    /// because inode→pid only misleads if a socket is closed and its inode
-    /// number recycled into a *different* process's socket within the
-    /// window — rare, and the table revalidates that the inode is still a
-    /// live socket before the cached owner is trusted.
+    /// most TTL ago. The misattribution vector is ephemeral-port reuse —
+    /// within `TABLE_TTL` a re-bound port can map to the *closed* socket's
+    /// inode, so `INODE_MAP` then returns the previous owner for up to
+    /// ~100 ms (sockfs inode numbers are monotonic and never recycled, so
+    /// the inode→pid entry itself stays accurate while the inode lives).
+    /// A transient `/proc/<pid>/fd` read failure caches `None` for
+    /// `INODE_TTL`, suppressing attribution for up to 1 s.
+    #[cfg(not(test))]
     const TABLE_TTL: Duration = Duration::from_millis(100);
     const INODE_TTL: Duration = Duration::from_secs(1);
     /// Bound on cached inode entries; cleared wholesale past this so a host
@@ -82,6 +84,7 @@ mod platform {
     /// target port filters nearly every row out before address matching.
     type SockTable = HashMap<u16, Vec<(IpAddr, u64, u32)>>;
 
+    #[cfg(not(test))]
     struct CachedTable {
         at: Instant,
         map: std::sync::Arc<SockTable>,
@@ -92,6 +95,7 @@ mod platform {
     type InodeCache = HashMap<u64, (Instant, Option<(u32, String, String)>)>;
 
     /// Slots indexed `[network as usize][is_ipv6 as usize]`.
+    #[cfg(not(test))]
     static SOCK_TABLES: OnceLock<Mutex<[[Option<CachedTable>; 2]; 2]>> = OnceLock::new();
     static INODE_MAP: OnceLock<Mutex<InodeCache>> = OnceLock::new();
 
@@ -126,23 +130,34 @@ mod platform {
     /// host where /proc is unreadable (lookups report "no process", same
     /// observable result as before).
     fn sock_table(idx: usize, path: &str, ipv6: bool) -> Arc<SockTable> {
-        let tables = SOCK_TABLES.get_or_init(|| Mutex::new(Default::default()));
-        let mut guard = tables.lock();
-        let slot = &mut guard[idx][usize::from(ipv6)];
-        let stale = slot.as_ref().is_none_or(|t| t.at.elapsed() > TABLE_TTL);
-        if stale {
-            *slot = Some(CachedTable {
-                at: Instant::now(),
-                map: Arc::new(parse_proc_net(path, ipv6).unwrap_or_default()),
-            });
+        // Unit tests bind fresh sockets and look them up immediately — a
+        // TTL'd snapshot taken by a parallel test would be racy, so test
+        // builds always re-parse.
+        #[cfg(test)]
+        {
+            let _ = idx;
+            Arc::new(parse_proc_net(path, ipv6).unwrap_or_default())
         }
-        Arc::clone(&slot.as_ref().expect("slot just populated").map)
+        #[cfg(not(test))]
+        {
+            let tables = SOCK_TABLES.get_or_init(|| Mutex::new(Default::default()));
+            let mut guard = tables.lock();
+            let slot = &mut guard[idx][usize::from(ipv6)];
+            let stale = slot.as_ref().is_none_or(|t| t.at.elapsed() > TABLE_TTL);
+            if stale {
+                *slot = Some(CachedTable {
+                    at: Instant::now(),
+                    map: Arc::new(parse_proc_net(path, ipv6).unwrap_or_default()),
+                });
+            }
+            Arc::clone(&slot.as_ref().expect("slot just populated").map)
+        }
     }
 
     /// Parse a `/proc/net/{tcp,udp}{,6}` table into a port-keyed map.
     /// Returns `None` when the file cannot be read at all (treated as a
     /// lookup miss, same as before — the caller reports "no process").
-    fn parse_proc_net(path: &str, ipv6: bool) -> Option<SockTable> {
+    pub(crate) fn parse_proc_net(path: &str, ipv6: bool) -> Option<SockTable> {
         let mut buf = String::new();
         fs::File::open(path).ok()?.read_to_string(&mut buf).ok()?;
         let mut map = SockTable::new();
@@ -176,7 +191,7 @@ mod platform {
         Some(map)
     }
 
-    fn find_pid_by_inode_cached(inode: u64) -> Option<(u32, String, String)> {
+    pub(crate) fn find_pid_by_inode_cached(inode: u64) -> Option<(u32, String, String)> {
         let cache = INODE_MAP.get_or_init(|| Mutex::new(HashMap::new()));
         if let Some((at, cached)) = cache.lock().get(&inode) {
             if at.elapsed() <= INODE_TTL {
@@ -741,6 +756,50 @@ mod tests {
             assert_eq!(s.name, a.name);
             assert_eq!(s.path, a.path);
             assert_eq!(s.uid, a.uid);
+        }
+    }
+
+    /// The Linux cache layer itself (issue #515). `sock_table`'s slots are
+    /// shared process-wide, so fixture coverage goes through the pure
+    /// parser rather than the cache — populating a slot with fixture data
+    /// would poison parallel tests for `TABLE_TTL`.
+    #[cfg(target_os = "linux")]
+    mod linux_cache {
+        use super::super::platform;
+        use std::io::Write;
+
+        #[test]
+        fn parse_proc_net_reads_fixture() {
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            // Header line + one row: 127.0.0.1:8080 (0100007F:1F90), uid 0,
+            // inode 4242.
+            writeln!(
+                f,
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when \
+                 retrnsmt   uid  timeout inode"
+            )
+            .unwrap();
+            writeln!(
+                f,
+                "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 \
+                 00000000     0        0 4242 1 0000000000000000 100 0 0 10 0"
+            )
+            .unwrap();
+            let table = platform::parse_proc_net(f.path().to_str().unwrap(), false)
+                .expect("fixture must parse");
+            let rows = table.get(&8080).expect("port 8080 row");
+            assert_eq!(rows[0].0, "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
+            assert_eq!(rows[0].1, 4242, "inode");
+            assert_eq!(rows[0].2, 0, "uid");
+
+            // An unreadable path yields None → cached as a lookup miss.
+            assert!(platform::parse_proc_net("/nonexistent", false).is_none());
+        }
+
+        #[test]
+        fn inode_cache_returns_none_for_unknown() {
+            // u64::MAX never matches a real inode; the miss is cached.
+            assert!(platform::find_pid_by_inode_cached(u64::MAX).is_none());
         }
     }
 }

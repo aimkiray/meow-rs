@@ -165,7 +165,7 @@ ip route | grep -c '/1 dev' # → 0
 | `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in `global` mode. Ignored otherwise. |
 | `dns-hijack` | off | List of targets; any `:53` entry turns on in-process answering of UDP :53 flows entering the device. Non-`:53` entries warn and are ignored. |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
-| `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); a change while TUN runs restarts the listener. |
+| `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
 
 mihomo fields meow does not implement (`stack`, `strict-route`,
 `auto-detect-interface`, `inet6-address`, `endpoint-independent-nat`,

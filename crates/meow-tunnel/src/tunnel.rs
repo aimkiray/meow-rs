@@ -1104,6 +1104,38 @@ mod tests {
         }
     }
 
+    /// Issue #515: `tun_udp_flow_count` reads the live gauge only while the
+    /// listener task runs — a stored-but-finished handle reports zero, not
+    /// the gauge's frozen final value.
+    #[tokio::test]
+    async fn tun_udp_flow_count_tracks_live_gauge() {
+        let tunnel = test_tunnel();
+        assert_eq!(tunnel.tun_udp_flow_count(), 0, "no handle → zero");
+
+        let gauge = Arc::new(std::sync::atomic::AtomicUsize::new(7));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut handle = task_handle(tokio::spawn(async move {
+            let _ = done_rx.await;
+        }));
+        handle.udp_flows = Arc::clone(&gauge);
+        tunnel.set_tun_handle(handle).await;
+        assert_eq!(tunnel.tun_udp_flow_count(), 7);
+
+        gauge.store(3, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(tunnel.tun_udp_flow_count(), 3, "gauge is read live");
+
+        // The task exits while the handle stays stored — the count must
+        // read zero rather than the gauge's frozen final value.
+        let _ = done_tx.send(());
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            tunnel.tun_udp_flow_count(),
+            0,
+            "a finished listener reports zero even though the gauge lingers"
+        );
+    }
+
     #[tokio::test]
     async fn tun_handle_lifecycle() {
         let tunnel = test_tunnel();
@@ -1592,5 +1624,59 @@ mod tests {
         };
         assert_eq!(dial.dst_ip, Some("127.0.0.1".parse().unwrap()));
         assert_eq!(dial.dst_port, 1);
+    }
+
+    /// Issue #515: the PROCESS-* enrichment call inside `resolve_proxy`
+    /// itself — not just the helper — must run when the compiled rule set
+    /// demands it. A regression that dropped the `.await` enrichment would
+    /// leave every test here green while PROCESS rules silently stop
+    /// matching in production.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn resolve_proxy_invokes_process_enrichment() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap();
+        let proc_name = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        assert!(!proc_name.is_empty(), "expected a test binary name");
+
+        let tunnel = test_tunnel();
+        let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        let mut proxies = res.proxies;
+        let direct = Arc::clone(proxies.get("DIRECT").unwrap());
+        proxies.insert("proc-target".into(), direct);
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(meow_rules::process::ProcessRule::new(
+                    &proc_name,
+                    "proc-target",
+                )) as Box<dyn Rule>,
+                Box::new(meow_rules::final_rule::FinalRule::new("DIRECT")),
+            ],
+            res.dialer_registry,
+        );
+
+        let metadata = Metadata {
+            network: Network::Tcp,
+            src_ip: Some(local.ip()),
+            src_port: local.port(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let resolved = tunnel
+            .inner()
+            .resolve_proxy(&metadata)
+            .await
+            .expect("rule table must resolve");
+        // The adapter re-registered under "proc-target" is the DIRECT
+        // instance, so `adapter.name()` stays "DIRECT" — pin the matched
+        // rule instead, which is what proves the enrichment ran.
+        assert_eq!(
+            resolved.rule_name, "PROCESS-NAME",
+            "PROCESS-NAME rule must match the enrichment done inside resolve_proxy"
+        );
     }
 }

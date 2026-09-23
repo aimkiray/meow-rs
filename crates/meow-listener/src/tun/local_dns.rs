@@ -2,7 +2,7 @@
 //!
 //! Binds UDP sockets to `127.0.0.1:53` and `[::1]:53`, answering DNS
 //! queries via `BoundDnsServer::run` — the same hardened serve loop
-//! (bounded worker pool with backpressure, panic-guarded workers) and
+//! (inline local answers, semaphore-bounded upstream tasks) and
 //! `handle_query` pipeline used by the main DNS server and the TUN
 //! dns-hijack path.  System DNS is set to
 //! `127.0.0.1` / `::1` by `DnsGuard`, so all DNS queries from the OS DNS

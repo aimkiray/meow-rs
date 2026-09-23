@@ -48,7 +48,7 @@ pub(super) mod flow {
     use meow_tunnel::Tunnel;
     use tokio::sync::mpsc;
     use tokio::time::{sleep_until, Instant};
-    use tracing::info;
+    use tracing::{debug, info};
 
     /// One datagram payload cap. UDP tops out below 64 KiB.
     pub(super) const DATAGRAM_BUF: usize = 65535;
@@ -205,7 +205,9 @@ pub(super) mod flow {
                         // flow (and its idle timer) on a slow dispatcher.
                         match reply_tx.try_send((data, orig_dst, client)) {
                             Ok(()) => idle.as_mut().reset(next_deadline(udp_timeout)),
-                            Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                debug!("tproxy UDP reply queue full: dropping reply to {client}");
+                            }
                             // Dispatcher gone — listener shutdown.
                             Err(mpsc::error::TrySendError::Closed(_)) => break Ok(()),
                         }

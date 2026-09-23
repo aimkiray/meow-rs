@@ -658,6 +658,14 @@ the canonical, in-repo source a release is cut from.
   on Linux a 100 ms socket-table cache plus a 1 s inode→process cache
   (4096-entry cap) turn bursts into map hits. (#515)
 
+  Breaking for crate consumers: `TunnelInner::resolve_proxy` and
+  `resolve_proxy_lazy` are now `async` (same `Option<ResolvedTarget>`
+  return) so PROCESS-* enrichment can offload to the blocking pool;
+  `TunHandle` gains a `pub udp_flows` field (breaking struct-literal
+  construction) and `TunReady::Ready` is now a struct variant carrying
+  it; and `meow_dns::server::LocalAnswer` is newly public for the TUN
+  dns-hijack inline-answer path.
+
 - **TLS handshakes no longer fail on multiplexed transports whose
   `poll_flush` pends.** Every TLS-over-mux handshake — AnyTLS, smux, and any
   stream whose `poll_flush` waits on a writer-task acknowledgement — died at

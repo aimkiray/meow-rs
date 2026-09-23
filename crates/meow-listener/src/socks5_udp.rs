@@ -8,10 +8,10 @@
 //! reply task is dropped).
 //!
 //! Routing mirrors `meow_tunnel::udp::handle_udp`: fake-IP rewrite → pre-resolve
-//! → rule match → `dial_udp`. A small per-association
-//! NAT (`dst -> session`) dedups outbound conns; each session has a reply task
-//! that reads server→client datagrams and writes them back wrapped in the
-//! SOCKS5 UDP header.
+//! → rule match → `dial_udp`. A bounded per-association
+//! NAT (`SessionKey -> session`, keying on address or hostname) dedups outbound
+//! conns; each session task performs its own dial then writes queued datagrams
+//! in order while a nested reply task pumps server→client traffic back.
 
 use meow_common::atomic::AtomicU;
 use std::collections::HashMap;
@@ -166,8 +166,9 @@ pub async fn handle_udp_associate(
             _ = sweeper.tick() => {
                 let idle_ms = meow_tunnel::udp::DEFAULT_UDP_IDLE.as_millis() as u64;
                 nat.retain(|_, session| {
-                    // A dead session (reply task exited) is one-way — evict
-                    // promptly instead of waiting for its next datagram.
+                    // A dead session (task exited — dial failure, write
+                    // error, or reply-reader death) is evicted promptly
+                    // instead of waiting for its next datagram.
                     if session.dead.load(Ordering::Relaxed) {
                         return false;
                     }
@@ -425,13 +426,12 @@ async fn run_session(
     }
     .await;
 
-    // Computed after enrichment so a fake-IP destination logs its recovered
-    // hostname rather than the 198.18.x.x literal.
-    let dst_desc = metadata.remote_address().to_string();
     let (conn, dst_addr) = match outcome {
         Ok(v) => v,
         Err(e) => {
-            debug!("SOCKS5 UDP session to {dst_desc}: {e}");
+            // Computed after enrichment so a fake-IP destination logs its
+            // recovered hostname rather than the 198.18.x.x literal.
+            debug!("SOCKS5 UDP session to {}: {e}", metadata.remote_address());
             return;
         }
     };
@@ -1073,5 +1073,359 @@ mod tests {
             .expect("evicted session's task never finished")
             .expect_err("evicted session's task must be cancelled");
         assert!(outcome.is_cancelled());
+    }
+
+    /// Issue #515: the `nat.len() >= MAX_SESSIONS` admission guard inside
+    /// `start_session` itself — remove it and this fails even though the
+    /// `evict_for_admission` unit tests still pass.
+    #[tokio::test]
+    async fn start_session_admission_holds_the_table_cap() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::Normal,
+                meow_trie::DomainTrie::new(),
+                false,
+                true,
+            ));
+            let tunnel = meow_tunnel::Tunnel::new(resolver);
+            let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let inner = Arc::clone(tunnel.inner());
+
+            let mut nat = stub_nat(MAX_SESSIONS, 0);
+            let key = SessionKey::Addr(SocketAddr::from(([192, 0, 2, 1], 443)));
+            let client: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            start_session(
+                &inner,
+                &relay,
+                &mut nat,
+                key.clone(),
+                client,
+                Metadata::default(),
+                SmallVec::from_slice(b"payload"),
+            )
+            .unwrap();
+
+            assert!(
+                nat.len() <= MAX_SESSIONS,
+                "admission must not grow the table past MAX_SESSIONS"
+            );
+            assert!(nat.contains_key(&key), "the new session was admitted");
+        })
+        .await
+        .expect("admission test timed out");
+    }
+
+    /// Mock conn whose `read_packet` pends forever (keeping the session
+    /// alive) and whose `write_packet` records payloads once `write_gate`
+    /// opens — the session's FIFO drain and queue bound are observable
+    /// through `writes`.
+    struct RecordingConn {
+        writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        write_gate: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyPacketConn for RecordingConn {
+        async fn read_packet(&self, _buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+        async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> meow_common::Result<usize> {
+            let mut gate = self.write_gate.clone();
+            while !*gate.borrow_and_update() {
+                if gate.changed().await.is_err() {
+                    break;
+                }
+            }
+            self.writes.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
+        }
+        fn close(&self) -> meow_common::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `dial_udp` parks until `dial_gate` opens, then yields a
+    /// [`RecordingConn`] — letting a test queue datagrams deterministically
+    /// before any write can run.
+    struct GatedRecordingProxy {
+        dial_gate: tokio::sync::watch::Receiver<bool>,
+        write_gate: tokio::sync::watch::Receiver<bool>,
+        writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for GatedRecordingProxy {
+        fn name(&self) -> &str {
+            "gated-recording"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("no tcp".into()))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            let mut gate = self.dial_gate.clone();
+            while !*gate.borrow_and_update() {
+                if gate.changed().await.is_err() {
+                    break;
+                }
+            }
+            Ok(Box::new(RecordingConn {
+                writes: Arc::clone(&self.writes),
+                write_gate: self.write_gate.clone(),
+            }))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for GatedRecordingProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// Issue #515's core claims made observable: datagrams queued while the
+    /// session dials are written in FIFO order, and a full 64-deep queue
+    /// drops extras without killing the session.
+    #[tokio::test]
+    async fn session_queue_preserves_order_and_bounds() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (dial_open, dial_gate) = tokio::sync::watch::channel(false);
+            let (write_open, write_gate) = tokio::sync::watch::channel(true);
+            let writes = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+            let proxy = Arc::new(GatedRecordingProxy {
+                dial_gate,
+                write_gate,
+                writes: Arc::clone(&writes),
+                health: meow_common::ProxyHealth::new(),
+            });
+            let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::Normal,
+                meow_trie::DomainTrie::new(),
+                false,
+                true,
+            ));
+            let tunnel = meow_tunnel::Tunnel::new(resolver);
+            let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+            let mut proxies = res.proxies;
+            proxies.insert(
+                "gated-recording".into(),
+                Arc::clone(&proxy) as Arc<dyn meow_common::Proxy>,
+            );
+            tunnel.update_proxies(proxies, res.dialer_registry);
+            tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+                "gated-recording",
+            ))]);
+
+            let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let inner = Arc::clone(tunnel.inner());
+            let mut nat: HashMap<SessionKey, Session> = HashMap::new();
+            let client: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            let inbound = Metadata::default();
+            let dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+            let key = SessionKey::Addr(dst);
+            let packet = |payload: &[u8]| {
+                let mut p: SmallVec<[u8; 1500]> = SmallVec::new();
+                encode_udp_header(&mut p, &dst);
+                p.extend_from_slice(payload);
+                p
+            };
+
+            // Phase 1 — ordering: the dial is parked, so every datagram
+            // queues; once released they must reach the conn in FIFO order.
+            for payload in [b"p1".as_slice(), b"p2", b"p3"] {
+                handle_client_datagram(
+                    &inner,
+                    &relay,
+                    &mut nat,
+                    &packet(payload),
+                    client,
+                    &inbound,
+                )
+                .unwrap();
+            }
+            assert!(nat.contains_key(&key));
+            dial_open.send(true).unwrap();
+            assert!(
+                eventually(Duration::from_secs(2), || {
+                    writes.lock().unwrap().len() == 3
+                })
+                .await,
+                "queued datagrams never reached the conn"
+            );
+            assert_eq!(
+                writes.lock().unwrap().as_slice(),
+                &[b"p1".as_slice(), b"p2", b"p3"],
+                "per-destination ordering must be preserved through establishment"
+            );
+
+            // Phase 2 — the bound: park the write path, refill the queue to
+            // its full 64-datagram depth, then send extras that must drop.
+            write_open.send(false).unwrap();
+            handle_client_datagram(
+                &inner,
+                &relay,
+                &mut nat,
+                &packet(b"parked"),
+                client,
+                &inbound,
+            )
+            .unwrap();
+            // Wait until the writer consumed "parked" into write_packet —
+            // the queue is empty again at that point (capacity back to 64).
+            assert!(
+                eventually(Duration::from_secs(2), || {
+                    nat.get(&key).unwrap().tx.capacity() == SESSION_QUEUE
+                })
+                .await,
+                "writer never consumed the parked datagram"
+            );
+            for i in 0..SESSION_QUEUE {
+                let payload = vec![b'q', i as u8];
+                handle_client_datagram(
+                    &inner,
+                    &relay,
+                    &mut nat,
+                    &packet(&payload),
+                    client,
+                    &inbound,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                nat.get(&key).unwrap().tx.capacity(),
+                0,
+                "queue must be full"
+            );
+            // Five more datagrams: all dropped, session alive.
+            for _ in 0..5 {
+                handle_client_datagram(&inner, &relay, &mut nat, &packet(b"x"), client, &inbound)
+                    .unwrap();
+            }
+            write_open.send(true).unwrap();
+            // The parked write + the 64 queued drain; the 5 extras are gone.
+            let want_total = 3 + 1 + SESSION_QUEUE;
+            assert!(
+                eventually(Duration::from_secs(2), || {
+                    writes.lock().unwrap().len() == want_total
+                })
+                .await,
+                "queue must drain exactly its capacity, extras dropped"
+            );
+            let recorded = writes.lock().unwrap();
+            assert_eq!(recorded[3].as_slice(), b"parked");
+            assert_eq!(recorded[4].as_slice(), b"q\x00".as_slice());
+            assert_eq!(recorded[4 + SESSION_QUEUE - 1].as_slice(), &[b'q', 63]);
+            assert!(
+                nat.contains_key(&key),
+                "a full queue must not kill the session"
+            );
+        })
+        .await
+        .expect("queue ordering/bounds test timed out");
+    }
+
+    /// Issue #514/#515: evicting a session while its task is parked inside
+    /// `dial_udp` must abort the task, not let the establishment complete
+    /// and leak a detached conn.
+    #[tokio::test]
+    async fn evict_during_dial_aborts_the_task() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (dial_open, dial_gate) = tokio::sync::watch::channel(false);
+            let (_write_open, write_gate) = tokio::sync::watch::channel(true);
+            let proxy = Arc::new(GatedRecordingProxy {
+                dial_gate,
+                write_gate,
+                writes: Arc::new(std::sync::Mutex::new(Vec::new())),
+                health: meow_common::ProxyHealth::new(),
+            });
+            let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::Normal,
+                meow_trie::DomainTrie::new(),
+                false,
+                true,
+            ));
+            let tunnel = meow_tunnel::Tunnel::new(resolver);
+            let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+            let mut proxies = res.proxies;
+            proxies.insert(
+                "gated-recording".into(),
+                Arc::clone(&proxy) as Arc<dyn meow_common::Proxy>,
+            );
+            tunnel.update_proxies(proxies, res.dialer_registry);
+            tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+                "gated-recording",
+            ))]);
+
+            let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let inner = Arc::clone(tunnel.inner());
+            let mut nat: HashMap<SessionKey, Session> = HashMap::new();
+            let client: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            let dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+            let key = SessionKey::Addr(dst);
+            let mut packet: SmallVec<[u8; 1500]> = SmallVec::new();
+            encode_udp_header(&mut packet, &dst);
+            packet.extend_from_slice(b"payload");
+
+            handle_client_datagram(
+                &inner,
+                &relay,
+                &mut nat,
+                &packet,
+                client,
+                &Metadata::default(),
+            )
+            .unwrap();
+            // Give the task a scheduling slot to reach the parked dial.
+            tokio::task::yield_now().await;
+            let session = nat.remove(&key).expect("session must exist");
+            let handle = session.task.clone();
+            drop(session);
+            assert!(
+                eventually(Duration::from_secs(2), || handle.is_finished()).await,
+                "evicting mid-dial must abort the session task"
+            );
+            // Releasing the dial gate afterwards must not resurrect anything.
+            dial_open.send(true).unwrap();
+        })
+        .await
+        .expect("mid-dial eviction test timed out");
     }
 }

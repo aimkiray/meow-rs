@@ -2487,6 +2487,7 @@ dependencies = [
  "smol_str",
  "socket2 0.5.10",
  "subtle",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
