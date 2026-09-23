@@ -184,32 +184,50 @@ impl TunnelInner {
     /// - `metadata.host` ← real domain recovered from the pool reverse map
     /// - `metadata.dst_ip` ← `None`, so `pre_resolve` (or the adapter)
     ///   re-resolves to a real address via the configured DNS path
-    pub fn pre_handle_metadata(&self, metadata: &mut Metadata) {
+    ///
+    /// Returns [`PreHandleVerdict::Drop`] when `dst_ip` is inside the
+    /// fake-IP range with no live allocation and no recoverable hostname —
+    /// every caller must honour it (issue #618).
+    pub fn pre_handle_metadata(&self, metadata: &mut Metadata) -> PreHandleVerdict {
         let Some(ip) = metadata.dst_ip else {
-            return;
+            return PreHandleVerdict::Continue;
         };
         let resolver = self.resolver();
-        if !resolver.is_fake_ip(ip) {
-            // Outside fake-IP mode — also fold in a snooping-cache hostname
-            // if metadata.host is currently empty. Preserves the upstream
-            // `DNSMapping` mode contract used by the tproxy listener.
-            if metadata.host.is_empty() {
-                if let Some(host) = resolver.reverse_lookup(ip) {
+        if resolver.in_fake_ip_range(ip) {
+            match resolver.reverse_lookup(ip) {
+                Some(host) => {
+                    debug!("pre_handle_metadata: fake-ip {ip} → {host}");
                     metadata.host = host;
+                    metadata.dst_ip = None;
                 }
+                // In range with no live allocation — a stale or
+                // never-mapped fake IP (restart wiped the pool, wrap
+                // evicted the row, a literal connect into the range, or
+                // the allocation raced out mid-lookup). Dialing the
+                // literal loops the packet back into a fake-IP-routed
+                // inbound (TUN `auto-route`) and self-saturates
+                // `max-connections` (issue #618); mihomo drops the same
+                // class in `preHandleMetadata`.
+                None if metadata.host.is_empty() => {
+                    debug!("pre_handle_metadata: drop unmapped fake-ip {ip}");
+                    return PreHandleVerdict::Drop;
+                }
+                // Stale literal but a name survived (e.g. sniffed SNI) —
+                // clear the fake IP so the adapter resolves the real
+                // name instead of looping it.
+                None => metadata.dst_ip = None,
             }
-            return;
+            return PreHandleVerdict::Continue;
         }
-        if let Some(host) = resolver.reverse_lookup(ip) {
-            debug!("pre_handle_metadata: fake-ip {} → {}", ip, host);
-            metadata.host = host;
-            metadata.dst_ip = None;
-        } else {
-            // Fake IP without a reverse mapping — pool wrap evicted the
-            // entry since synthesis. Leave the IP in place; the connection
-            // dials to a dead address but we don't drop the metadata silently.
-            debug!("pre_handle_metadata: fake-ip {} has no reverse mapping", ip);
+        // Outside fake-IP mode — also fold in a snooping-cache hostname
+        // if metadata.host is currently empty. Preserves the upstream
+        // `DNSMapping` mode contract used by the tproxy listener.
+        if metadata.host.is_empty() {
+            if let Some(host) = resolver.reverse_lookup(ip) {
+                metadata.host = host;
+            }
         }
+        PreHandleVerdict::Continue
     }
 
     /// Pre-process metadata before rule matching: if any rule needs IP
@@ -467,6 +485,19 @@ pub struct ResolvedTarget {
     /// the dial (`route: _route`) — dropping it early re-opens the reload
     /// race this type exists to close.
     pub route: Arc<RouteTable>,
+}
+
+/// Verdict from [`TunnelInner::pre_handle_metadata`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreHandleVerdict {
+    /// Proceed to rule matching and dispatch.
+    Continue,
+    /// Drop the flow: `dst_ip` sits inside the fake-IP range with no live
+    /// allocation and no recoverable hostname — a stale or never-mapped
+    /// fake IP. Dialing it loops the packet back into a fake-IP-routed
+    /// inbound (TUN `auto-route`) and self-saturates `max-connections`
+    /// (issue #618); mihomo drops the same class in `preHandleMetadata`.
+    Drop,
 }
 
 /// Route-table-backed [`TargetProbe`] for the match engines.

@@ -175,8 +175,15 @@ pub async fn route_inbound_tcp<C>(
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     // Fake-IP → host rewrite (no-op outside fake-IP mode aside from a
-    // snooping-cache hostname fill-in).
-    inner.pre_handle_metadata(&mut metadata);
+    // snooping-cache hostname fill-in). An unmapped fake-IP destination
+    // is dropped — dialing it loops back into a fake-IP-routed inbound
+    // (issue #618).
+    if matches!(
+        inner.pre_handle_metadata(&mut metadata),
+        crate::tunnel::PreHandleVerdict::Drop
+    ) {
+        return;
+    }
 
     let admission = inner.tcp_admission();
 

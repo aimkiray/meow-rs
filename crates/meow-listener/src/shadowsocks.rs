@@ -745,7 +745,12 @@ where
         ..Default::default()
     };
 
-    inner.pre_handle_metadata(&mut metadata);
+    if matches!(
+        inner.pre_handle_metadata(&mut metadata),
+        meow_tunnel::PreHandleVerdict::Drop
+    ) {
+        return Err("unmapped fake-ip destination".into());
+    }
     inner.pre_resolve(&mut metadata).await;
     if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
         metadata.dst_ip = inner.resolver().resolve_ip_real(&metadata.host).await;

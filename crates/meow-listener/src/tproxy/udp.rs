@@ -109,7 +109,12 @@ pub(super) mod flow {
         };
 
         let inner = tunnel.inner();
-        inner.pre_handle_metadata(&mut metadata);
+        if matches!(
+            inner.pre_handle_metadata(&mut metadata),
+            meow_tunnel::PreHandleVerdict::Drop
+        ) {
+            return Err("unmapped fake-ip destination".into());
+        }
         // UDP keeps the eager pre_resolve (no lazy enrichment): the outbound
         // packet API needs a resolved dst_ip regardless of what the rules
         // demand — including after a fake-IP was rewritten back to a hostname.

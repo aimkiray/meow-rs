@@ -1696,6 +1696,26 @@ impl Resolver {
         false
     }
 
+    /// True if `ip` lies inside any configured fake-IP pool range,
+    /// regardless of allocation state. An in-range IP that is *not*
+    /// [`Self::is_fake_ip`] is stale or never mapped — a restart wiping the
+    /// pool, a wrap eviction, or a literal connect into the range — and must
+    /// be dropped rather than dialed: a fake-IP-routed inbound (TUN
+    /// `auto-route`) would loop the dial back into itself (issue #618).
+    pub fn in_fake_ip_range(&self, ip: IpAddr) -> bool {
+        if let Some(pool) = &self.fakeip_v4 {
+            if pool.in_range(ip) {
+                return true;
+            }
+        }
+        if let Some(pool) = &self.fakeip_v6 {
+            if pool.in_range(ip) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Clear every fake-IP allocation; resets cursors. No-op when fake-ip
     /// is disabled. Returns `Ok` unless persistence fails (currently
     /// infallible — failures are logged, not returned).

@@ -882,3 +882,21 @@ the canonical, in-repo source a release is cut from.
   commit-consistent snapshot. Embedders: `reconcile_dns_config` and
   `parse_dns_from_raw` gained a `prefetched_payloads` parameter.
   (issue #543)
+
+- **A destination inside the fake-IP range with no live allocation is now
+  dropped, not dialed.** A stale fake IP — left in a client's resolver
+  cache across a restart, evicted by pool wrap, or hit by a literal
+  connect into the range — kept its `dst_ip` through dispatch, so the
+  outbound adapter dialed it. Under TUN `auto-route` the whole fake range
+  routes back into the device, so that dial re-entered the listener as a
+  fresh flow whose own dial looped again, self-saturating
+  `max-connections` in milliseconds (issue #618). `pre_handle_metadata`
+  now returns a verdict: an in-range destination with no live pool
+  allocation and no recoverable hostname is dropped (mihomo drops the
+  same class in `preHandleMetadata`), while one still carrying a host
+  (e.g. sniffed SNI) clears the stale literal and resolves the name.
+  The drop applies uniformly across TUN, TProxy, SOCKS5/HTTP and
+  Shadowsocks inbounds since they all share the call site.
+
+  Breaking for crate consumers: `TunnelInner::pre_handle_metadata` now
+  returns `PreHandleVerdict` (`Continue`/`Drop`) instead of `()`.

@@ -11,7 +11,7 @@ use meow_common::{DnsMode, Metadata, Network};
 use meow_dns::fakeip::{MemoryStore, Pool};
 use meow_dns::{HostEntry, Resolver};
 use meow_trie::DomainTrie;
-use meow_tunnel::Tunnel;
+use meow_tunnel::{PreHandleVerdict, Tunnel};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
@@ -62,8 +62,9 @@ async fn fakeip_destination_rewritten_to_hostname() {
         ..Default::default()
     };
 
-    tunnel.inner().pre_handle_metadata(&mut md);
+    let verdict = tunnel.inner().pre_handle_metadata(&mut md);
 
+    assert_eq!(verdict, PreHandleVerdict::Continue);
     assert_eq!(
         md.host.as_str(),
         "example.test",
@@ -91,9 +92,95 @@ async fn non_fakeip_destination_passes_through() {
         network: Network::Tcp,
         ..Default::default()
     };
-    tunnel.inner().pre_handle_metadata(&mut md);
+    let verdict = tunnel.inner().pre_handle_metadata(&mut md);
+    assert_eq!(verdict, PreHandleVerdict::Continue);
     assert_eq!(md.dst_ip, Some(bystander), "real IP must stay put");
     assert_eq!(md.host.as_str(), "");
+}
+
+/// Issue #618: an address inside the fake-IP range with no live
+/// allocation (stale after restart/wrap, or a literal connect into the
+/// range) must be dropped — never dialed. Under TUN `auto-route` the
+/// whole fake range routes into the device, so dialing a stale fake IP
+/// re-enters the listener and self-saturates `max-connections`.
+#[tokio::test]
+async fn unmapped_fakeip_destination_is_dropped() {
+    let resolver = build_fakeip_resolver("example.test", IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    let tunnel = Tunnel::new(resolver);
+
+    // 198.18.0.4 is in range but was never allocated.
+    let stale = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 4));
+    let mut md = Metadata {
+        host: "".into(),
+        dst_ip: Some(stale),
+        dst_port: 80,
+        network: Network::Tcp,
+        ..Default::default()
+    };
+    assert_eq!(
+        tunnel.inner().pre_handle_metadata(&mut md),
+        PreHandleVerdict::Drop,
+        "unmapped fake-IP must be dropped, not dialed"
+    );
+
+    // The pool gateway is in-range but never a real destination either.
+    let mut md = Metadata {
+        host: "".into(),
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))),
+        dst_port: 80,
+        network: Network::Tcp,
+        ..Default::default()
+    };
+    assert_eq!(
+        tunnel.inner().pre_handle_metadata(&mut md),
+        PreHandleVerdict::Drop,
+        "pool gateway has no allocation — drop, not dial"
+    );
+}
+
+/// Issue #618 sibling: a stale fake IP that still carries a hostname
+/// (e.g. sniffed SNI) is rescued — the adapter resolves the real name
+/// instead of dialing the looping literal.
+#[tokio::test]
+async fn stale_fakeip_with_host_falls_back_to_name() {
+    let resolver = build_fakeip_resolver("example.test", IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    let tunnel = Tunnel::new(resolver);
+    let mut md = Metadata {
+        host: "example.test".into(),
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 9))),
+        dst_port: 443,
+        network: Network::Tcp,
+        ..Default::default()
+    };
+    assert_eq!(
+        tunnel.inner().pre_handle_metadata(&mut md),
+        PreHandleVerdict::Continue
+    );
+    assert_eq!(
+        md.dst_ip, None,
+        "stale literal must clear so the adapter resolves the host"
+    );
+    assert_eq!(md.host.as_str(), "example.test");
+}
+
+/// A live allocation still rewrites normally (not dropped).
+#[tokio::test]
+async fn mapped_fakeip_is_never_dropped() {
+    let resolver = build_fakeip_resolver("example.test", IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    let fake = resolver.lookup_ipv4("example.test").await.unwrap();
+    let tunnel = Tunnel::new(resolver);
+    let mut md = Metadata {
+        host: "".into(),
+        dst_ip: Some(fake),
+        dst_port: 443,
+        network: Network::Tcp,
+        ..Default::default()
+    };
+    assert_eq!(
+        tunnel.inner().pre_handle_metadata(&mut md),
+        PreHandleVerdict::Continue
+    );
+    assert_eq!(md.host.as_str(), "example.test");
 }
 
 #[tokio::test]

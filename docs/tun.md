@@ -92,6 +92,11 @@ Consequences:
   concurrent in-process answers (queries it cannot decide locally past
   that bound are dropped; clients retry). Live occupancy is observable via
   `Tunnel::tun_udp_flow_count`.
+- A destination **inside** the fake-ip range with **no live allocation** —
+  stale across a restart, evicted by pool wrap, or a literal connect into
+  the range — is dropped rather than dialed: dialing it would route
+  straight back into the device (issue #618). The drop applies on every
+  inbound, not just TUN.
 - ICMP echo requests entering the device are answered by the userspace
   stack itself — `ping` to a fake IP confirms the tun is up, but is not an
   end-to-end probe of the remote host.

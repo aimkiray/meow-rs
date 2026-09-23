@@ -239,7 +239,13 @@ async fn handle_http_inner(
         debug!("HTTP {} to {}:{}", method, host, port);
 
         let inner = tunnel.inner();
-        inner.pre_handle_metadata(&mut metadata);
+        if matches!(
+            inner.pre_handle_metadata(&mut metadata),
+            meow_tunnel::PreHandleVerdict::Drop
+        ) {
+            write_bad_gateway(stream).await?;
+            return Err("unmapped fake-ip destination".into());
+        }
         let admission = inner.tcp_admission();
         let Some(target) = inner.resolve_proxy_lazy(&mut metadata).await else {
             write_bad_gateway(stream).await?;

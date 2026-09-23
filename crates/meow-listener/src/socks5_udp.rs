@@ -378,7 +378,12 @@ async fn run_session(
     let _dead_guard = DeadOnExit(Arc::clone(&dead));
 
     let outcome = async {
-        inner.pre_handle_metadata(&mut metadata);
+        if matches!(
+            inner.pre_handle_metadata(&mut metadata),
+            meow_tunnel::PreHandleVerdict::Drop
+        ) {
+            return Err("unmapped fake-ip destination".into());
+        }
         // UDP keeps the eager pre_resolve (no lazy enrichment): the writer
         // needs a resolved dst_ip regardless of what the rules demand.
         inner.pre_resolve(&mut metadata).await;

@@ -124,8 +124,15 @@ pub async fn handle_udp(
     mut metadata: Metadata,
 ) {
     // Fake-IP → host rewrite (no-op outside fake-IP mode aside from a
-    // snooping-cache hostname fill-in).
-    tunnel.pre_handle_metadata(&mut metadata);
+    // snooping-cache hostname fill-in). An unmapped fake-IP destination
+    // is dropped — dialing it loops back into a fake-IP-routed inbound
+    // (issue #618).
+    if matches!(
+        tunnel.pre_handle_metadata(&mut metadata),
+        crate::tunnel::PreHandleVerdict::Drop
+    ) {
+        return;
+    }
 
     // Pre-resolve metadata (host -> real IP if rules need it). UDP keeps
     // the eager pre_resolve + resolve_proxy pair (no lazy enrichment): the
