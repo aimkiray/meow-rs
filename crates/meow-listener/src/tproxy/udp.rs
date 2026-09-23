@@ -398,16 +398,14 @@ mod linux {
                     queued_bytes: Arc::clone(&queued_bytes),
                 },
             );
-            spawn_flow(
-                tunnel.clone(),
-                rx,
-                queued_bytes,
-                self.reply_tx.clone(),
-                key,
-                self.udp_timeout,
-                &self.in_name,
-                self.in_port,
-            );
+            let ctx = flow::FlowCtx {
+                client: key.0,
+                orig_dst: key.1,
+                udp_timeout: self.udp_timeout,
+                in_name: self.in_name.clone(),
+                in_port: self.in_port,
+            };
+            spawn_flow(tunnel.clone(), rx, queued_bytes, self.reply_tx.clone(), ctx);
             true
         }
     }
@@ -421,19 +419,10 @@ mod linux {
         rx: mpsc::Receiver<Vec<u8>>,
         queued_bytes: Arc<AtomicUsize>,
         reply_tx: mpsc::Sender<ReplyMsg>,
-        key: (SocketAddr, SocketAddr),
-        udp_timeout: Duration,
-        in_name: &str,
-        in_port: u16,
+        ctx: flow::FlowCtx,
     ) {
-        let ctx = flow::FlowCtx {
-            client: key.0,
-            orig_dst: key.1,
-            udp_timeout,
-            in_name: in_name.to_string(),
-            in_port,
-        };
-        let (client, orig_dst) = key;
+        let client = ctx.client;
+        let orig_dst = ctx.orig_dst;
         tokio::spawn(async move {
             if let Err(e) = flow::relay_udp_flow(tunnel, rx, queued_bytes, reply_tx, ctx).await {
                 debug!("tproxy UDP {client} -> {orig_dst}: {e}");
