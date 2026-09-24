@@ -63,6 +63,7 @@ httparse = "1"
 # Optional: only compiled when the `external-ui-download` feature is enabled.
 # `deflate` is the only codec GitHub release zips use; skip the heavier ones.
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+dashmap = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

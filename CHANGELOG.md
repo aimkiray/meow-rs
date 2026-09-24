@@ -981,3 +981,20 @@ the canonical, in-repo source a release is cut from.
   keys now use the unresolved destination (domain-form targets key by
   host), so two names resolving to one address get independent flows —
   same routing semantics, finer dedup. (#625)
+
+- `proxy-providers` entries now honour `interval:` — a per-provider
+  background task refreshes the payload on the timer (`http` refetches
+  and rewrites the `path:` cache, `file` re-reads), matching mihomo's
+  `resource.Fetcher` pull loop. Previously the field was parsed but never
+  consumed, so node lists went silently stale until a manual
+  `PUT /providers/proxies/{name}` or a restart. A
+  `ProxyProviderRefreshSupervisor` reconciles the task set on every
+  committed registry swap — providers added, removed, or re-`interval`ed
+  by `PUT /configs` or a subscription refresh gain/lose/respawn their
+  task without a restart, and a reused provider object keeps its slot,
+  health state, and derived group views. Scheduled and manual refreshes
+  serialize through the provider's `refresh_lock`, and a failed tick
+  keeps the last-good node list. Provider `health-check` blocks now log a
+  warning that they are not periodically scheduled (the manual
+  healthcheck endpoint and group health checks still consume them).
+  (#625)

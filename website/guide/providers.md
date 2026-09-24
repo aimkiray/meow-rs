@@ -36,7 +36,7 @@ proxy-groups:
 | `filter` | regex | — | Keep only proxies whose name matches |
 | `exclude-filter` | regex | — | Drop proxies whose name matches |
 | `exclude-type` | string \| list | `[]` | Drop proxy types, e.g. `[ss]` |
-| `health-check` | block | — | Periodic probing (below) |
+| `health-check` | block | — | Probe defaults for the manual `GET /providers/proxies/{name}/healthcheck` endpoint — **not periodically scheduled**; members are otherwise probed by a `use:`ing group's own health check |
 | `header` | map | `{}` | Extra HTTP request headers (`http` only) |
 | `dialer-proxy` | string | — | Chain every node through the named `proxies:`/`proxy-groups:` entry. Overrides node-level `dialer-proxy` fields (mihomo writes it into each node unconditionally) |
 | `override` | map | — | Provider-level node defaults (mihomo `OverrideSchema`). Only `dialer-proxy` is honoured — it chains every node **unconditionally**, outranking both provider-level and node-level values; an empty string clears the chain (the node dials direct), and a non-string value rejects the provider. Other keys log a warning |
@@ -57,7 +57,7 @@ named dial error at 16 hops instead.
 | --- | --- | --- | --- |
 | `url` | string | — | **Required.** Source URL |
 | `path` | string | `provider_{name}.yaml` | Local cache (absolute or relative to config dir) |
-| `interval` | u64 | `0` | Accepted for compatibility; proxy-provider payloads are not refreshed on a timer — refresh manually with `PUT /providers/proxies/{name}` or restart |
+| `interval` | u64 | `0` | Refresh period in seconds; `0` disables the timer — refresh manually with `PUT /providers/proxies/{name}` |
 
 The cached file is the offline fallback: startup always fetches first and
 writes the cache; the file is read only when that fetch fails.
@@ -67,6 +67,7 @@ writes the cache; the file is read only when that fetch fails.
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `path` | string | — | **Required.** Local YAML file of proxies |
+| `interval` | u64 | `0` | Refresh period in seconds — the file is re-read on each tick; `0` disables the timer |
 
 ### Health check
 
@@ -134,14 +135,16 @@ rule-providers:
 provider fails to load with a warning, and `RULE-SET` entries referencing it
 warn-and-skip; under `strict: true` it is a hard config error.
 
-Only HTTP **rule providers** with a non-zero `interval` are refreshed
-automatically by a background task; proxy providers reload on manual
-refresh (`PUT /providers/proxies/{name}` — a `file` provider re-reads its
-file) or restart, and `inline` providers never refresh. A refresh
-supervisor reconciles the task set on every config commit: a provider
-*added* later via `PUT /configs` or a subscription refresh gains a task,
-a removed one loses it, and a changed `interval` respawns it — while an
-untouched provider keeps its existing task (and countdown).
+**Proxy providers** with a non-zero `interval` refresh on a background
+timer — `http` refetches the URL (updating the `path:` cache), `file`
+re-reads its file — and HTTP **rule providers** do the same; `inline`
+providers never refresh. A refresh supervisor reconciles the task set on
+every config commit: a provider *added* later via `PUT /configs` or a
+subscription refresh gains a task, a removed one loses it, and a changed
+`interval` respawns it — while an untouched provider keeps its existing
+task (and countdown). Manual refresh (`PUT /providers/proxies/{name}`)
+works regardless of `interval`, and a failed refresh keeps the last-good
+node list.
 
 ## Subscriptions
 

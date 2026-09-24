@@ -17,6 +17,7 @@ pub mod geodata;
 pub mod internal_http;
 pub mod proxy_parser;
 pub mod proxy_provider;
+pub mod proxy_provider_refresh;
 pub mod raw;
 pub mod rule_parser;
 pub mod rule_provider;
