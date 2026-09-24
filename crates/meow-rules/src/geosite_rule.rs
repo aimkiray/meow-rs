@@ -1,4 +1,4 @@
-//! `GEOSITE,<category>[,no-resolve]` rule — matches `Metadata.rule_host`
+//! `GEOSITE,<category>,<target>[,no-resolve]` rule — matches `Metadata.rule_host`
 //! against a named category in the shared `GeositeDB`.
 //!
 //! upstream: `rules/geosite.go::Match`

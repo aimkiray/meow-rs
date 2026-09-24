@@ -65,7 +65,7 @@ rules:
 #   ./meow/geosite.mrs
 ```
 
-**Rule syntax:** `GEOSITE,<category>[,<no-resolve>]`
+**Rule syntax:** `GEOSITE,<category>,<target>[,no-resolve]`
 
 | Field | Format | Meaning |
 |-------|--------|---------|
