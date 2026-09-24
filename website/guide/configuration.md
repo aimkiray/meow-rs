@@ -237,10 +237,10 @@ after a built-in adapter (`DIRECT`, `REJECT`, …), and a malformed `dialer-prox
 This is opt-in because it rejects real-world mihomo subscriptions that mix in node types
 meow-rs does not support — under `strict`, one unsupported node fails the whole provider
 load. Fetch failures stay lenient: a provider that cannot be downloaded (or a `type: file`
-provider whose file is unreadable) starts empty and stays empty until a manual
-`PUT /providers/proxies/{name}` refresh or restart, since a network blip is not a config
-defect. The same applies to `rule-providers:`: a definition defect or an unparseable
-acquired payload is fatal under strict, while a failed download is not.
+provider whose file is unreadable) starts empty and retries on each `interval` tick — or
+via a manual `PUT /providers/proxies/{name}` refresh or restart — since a network blip is
+not a config defect. The same applies to `rule-providers:`: a definition defect or an
+unparseable acquired payload is fatal under strict, while a failed download is not.
 
 Two scope notes: `PUT /configs` rebuilds apply strictness to the candidate's
 `proxies:`/`proxy-groups:`/`rules:`/`rule-providers:`/`proxy-providers:` —

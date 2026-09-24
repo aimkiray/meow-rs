@@ -155,7 +155,7 @@ proxy-groups:
 | `type` | `http\|file` | yes | — | Source type. |
 | `url` | string | if `http` | — | Subscription URL. |
 | `path` | string | yes | — | Local cache path. For `http`: write fetched YAML here. For `file`: read from here. Relative paths resolved from the config file's directory. |
-| `interval` | integer | no | `0` | Refresh interval in seconds. `0` or absent = no background refresh. `file` providers accept the field but ignore it (warn-once; file watch is out of scope). |
+| `interval` | integer | no | `0` | Refresh interval in seconds, scheduled by the refresh supervisor on every config commit. `0` or absent = no background refresh (manual `PUT /providers/proxies/{name}` still works). `file` providers re-read their file each tick — upstream instead fs-watchers file providers, so an un-`interval`ed `file` provider does not auto-reload here (divergence #2). |
 | `health-check.enable` | bool | no | `false` | Enable periodic health-check probes. |
 | `health-check.url` | string | if `enable` | — | URL used for reachability probes. |
 | `health-check.interval` | integer | no | `300` | Health-check sweep interval in seconds. |
@@ -469,7 +469,7 @@ handlers access providers through `State<Arc<AppState>>` as today.
 | # | Case | Class | Rationale |
 |---|------|:-----:|-----------|
 | 1 | Unknown override key — upstream applies via reflection | B | Reflection is unavailable in Rust's type system; warn-once and ignore. User's proxy still routes correctly; only the override field is skipped. |
-| 2 | `interval` on `file` provider — upstream ignores, no warn | B | We warn-once: "interval is ignored for file providers". Same behaviour, but surfaces the config field that has no effect. |
+| 2 | `file` provider auto-reload — upstream fs-watches the file (any modification reloads immediately, regardless of `interval`) | B | We re-read on `interval` ticks instead of watching; `interval: 0`/absent means no auto-reload (manual `PUT` only). Same content model, different trigger. |
 | 3 | Unknown provider name in `use:` — upstream silently skips | B | We warn-once at load: "proxy group '...' references unknown provider '...'; it will be empty". Same runtime behaviour, more operator signal. |
 | 4 | `include-all-proxies:` — upstream alias | B | Warn-once "use include-all:", treat identically. No routing change. |
 | 5 | Proxy-providers feature disabled, providers in config — upstream N/A (always enabled) | A | Hard-error per provider entry instead of silent empty group. Class A: silently skipping all provider proxies causes misrouting without diagnostic. |
@@ -502,7 +502,8 @@ A PR implementing this spec must:
    returns 204.
 10. Unknown override key logs exactly one `warn!` per key per provider
     (not one per proxy). Class B per ADR-0002.
-11. `interval:` on a `file` provider logs exactly one `warn!` at load.
+11. `interval:` on a `file` provider schedules a periodic re-read (see
+    divergence #2 — no fs-watch; `interval: 0` = manual refresh only).
 12. Unknown `use:` provider name logs exactly one `warn!` per group.
 13. `crates/meow-config` with `--no-default-features` compiles; a
     config with `proxy-providers:` entries hard-errors at load with

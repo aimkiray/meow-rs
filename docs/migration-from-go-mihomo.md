@@ -653,10 +653,13 @@ Most common format from public providers. Typical issues:
 
 1. **`proxy-providers:`** — supported in M1.H-1 (http + file sources, health-check,
    `include-all` shorthand).
-2. **`interval:` refresh** — the field is accepted for compatibility, but
-   proxy providers are not refreshed on a schedule; reload via
-   `PUT /providers/proxies/{name}` or restart. Scheduled refresh exists only
-   for HTTP **rule** providers.
+2. **`interval:` refresh** — scheduled for both `http` and `file` proxy
+   providers (`http` refetches and rewrites the `path:` cache, `file`
+   re-reads). `0`/absent disables the timer; manual
+   `PUT /providers/proxies/{name}` always works. One divergence: upstream
+   additionally fs-watches `file` providers, so a file edit reloads
+   immediately even without `interval` — here an un-`interval`ed file
+   provider does not auto-reload.
 3. **`use:` in proxy groups** — wired for proxy providers. Provider filters and
    `include-all` shorthands are applied when groups are resolved.
 

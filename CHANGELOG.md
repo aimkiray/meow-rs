@@ -993,12 +993,23 @@ the canonical, in-repo source a release is cut from.
   by `PUT /configs` or a subscription refresh gain/lose/respawn their
   task without a restart, and a reused provider object keeps its slot,
   health state, and derived group views. Scheduled and manual refreshes
-  serialize through the provider's `refresh_lock`, and a failed tick
-  keeps the last-good node list. Provider `health-check` blocks now log a
+  serialize through the provider's `refresh_lock`. Refresh semantics were
+  aligned with upstream's `Update`/`loadBuf` at the same time: a failed
+  tick — transport error OR a document-level parse defect (a 200-OK
+  captive-portal page no longer empties the provider under lenient mode;
+  `strict` still governs per-node leniency) — keeps the last-good node
+  list, a byte-identical payload short-circuits before parse so
+  `updated_at` tracks real content changes, the `path:` cache is written
+  only after a successful parse, and the cache fallback applies only to
+  initial acquisition (a failed refresh no longer rewinds the slot to a
+  stale on-disk generation). Provider `health-check` blocks now log a
   warning that they are not periodically scheduled (the manual
   healthcheck endpoint and group health checks still consume them).
   Embedders: `ApiServer::new`, `subscription_refresh::run_loop`, and
   `commit_proxy_providers` take a new `ProxyProviderRefreshSupervisor`
-  argument, `AppState` gains a `proxy_provider_refresh` field, and
+  argument, `AppState` gains a `proxy_provider_refresh` field,
   `commit_proxy_providers` additionally takes the candidate's
-  `proxy-providers:` declarations. (#625)
+  `proxy-providers:` declarations and its `registry` parameter changed
+  `&DashMap` → `&Arc<DashMap>`, and `ProxyProvider` gained a public
+  `acquire_initial` (initial-load acquisition with the on-disk cache
+  fallback that `refresh` intentionally skips). (#625)

@@ -2,7 +2,7 @@ use crate::proxy_parser;
 use crate::raw::{RawHealthCheck, RawProxyProvider};
 use meow_common::atomic::AtomicU;
 use meow_common::{ProviderSlot, Proxy};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +77,14 @@ pub struct ProxyProvider {
     /// provider, not silently keep fetching the old one (issue #533
     /// review).
     def: RawProxyProvider,
+    /// Hash of the last committed payload plus the `strict` flag it was
+    /// parsed under — upstream's `loadBuf` hash dedup: a byte-identical
+    /// refresh skips parse + commit entirely, so `updated_at` tracks the
+    /// last real content change and an unchanged payload doesn't rebuild
+    /// every adapter and derived view each tick. A committed
+    /// `strict`-flip still re-parses the same payload under the new
+    /// strictness (issue #625 review).
+    content_hash: Mutex<Option<(u64, bool)>>,
 }
 
 /// Weak counterpart of [`ProviderSlot`].
@@ -344,6 +352,7 @@ impl ProxyProvider {
             refresh_lock: tokio::sync::Mutex::new(()),
             derived: RwLock::new(Vec::new()),
             def: Self::def_identity(raw),
+            content_hash: Mutex::new(None), // see field docs
         })
     }
 
@@ -421,7 +430,12 @@ impl ProxyProvider {
             .retain(|(_, weak)| weak.upgrade().is_some());
     }
 
-    async fn fetch_content(&self) -> Result<String, String> {
+    /// Fetch the payload from its source — file read or HTTP GET. No
+    /// on-disk cache write and no fallback: the cache is persisted only
+    /// for content that *parses* ([`Self::ingest`]), matching upstream's
+    /// `loadBuf` order (`vehicle.Write` runs after `parser` succeeds), so
+    /// a 200-OK garbage body can't durably poison the fallback cache.
+    async fn fetch_source(&self) -> Result<String, String> {
         match &self.vehicle {
             Vehicle::File(path) => tokio::fs::read_to_string(path).await.map_err(|e| {
                 format!(
@@ -429,89 +443,117 @@ impl ProxyProvider {
                     self.name, path, e
                 )
             }),
-            Vehicle::Http { url, cache_path } => {
-                let fetched = crate::internal_http::fetch(url, None, &self.header)
-                    .await
-                    .and_then(|bytes| {
-                        String::from_utf8(bytes)
-                            .map_err(|e| anyhow::anyhow!("response body is not UTF-8: {e}"))
-                    });
-                match fetched {
-                    Ok(text) => {
-                        // Cache to disk for offline fallback — atomic
-                        // write-then-rename on a unique scratch: the
-                        // manual-refresh endpoint and a detached initial
-                        // fetch can race this write unlaned, and a torn
-                        // cache would poison the next fallback read
-                        // (issue #543 review).
-                        if let Some(cache_path) = cache_path {
-                            if let Some(parent) = cache_path.parent() {
-                                let _ = tokio::fs::create_dir_all(parent).await;
-                            }
-                            // Sweep scratch siblings a crashed writer left
-                            // behind (issue #621) — on the blocking pool so
-                            // the dir walk never stalls the worker.
-                            {
-                                let sweep_target = cache_path.clone();
-                                let _ = crate::spawn_blocking_with_current_dispatcher(move || {
-                                    meow_common::fs_util::sweep_scratch_siblings(
-                                        &sweep_target,
-                                        meow_common::fs_util::SCRATCH_STALE_AGE,
-                                    );
-                                })
-                                .await;
-                            }
-                            let tmp = crate::unique_scratch_path(cache_path);
-                            let saved = match tokio::fs::write(&tmp, &text).await {
-                                Ok(()) => tokio::fs::rename(&tmp, cache_path).await.is_ok(),
-                                Err(_) => false,
-                            };
-                            if !saved {
-                                let _ = tokio::fs::remove_file(&tmp).await;
-                            }
-                        }
-                        Ok(text)
-                    }
-                    Err(e) => {
-                        warn!(provider = %self.name, error = %e, "HTTP provider fetch failed, trying cache");
-                        read_cache(cache_path.as_deref(), &self.name).await
-                    }
-                }
-            }
+            Vehicle::Http { url, .. } => crate::internal_http::fetch(url, None, &self.header)
+                .await
+                .and_then(|bytes| {
+                    String::from_utf8(bytes)
+                        .map_err(|e| anyhow::anyhow!("response body is not UTF-8: {e}"))
+                })
+                .map_err(|e| e.to_string()),
         }
     }
 
-    /// Parse a fetched provider payload into proxies. `Err` only under
-    /// `strict` (`strict: true`, issue #533) — a malformed document or an
-    /// unparseable node; the lenient path warns and skips instead.
+    /// Initial-load acquisition: [`Self::fetch_source`] with an on-disk
+    /// cache fallback for HTTP providers — the offline bootstrap path.
+    /// The returned flag is `false` when the payload came from the cache
+    /// (no point rewriting it). Deliberately NOT used by refresh ticks:
+    /// a failed refresh keeps the in-memory last-good set (upstream
+    /// `Update` semantics) instead of rewinding the slot to whatever
+    /// generation the disk happens to hold.
+    async fn fetch_content(&self) -> Result<(String, bool), String> {
+        match self.fetch_source().await {
+            Ok(text) => Ok((text, true)),
+            Err(e) => match &self.vehicle {
+                Vehicle::Http { cache_path, .. } => {
+                    warn!(provider = %self.name, error = %e, "HTTP provider fetch failed, trying cache");
+                    read_cache(cache_path.as_deref(), &self.name)
+                        .await
+                        .map(|text| (text, false))
+                }
+                Vehicle::File(_) => Err(e),
+            },
+        }
+    }
+
+    /// Persist a parsed-and-committed HTTP payload for offline fallback —
+    /// atomic write-then-rename on a unique scratch: the manual-refresh
+    /// endpoint, an interval tick, and a detached initial fetch can race
+    /// this write unlaned, and a torn cache would poison the next
+    /// fallback read (issue #543 review).
+    async fn write_cache(&self, text: &str) {
+        let Vehicle::Http {
+            cache_path: Some(cache_path),
+            ..
+        } = &self.vehicle
+        else {
+            return;
+        };
+        if let Some(parent) = cache_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        // Sweep scratch siblings a crashed writer left behind
+        // (issue #621) — on the blocking pool so the dir walk never
+        // stalls the worker.
+        {
+            let sweep_target = cache_path.clone();
+            let _ = crate::spawn_blocking_with_current_dispatcher(move || {
+                meow_common::fs_util::sweep_scratch_siblings(
+                    &sweep_target,
+                    meow_common::fs_util::SCRATCH_STALE_AGE,
+                );
+            })
+            .await;
+        }
+        let tmp = crate::unique_scratch_path(cache_path);
+        let saved = match tokio::fs::write(&tmp, text).await {
+            Ok(()) => tokio::fs::rename(&tmp, cache_path).await.is_ok(),
+            Err(_) => false,
+        };
+        if !saved {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+    }
+
+    /// Shared acquisition tail: dedup → parse → persist cache → commit.
+    /// `Ok(false)` when the payload is byte-identical to the last commit
+    /// (upstream's hash early-return — `updated_at` only advances on real
+    /// content changes). `from_remote` distinguishes a live fetch from an
+    /// on-disk cache read — cache content is never written back.
+    async fn ingest(&self, content: String, from_remote: bool) -> Result<bool, String> {
+        let strict = self.strict.load(Ordering::Relaxed);
+        let hash = content_hash(&content);
+        if *self.content_hash.lock() == Some((hash, strict)) {
+            return Ok(false);
+        }
+        let proxies = self.parse_proxies(&content).await?;
+        if from_remote {
+            self.write_cache(&content).await;
+        }
+        self.commit(proxies);
+        *self.content_hash.lock() = Some((hash, strict));
+        Ok(true)
+    }
+
+    /// Parse a fetched provider payload into proxies.
+    ///
+    /// Document-level defects (malformed YAML, depth limit, merge-key
+    /// failure, non-list document) are `Err` in BOTH modes — upstream
+    /// `loadBuf` treats a parser failure as a failed update, so the caller
+    /// keeps the last-good slot instead of committing an empty one. This
+    /// matters now that refreshes are timer-driven: a 200-OK captive-portal
+    /// page must not wipe the provider every tick. `strict` still gates
+    /// *per-node* failures only.
+    ///
+    /// `declared_dialers` is rewritten only on the success path that will
+    /// be committed: an `Err` keeps the last-good slot running, so it must
+    /// keep that generation's declarations too (issue #489 review).
     async fn parse_proxies(&self, content: &str) -> Result<Vec<Arc<dyn Proxy>>, String> {
         let strict = self.strict.load(Ordering::Relaxed);
-        // `declared_dialers` is rewritten only where the parsed result will
-        // be committed: the lenient `Ok(vec![])` early returns empty the
-        // slot, so they clear the list; a strict `Err` keeps the last-good
-        // slot running, so it must keep that generation's declarations too
-        // (issue #489 review).
         if !crate::yaml_within_depth(content) {
-            if strict {
-                return Err(
-                    "provider YAML exceeds the nesting-depth limit (strict mode)".to_string(),
-                );
-            }
-            warn!(provider = %self.name, "provider YAML exceeds the nesting-depth limit");
-            self.declared_dialers.write().clear();
-            return Ok(Vec::new());
+            return Err("provider YAML exceeds the nesting-depth limit".to_string());
         }
-        let mut doc: serde_yaml::Value = match serde_yaml::from_str(content) {
-            Ok(v) => v,
-            Err(e) => {
-                if strict {
-                    return Err(format!("provider YAML is malformed (strict mode): {e}"));
-                }
-                warn!(provider = %self.name, error = %e, "failed to parse provider YAML");
-                self.declared_dialers.write().clear();
-                return Ok(Vec::new());
-            }
-        };
+        let mut doc: serde_yaml::Value = serde_yaml::from_str(content)
+            .map_err(|e| format!("provider YAML is malformed: {e}"))?;
         // Expand `<<:` merge keys — remote payloads legitimately carry
         // anchors, and an unexpanded merge silently drops the merged
         // `dialer-proxy` into a literal `<<` key (the one field whose loss
@@ -520,16 +562,8 @@ impl ProxyProvider {
         // partially expanded, so treat it like the parse failure above:
         // drop the whole payload rather than risk nodes losing their
         // chained front hop.
-        if let Err(e) = doc.apply_merge() {
-            if strict {
-                return Err(format!(
-                    "provider YAML merge keys failed to expand (strict mode): {e}"
-                ));
-            }
-            warn!(provider = %self.name, error = %e, "failed to expand YAML merge keys");
-            self.declared_dialers.write().clear();
-            return Ok(Vec::new());
-        }
+        doc.apply_merge()
+            .map_err(|e| format!("provider YAML merge keys failed to expand: {e}"))?;
 
         // Accept both `proxies: [...]` wrapper and a bare list. A
         // `Value::Null` document is an empty or comments-only file — treat
@@ -541,21 +575,9 @@ impl ProxyProvider {
             v => v,
         };
 
-        let mut proxy_maps: Vec<HashMap<String, serde_yaml::Value>> = match serde_yaml::from_value(
-            list_val,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                if strict {
-                    return Err(format!(
-                        "provider content is not a proxy list (strict mode): {e}"
-                    ));
-                }
-                warn!(provider = %self.name, error = %e, "provider content is not a proxy list");
-                self.declared_dialers.write().clear();
-                return Ok(Vec::new());
-            }
-        };
+        let mut proxy_maps: Vec<HashMap<String, serde_yaml::Value>> =
+            serde_yaml::from_value(list_val)
+                .map_err(|e| format!("provider content is not a proxy list: {e}"))?;
 
         // Pre-resolve any DNS-sourced ECH configs into inline base64 — keeps
         // `parse_proxy` itself sync. An `ech-opts.enable: true` node with no
@@ -753,20 +775,22 @@ impl ProxyProvider {
         self.declared_dialers.read().clone()
     }
 
+    /// Periodic/manual refresh — upstream `Update` semantics: fetch the
+    /// source, and on ANY failure (transport or document-level parse)
+    /// return `Err` and keep the in-memory last-good set. There is no
+    /// on-disk cache fallback here — rewinding the slot to a stale cache
+    /// generation would be a silent regression (issue #625 review).
     pub async fn refresh(&self) -> Result<(), String> {
         // Hold the generation across fetch+parse+swap: two overlapping
         // refreshes could otherwise interleave slot/derived/declared_dialers
         // from different payloads.
         let _generation = self.refresh_lock.lock().await;
-        match self.fetch_content().await {
-            Ok(content) => match self.parse_proxies(&content).await {
-                Ok(proxies) => {
-                    self.commit(proxies);
-                    Ok(())
-                }
+        match self.fetch_source().await {
+            Ok(content) => match self.ingest(content, true).await {
+                Ok(_) => Ok(()),
                 Err(e) => {
-                    // Reachable only under `strict` — a torn payload keeps the
-                    // last-good set instead of replacing it with nothing.
+                    // A torn payload keeps the last-good set instead of
+                    // replacing it with nothing.
                     warn!(provider = %self.name, error = %e, "proxy-provider refresh failed");
                     Err(e)
                 }
@@ -775,6 +799,19 @@ impl ProxyProvider {
                 warn!(provider = %self.name, error = %e, "proxy-provider refresh failed");
                 Err(e)
             }
+        }
+    }
+
+    /// First acquisition for a freshly built provider — startup and the
+    /// detached post-commit fetch. Unlike [`Self::refresh`] this DOES fall
+    /// back to the on-disk cache when the remote is unreachable (offline
+    /// bootstrap); the slot is empty at this point, so last-good
+    /// retention is moot.
+    pub async fn acquire_initial(&self) -> Result<(), String> {
+        let _generation = self.refresh_lock.lock().await;
+        match self.fetch_content().await {
+            Ok((content, from_remote)) => self.ingest(content, from_remote).await.map(|_| ()),
+            Err(e) => Err(e),
         }
     }
 
@@ -846,23 +883,23 @@ pub async fn load_proxy_providers(
                 if strict {
                     // Strict gates the *parse*, not the fetch: a transient
                     // download failure is not a config defect, so a provider
-                    // that can't be fetched still starts empty and stays
-                    // empty until a manual refresh or restart.
+                    // that can't be fetched still starts empty until a
+                    // scheduled tick or manual refresh succeeds.
                     match provider.fetch_content().await {
-                        Ok(content) => {
-                            let proxies = provider
-                                .parse_proxies(&content)
+                        Ok((content, from_remote)) => {
+                            provider
+                                .ingest(content, from_remote)
                                 .await
                                 .map_err(|e| anyhow::anyhow!("proxy-provider '{name}': {e}"))?;
-                            provider.commit(proxies);
                         }
                         Err(e) => {
                             warn!(provider = %name, error = %e,
                                 "initial fetch failed; starting empty");
                         }
                     }
-                } else {
-                    let _ = provider.refresh().await;
+                } else if let Err(e) = provider.acquire_initial().await {
+                    warn!(provider = %name, error = %e,
+                        "initial provider load failed; starting empty");
                 }
                 result.insert(name.clone(), provider);
             }
@@ -895,6 +932,16 @@ fn compile_opt_regex(
         }),
         None => Ok(None),
     }
+}
+
+/// Content hash for the unchanged-payload dedup — `DefaultHasher`
+/// (SipHash) is fine here; this is a same-process dedup, not a checksum
+/// persisted or compared across trust boundaries.
+fn content_hash(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut h);
+    h.finish()
 }
 
 async fn read_cache(path: Option<&Path>, name: &str) -> Result<String, String> {
@@ -1290,6 +1337,11 @@ header:
         assert_eq!(slot_names(&derived), ["US 1", "US 9"]);
 
         drop(derived);
+        // The dedup short-circuit skips commit on byte-identical
+        // payloads — a dead view is pruned on the next *changed* payload
+        // (or at commit-time `prune_dead_derived`), so the refresh that
+        // observes the drop must carry new content.
+        write_provider_file(tmp.path(), &[("US 1", "ss"), ("HK 3", "ss")]);
         provider.refresh().await.unwrap();
         assert_eq!(provider.derived_len(), 0);
     }
@@ -2068,12 +2120,75 @@ header:
             "a node without dialer-proxy must not touch the front hop"
         );
 
-        // Generation 3 is malformed — slot empties and so does the
-        // declared list (no phantom warnings on the next config build).
+        // Generation 3 is malformed — a document-level defect fails the
+        // refresh in both modes and keeps the last-good slot (upstream
+        // `loadBuf`: a parser error is a failed update, not an empty
+        // commit — critical now that interval ticks make this unattended).
         std::fs::write(&path, "proxies: [unclosed\n").unwrap();
+        p.refresh()
+            .await
+            .expect_err("a malformed payload must fail the refresh");
+        assert_eq!(
+            p.proxies().len(),
+            1,
+            "a torn refresh keeps the last-good set"
+        );
+    }
+
+    /// A byte-identical payload must not churn: upstream's `loadBuf` hash
+    /// early-return means `updated_at` and the committed adapters only
+    /// change on real content changes — otherwise every interval tick
+    /// rebuilds every node and derived view for nothing (issue #625
+    /// review).
+    #[tokio::test]
+    async fn refresh_skips_unchanged_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.yaml");
+        std::fs::write(
+            &path,
+            "proxies:\n  - {name: n1, type: socks5, server: 203.0.113.9, port: 1081}\n",
+        )
+        .unwrap();
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            Default::default(),
+        )
+        .unwrap();
         p.refresh().await.unwrap();
-        assert!(p.proxies().is_empty());
-        assert!(p.declared_dialer_names().is_empty());
+        let first = p.proxies();
+
+        // Identical content (mtime-bumped rewrite) → no re-commit: the
+        // adapter Arcs are literally the same objects.
+        std::fs::write(
+            &path,
+            "proxies:\n  - {name: n1, type: socks5, server: 203.0.113.9, port: 1081}\n",
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        let second = p.proxies();
+        assert!(
+            Arc::ptr_eq(&first[0], &second[0]),
+            "an unchanged payload must not rebuild adapters"
+        );
+
+        // Real content change → fresh commit.
+        std::fs::write(
+            &path,
+            "proxies:\n  - {name: n1, type: socks5, server: 203.0.113.9, port: 1081}\n\
+             \x20 - {name: n2, type: direct}\n",
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(p.proxies().len(), 2);
+        assert!(
+            !Arc::ptr_eq(&p.proxies()[0], &first[0]),
+            "a changed payload must rebuild adapters"
+        );
     }
 
     /// A `dialer-proxy`-carrying node dropped by the provider's own filters

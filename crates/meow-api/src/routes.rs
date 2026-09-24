@@ -1252,8 +1252,12 @@ pub fn commit_proxy_providers(
         if needs_fetch {
             let provider = Arc::clone(provider);
             let name = name.clone();
+            // `acquire_initial`, not `refresh`: a freshly committed
+            // provider has an empty slot, so the on-disk cache fallback
+            // (offline bootstrap) applies — refresh ticks deliberately
+            // skip it to keep the in-memory last-good set.
             tokio::spawn(async move {
-                if let Err(e) = provider.refresh().await {
+                if let Err(e) = provider.acquire_initial().await {
                     tracing::warn!("proxy-provider '{name}': initial fetch failed: {e}");
                 }
             });
@@ -3659,6 +3663,11 @@ mod tests {
     /// a committed `file` provider with `interval: 1` must tick-refresh its
     /// slot without any manual PUT. Driven on a real file + real clock so a
     /// missing `reconcile` call fails the assertion outright.
+    ///
+    /// The provider is pre-seeded into the registry so the commit's
+    /// `needs_fetch` is false — otherwise the detached initial fetch (which
+    /// polls on the test's first `.await`, after the file is rewritten)
+    /// satisfies the assertion even with `reconcile` stubbed out.
     #[tokio::test]
     async fn commit_proxy_providers_reconciles_interval_tasks() {
         use meow_config::proxy_provider::ProxyProvider;
@@ -3696,6 +3705,9 @@ mod tests {
         assert_eq!(provider.proxies().len(), 0);
 
         let registry: Arc<DashMap<String, Arc<ProxyProvider>>> = Arc::new(DashMap::new());
+        // Pre-seed: same Arc ⇒ `needs_fetch` false ⇒ no detached initial
+        // fetch — the interval task is the only refresher in this test.
+        registry.insert("p".to_string(), Arc::clone(&provider));
         let refresh =
             meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default();
         let _lane = CONFIG_MUTATION.lock().await;

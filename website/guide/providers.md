@@ -79,6 +79,10 @@ writes the cache; the file is read only when that fetch fails.
 | `timeout` | u64 (ms) | `5000` |
 | `lazy` | bool | `false` |
 
+These fields configure probes for the **manual** healthcheck endpoint and are
+stored on the provider — unlike the provider-level `interval` above, the
+health-check `interval`/`lazy` are not periodically scheduled.
+
 ## Rule providers
 
 `rule-providers` supplies external rule sets, referenced from `rules` via

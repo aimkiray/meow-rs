@@ -6702,6 +6702,53 @@ rules:
         );
     }
 
+    /// `interval` is excluded from provider identity — it configures the
+    /// refresh *schedule*, not the payload source. An interval-only
+    /// `PUT /configs` must reuse the live provider (no refetch); the
+    /// supervisor respawns the task from the committed declarations
+    /// (issue #625). A regression that re-added `interval` to
+    /// `def_identity` would silently refetch on every interval change.
+    #[test]
+    fn provider_interval_only_change_reuses_provider() {
+        let yaml = r#"
+strict: false
+proxy-providers:
+  p:
+    type: file
+    path: nodes.yaml
+    interval: 60
+proxies:
+  - { name: ok, type: direct }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let cache_dir = std::path::Path::new("/tmp");
+        let raw = raw_config(yaml);
+        let first = materialize_proxy_providers(
+            &raw,
+            &HashMap::new(),
+            Some(cache_dir),
+            false,
+            &Default::default(),
+        )
+        .expect("provider materializes");
+        let provider = Arc::clone(first.get("p").unwrap());
+
+        let changed = raw_config(&yaml.replace("interval: 60", "interval: 120"));
+        let again = materialize_proxy_providers(
+            &changed,
+            &first,
+            Some(cache_dir),
+            false,
+            &Default::default(),
+        )
+        .expect("interval-only change must reuse the provider");
+        assert!(
+            Arc::ptr_eq(again.get("p").unwrap(), &provider),
+            "interval is a schedule knob, not provider identity"
+        );
+    }
+
     /// A malformed `proxy-groups`/`rules`/`proxies` section in a fetched
     /// subscription is remote-controlled content — under strict it fails the
     /// fetch instead of silently emptying the committed lists (issue #533
