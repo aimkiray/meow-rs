@@ -915,6 +915,16 @@ impl Session {
         // holds `Weak` so a dropped session needs no cleanup, and close()
         // deliberately does NOT abort the handle — the watchdog task itself
         // may be the close() caller.
+        //
+        // The arm deliberately precedes `write_frame` — upstream arms
+        // before `writeControlFrame` and keeps the watcher on write error.
+        // One Rust-specific edge: if the caller drops this future while
+        // `write_frame` pends on the writer budget, the armed watchdog
+        // outlives a SYN that was never enqueued and closes the session
+        // ~3s later. Erring toward closing matches upstream intent (a
+        // saturated writer budget is itself a wedged-session symptom), and
+        // a cancel-path disarm cannot distinguish this arm from a later
+        // open's re-armed one.
         if self.is_client
             && stream_id >= 2
             && self.peer_version.load(std::sync::atomic::Ordering::Relaxed) >= 2
