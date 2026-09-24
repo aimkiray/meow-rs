@@ -918,6 +918,7 @@ impl Session {
         if self.is_client
             && stream_id >= 2
             && self.peer_version.load(std::sync::atomic::Ordering::Relaxed) >= 2
+            && !self.is_closed()
         {
             let weak = Arc::downgrade(self);
             let watchdog = tokio::spawn(async move {
@@ -2437,6 +2438,73 @@ mod padding_bounds_tests {
         time::advance(SYN_WATCHDOG_TIMEOUT * 2).await;
         tokio::task::yield_now().await;
         assert!(!session.is_closed());
+    }
+
+    /// Disarm happens before the stream lookup (upstream `cmdSYNACK`
+    /// semantics): a SynAck for an unknown sid still proves the peer's
+    /// control plane is alive and must cancel the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_sid_synack_disarms_session_watchdog() {
+        let session = Arc::new(Session::new_client(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            PaddingFactory::default().into_shared(),
+            None,
+        ));
+        let _writer = spawn_writer(&session);
+        session
+            .peer_version
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        let (_s1, _a1) = session.open_stream().await.unwrap();
+        let (_s2, _a2) = session.open_stream().await.unwrap();
+        assert!(session.syn_watchdog.lock().unwrap().is_some());
+
+        session
+            .handle_frame(Frame::control(Command::SynAck, 999))
+            .await
+            .unwrap();
+        assert!(session.syn_watchdog.lock().unwrap().is_none());
+
+        time::advance(SYN_WATCHDOG_TIMEOUT * 2).await;
+        tokio::task::yield_now().await;
+        assert!(!session.is_closed());
+    }
+
+    /// The #625 scenario: a peer that answers heartbeats but never SynAcks.
+    /// Only SynAck may disarm — a HeartResponse mid-window must leave the
+    /// deadline armed and the session must still close on expiry.
+    #[tokio::test(start_paused = true)]
+    async fn heart_response_does_not_disarm_session_watchdog() {
+        let session = Arc::new(Session::new_client(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            PaddingFactory::default().into_shared(),
+            None,
+        ));
+        let _writer = spawn_writer(&session);
+        session
+            .peer_version
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        let (_s1, _a1) = session.open_stream().await.unwrap();
+        let (_s2, _a2) = session.open_stream().await.unwrap();
+        assert!(session.syn_watchdog.lock().unwrap().is_some());
+
+        session
+            .handle_frame(Frame::control(Command::HeartResponse, 0))
+            .await
+            .unwrap();
+        assert!(session.syn_watchdog.lock().unwrap().is_some());
+
+        time::advance(SYN_WATCHDOG_TIMEOUT + Duration::from_millis(1)).await;
+        for _ in 0..200 {
+            if session.is_closed() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("heartbeat-only peer must still hit the synDone deadline");
     }
 
     /// Each new open aborts the previous deadline and starts a fresh one —
