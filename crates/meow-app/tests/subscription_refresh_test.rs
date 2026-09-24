@@ -199,6 +199,7 @@ fn spawn_loop(fx: &Fixture) {
         Arc::clone(&fx.proxy_providers),
         fx.provider_dialer_registry.clone(),
         Arc::new(RefreshSupervisor::default()),
+        Arc::new(meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default()),
     ));
 }
 

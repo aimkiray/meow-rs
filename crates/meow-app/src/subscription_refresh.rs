@@ -45,6 +45,12 @@ pub async fn run_loop(
     // provider additions/removals/interval changes gain/lose their refresh
     // task without a restart (issue #543).
     rule_provider_refresh: Arc<meow_config::rule_provider_refresh::RefreshSupervisor>,
+    // Shared supervisor for the proxy-provider `interval` tasks —
+    // `commit_proxy_providers` reconciles it against the committed
+    // declarations after each registry swap (issue #625).
+    proxy_provider_refresh: Arc<
+        meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor,
+    >,
 ) {
     // Same provider-cache directory `load_config` used at startup — trusted
     // rebuilds of the daemon's own config must keep resolving relative
@@ -301,6 +307,8 @@ pub async fn run_loop(
                                 &proxy_providers,
                                 &new_proxy_providers,
                                 candidate.strict.unwrap_or(false),
+                                candidate.proxy_providers.as_ref(),
+                                &proxy_provider_refresh,
                             );
                             // Commit raw + routing together inside the lane:
                             // the on-disk/dashboard view and the running

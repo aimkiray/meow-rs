@@ -847,6 +847,14 @@ async fn run(
         Arc::new(meow_config::rule_provider_refresh::RefreshSupervisor::default());
     rule_provider_refresh.reconcile(&rule_providers);
 
+    // Same supervision for `proxy-providers` `interval:` — reconciled
+    // against the committed declarations on every registry swap
+    // (`commit_proxy_providers`), and once here for the startup set
+    // (issue #625).
+    let proxy_provider_refresh =
+        Arc::new(meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default());
+    proxy_provider_refresh.reconcile(&proxy_providers, config.raw.proxy_providers.as_ref());
+
     // Start subscription background refresh task
     {
         let raw_config = Arc::clone(&raw_config);
@@ -856,6 +864,7 @@ async fn run(
         let rule_providers = Arc::clone(&rule_providers);
         let proxy_providers = Arc::clone(&proxy_providers);
         let rule_provider_refresh = Arc::clone(&rule_provider_refresh);
+        let proxy_provider_refresh = Arc::clone(&proxy_provider_refresh);
         let provider_dialer_registry = config.provider_dialer_registry.clone();
         tokio::spawn(async move {
             meow_app::subscription_refresh::run_loop(
@@ -867,6 +876,7 @@ async fn run(
                 proxy_providers,
                 provider_dialer_registry,
                 rule_provider_refresh,
+                proxy_provider_refresh,
             )
             .await;
         });
@@ -1114,6 +1124,7 @@ async fn run(
             Arc::clone(&proxy_providers),
             Arc::clone(&rule_providers),
             Arc::clone(&rule_provider_refresh),
+            Arc::clone(&proxy_provider_refresh),
             named_listeners.clone(),
             config.api.external_ui.clone(),
             Arc::clone(&dns_server_handle),

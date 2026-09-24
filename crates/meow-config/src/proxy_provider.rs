@@ -239,6 +239,19 @@ impl ProxyProvider {
         let exclude_type = split_exclude_types(raw.exclude_type.as_deref());
 
         let health_check = build_health_check_config(raw.health_check.as_ref());
+        if health_check.is_some() {
+            // The config is honoured by the manual
+            // `GET /providers/proxies/{name}/healthcheck` endpoint, but
+            // nothing probes provider members on a timer (mihomo schedules
+            // the provider health-check alongside `interval`). Warn once
+            // per build so the config isn't silently half-wired.
+            warn!(
+                provider = %name,
+                "proxy-provider 'health-check' is stored but not periodically \
+                 scheduled — members are probed only via the manual \
+                 healthcheck endpoint or a group's own health check"
+            );
+        }
         let header = raw
             .header
             .as_ref()
@@ -335,9 +348,12 @@ impl ProxyProvider {
     }
 
     /// The fields of a declaration that determine provider identity.
-    /// `interval` is excluded: no periodic proxy-provider refresh task
-    /// consumes it (only the manual PUT endpoint exists), so changing it
-    /// alone must not force a rebuild + refetch (issue #533 review).
+    /// `interval` is excluded: it configures the refresh *schedule*, not
+    /// the payload source — the supervisor consumes the committed
+    /// declarations directly
+    /// ([`crate::proxy_provider_refresh::ProxyProviderRefreshSupervisor`]),
+    /// so an interval-only change respawns the task without rebuilding the
+    /// provider or refetching its payload (issue #625).
     fn def_identity(raw: &RawProxyProvider) -> RawProxyProvider {
         RawProxyProvider {
             interval: None,
