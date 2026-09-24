@@ -928,7 +928,19 @@ impl Session {
                         "[Session] No SYNACK within {:?} of open_stream - closing session",
                         SYN_WATCHDOG_TIMEOUT
                     );
-                    let _ = session.close().await;
+                    // Detach the close: `abort()` on this task's handle —
+                    // by a racing SynAck disarm or a later re-arm — can
+                    // still land while `close()` is suspended (writer lock
+                    // + 1 s shutdown timeout), which would drop the future
+                    // mid-teardown after `is_closed` was already set and
+                    // strand the drain/shutdown forever (close() is
+                    // idempotent and non-resumable). A spawned close runs
+                    // to completion; an abort before the spawn is a clean
+                    // disarm. Go parity: upstream's watcher goroutine is
+                    // uncancellable once it selects the deadline branch.
+                    tokio::spawn(async move {
+                        let _ = session.close().await;
+                    });
                 }
             });
             let mut slot = self.syn_watchdog.lock().unwrap();
@@ -2331,6 +2343,34 @@ mod padding_bounds_tests {
         tokio::spawn(async move { worker.process_stream_data().await })
     }
 
+    /// `AsyncWrite` that records `poll_shutdown` — the observable evidence
+    /// that `close()` ran its writer-shutdown phase to completion.
+    struct ShutdownTracker {
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl tokio::io::AsyncWrite for ShutdownTracker {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     /// Upstream `synDone` parity (#625): on a v2+ peer, opening any stream
     /// beyond the first arms a session-level deadline — no SynAck within
     /// `SYN_WATCHDOG_TIMEOUT` closes the *session*.
@@ -2435,6 +2475,85 @@ mod padding_bounds_tests {
             tokio::task::yield_now().await;
         }
         panic!("re-armed watchdog must close the session at its own deadline");
+    }
+
+    /// A late SynAck must not kill a watchdog-initiated `close()` mid-flight:
+    /// `is_closed` is set in close's synchronous prefix, so a cancelled close
+    /// strands the stream drain + writer shutdown forever (close() is
+    /// idempotent and never retries). The close is detached from the
+    /// abortable watchdog task — abort lands before the detach point or
+    /// misses it entirely (#625 review).
+    #[tokio::test(start_paused = true)]
+    async fn synack_cannot_abort_inflight_watchdog_close() {
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let session = Arc::new(Session::new_client(
+            tokio::io::empty(),
+            ShutdownTracker {
+                flag: Arc::clone(&shutdown),
+            },
+            PaddingFactory::default().into_shared(),
+            None,
+        ));
+        let _writer = spawn_writer(&session);
+        session
+            .peer_version
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        let (_s1, _a1) = session.open_stream().await.unwrap();
+        let (_s2, _a2) = session.open_stream().await.unwrap();
+        assert!(session.syn_watchdog.lock().unwrap().is_some());
+        tokio::task::yield_now().await;
+
+        // Pend the watchdog's close() on the writer lock — close's last
+        // suspension point — so the SynAck's abort lands while teardown is
+        // mid-flight (the stream drain has already run).
+        let writer_guard = session.writer.lock().await;
+        time::advance(SYN_WATCHDOG_TIMEOUT).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        session
+            .handle_frame(Frame::control(Command::SynAck, 2))
+            .await
+            .unwrap();
+        drop(writer_guard);
+
+        // The detached close must still finish — `writer.shutdown()` is
+        // the tail of teardown. If the abort had killed the future the
+        // flag would never be set.
+        for _ in 0..200 {
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                assert!(session.is_closed());
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("watchdog close aborted mid-flight: writer never shut down");
+    }
+
+    /// Server sessions never arm the watchdog even with a v2+ peer — the
+    /// `is_client` gate is load-bearing: server sessions learn the peer
+    /// version from the client's Settings frame, and `open_stream` is pub.
+    #[tokio::test(start_paused = true)]
+    async fn server_session_never_arms_watchdog() {
+        let session = Arc::new(Session::new_server(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            PaddingFactory::default(),
+        ));
+        let _writer = spawn_writer(&session);
+        session
+            .peer_version
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        let (_s1, _a1) = session.open_stream().await.unwrap();
+        let (_s2, _a2) = session.open_stream().await.unwrap();
+        assert!(session.syn_watchdog.lock().unwrap().is_none());
+
+        time::advance(SYN_WATCHDOG_TIMEOUT * 2).await;
+        tokio::task::yield_now().await;
+        assert!(!session.is_closed());
     }
 
     /// Below v2 the peer has no SynAck contract — no watchdog ever arms.
