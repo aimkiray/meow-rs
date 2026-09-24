@@ -336,23 +336,32 @@ fn build_metadata(peer: SocketAddr, target: &Address, in_name: &str, in_port: u1
 // across all SS clients. Each decrypted datagram carries a `(peer, target)`
 // pair: `peer` is the SS client's source address, `target` is the SOCKS
 // destination encoded in the SS header. We maintain a flat
-// `HashMap<(peer, target), Flow>` so datagrams from different clients (or to
+// `HashMap<(peer, FlowKey), UdpFlow>` so datagrams from different clients (or to
 // different destinations from the same client) get distinct outbound conns —
 // mirroring the SOCKS5-UDP per-destination NAT, but keyed by both endpoints
 // since the socket is shared.
 //
+// Each flow is a bounded FIFO queue plus a task that performs resolve →
+// route → `dial_udp` → ordered writes and owns the reply pump — the recv
+// loop never awaits any of that (issue #625; the same restructure #619
+// gave the SOCKS5-UDP listener for issue #515).
+//
 // Idle eviction reuses `meow_tunnel::udp::DEFAULT_UDP_IDLE`; a flow on which
 // neither direction has touched `last_activity_ms` within the idle window is
-// dropped, aborting its reply task and freeing the outbound conn.
+// dropped, aborting its task and freeing the outbound conn.
 
 use meow_common::atomic::{checked_increment, AtomicU, Uint};
 use meow_common::{with_dial_timeout, ProxyPacketConn, ReplayWindow};
 use meow_tunnel::udp::DEFAULT_UDP_IDLE;
+use meow_tunnel::TunnelInner;
 use shadowsocks::context::SharedContext;
 use shadowsocks::relay::udprelay::options::UdpSocketControlData;
 use shadowsocks::relay::udprelay::{DatagramReceive, DatagramSend};
+use smallvec::SmallVec;
+use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 use crate::monotonic_ms;
@@ -428,11 +437,11 @@ struct ClientSession {
     last_seen_ms: Uint,
 }
 
-/// Mutable state owned by [`run_udp_relay`]'s loop: the `(peer, target)`
+/// Mutable state owned by [`run_udp_relay`]'s loop: the `(peer, FlowKey)`
 /// flow table plus the AEAD-2022 client-session table.
 #[derive(Default)]
 struct UdpRelayState {
-    flows: HashMap<(SocketAddr, SocketAddr), UdpFlow>,
+    flows: HashMap<(SocketAddr, FlowKey), UdpFlow>,
     /// Relay sessions keyed by client session ID — the spec's session
     /// discriminator (§3.2.4: "Servers MUST route packets based on client
     /// session ID, not packet source address"). Non-2022 ciphers carry no
@@ -474,27 +483,57 @@ fn build_reply_control(
     control
 }
 
-/// One `(peer, target)` outbound flow.
+/// Per-destination flow key — the *unresolved* destination, because
+/// resolution itself moved off the recv loop (issue #625). Literal-IP
+/// targets key by socket address (no allocation on the per-datagram path);
+/// domain-form targets key by the already-lowercased `SmolStr` host. Two
+/// names resolving to one address now get separate flows — same routing
+/// semantics, slightly finer dedup granularity (the same trade-off
+/// socks5_udp took in #619).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FlowKey {
+    Addr(SocketAddr),
+    Host(SmolStr, u16),
+}
+
+/// Per-flow client→upstream queue bound. Datagrams arriving while the flow
+/// task is still establishing (resolve + route + `dial_udp`) queue here;
+/// overflow is dropped (UDP semantics — the client retries), mirroring
+/// socks5_udp's `SESSION_QUEUE`.
+const UDP_FLOW_QUEUE: usize = 64;
+
+/// One `(peer, target)` outbound flow: a bounded FIFO queue feeding a task
+/// that performs resolve → route → `dial_udp` → ordered upstream writes and
+/// owns the reply pump. The recv loop only queues onto `tx` — it never
+/// awaits a dial or a write, so one slow destination can no longer
+/// head-of-line block every SS client on the shared socket (issue #625).
 struct UdpFlow {
-    conn: Arc<dyn ProxyPacketConn>,
+    tx: mpsc::Sender<SmallVec<[u8; 1500]>>,
     last_activity_ms: Arc<AtomicU>,
-    /// Set by the reply task when it exits (upstream read error or
-    /// client-relay write failure) — the fast path must evict the flow so
-    /// the next datagram redials instead of writing into a conn that can
-    /// never answer (issue #514, same class as the SOCKS5-UDP fix).
+    /// Set when the flow task exits for any reason (dial failure, upstream
+    /// write/read error, eviction) — the next datagram re-dials instead of
+    /// queueing into a dead channel (issue #514, same class as the
+    /// SOCKS5-UDP fix).
     dead: Arc<std::sync::atomic::AtomicBool>,
+    /// Filled by the flow task once `dial_udp` returns — lets tests observe
+    /// the established conn (previously reachable as `flow.conn`).
+    #[allow(
+        dead_code,
+        reason = "written by the flow task; read only by tests observing establishment"
+    )]
+    established: Arc<tokio::sync::OnceCell<Arc<dyn ProxyPacketConn>>>,
     /// The client session ID this flow echoes in replies (`0` for ciphers
     /// outside AEAD-2022). A datagram carrying a *different* ID on the same
     /// `(peer, target)` key is a new relay session per SIP022 §3.2.4 — the
     /// flow must be torn down and re-dialed, not reused with a stale echo.
     client_session_id: u64,
-    /// Reply task (server→client); aborted when the flow is evicted.
-    reply_task: AbortHandle,
+    /// Flow task (establish → writer loop + reply pump); aborted on evict.
+    task: AbortHandle,
 }
 
 impl Drop for UdpFlow {
     fn drop(&mut self) {
-        self.reply_task.abort();
+        self.task.abort();
     }
 }
 
@@ -546,12 +585,14 @@ fn session_is_live(session: &ClientSession, now: Uint) -> bool {
 /// drop or panic on every reply. Ciphers outside the 2022 category ignore
 /// the control field entirely, so they are unaffected either way.
 ///
-/// `handle_ss_udp_datagram` is awaited inline, not spawned: every datagram
-/// runs the flow-table check-then-insert under one task, so a retransmitted
-/// first datagram can never create a duplicate flow. The cost is that one
-/// client's slow `dial_udp` stalls decrypt→dispatch for the whole shared
-/// socket — bounded by `with_dial_timeout` and the same trade-off the
-/// SOCKS5-UDP loop makes.
+/// `handle_ss_udp_datagram` runs synchronously on the loop — the AEAD-2022
+/// session bookkeeping, replay check, and flow-table check-then-insert all
+/// happen inline, so a retransmitted first datagram can never create a
+/// duplicate flow — then the payload is queued onto the flow's bounded
+/// channel. Resolution, routing, `dial_udp`, and the ordered upstream
+/// writes run inside the per-flow task, so one client's slow dial can no
+/// longer stall decrypt→dispatch for every SS client on the shared socket
+/// (issue #625; mirrors the SOCKS5-UDP restructure in #619).
 async fn run_udp_relay<S>(
     tunnel: Tunnel,
     sock: shadowsocks::ProxySocket<S>,
@@ -562,6 +603,7 @@ async fn run_udp_relay<S>(
 ) where
     S: DatagramSend + DatagramReceive + Send + Sync + 'static,
 {
+    let inner = tunnel.inner();
     let sock = Arc::new(sock);
     let mut state = UdpRelayState::default();
     // The crate asks for ≥65536 bytes of intermediate storage — the full
@@ -587,7 +629,7 @@ async fn run_udp_relay<S>(
                 };
                 let payload = &buf[..n];
                 match handle_ss_udp_datagram(
-                    &tunnel,
+                    inner,
                     &sock,
                     &mut state,
                     payload,
@@ -598,9 +640,7 @@ async fn run_udp_relay<S>(
                     &in_name,
                     in_port,
                     max_flows,
-                )
-                .await
-                {
+                ) {
                     Ok(true) => {}
                     Ok(false) => {
                         if !warned_saturated {
@@ -649,8 +689,15 @@ async fn run_udp_relay<S>(
     }
 }
 
-/// Decrypt is already done by `ProxySocket`; here we resolve the target,
-/// route, and forward through the (possibly new) per-flow outbound conn.
+/// Decrypt is already done by `ProxySocket`; here we run the AEAD-2022
+/// session bookkeeping + replay check, resolve the *flow* (not the target —
+/// that happens inside the flow task), and queue the payload onto the
+/// flow's bounded channel — creating the flow's task on first use. Runs
+/// synchronously on the shared recv loop and never awaits resolution,
+/// routing, `dial_udp`, or an upstream write (issue #625: a slow
+/// destination must not head-of-line block every SS client on the socket).
+/// Per-flow ordering is preserved because every payload for a destination
+/// travels the same FIFO queue.
 ///
 /// `control` is the client's per-datagram control as decrypted by
 /// `recv_from_with_ctrl` (`None` for ciphers outside the AEAD-2022 category,
@@ -659,7 +706,7 @@ async fn run_udp_relay<S>(
 /// server session ID + reply packet counter for every flow of the session
 /// and the replay window the datagram's packet ID is checked against.
 ///
-/// Returns `Ok(true)` when the datagram was handled (existing or new flow),
+/// Returns `Ok(true)` when the datagram was queued (existing or new flow),
 /// `Ok(false)` when it was dropped because the flow or session table is at
 /// `max_flows` (cap on *new* entries only — datagrams for existing flows
 /// and known session IDs always pass), and `Err` with a reason for
@@ -668,8 +715,8 @@ async fn run_udp_relay<S>(
     clippy::too_many_arguments,
     reason = "mirrors socks5_udp::handle_client_datagram's parameter set plus the shared socket, the flow/session caps, and the AEAD-2022 reply-control inputs"
 )]
-async fn handle_ss_udp_datagram<S>(
-    tunnel: &Tunnel,
+fn handle_ss_udp_datagram<S>(
+    inner: &Arc<TunnelInner>,
     sock: &Arc<shadowsocks::ProxySocket<S>>,
     state: &mut UdpRelayState,
     payload: &[u8],
@@ -726,7 +773,6 @@ where
         }
     }
 
-    let inner = tunnel.inner();
     let (host, dst_ip, dst_port) = match target {
         Address::DomainNameAddress(d, port) => (d.to_lowercase(), None, *port),
         Address::SocketAddress(sa) => (String::new(), Some(sa.ip()), sa.port()),
@@ -745,28 +791,36 @@ where
         ..Default::default()
     };
 
+    // Drop an unmapped fake-IP destination before it spawns a flow — a
+    // stale-datagram flood would otherwise churn a spawn+evict per packet
+    // (issue #618, same guard as socks5_udp). The flow task re-checks.
     if matches!(
         inner.pre_handle_metadata(&mut metadata),
         meow_tunnel::PreHandleVerdict::Drop
     ) {
         return Err("unmapped fake-ip destination".into());
     }
-    inner.pre_resolve(&mut metadata).await;
-    if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
-        metadata.dst_ip = inner.resolver().resolve_ip_real(&metadata.host).await;
-    }
-    let Some(dst_ip) = metadata.dst_ip else {
-        return Err(format!(
-            "dst_ip not resolved for {}",
-            metadata.remote_address()
-        ));
-    };
-    let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
-    let key = (peer, dst_addr);
+
+    // Key by the unresolved destination — `metadata.dst_ip` after
+    // `pre_handle_metadata` (which folds domain-typed IP literals into
+    // dst_ip), else the lowercased host. Resolution happens inside the flow
+    // task, so a slow lookup cannot stall the recv loop, and the flow pins
+    // the resolved address for its life (what QUIC wants; the old key used
+    // the resolved address anyway, so no flow ever re-resolved).
+    let key = (
+        peer,
+        match metadata.dst_ip {
+            Some(ip) => FlowKey::Addr(SocketAddr::new(ip, metadata.dst_port)),
+            None if !metadata.host.is_empty() => {
+                FlowKey::Host(metadata.host.clone(), metadata.dst_port)
+            }
+            None => return Err("UDP datagram with neither IP nor domain".into()),
+        },
+    );
 
     // Fast path: existing flow. Two reasons to evict and fall through to a
     // fresh dial instead of reusing it:
-    //   * a dead reply task means the conn can never answer (issue #514);
+    //   * a dead task means the conn can never answer (issue #514);
     //   * a changed client session ID on the same `(peer, target)` is a new
     //     relay session per SIP022 §3.2.4 — replies must echo the new ID,
     //     which only a freshly built flow can do.
@@ -776,59 +830,45 @@ where
         {
             state.flows.remove(&key);
         } else {
-            match flow.conn.write_packet(payload, &dst_addr).await {
-                Ok(_n) => {
+            // Check capacity before copying the payload onto the queue — a
+            // flooded flow drops the datagram without paying the copy.
+            if flow.tx.capacity() == 0 {
+                debug!("ss udp flow queue full: dropping datagram");
+                return Ok(true);
+            }
+            match flow.tx.try_send(SmallVec::from_slice(payload)) {
+                Ok(()) => {
                     flow.last_activity_ms
                         .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
                     return Ok(true);
                 }
-                Err(e) => {
-                    // A failed write leaves the flow half-dead — the reply
-                    // task's read may still block indefinitely, so every
-                    // later datagram on this key would keep erroring. Evict
-                    // now so the next packet redials (mirrors the SOCKS5
-                    // path, issue #514 review).
+                // Queue filled between the capacity check and the send:
+                // drop the datagram (UDP semantics — the client retries).
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    debug!("ss udp flow queue full: dropping datagram");
+                    return Ok(true);
+                }
+                // The task exited between the dead check and the send:
+                // evict and start a fresh flow with this datagram.
+                Err(mpsc::error::TrySendError::Closed(_)) => {
                     state.flows.remove(&key);
-                    return Err(format!("udp write {dst_addr}: {e}"));
                 }
             }
         }
     }
 
-    // Flow-table cap: a new flow costs a 64 KiB reply buffer, a task, and an
-    // outbound socket; without a cap any password holder could exhaust
-    // memory/FDs between idle sweeps. `0` disables the cap.
+    // Flow-table cap: a new flow costs a queue, a task, a 64 KiB reply
+    // buffer, and an outbound socket; without a cap any password holder
+    // could exhaust memory/FDs between idle sweeps. `0` disables the cap.
     if max_flows > 0 && state.flows.len() >= max_flows {
         return Ok(false);
     }
 
-    // Client UDP follows the configured routing policy, including port 53.
-    let Some(ResolvedTarget {
-        adapter: proxy,
-        route: _route,
-        ..
-    }) = inner.resolve_proxy(&metadata).await
-    else {
-        return Err(format!(
-            "no matching rule for {}",
-            metadata.remote_address()
-        ));
-    };
-
-    let conn: Arc<dyn ProxyPacketConn> = Arc::from(
-        with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata))
-            .await
-            .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?,
-    );
-    conn.write_packet(payload, &dst_addr)
-        .await
-        .map_err(|e| format!("udp initial write {dst_addr}: {e}"))?;
-
-    let last_activity_ms = Arc::new(AtomicU::new(monotonic_ms() as Uint));
-    let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // The session created (or found) above supplies the server session ID and
-    // the reply packet-ID allocator; `build_reply_control` echoes this
+    // The session created (or found) above supplies the server session ID
+    // and the reply packet-ID allocator; `build_reply_control` echoes this
     // datagram's client session ID and carries its EIH user key through.
+    // Both are computed here — the session table lives on the loop — and
+    // moved into the task.
     let server_session = control.and_then(|c| {
         state
             .sessions
@@ -836,13 +876,145 @@ where
             .map(|s| Arc::clone(&s.server))
     });
     let reply_control = build_reply_control(control, server_session.as_deref());
-    let reply_task = {
-        let sock = Arc::clone(sock);
+
+    let (tx, rx) = mpsc::channel(UDP_FLOW_QUEUE);
+    tx.try_send(SmallVec::from_slice(payload))
+        .map_err(|_| "fresh flow queue rejected payload".to_string())?;
+
+    let last_activity_ms = Arc::new(AtomicU::new(monotonic_ms() as Uint));
+    let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let established = Arc::new(tokio::sync::OnceCell::new());
+    let task = tokio::spawn(run_ss_udp_flow(
+        Arc::clone(inner),
+        Arc::clone(sock),
+        rx,
+        metadata,
+        peer,
+        reply_control,
+        server_session,
+        Arc::clone(&established),
+        Arc::clone(&last_activity_ms),
+        Arc::clone(&dead),
+    ))
+    .abort_handle();
+
+    state.flows.insert(
+        key,
+        UdpFlow {
+            tx,
+            last_activity_ms,
+            dead,
+            established,
+            client_session_id,
+            task,
+        },
+    );
+    Ok(true)
+}
+
+/// One flow's outbound task: resolve → route → `dial_udp`, then write
+/// queued client datagrams in order while a reply pump ships
+/// server→client datagrams back. Exiting for any reason marks `dead` so
+/// the next datagram on the key re-establishes (issue #514); the reply
+/// pump's death also ends the session — a conn that cannot deliver replies
+/// must be re-dialed — and an abort drops the `AbortOnDrop` guard that
+/// kills the pump.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "moved state: the reply-control template, server session, and observability handles are all computed on the loop where the session table lives"
+)]
+async fn run_ss_udp_flow<S>(
+    inner: Arc<TunnelInner>,
+    sock: Arc<shadowsocks::ProxySocket<S>>,
+    mut rx: mpsc::Receiver<SmallVec<[u8; 1500]>>,
+    mut metadata: Metadata,
+    peer: SocketAddr,
+    reply_control: UdpSocketControlData,
+    server_session: Option<Arc<ServerSession>>,
+    established: Arc<tokio::sync::OnceCell<Arc<dyn ProxyPacketConn>>>,
+    last_activity_ms: Arc<AtomicU>,
+    dead: Arc<std::sync::atomic::AtomicBool>,
+) where
+    S: DatagramSend + DatagramReceive + Send + Sync + 'static,
+{
+    // Whatever happens below, mark the flow dead on exit so the recv loop
+    // evicts it instead of queueing into a closed channel.
+    struct DeadOnExit(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DeadOnExit {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _dead_guard = DeadOnExit(Arc::clone(&dead));
+
+    // UDP keeps the eager pre_resolve (no lazy enrichment): the writer
+    // needs a resolved dst_ip regardless of what the rules demand.
+    inner.pre_resolve(&mut metadata).await;
+    if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
+        metadata.dst_ip = inner.resolver().resolve_ip_real(&metadata.host).await;
+    }
+    let Some(dst_ip) = metadata.dst_ip else {
+        debug!(
+            "ss udp flow: dst_ip not resolved for {}",
+            metadata.remote_address()
+        );
+        return;
+    };
+    let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
+
+    // Client UDP follows the configured routing policy, including port 53.
+    // `_route` pins this generation's dialer registry across `dial_udp`
+    // (issue #533 review).
+    let Some(ResolvedTarget {
+        adapter: proxy,
+        rule_name,
+        rule_payload,
+        route: _route,
+    }) = inner.resolve_proxy(&metadata).await
+    else {
+        debug!(
+            "ss udp flow: no matching rule for {}",
+            metadata.remote_address()
+        );
+        return;
+    };
+    info!(
+        "UDP {peer} --> {} match {rule_name}({rule_payload}) using {}",
+        metadata.remote_address(),
+        proxy.name()
+    );
+
+    let conn: Arc<dyn ProxyPacketConn> =
+        match with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata)).await {
+            Ok(conn) => Arc::from(conn),
+            Err(e) => {
+                debug!(
+                    "ss udp flow to {dst_addr}: dial_udp via {}: {e}",
+                    proxy.name()
+                );
+                return;
+            }
+        };
+
+    // Reply pump: server→client. Same logic as the pre-#625 per-flow reply
+    // task — wraps each datagram in the SS UDP reply header (echoing the
+    // client session ID + allocating a session-wide reply packet ID) and
+    // sends it back to the originating peer. The `select!` below treats its
+    // exit as flow death (a conn that cannot deliver replies must be
+    // re-dialed, issue #514); `AbortOnDrop` kills it if the flow task is
+    // aborted first.
+    struct AbortOnDrop(AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut reply_task = tokio::spawn({
+        let sock = Arc::clone(&sock);
         let conn = Arc::clone(&conn);
         let last_activity_ms = Arc::clone(&last_activity_ms);
-        let dead = Arc::clone(&dead);
         let mut control = reply_control;
-        tokio::spawn(async move {
+        async move {
             let mut rbuf = vec![0u8; 65536];
             // Warn-once: an exhausted counter (32-bit targets, after 2^32
             // replies) makes every later reply hit this branch.
@@ -873,8 +1045,6 @@ where
                 }
                 // The reply's inner address is the responder's real socket
                 // address (matching ssserver), not the request's target:
-                // two domains resolving to one IP share this flow — the
-                // flow's flow key is the resolved `(peer, dst_ip)` — and
                 // stamping the request's domain form would mislabel every
                 // datagram that didn't create the flow.
                 let reply_addr = Address::SocketAddress(src);
@@ -888,22 +1058,41 @@ where
                 last_activity_ms
                     .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
             }
-            dead.store(true, std::sync::atomic::Ordering::Relaxed);
-        })
-        .abort_handle()
-    };
+        }
+    });
+    let _reply_guard = AbortOnDrop(reply_task.abort_handle());
 
-    state.flows.insert(
-        key,
-        UdpFlow {
-            conn,
-            last_activity_ms,
-            dead,
-            client_session_id,
-            reply_task,
-        },
-    );
-    Ok(true)
+    // Expose the established conn for tests (previously `flow.conn`) —
+    // set once the reply pump is up so an observer also implies "replies
+    // are being pumped".
+    let _ = established.set(Arc::clone(&conn));
+
+    // Writer loop: drain the queue in FIFO order until the flow is evicted
+    // (all senders gone), the upstream write fails, or the reply pump dies
+    // (one-way conn — re-dial on next datagram, issue #514).
+    loop {
+        tokio::select! {
+            queued = rx.recv() => match queued {
+                Some(payload) => {
+                    if let Err(e) = conn.write_packet(&payload, &dst_addr).await {
+                        debug!("ss udp flow to {dst_addr}: upstream write: {e}");
+                        return;
+                    }
+                    last_activity_ms
+                        .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
+                }
+                None => return, // all senders dropped — flow evicted
+            },
+            done = &mut reply_task => {
+                let reason = match done {
+                    Ok(()) => "reply pump exited".to_string(),
+                    Err(e) => format!("reply pump task: {e}"),
+                };
+                debug!("ss udp flow to {dst_addr}: {reason}; next datagram re-dials");
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -972,6 +1161,21 @@ mod tests {
         c
     }
 
+    /// Wait for the flow task to dial and publish its conn (previously the
+    /// synchronous `flow.conn` — the dial moved off the recv loop, #625).
+    async fn flow_conn(
+        state: &UdpRelayState,
+        key: &(SocketAddr, FlowKey),
+    ) -> Arc<dyn ProxyPacketConn> {
+        for _ in 0..500 {
+            if let Some(conn) = state.flows[key].established.get() {
+                return Arc::clone(conn);
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("flow task never established a conn for {key:?}");
+    }
+
     #[tokio::test]
     async fn udp_port_53_obeys_reject_rule() {
         let tunnel = crate::test_rule_tunnel();
@@ -980,8 +1184,9 @@ mod tests {
         let peer = "127.0.0.1:12345".parse().unwrap();
         for port in [53, 5353] {
             let dst = SocketAddr::from(([127, 0, 0, 1], port));
+            let key = (peer, FlowKey::Addr(dst));
             assert!(handle_ss_udp_datagram(
-                &tunnel,
+                tunnel.inner(),
                 &sock,
                 &mut state,
                 b"not a DNS query",
@@ -993,10 +1198,9 @@ mod tests {
                 8388,
                 8,
             )
-            .await
             .unwrap());
             assert!(
-                state.flows[&(peer, dst)].conn.local_addr().is_err(),
+                flow_conn(&state, &key).await.local_addr().is_err(),
                 "must use REJECT, not DIRECT"
             );
         }
@@ -1074,7 +1278,7 @@ mod tests {
             let dst = SocketAddr::from(([127, 0, 0, 1], port));
             let control = client_control(csid, i as u64);
             assert!(handle_ss_udp_datagram(
-                &tunnel,
+                tunnel.inner(),
                 &sock,
                 &mut state,
                 b"payload",
@@ -1086,8 +1290,10 @@ mod tests {
                 8388,
                 8,
             )
-            .await
             .unwrap());
+            // Wait for the flow's reply pump to come up — it is what holds
+            // the extra `Arc<ServerSession>` reference below.
+            flow_conn(&state, &(peer, FlowKey::Addr(dst))).await;
         }
 
         assert_eq!(state.flows.len(), 2, "each target keeps its own flow");
@@ -1134,7 +1340,7 @@ mod tests {
         // same saturation signal the flow cap returns.
         let control = client_control(0xbbbb_2222, 0);
         let verdict = handle_ss_udp_datagram(
-            &tunnel,
+            tunnel.inner(),
             &sock,
             &mut state,
             b"forged session",
@@ -1145,8 +1351,7 @@ mod tests {
             "ss",
             8388,
             1,
-        )
-        .await;
+        );
         assert!(
             matches!(verdict, Ok(false)),
             "unseen session ID must be dropped at the sessions cap: {verdict:?}"
@@ -1158,7 +1363,7 @@ mod tests {
         // (fresh) window and gets its flow.
         let control = client_control(0xaaaa_1111, 0);
         assert!(handle_ss_udp_datagram(
-            &tunnel,
+            tunnel.inner(),
             &sock,
             &mut state,
             b"known session",
@@ -1170,7 +1375,6 @@ mod tests {
             8388,
             1,
         )
-        .await
         .unwrap());
         assert_eq!(state.flows.len(), 1);
     }
@@ -1226,12 +1430,12 @@ mod tests {
         let peer = "127.0.0.1:12345".parse().unwrap();
         let dst = SocketAddr::from(([127, 0, 0, 1], 443));
         let target = Address::SocketAddress(dst);
-        let key = (peer, dst);
+        let key = (peer, FlowKey::Addr(dst));
 
         let old_csid = 0xaaaa_0001_u64;
         let control = client_control(old_csid, 0);
         assert!(handle_ss_udp_datagram(
-            &tunnel,
+            tunnel.inner(),
             &sock,
             &mut state,
             b"first",
@@ -1243,9 +1447,8 @@ mod tests {
             8388,
             8,
         )
-        .await
         .unwrap());
-        let old_conn = Arc::clone(&state.flows[&key].conn);
+        let old_conn = flow_conn(&state, &key).await;
         let old_server = Arc::clone(&state.sessions[&old_csid].server);
 
         // Same (peer, target), new client session ID: the flow must be
@@ -1253,7 +1456,7 @@ mod tests {
         let new_csid = 0xbbbb_0002_u64;
         let control = client_control(new_csid, 0);
         assert!(handle_ss_udp_datagram(
-            &tunnel,
+            tunnel.inner(),
             &sock,
             &mut state,
             b"second",
@@ -1265,7 +1468,6 @@ mod tests {
             8388,
             8,
         )
-        .await
         .unwrap());
 
         let flow = &state.flows[&key];
@@ -1273,8 +1475,9 @@ mod tests {
             flow.client_session_id, new_csid,
             "the live flow must echo the new session ID"
         );
+        let new_conn = flow_conn(&state, &key).await;
         assert!(
-            !Arc::ptr_eq(&flow.conn, &old_conn),
+            !Arc::ptr_eq(&new_conn, &old_conn),
             "rotation must re-dial, not reuse the stale flow's conn"
         );
         assert_eq!(
@@ -1293,7 +1496,7 @@ mod tests {
         // dropped — and the flow re-dials back under session A.
         let control = client_control(old_csid, 0);
         let err = handle_ss_udp_datagram(
-            &tunnel,
+            tunnel.inner(),
             &sock,
             &mut state,
             b"replay of A",
@@ -1305,13 +1508,12 @@ mod tests {
             8388,
             8,
         )
-        .await
         .unwrap_err();
         assert!(err.contains("replay"), "A's window must persist: {err}");
 
         let control = client_control(old_csid, 1);
         assert!(handle_ss_udp_datagram(
-            &tunnel,
+            tunnel.inner(),
             &sock,
             &mut state,
             b"back to A",
@@ -1323,7 +1525,6 @@ mod tests {
             8388,
             8,
         )
-        .await
         .unwrap());
         assert_eq!(state.flows[&key].client_session_id, old_csid);
         assert!(
@@ -1344,7 +1545,7 @@ mod tests {
         let control = client_control(0xcccc_0003, 42);
 
         assert!(handle_ss_udp_datagram(
-            &tunnel,
+            tunnel.inner(),
             &sock,
             &mut state,
             b"first",
@@ -1356,12 +1557,11 @@ mod tests {
             8388,
             8,
         )
-        .await
         .unwrap());
 
         // Same session + same packet ID → replay.
         let err = handle_ss_udp_datagram(
-            &tunnel,
+            tunnel.inner(),
             &sock,
             &mut state,
             b"retransmitted",
@@ -1373,7 +1573,6 @@ mod tests {
             8388,
             8,
         )
-        .await
         .unwrap_err();
         assert!(err.contains("replay"), "unexpected drop reason: {err}");
 
@@ -1381,7 +1580,7 @@ mod tests {
         // accepted (real UDP reorders; the window is not strict-FIFO).
         let control = client_control(0xcccc_0003, 41);
         assert!(handle_ss_udp_datagram(
-            &tunnel,
+            tunnel.inner(),
             &sock,
             &mut state,
             b"reordered",
@@ -1393,13 +1592,12 @@ mod tests {
             8388,
             8,
         )
-        .await
         .unwrap());
 
         // Same session + a fresh packet ID on the same flow → accepted.
         let control = client_control(0xcccc_0003, 43);
         assert!(handle_ss_udp_datagram(
-            &tunnel,
+            tunnel.inner(),
             &sock,
             &mut state,
             b"next",
@@ -1411,7 +1609,6 @@ mod tests {
             8388,
             8,
         )
-        .await
         .unwrap());
         assert_eq!(state.flows.len(), 1, "the replay never touched the table");
     }
@@ -1429,10 +1626,10 @@ mod tests {
         let mut state = UdpRelayState::default();
         let peer = "127.0.0.1:12345".parse().unwrap();
         let target = Address::SocketAddress(SocketAddr::from(([127, 0, 0, 1], 443)));
-        let key = (peer, SocketAddr::from(([127, 0, 0, 1], 443)));
+        let key = (peer, FlowKey::Addr(SocketAddr::from(([127, 0, 0, 1], 443))));
 
         assert!(handle_ss_udp_datagram(
-            &tunnel,
+            tunnel.inner(),
             &sock,
             &mut state,
             b"first",
@@ -1444,9 +1641,8 @@ mod tests {
             8388,
             8,
         )
-        .await
         .unwrap());
-        let dead_flow_conn = Arc::clone(&state.flows[&key].conn);
+        let dead_flow_conn = flow_conn(&state, &key).await;
 
         // Let the reply task run to its read error and mark the flow dead.
         for _ in 0..10 {
@@ -1466,7 +1662,7 @@ mod tests {
         );
 
         assert!(handle_ss_udp_datagram(
-            &tunnel,
+            tunnel.inner(),
             &sock,
             &mut state,
             b"second",
@@ -1478,11 +1674,81 @@ mod tests {
             8388,
             8,
         )
-        .await
         .unwrap());
+        let redialed = flow_conn(&state, &key).await;
         assert!(
-            !Arc::ptr_eq(&state.flows[&key].conn, &dead_flow_conn),
+            !Arc::ptr_eq(&redialed, &dead_flow_conn),
             "a dead flow must be evicted and re-dialed, not reused"
         );
+    }
+
+    /// Issue #625 regression: the recv loop must never await a flow's
+    /// resolve/route/dial — payloads queue onto a bounded per-flow channel
+    /// and dispatch moves on. Under the old inline-await shape, a slow
+    /// `dial_udp` stalled decrypt→dispatch for every client on the shared
+    /// socket; here the proof is that with zero yields (the flow task has
+    /// never been polled — no conn exists yet) datagrams still queue for
+    /// the pending flow, a *different* destination gets its own flow
+    /// immediately, and queue overflow drops without erroring.
+    #[tokio::test]
+    async fn datagrams_queue_off_loop_while_flow_establishes() {
+        let tunnel = direct_rule_tunnel();
+        let (sock, session_ids) = server_sock_and_ids("aes-256-gcm").await;
+        let mut state = UdpRelayState::default();
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let dst = SocketAddr::from(([127, 0, 0, 1], 443));
+        let target = Address::SocketAddress(dst);
+        let key = (peer, FlowKey::Addr(dst));
+
+        // Fill the queue past its bound while the task has never run —
+        // every datagram is still "handled" (surplus drops silently).
+        for _ in 0..UDP_FLOW_QUEUE + 10 {
+            assert!(handle_ss_udp_datagram(
+                tunnel.inner(),
+                &sock,
+                &mut state,
+                b"payload",
+                peer,
+                &target,
+                None,
+                &session_ids,
+                "ss",
+                8388,
+                8,
+            )
+            .unwrap());
+        }
+        assert_eq!(state.flows.len(), 1, "all datagrams share one flow");
+        assert!(
+            state.flows[&key].established.get().is_none(),
+            "dispatch must not have waited on the flow's establish"
+        );
+
+        // A different destination on the same peer gets its own queued
+        // flow without waiting for the first task either.
+        let dst2 = SocketAddr::from(([127, 0, 0, 1], 853));
+        assert!(handle_ss_udp_datagram(
+            tunnel.inner(),
+            &sock,
+            &mut state,
+            b"other",
+            peer,
+            &Address::SocketAddress(dst2),
+            None,
+            &session_ids,
+            "ss",
+            8388,
+            8,
+        )
+        .unwrap());
+        assert_eq!(state.flows.len(), 2);
+        assert!(state.flows[&(peer, FlowKey::Addr(dst2))]
+            .established
+            .get()
+            .is_none());
+
+        // Once scheduled, each task dials and drains its queue in order.
+        flow_conn(&state, &key).await;
+        flow_conn(&state, &(peer, FlowKey::Addr(dst2))).await;
     }
 }
