@@ -907,3 +907,10 @@ the canonical, in-repo source a release is cut from.
 
   Breaking for crate consumers: `TunnelInner::pre_handle_metadata` now
   returns `PreHandleVerdict` (`Continue`/`Drop`) instead of `()`.
+- **Sniffer: fragmented TLS ClientHello no longer loses the SNI**
+  (#622). The sniffer peeked at the socket once and parsed whatever was
+  buffered; a ClientHello split across TCP segments parsed as a
+  truncated record and `sniff_host` stayed empty — sniff-based routing
+  failed open. The gather now re-peeks (5→50ms poll, bounded by
+  `sniffer.timeout`) until the declared record length is buffered or the
+  prefix is provably not TLS. Found by the Docker TProxy e2e. (#623)
