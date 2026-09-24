@@ -313,8 +313,19 @@ async fn handle_ss_conn<S: AsyncRead + AsyncWrite + Unpin + Send + Sync>(
 /// Map an SS target `Address` + peer into a `Metadata` for the tunnel.
 fn build_metadata(peer: SocketAddr, target: &Address, in_name: &str, in_port: u16) -> Metadata {
     let (host, dst_ip, dst_port) = match target {
-        Address::DomainNameAddress(d, port) => (d.to_lowercase(), None, *port),
-        Address::SocketAddress(sa) => (String::new(), Some(sa.ip()), sa.port()),
+        // Lowercase only when needed — `SmolStr::from` on an
+        // already-lowercase name is inline (≤22 B) with no String
+        // round-trip.
+        Address::DomainNameAddress(d, port) => (
+            if d.bytes().any(|b| b.is_ascii_uppercase()) {
+                SmolStr::from(d.to_lowercase())
+            } else {
+                SmolStr::from(d.as_str())
+            },
+            None,
+            *port,
+        ),
+        Address::SocketAddress(sa) => (SmolStr::default(), Some(sa.ip()), sa.port()),
     };
     Metadata {
         network: Network::Tcp,
@@ -323,7 +334,7 @@ fn build_metadata(peer: SocketAddr, target: &Address, in_name: &str, in_port: u1
         src_port: peer.port(),
         dst_ip,
         dst_port,
-        host: host.into(),
+        host,
         in_name: in_name.into(),
         in_port,
         ..Default::default()
@@ -490,7 +501,7 @@ fn build_reply_control(
 /// names resolving to one address now get separate flows — same routing
 /// semantics, slightly finer dedup granularity (the same trade-off
 /// socks5_udp took in #619).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 enum FlowKey {
     Addr(SocketAddr),
     Host(SmolStr, u16),
@@ -561,9 +572,9 @@ fn session_is_live(session: &ClientSession, now: Uint) -> bool {
 ///
 /// `max_flows` caps the concurrent `(peer, target)` flow table (`0` =
 /// uncapped), mirroring the TCP accept loop's `max_connections` — each flow
-/// holds a 64 KiB reply buffer, a task, and an outbound socket, so an
-/// unbounded table is a memory/FD exhaustion vector on an internet-exposed
-/// listener. The same value bounds the AEAD-2022 session table: each entry
+/// holds a bounded 64-datagram queue, a 64 KiB reply buffer, two tasks
+/// (flow loop + reply pump), and an outbound socket, so an unbounded table
+/// is a memory/FD exhaustion vector on an internet-exposed listener. The same value bounds the AEAD-2022 session table: each entry
 /// is only ~400 B, but the map is otherwise the relay's only unbounded
 /// state — a key holder could grow it by one entry per forged client
 /// session ID between sweeps. Saturated new flows *and* unseen session IDs
@@ -706,7 +717,8 @@ async fn run_udp_relay<S>(
 /// server session ID + reply packet counter for every flow of the session
 /// and the replay window the datagram's packet ID is checked against.
 ///
-/// Returns `Ok(true)` when the datagram was queued (existing or new flow),
+/// Returns `Ok(true)` when the datagram was consumed — queued onto an
+/// existing or new flow, or dropped on a full queue (UDP semantics) —
 /// `Ok(false)` when it was dropped because the flow or session table is at
 /// `max_flows` (cap on *new* entries only — datagrams for existing flows
 /// and known session IDs always pass), and `Err` with a reason for
@@ -774,8 +786,20 @@ where
     }
 
     let (host, dst_ip, dst_port) = match target {
-        Address::DomainNameAddress(d, port) => (d.to_lowercase(), None, *port),
-        Address::SocketAddress(sa) => (String::new(), Some(sa.ip()), sa.port()),
+        // Lowercase only when needed — `SmolStr::from` on an
+        // already-lowercase name is inline (≤22 B) with no String
+        // round-trip; longer names still heap-allocate once (the flow key
+        // then clones by refcount).
+        Address::DomainNameAddress(d, port) => (
+            if d.bytes().any(|b| b.is_ascii_uppercase()) {
+                SmolStr::from(d.to_lowercase())
+            } else {
+                SmolStr::from(d.as_str())
+            },
+            None,
+            *port,
+        ),
+        Address::SocketAddress(sa) => (SmolStr::default(), Some(sa.ip()), sa.port()),
     };
 
     let mut metadata = Metadata {
@@ -785,7 +809,7 @@ where
         src_port: peer.port(),
         dst_ip,
         dst_port,
-        host: host.into(),
+        host,
         in_name: in_name.into(),
         in_port,
         ..Default::default()
@@ -824,6 +848,7 @@ where
     //   * a changed client session ID on the same `(peer, target)` is a new
     //     relay session per SIP022 §3.2.4 — replies must echo the new ID,
     //     which only a freshly built flow can do.
+    let mut first_payload: Option<SmallVec<[u8; 1500]>> = None;
     if let Some(flow) = state.flows.get(&key) {
         if flow.dead.load(std::sync::atomic::Ordering::Relaxed)
             || flow.client_session_id != client_session_id
@@ -840,16 +865,18 @@ where
                         .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
                     return Ok(true);
                 }
-                // Queue filled between the capacity check and the send:
-                // drop the datagram (UDP semantics — the client retries).
+                // Queue full — drop the datagram (UDP semantics — the
+                // client retries).
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     debug!("ss udp flow queue full: dropping datagram");
                     return Ok(true);
                 }
                 // The task exited between the dead check and the send:
-                // evict and start a fresh flow with this datagram.
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                // evict and start a fresh flow, reusing the datagram the
+                // dead channel handed back instead of re-copying it.
+                Err(mpsc::error::TrySendError::Closed(returned)) => {
                     state.flows.remove(&key);
+                    first_payload = Some(returned);
                 }
             }
         }
@@ -859,7 +886,15 @@ where
     // buffer, and an outbound socket; without a cap any password holder
     // could exhaust memory/FDs between idle sweeps. `0` disables the cap.
     if max_flows > 0 && state.flows.len() >= max_flows {
-        return Ok(false);
+        // Admission-time reclaim (socks5_udp's evict_for_admission): a
+        // flood of distinct fast-failing destinations could otherwise pin
+        // the table at cap for up to a sweep interval.
+        state
+            .flows
+            .retain(|_, f| !f.dead.load(std::sync::atomic::Ordering::Relaxed));
+        if state.flows.len() >= max_flows {
+            return Ok(false);
+        }
     }
 
     // The session created (or found) above supplies the server session ID
@@ -876,7 +911,7 @@ where
     let reply_control = build_reply_control(control, server_session.as_deref());
 
     let (tx, rx) = mpsc::channel(UDP_FLOW_QUEUE);
-    tx.try_send(SmallVec::from_slice(payload))
+    tx.try_send(first_payload.unwrap_or_else(|| SmallVec::from_slice(payload)))
         .map_err(|_| "fresh flow queue rejected payload".to_string())?;
 
     let last_activity_ms = Arc::new(AtomicU::new(monotonic_ms() as Uint));
@@ -969,28 +1004,29 @@ async fn run_ss_udp_flow<S>(
     let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
 
     // Client UDP follows the configured routing policy, including port 53.
-    // `_route` pins this generation's dialer registry across `dial_udp`
-    // (issue #533 review).
-    let Some(ResolvedTarget {
-        adapter: proxy,
-        rule_name,
-        rule_payload,
-        route: _route,
-    }) = inner.resolve_proxy(&metadata).await
-    else {
-        debug!(
-            "ss udp flow: no matching rule for {}",
-            metadata.remote_address()
+    // `route` pins this generation's dialer registry across `dial_udp`
+    // (issue #533 review) — block-scoped so a long-lived flow doesn't
+    // retain a stale route table (or adapter/rule Arcs) for its whole
+    // idle window.
+    let conn: Arc<dyn ProxyPacketConn> = {
+        let Some(ResolvedTarget {
+            adapter: proxy,
+            rule_name,
+            rule_payload,
+            route: _route,
+        }) = inner.resolve_proxy(&metadata).await
+        else {
+            debug!(
+                "ss udp flow: no matching rule for {}",
+                metadata.remote_address()
+            );
+            return;
+        };
+        info!(
+            "UDP {peer} --> {} match {rule_name}({rule_payload}) using {}",
+            metadata.remote_address(),
+            proxy.name()
         );
-        return;
-    };
-    info!(
-        "UDP {peer} --> {} match {rule_name}({rule_payload}) using {}",
-        metadata.remote_address(),
-        proxy.name()
-    );
-
-    let conn: Arc<dyn ProxyPacketConn> =
         match with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata)).await {
             Ok(conn) => Arc::from(conn),
             Err(e) => {
@@ -1000,7 +1036,8 @@ async fn run_ss_udp_flow<S>(
                 );
                 return;
             }
-        };
+        }
+    };
 
     // Reply pump: server→client. Same logic as the pre-#625 per-flow reply
     // task — wraps each datagram in the SS UDP reply header (echoing the

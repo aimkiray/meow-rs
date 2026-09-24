@@ -136,11 +136,15 @@ identically to the other inbounds.
 
 With `udp: true` the listener binds a `shadowsocks::ProxySocket` (server
 mode) on the same resolved port. Each decrypted datagram carries a
-`(peer, target)` pair; a flat `HashMap<(peer, target), Flow>` dedups outbound
-conns (mirroring the SOCKS5-UDP per-destination NAT, but keyed by both
-endpoints since the socket is shared across SS clients). Each flow has a
-reply task that reads server→client datagrams and re-encrypts them back to
-the originating peer. Idle flows are evicted after 60 s
+`(peer, target)` pair; a flat `HashMap<(peer, FlowKey), UdpFlow>` dedups
+outbound conns — `FlowKey` is the *unresolved* destination (literal IP or
+lowercased domain + port) — mirroring the SOCKS5-UDP per-destination NAT,
+but keyed by both endpoints since the socket is shared across SS clients.
+Each flow is a bounded 64-datagram FIFO queue feeding a task that performs
+resolve → route → `dial_udp` → ordered upstream writes and owns the reply
+pump, so a slow destination can never head-of-line block the shared recv
+loop (issue #625; the same restructure #619 gave SOCKS5-UDP for #515).
+Idle flows are evicted after 60 s
 (`meow_tunnel::udp::DEFAULT_UDP_IDLE`, the same constant SOCKS5-UDP uses;
 the per-listener `udp-timeout` knob only applies to TProxy UDP and TUN
 listeners, not SS). The flow table is capped at the listener's
