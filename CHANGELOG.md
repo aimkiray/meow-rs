@@ -969,3 +969,15 @@ the canonical, in-repo source a release is cut from.
   never SynAcks previously stayed pooled and wedged every later dial for
   the full 30 s per-stream timeout; the session is now closed and
   evicted instead. (#625)
+
+- The Shadowsocks UDP listener no longer runs `resolve` → route →
+  `dial_udp` → upstream writes inline on the shared socket loop — a
+  single slow destination used to head-of-line block decrypt→dispatch
+  for *every* SS client (worse than the SOCKS5 case fixed in #619, since
+  this socket serves all clients). Each `(peer, target)` flow is now a
+  bounded 64-datagram FIFO queue feeding a spawned task that owns
+  establishment, ordered writes, and the reply pump; the loop only runs
+  the AEAD-2022 session/replay bookkeeping and queues payloads. Flow
+  keys now use the unresolved destination (domain-form targets key by
+  host), so two names resolving to one address get independent flows —
+  same routing semantics, finer dedup. (#625)
