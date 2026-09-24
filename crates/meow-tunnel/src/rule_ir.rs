@@ -3446,6 +3446,28 @@ mod tests {
     }
 
     #[test]
+    fn geosite_beside_ip_rule_still_demands_resolution() {
+        // The GEOSITE drop must not mask a sibling's demand: aggregation is
+        // per-slot `|=` — a live IP-CIDR in the same set keeps
+        // `needs_ip_resolution` set (#625).
+        let mut db = GeositeDB::empty();
+        db.insert("cn", "cn.example");
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(GeoSiteRule::new("cn", "Direct", Some(Arc::new(db)))),
+            Box::new(IpCidrRule::new("10.0.0.0/8", "A", false, false).unwrap()),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+
+        let set = CompiledRuleSet::build(&rules);
+
+        assert_eq!(set.len(), 3);
+        assert!(
+            set.needs_ip_resolution(),
+            "the IP-CIDR sibling must still demand resolution"
+        );
+    }
+
+    #[test]
     fn geoip_rule_lowers_to_ip_ranges_op() {
         let ranges = Arc::new(IpRangeSet::from_nets(["203.0.113.0/24".parse().unwrap()]));
         let rules: Vec<Box<dyn Rule>> = vec![
@@ -3604,7 +3626,7 @@ mod tests {
         let rules: Vec<Box<dyn Rule>> = vec![
             Box::new(DomainSuffixRule::new("example.com", "Proxy")),
             Box::new(FinalRule::new("DIRECT")),
-            // Unreachable: would otherwise force DNS pre-resolution.
+            // Unreachable — dead-rule elimination must drop it.
             Box::new(GeoSiteRule::new("cn", "Direct", Some(Arc::new(db)))),
         ];
 
@@ -3752,9 +3774,7 @@ mod tests {
     #[test]
     fn never_match_geosite_rule_is_pruned() {
         let rules: Vec<Box<dyn Rule>> = vec![
-            // No DB loaded: provably never matches, but without pruning its
-            // `should_resolve_ip()` would force pre-resolution for every
-            // connection.
+            // No DB loaded: provably never matches — pruning must drop it.
             Box::new(GeoSiteRule::new("cn", "Direct", None)),
             Box::new(FinalRule::new("DIRECT")),
         ];
