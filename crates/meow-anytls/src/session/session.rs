@@ -17,6 +17,14 @@ use tracing::{field, info_span};
 static SESSION_COUNTER: meow_common::atomic::AtomicU = meow_common::atomic::AtomicU::new(1);
 use tokio_util::codec::Decoder;
 
+/// Grace period for a SynAck after `open_stream` on a v2+ peer before the
+/// whole session is closed — mihomo arms the identical 3 s `synDone`
+/// deadline (`sid >= 2 && peerVersion >= 2`, transport/anytls
+/// session.go). A peer that still answers heartbeats but never SynAcks
+/// would otherwise stay pooled and wedge every later dial for the 30 s
+/// per-stream timeout (issue #625).
+const SYN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Type alias for new stream callback channel
 type NewStreamCallback =
     Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Arc<Stream>>>>>;
@@ -66,7 +74,6 @@ pub struct Session {
     pkt_counter: Arc<std::sync::atomic::AtomicU32>,
 
     // Peer version
-    #[allow(dead_code)]
     peer_version: Arc<std::sync::atomic::AtomicU8>,
 
     // Session sequence number (for pool ordering)
@@ -85,6 +92,12 @@ pub struct Session {
     // Heartbeat configuration (client side)
     heartbeat: Option<Arc<HeartbeatState>>,
     close_notify: Arc<Notify>,
+
+    // Session-level SYN watchdog (upstream `synDone` parity): while a
+    // client stream `sid >= 2` on a v2+ peer awaits its SynAck, a spawned
+    // deadline task holding `Weak<Session>` closes the session on expiry.
+    // Sync mutex — held only across abort/store, never across an await.
+    syn_watchdog: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl Session {
@@ -155,6 +168,7 @@ impl Session {
             server_settings: None,
             heartbeat: heartbeat_state,
             close_notify: Arc::new(Notify::new()),
+            syn_watchdog: std::sync::Mutex::new(None),
         }
     }
 
@@ -195,6 +209,7 @@ impl Session {
             server_settings: None,
             heartbeat: None,
             close_notify: Arc::new(Notify::new()),
+            syn_watchdog: std::sync::Mutex::new(None),
         }
     }
 
@@ -589,6 +604,13 @@ impl Session {
             Command::SynAck => {
                 // Server acknowledges stream open (client side)
                 if self.is_client {
+                    // Any SynAck proves the peer's control plane is alive —
+                    // disarm the session watchdog `open_stream` armed
+                    // (upstream disarms on frame receipt, before the stream
+                    // lookup, so an unknown-sid SynAck still counts).
+                    if let Some(prev) = self.syn_watchdog.lock().unwrap().take() {
+                        prev.abort();
+                    }
                     tracing::debug!(
                         session_id = session_id,
                         "[Session] Received SYNACK for stream {}",
@@ -845,7 +867,7 @@ impl Session {
     /// a caller may hold it across a local `stream.close()` without
     /// needing its own timeout (issue #543).
     pub async fn open_stream(
-        &self,
+        self: &Arc<Self>,
     ) -> Result<(Arc<Stream>, tokio::sync::oneshot::Receiver<Result<()>>)> {
         if self.is_closed() {
             tracing::warn!("[Session] Attempted to open stream on closed session");
@@ -884,6 +906,36 @@ impl Session {
         let mut guard = crate::session::stream::OpeningStreamGuard::new(Arc::clone(&stream));
 
         tracing::trace!("[Session] Stream {} stored in session", stream_id);
+
+        // Upstream `synDone` parity: on a v2+ peer, every open beyond the
+        // first stream (sid >= 2 — sid 1 predates the ServerSettings
+        // handshake) re-arms a session-level deadline that closes the
+        // *session* when no SynAck arrives. Each open aborts the previous
+        // deadline; a SynAck disarms it (see `Command::SynAck`). The task
+        // holds `Weak` so a dropped session needs no cleanup, and close()
+        // deliberately does NOT abort the handle — the watchdog task itself
+        // may be the close() caller.
+        if self.is_client
+            && stream_id >= 2
+            && self.peer_version.load(std::sync::atomic::Ordering::Relaxed) >= 2
+        {
+            let weak = Arc::downgrade(self);
+            let watchdog = tokio::spawn(async move {
+                time::sleep(SYN_WATCHDOG_TIMEOUT).await;
+                if let Some(session) = weak.upgrade() {
+                    tracing::warn!(
+                        session_id = session.id(),
+                        "[Session] No SYNACK within {:?} of open_stream - closing session",
+                        SYN_WATCHDOG_TIMEOUT
+                    );
+                    let _ = session.close().await;
+                }
+            });
+            let mut slot = self.syn_watchdog.lock().unwrap();
+            if let Some(prev) = slot.replace(watchdog.abort_handle()) {
+                prev.abort();
+            }
+        }
 
         // Send SYN frame
         tracing::trace!("[Session] Sending SYN frame for stream {}", stream_id);
@@ -2270,5 +2322,138 @@ mod padding_bounds_tests {
         result
             .expect("server-pushed padding must not panic")
             .unwrap();
+    }
+
+    /// `write_frame` resolves its completion oneshot only when the session
+    /// writer task drains the queue — every open_stream test needs it.
+    fn spawn_writer(session: &Arc<Session>) -> tokio::task::JoinHandle<Result<()>> {
+        let worker = Arc::clone(session);
+        tokio::spawn(async move { worker.process_stream_data().await })
+    }
+
+    /// Upstream `synDone` parity (#625): on a v2+ peer, opening any stream
+    /// beyond the first arms a session-level deadline — no SynAck within
+    /// `SYN_WATCHDOG_TIMEOUT` closes the *session*.
+    #[tokio::test(start_paused = true)]
+    async fn syn_watchdog_closes_v2_session_without_synack() {
+        let session = Arc::new(Session::new_client(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            PaddingFactory::default().into_shared(),
+            None,
+        ));
+        let _writer = spawn_writer(&session);
+        session
+            .peer_version
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        // sid 1 predates the ServerSettings handshake — never arms.
+        let (_s1, _ack1) = session.open_stream().await.unwrap();
+        assert!(session.syn_watchdog.lock().unwrap().is_none());
+
+        let (_s2, _ack2) = session.open_stream().await.unwrap();
+        assert!(session.syn_watchdog.lock().unwrap().is_some());
+        // Let the spawned watchdog register its sleep before advancing.
+        tokio::task::yield_now().await;
+
+        time::advance(SYN_WATCHDOG_TIMEOUT - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!session.is_closed());
+
+        time::advance(Duration::from_millis(2)).await;
+        for _ in 0..200 {
+            if session.is_closed() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("syn watchdog must close the session past the deadline");
+    }
+
+    /// A SynAck disarms the deadline — the session must survive past it.
+    #[tokio::test(start_paused = true)]
+    async fn synack_disarms_session_watchdog() {
+        let session = Arc::new(Session::new_client(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            PaddingFactory::default().into_shared(),
+            None,
+        ));
+        let _writer = spawn_writer(&session);
+        session
+            .peer_version
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        let (_s1, _a1) = session.open_stream().await.unwrap();
+        let (_s2, _a2) = session.open_stream().await.unwrap();
+        assert!(session.syn_watchdog.lock().unwrap().is_some());
+
+        session
+            .handle_frame(Frame::control(Command::SynAck, 2))
+            .await
+            .unwrap();
+        assert!(session.syn_watchdog.lock().unwrap().is_none());
+
+        time::advance(SYN_WATCHDOG_TIMEOUT * 2).await;
+        tokio::task::yield_now().await;
+        assert!(!session.is_closed());
+    }
+
+    /// Each new open aborts the previous deadline and starts a fresh one —
+    /// a stale watchdog must not kill the session at its original expiry.
+    #[tokio::test(start_paused = true)]
+    async fn later_open_rearms_session_watchdog() {
+        let session = Arc::new(Session::new_client(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            PaddingFactory::default().into_shared(),
+            None,
+        ));
+        let _writer = spawn_writer(&session);
+        session
+            .peer_version
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        let (_s1, _a1) = session.open_stream().await.unwrap();
+        let (_s2, _a2) = session.open_stream().await.unwrap();
+        tokio::task::yield_now().await;
+
+        time::advance(Duration::from_secs(2)).await;
+        // sid 3 re-arms at t=2s: the first deadline (t=3s) must not fire.
+        let (_s3, _a3) = session.open_stream().await.unwrap();
+        tokio::task::yield_now().await;
+
+        time::advance(Duration::from_millis(1500)).await; // t = 3.5s
+        tokio::task::yield_now().await;
+        assert!(!session.is_closed());
+
+        time::advance(Duration::from_secs(2)).await; // t = 5.5s, past the re-armed deadline
+        for _ in 0..200 {
+            if session.is_closed() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("re-armed watchdog must close the session at its own deadline");
+    }
+
+    /// Below v2 the peer has no SynAck contract — no watchdog ever arms.
+    #[tokio::test(start_paused = true)]
+    async fn pre_v2_peer_never_arms_session_watchdog() {
+        let session = Arc::new(Session::new_client(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            PaddingFactory::default().into_shared(),
+            None,
+        ));
+        let _writer = spawn_writer(&session);
+
+        let (_s1, _a1) = session.open_stream().await.unwrap();
+        let (_s2, _a2) = session.open_stream().await.unwrap();
+        assert!(session.syn_watchdog.lock().unwrap().is_none());
+
+        time::advance(SYN_WATCHDOG_TIMEOUT * 2).await;
+        tokio::task::yield_now().await;
+        assert!(!session.is_closed());
     }
 }

@@ -962,3 +962,10 @@ the canonical, in-repo source a release is cut from.
   upstream never resolves for a domain-only matcher, so the demand was
   pure latency plus a DNS-leak surface for proxy-bound names. The
   `no-resolve` flag remains accepted but is now vestigial. (#625)
+
+- AnyTLS sessions now arm upstream's `synDone` watchdog — opening a
+  stream (`sid >= 2`) on a negotiated v2+ peer starts a 3 s session
+  deadline that any SynAck disarms. A peer that answers heartbeats but
+  never SynAcks previously stayed pooled and wedged every later dial for
+  the full 30 s per-stream timeout; the session is now closed and
+  evicted instead. (#625)
