@@ -170,7 +170,7 @@ tests (section B) use binary mrs fixtures.
 | # | Case | Asserts |
 |---|------|---------|
 | G1 | `parser_dispatches_geosite_keyword` | Rule string `"GEOSITE,cn,DIRECT"`; `parse_rule()` returns `Box<dyn Rule>` that downcasts to `GeoSiteRule`. NOT unknown rule type error. NOT panicking dispatch. |
-| G2 | `parser_geosite_no_resolve_flag` | Rule string `"GEOSITE,cn,DIRECT,no-resolve"`; assert `GeoSiteRule.no_resolve == true`. NOT parse error. |
+| G2 | `parser_geosite_no_resolve_flag` | Rule string `"GEOSITE,cn,DIRECT,no-resolve"`; assert it parses and `should_resolve_ip() == false` — the modifier is accepted for compatibility but vestigial: GEOSITE is domain-only and never demands resolution (#625). NOT parse error. |
 | G3 | `parser_geosite_missing_category_hard_errors` | Rule string `"GEOSITE,,DIRECT"` (empty category); assert `Err(...)`. NOT silently creates a rule that never matches. |
 | G4 | `parser_geosite_missing_target_hard_errors` | Rule string `"GEOSITE,cn"` (no target); assert `Err(...)`. NOT default target assumed. |
 | G5 | `adapter_type_is_geosite` | `GeoSiteRule::adapter_type()` (or equivalent introspection) → `AdapterType::GeoSite` (or the enum variant defined for this rule type). NOT misidentified as GeoIP or other. |

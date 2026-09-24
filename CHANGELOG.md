@@ -997,4 +997,8 @@ the canonical, in-repo source a release is cut from.
   keeps the last-good node list. Provider `health-check` blocks now log a
   warning that they are not periodically scheduled (the manual
   healthcheck endpoint and group health checks still consume them).
-  (#625)
+  Embedders: `ApiServer::new`, `subscription_refresh::run_loop`, and
+  `commit_proxy_providers` take a new `ProxyProviderRefreshSupervisor`
+  argument, `AppState` gains a `proxy_provider_refresh` field, and
+  `commit_proxy_providers` additionally takes the candidate's
+  `proxy-providers:` declarations. (#625)
