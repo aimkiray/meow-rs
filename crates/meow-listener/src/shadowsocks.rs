@@ -830,12 +830,10 @@ where
         {
             state.flows.remove(&key);
         } else {
-            // Check capacity before copying the payload onto the queue — a
-            // flooded flow drops the datagram without paying the copy.
-            if flow.tx.capacity() == 0 {
-                debug!("ss udp flow queue full: dropping datagram");
-                return Ok(true);
-            }
+            // `try_send` alone discriminates all three outcomes — no
+            // capacity pre-check: a closed channel with a *full* queue
+            // would read capacity 0 and drop without evicting, widening
+            // the dead-flow race window (#625 review).
             match flow.tx.try_send(SmallVec::from_slice(payload)) {
                 Ok(()) => {
                     flow.last_activity_ms
@@ -947,6 +945,14 @@ async fn run_ss_udp_flow<S>(
     }
     let _dead_guard = DeadOnExit(Arc::clone(&dead));
 
+    // Re-run the fake-IP gate — idempotent, and it catches a fake-IP pool
+    // state change in the loop→task gap (socks5_udp parity, #625 review).
+    if matches!(
+        inner.pre_handle_metadata(&mut metadata),
+        meow_tunnel::PreHandleVerdict::Drop
+    ) {
+        return;
+    }
     // UDP keeps the eager pre_resolve (no lazy enrichment): the writer
     // needs a resolved dst_ip regardless of what the rules demand.
     inner.pre_resolve(&mut metadata).await;
