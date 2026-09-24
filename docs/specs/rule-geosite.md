@@ -70,7 +70,7 @@ rules:
 | Field | Format | Meaning |
 |-------|--------|---------|
 | `category` | string | Category name as stored in the geosite DB. Case-insensitive matching. |
-| no-resolve | literal `no-resolve` | Optional; skip DNS resolution for domain matching. Passed through to rule engine as existing behaviour. |
+| no-resolve | literal `no-resolve` | Accepted for compatibility but vestigial — GEOSITE matches domains only and never demands DNS resolution (upstream parity, #625). |
 
 **DB absence**: if no geosite.mrs is found at any discovery path, GEOSITE
 rules log a one-time `warn!` at startup and always return no-match. Not a
@@ -143,7 +143,6 @@ pub struct GeoSiteRule {
     category: String,           // lowercase, trimmed of @suffix
     target: String,
     db: Option<Arc<GeositeDB>>, // None if DB absent — zero allocation per rule when absent
-    no_resolve: bool,
 }
 
 impl Rule for GeoSiteRule {

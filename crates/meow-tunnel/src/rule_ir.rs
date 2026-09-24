@@ -3418,7 +3418,6 @@ mod tests {
                 "nonexistent",
                 "Direct",
                 Some(Arc::new(db)),
-                false,
             )),
             Box::new(FinalRule::new("DIRECT")),
         ];
@@ -3426,6 +3425,23 @@ mod tests {
         let set = CompiledRuleSet::build(&rules);
 
         assert_eq!(set.len(), 1, "unknown geosite category must be pruned");
+        assert!(!set.needs_ip_resolution());
+    }
+
+    #[test]
+    fn geosite_live_category_does_not_demand_ip_resolution() {
+        // A *live* GEOSITE rule must not flip `needs_ip_resolution` —
+        // it matches domains only; upstream never resolves for it (#625).
+        let mut db = GeositeDB::empty();
+        db.insert("cn", "cn.example");
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(GeoSiteRule::new("cn", "Direct", Some(Arc::new(db)))),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+
+        let set = CompiledRuleSet::build(&rules);
+
+        assert_eq!(set.len(), 2, "live geosite category must be kept");
         assert!(!set.needs_ip_resolution());
     }
 
@@ -3589,7 +3605,7 @@ mod tests {
             Box::new(DomainSuffixRule::new("example.com", "Proxy")),
             Box::new(FinalRule::new("DIRECT")),
             // Unreachable: would otherwise force DNS pre-resolution.
-            Box::new(GeoSiteRule::new("cn", "Direct", Some(Arc::new(db)), false)),
+            Box::new(GeoSiteRule::new("cn", "Direct", Some(Arc::new(db)))),
         ];
 
         let set = CompiledRuleSet::build(&rules);
@@ -3739,7 +3755,7 @@ mod tests {
             // No DB loaded: provably never matches, but without pruning its
             // `should_resolve_ip()` would force pre-resolution for every
             // connection.
-            Box::new(GeoSiteRule::new("cn", "Direct", None, false)),
+            Box::new(GeoSiteRule::new("cn", "Direct", None)),
             Box::new(FinalRule::new("DIRECT")),
         ];
 
@@ -3910,7 +3926,6 @@ mod tests {
             "microsoft@cn",
             "Direct",
             Some(Arc::new(db)),
-            false,
         ))];
 
         let set = CompiledRuleSet::build(&rules);

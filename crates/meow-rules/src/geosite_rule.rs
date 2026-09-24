@@ -2,6 +2,10 @@
 //! against a named category in the shared `GeositeDB`.
 //!
 //! upstream: `rules/geosite.go::Match`
+//!
+//! The `no-resolve` option is accepted for config compatibility but is a
+//! no-op: GEOSITE matches on the domain only, and upstream never calls
+//! `helper.ResolveIP` — so this rule never demands resolution (#625).
 
 use std::sync::Arc;
 
@@ -21,21 +25,19 @@ pub struct GeoSiteRule {
     /// Shared DB loaded once at startup. `None` when the DB file was not
     /// found at startup; matching always returns false.
     db: Option<Arc<GeositeDB>>,
-    no_resolve: bool,
 }
 
 impl GeoSiteRule {
     /// Construct a rule. `payload` may contain an `@suffix` (e.g.
     /// `"microsoft@cn"`); the suffix is preserved and interpreted by
     /// [`GeositeDB::lookup`].
-    pub fn new(payload: &str, adapter: &str, db: Option<Arc<GeositeDB>>, no_resolve: bool) -> Self {
+    pub fn new(payload: &str, adapter: &str, db: Option<Arc<GeositeDB>>) -> Self {
         let category = payload.trim().to_ascii_lowercase().into();
         Self {
             category,
             payload_raw: payload.into(),
             adapter: intern_adapter(adapter),
             db,
-            no_resolve,
         }
     }
 
@@ -76,7 +78,10 @@ impl Rule for GeoSiteRule {
     }
 
     fn should_resolve_ip(&self) -> bool {
-        !self.no_resolve
+        // Upstream GEOSITE never calls `helper.ResolveIP` — it matches the
+        // domain only, so demanding a local resolution per connection would
+        // be pure cost (and a DNS-leak surface for proxy-bound names).
+        false
     }
 
     fn never_matches(&self) -> bool {
@@ -126,7 +131,7 @@ mod tests {
     #[test]
     fn matches_known_category_domain() {
         let db = db_with(&[("test", &["example.com"])]);
-        let r = GeoSiteRule::new("test", "DIRECT", Some(db), false);
+        let r = GeoSiteRule::new("test", "DIRECT", Some(db));
         assert!(r.match_metadata(&meta_host("example.com"), &helper()));
     }
 
@@ -134,7 +139,7 @@ mod tests {
     #[test]
     fn no_match_domain_not_in_category() {
         let db = db_with(&[("test", &["example.com"])]);
-        let r = GeoSiteRule::new("test", "DIRECT", Some(db), false);
+        let r = GeoSiteRule::new("test", "DIRECT", Some(db));
         assert!(!r.match_metadata(&meta_host("other.com"), &helper()));
     }
 
@@ -142,14 +147,14 @@ mod tests {
     #[test]
     fn no_match_unknown_category() {
         let db = db_with(&[("cn", &["baidu.com"])]);
-        let r = GeoSiteRule::new("zz", "DIRECT", Some(db), false);
+        let r = GeoSiteRule::new("zz", "DIRECT", Some(db));
         assert!(!r.match_metadata(&meta_host("cn-domain.cn"), &helper()));
     }
 
     /// A4 — absent DB → always no-match.
     #[test]
     fn absent_db_always_no_match() {
-        let r = GeoSiteRule::new("cn", "DIRECT", None, false);
+        let r = GeoSiteRule::new("cn", "DIRECT", None);
         assert!(!r.match_metadata(&meta_host("example.com"), &helper()));
     }
 
@@ -158,7 +163,7 @@ mod tests {
     #[test]
     fn category_case_insensitive() {
         let db = db_with(&[("cn", &["baidu.com"])]);
-        let r = GeoSiteRule::new("CN", "DIRECT", Some(db), false);
+        let r = GeoSiteRule::new("CN", "DIRECT", Some(db));
         assert!(r.match_metadata(&meta_host("baidu.com"), &helper()));
     }
 
@@ -166,7 +171,7 @@ mod tests {
     #[test]
     fn category_case_insensitive_mixed() {
         let db = db_with(&[("geolocation-!cn", &["google.com"])]);
-        let r = GeoSiteRule::new("GeOlOcAtIoN-!CN", "REJECT", Some(db), false);
+        let r = GeoSiteRule::new("GeOlOcAtIoN-!CN", "REJECT", Some(db));
         assert!(r.match_metadata(&meta_host("google.com"), &helper()));
     }
 
@@ -174,24 +179,23 @@ mod tests {
     #[test]
     fn empty_host_no_match() {
         let db = db_with(&[("cn", &["baidu.com"])]);
-        let r = GeoSiteRule::new("cn", "DIRECT", Some(db), false);
+        let r = GeoSiteRule::new("cn", "DIRECT", Some(db));
         assert!(!r.match_metadata(&meta_host(""), &helper()));
     }
 
     /// rule_type is GeoSite.
     #[test]
     fn rule_type_is_geosite() {
-        let r = GeoSiteRule::new("cn", "DIRECT", None, false);
+        let r = GeoSiteRule::new("cn", "DIRECT", None);
         assert_eq!(r.rule_type(), RuleType::GeoSite);
     }
 
-    /// should_resolve_ip respects no-resolve flag.
+    /// GEOSITE never demands resolution — upstream parity (the domain-only
+    /// matcher cannot use a resolved IP anyway). Regression for #625.
     #[test]
-    fn should_resolve_ip_flag() {
-        let r_resolve = GeoSiteRule::new("cn", "DIRECT", None, false);
-        assert!(r_resolve.should_resolve_ip());
-        let r_no_resolve = GeoSiteRule::new("cn", "DIRECT", None, true);
-        assert!(!r_no_resolve.should_resolve_ip());
+    fn should_resolve_ip_always_false() {
+        let db = db_with(&[("cn", &["cn.example"])]);
+        assert!(!GeoSiteRule::new("cn", "DIRECT", Some(db)).should_resolve_ip());
     }
 
     /// @suffix is preserved for matching and payload output.
@@ -201,7 +205,7 @@ mod tests {
             ("microsoft", &["global.example"]),
             ("microsoft@cn", &["cn.example"]),
         ]);
-        let r = GeoSiteRule::new("microsoft@cn", "DIRECT", Some(db), false);
+        let r = GeoSiteRule::new("microsoft@cn", "DIRECT", Some(db));
         assert_eq!(r.category(), "microsoft@cn");
         assert_eq!(r.payload(), "microsoft@cn");
         assert!(r.match_metadata(&meta_host("cn.example"), &helper()));
@@ -212,7 +216,7 @@ mod tests {
     #[test]
     fn uses_sniff_host() {
         let db = db_with(&[("cn", &["baidu.com"])]);
-        let r = GeoSiteRule::new("cn", "DIRECT", Some(db), false);
+        let r = GeoSiteRule::new("cn", "DIRECT", Some(db));
         let mut m = meta_host("fake.com");
         m.sniff_host = "baidu.com".into();
         assert!(r.match_metadata(&m, &helper()));

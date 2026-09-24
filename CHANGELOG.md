@@ -957,3 +957,8 @@ the canonical, in-repo source a release is cut from.
   zero MSS; and AnyTLS session `synack_tx`/`close_error` moved to
   synchronous mutexes so close and FIN handling no longer await while
   holding both stream-map write locks. (#621)
+
+- GEOSITE rules no longer demand a local DNS resolution per connection —
+  upstream never resolves for a domain-only matcher, so the demand was
+  pure latency plus a DNS-leak surface for proxy-bound names. The
+  `no-resolve` flag remains accepted but is now vestigial. (#625)

@@ -169,12 +169,12 @@ fn parse_rule_depth(
             if category.is_empty() {
                 return Err("GEOSITE rule requires a category name".to_string());
             }
-            let no_resolve = extra.is_some_and(|e| e.eq_ignore_ascii_case("no-resolve"));
+            // `no-resolve` (extra) is accepted but vestigial — GEOSITE
+            // matches domains only and never demands resolution (#625).
             Ok(Box::new(GeoSiteRule::new(
                 payload,
                 adapter,
                 ctx.geosite.clone(),
-                no_resolve,
             )))
         }
         "IN-PORT" => InPortRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
@@ -544,13 +544,14 @@ mod tests {
         assert_eq!(rule.adapter(), "DIRECT");
     }
 
-    /// G2 — parser honours the no-resolve flag.
+    /// G2 — `no-resolve` is still accepted, but GEOSITE never demands
+    /// resolution regardless (upstream parity; regression for #625).
     #[test]
     fn test_parse_geosite_no_resolve_flag() {
         let rule = parse_rule("GEOSITE,cn,DIRECT,no-resolve", &ctx()).unwrap();
         assert!(!rule.should_resolve_ip());
         let rule = parse_rule("GEOSITE,cn,DIRECT", &ctx()).unwrap();
-        assert!(rule.should_resolve_ip());
+        assert!(!rule.should_resolve_ip());
     }
 
     /// G3 — empty category hard-errors.
