@@ -425,9 +425,27 @@ impl DnsClient {
     /// question must match the request before any response flags or records
     /// are used.
     pub async fn query(&self, name: &str, record_type: RecordType) -> Result<Message, ClientError> {
-        tokio::time::timeout(self.timeout, self.query_inner(name, record_type))
-            .await
-            .map_err(|_| ClientError::Timeout(self.timeout))?
+        let parsed: Name = name
+            .parse()
+            .map_err(|_| ClientError::Protocol("invalid query name"))?;
+        self.query_name(&parsed, record_type).await
+    }
+
+    /// `query` with an already-decoded `Name` — the generic relay forwards
+    /// the wire-faithful name from the client's question. Re-rendering it
+    /// to text and re-parsing would re-split labels containing a literal
+    /// '.' and mangle non-UTF-8 bytes.
+    pub async fn query_name(
+        &self,
+        name: &Name,
+        record_type: RecordType,
+    ) -> Result<Message, ClientError> {
+        tokio::time::timeout(
+            self.timeout,
+            self.query_parsed(Query::query(name.clone(), record_type)),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout(self.timeout))?
     }
 
     async fn query_inner(
@@ -435,13 +453,16 @@ impl DnsClient {
         name: &str,
         record_type: RecordType,
     ) -> Result<Message, ClientError> {
-        let id: u16 = rand::random();
-        let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
-        msg.metadata.recursion_desired = true;
         let parsed: Name = name
             .parse()
             .map_err(|_| ClientError::Protocol("invalid query name"))?;
-        let query = Query::query(parsed, record_type);
+        self.query_parsed(Query::query(parsed, record_type)).await
+    }
+
+    async fn query_parsed(&self, query: Query) -> Result<Message, ClientError> {
+        let id: u16 = rand::random();
+        let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
         if let Transport::RCode { code } = &self.transport {
             let mut resp = Message::new(id, MessageType::Response, OpCode::Query);
             resp.metadata.recursion_desired = true;

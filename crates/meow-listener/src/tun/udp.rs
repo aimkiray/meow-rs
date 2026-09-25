@@ -134,7 +134,8 @@ pub(super) async fn run_udp(
                     }
                     continue;
                 }
-                // Malformed — nothing to forward upstream either.
+                // Malformed or a response packet — nothing to forward
+                // upstream either.
                 LocalAnswer::Drop => continue,
                 LocalAnswer::Upstream => {}
             }

@@ -86,8 +86,8 @@ static files instead.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/dns/query` | Resolve — query `name` (`type` ignored) → `{ name, answer: [...] }` |
-| `POST` | `/dns/query` | Resolve via POST body `{ name, type? }` |
+| `GET` | `/dns/query` | Resolve `name` (optional `type`, default `A`) → mihomo DNS JSON `{ Status, Question, TC/RD/RA/AD/CD, Answer?, Authority?, Additional? }` — non-A/AAAA types relay the upstream response sections verbatim |
+| `POST` | `/dns/query` | Legacy resolve — body `{ name, type? }` (`type` ignored) → `{ name, answer }` |
 | `POST` | `/cache/dns/flush` | Clear the DNS cache → 204 |
 | `POST` | `/cache/fakeip/flush` | Clear FakeIP allocations → 204 |
 

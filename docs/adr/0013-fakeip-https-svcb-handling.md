@@ -64,10 +64,22 @@ Concretely:
    `host` (fake-IP mode, ≥1 pool configured, host is not an explicit hosts-trie
    mapping, skipper does not bypass). Mirrors the gating in `lookup_ipv4` /
    `lookup_ipv6` so the HTTPS path and the A/AAAA path agree on *which* hosts are
-   faked. Skipper-bypassed / hosts-mapped domains keep their real hints.
+   faked. Skipper-bypassed / hosts-mapped domains keep their real `ipv4hint`;
+   `ipv6hint` is additionally gated by the global `ipv6` toggle — when IPv6 is
+   off (the default) it is stripped from every owner, since a client that cannot
+   use IPv6 has no use for the hint.
 
 2. `strip_svc_ip_hints(record)` in the DNS server — for HTTPS/SVCB records,
    drop the two hint params; any other record type passes through unchanged.
+   (#632 later extended coverage from the answer section to authority and
+   additional records as well — glue can carry the same leak. The `ipv4hint`
+   gate is evaluated per record *owner name* — a faked CNAME target or faked
+   authority/SOA-adjacent record leaks the same way, while unrelated glue
+   keeps its hints — and in the same raw wire-label form `parse_question`
+   produces, since `Name::to_utf8` would IDNA-decode `xn--` labels away
+   from the form the pool and hosts trie key on. The `ipv6hint` gate is
+   per-owner-faked OR `!ipv6_enabled`, so under the default `ipv6: false`
+   every HTTPS/SVCB record loses its `ipv6hint` regardless of owner.)
 
 3. **RFC 9460 §8 `mandatory` scrub.** A key listed in `mandatory` but absent
    from the RR makes the whole record malformed, so the client discards it —
@@ -121,8 +133,11 @@ upstream (per ADR-0002 divergence policy).
 
 ## Consequences
 
-- HTTP/3 and ECH keep working in fake-IP mode; no IP can be derived from an
-  HTTPS/SVCB answer for a faked host.
+- HTTP/3 and ECH keep working in fake-IP mode; on the DNS wire path no IP
+  can be derived from an HTTPS/SVCB answer for a faked host. (The REST API
+  `GET /dns/query` route added in #632 relays the upstream response
+  verbatim — it bypasses `handle_generic_forward`'s stripping by design,
+  so an operator querying `type=HTTPS` through the API sees the raw hints.)
 - One extra A/AAAA round trip vs. rewriting hints — acceptable, and the records
   are short-TTL cached.
 - Coverage: `strip_hints_*` (hint removal, ech/alpn preservation, mandatory

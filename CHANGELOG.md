@@ -1049,3 +1049,42 @@ the canonical, in-repo source a release is cut from.
   enrichment actually resolves). `LazyMatchOutcome` is `#[must_use]` —
   dropping a `NeedsEnrichment` silently loses buffered dead-target
   warnings. (#625)
+
+- DNS answers for non-A/AAAA queries (TXT, MX, SRV, HTTPS, …) are now
+  relayed from the upstream response instead of being rebuilt from its
+  answer section alone. The authority section (negative-cache SOA,
+  RFC 2308), additional-section glue (MX/SRV target addresses), and the
+  upstream flag word (AA, response code) now reach the client verbatim;
+  the rewrites are per-hop identity — transaction id, opcode echoed from
+  the request, the question echo, RD/CD echoed from the request,
+  `recursion_available` asserted, and EDNS, where the upstream's OPT is
+  dropped and a minimal response OPT (flag-day payload 1232, DO echoed)
+  is synthesized only when the client query carried one
+  (RFC 6891 §6.1.1). The name sent upstream is the wire-faithful
+  decoded question name rather than a re-parsed text rendering, so
+  labels containing a literal dot or non-UTF-8 bytes reach the
+  upstream as the client sent them. AD is forwarded only to clients
+  that asked for DNSSEC processing (RFC 6840 §5.8); TSIG/SIG records
+  that cannot verify client-side are removed from the additional
+  section. Question validity is enforced on both arms before
+  dispatch: a stray response packet (QR=1) is dropped silently —
+  answering one would ping-pong forever between two forwarding
+  resolvers — a non-IN class or non-QUERY opcode gets NOTIMP, and a
+  compressed/extended leading QNAME is dropped silently — none of
+  which spends an upstream round-trip; error responses carry a
+  response OPT when the request had one. On the generic path a packet whose
+  declared record counts exceed what the datagram could physically
+  contain is FORMERR-ed before the decoder reserves memory for them,
+  a malformed packet hickory rejects gets FORMERR, and EDNS version
+  negotiation answers BADVERS for `version > 0` (RFC 6891 §6.1.3).
+  An extended rcode a non-EDNS client cannot express becomes SERVFAIL
+  instead of a misleading low nibble, and an upstream or encode
+  failure answers SERVFAIL instead of a cacheable NXDOMAIN. Fake-IP
+  `ipv4hint`/`ipv6hint` stripping now also covers HTTPS/SVCB records
+  carried in the authority or additional sections, gated per record
+  owner in the same wire form the fake-IP pool keys on so non-faked
+  names keep their `ipv4hint` (`ipv6hint` is stripped for every owner
+  whenever `ipv6` is off, which is the default). The REST API
+  `GET /dns/query` route relays
+  non-A/AAAA queries through the same path and serializes the upstream
+  status, flag word, and all three record sections. (#632)

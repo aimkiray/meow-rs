@@ -966,7 +966,18 @@ async fn dns_query_get(
         if !answers.is_empty() {
             response.insert("Answer".into(), serde_json::Value::Array(answers));
         }
-    } else if let Some(message) = resolver.forward_generic(&params.name, record_type).await {
+    } else if let Some(message) = {
+        let Ok(query_name) = fqdn.parse::<hickory_proto::rr::Name>() else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"message": "DNS query failed"})),
+            )
+                .into_response();
+        };
+        resolver
+            .forward_generic(&params.name, &query_name, record_type)
+            .await
+    } {
         let metadata = &message.metadata;
         response.insert("Status".into(), u16::from(metadata.response_code).into());
         response.insert("TC".into(), metadata.truncation.into());

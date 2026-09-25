@@ -1,7 +1,7 @@
 use crate::resolver::{AddressLookupResult, Resolver};
 use futures::FutureExt;
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
-use hickory_proto::rr::{Record, RecordType};
+use hickory_proto::op::{Edns, Message, MessageType, ResponseCode};
+use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Weak};
@@ -125,6 +125,21 @@ impl DnsServer {
         let qdcount = u16::from_be_bytes([data[4], data[5]]);
         let arcount = u16::from_be_bytes([data[10], data[11]]);
 
+        // A packet with QR=1 is a response, not a query — drop it
+        // silently like every resolver does on its query socket.
+        // Replying at all would ping-pong forever between two forwarding
+        // resolvers: each error reply is itself QR=1, and a spoofed
+        // source could even point the loop back at this socket.
+        if flags & 0x8000 != 0 {
+            return Err("response packet received on the query socket".into());
+        }
+        // A forwarding resolver serves opcode QUERY only. Status, Update,
+        // Notify and friends get NOTIMP rather than a lookup result echoed
+        // under an opcode it doesn't answer.
+        if flags & 0x7800 != 0 {
+            return Ok(Self::build_notimp(id, flags, arcount > 0));
+        }
+
         if qdcount == 0 {
             return Err("No questions in DNS query".into());
         }
@@ -133,7 +148,7 @@ impl DnsServer {
         // every real resolver. Answer FORMERR instead of emitting a response
         // whose header counts don't match its body.
         if qdcount != 1 {
-            return Ok(Self::build_formerr(id, flags));
+            return Ok(Self::build_formerr(id, flags, arcount > 0));
         }
 
         // Parse the question name
@@ -148,11 +163,21 @@ impl DnsServer {
             "DNS query: id={id:#06x} flags={flags:#06x} arcount={arcount} domain={domain} qtype={qtype}"
         );
 
+        // Only class IN resolves through this pipeline — the forward query
+        // hardcodes IN, so a CH/HS question would be answered from the IN
+        // class while echoing the original one back: a mixed-class lie.
+        // qclass is the last two bytes of the question section.
+        let qclass = u16::from_be_bytes([data[12 + question_len - 2], data[12 + question_len - 1]]);
+        if qclass != 1 {
+            return Ok(Self::build_notimp(id, flags, arcount > 0));
+        }
+
         // Non-address queries (TXT, MX, SRV, HTTPS, SOA, PTR, …) go through
-        // the same nameserver pipeline as A/AAAA — policy → main → fallback —
-        // and the typed `Lookup` is re-emitted into a wire-format response.
-        // We deliberately stop short of fake-IP synthesis here: only address
-        // records ever get a synthetic answer.
+        // the same nameserver pipeline as A/AAAA — domain-gate → policy →
+        // main → fallback — and the upstream `Message` is relayed back on
+        // the wire with only per-hop identity rewritten. We deliberately
+        // stop short of fake-IP synthesis here: only address records ever
+        // get a synthetic answer.
         if qtype != 1 && qtype != 28 {
             return Self::handle_generic_forward(
                 id,
@@ -237,10 +262,14 @@ impl DnsServer {
     /// queues behind a slow upstream (issue #515).
     ///
     /// Mirrors the decidable prefix of [`Self::handle_query`] step for step:
-    /// the hosts trie is checked BEFORE the IPv6-disable short-circuit (a
-    /// hosts entry is an explicit user override that outranks the global
-    /// toggle — including for AAAA), and malformed packets classify as
-    /// [`LocalAnswer::Drop`] so garbage under flood never spends a permit.
+    /// non-query packets (QR=1) classify as [`LocalAnswer::Drop`] — a
+    /// response packet gets wire silence on both paths — non-QUERY opcodes,
+    /// non-IN classes and multi-question queries get the same header-only
+    /// error answers inline, `qdcount == 0` and malformed packets classify
+    /// as [`LocalAnswer::Drop`] so garbage under flood never spends a
+    /// permit, and the hosts trie is checked BEFORE the IPv6-disable
+    /// short-circuit (a hosts entry is an explicit user override that
+    /// outranks the global toggle — including for AAAA).
     ///
     /// `pub` for the TUN dns-hijack path (`meow-listener`), which answers
     /// locally-decidable queries inline instead of spending a task spawn.
@@ -251,12 +280,22 @@ impl DnsServer {
         let id = u16::from_be_bytes([data[0], data[1]]);
         let flags = u16::from_be_bytes([data[2], data[3]]);
         let qdcount = u16::from_be_bytes([data[4], data[5]]);
+        let arcount = u16::from_be_bytes([data[10], data[11]]);
+        // Same rules as handle_query: a response packet is dropped
+        // silently (answering it would ping-pong between resolvers),
+        // and only opcode QUERY is served.
+        if flags & 0x8000 != 0 {
+            return LocalAnswer::Drop;
+        }
+        if flags & 0x7800 != 0 {
+            return LocalAnswer::Answer(Self::build_notimp(id, flags, arcount > 0));
+        }
         if qdcount == 0 {
             return LocalAnswer::Drop; // handle_query errs — silently dropped
         }
         // Same rule as handle_query: multi-question queries get FORMERR.
         if qdcount != 1 {
-            return LocalAnswer::Answer(Self::build_formerr(id, flags));
+            return LocalAnswer::Answer(Self::build_formerr(id, flags, arcount > 0));
         }
         let Ok((domain, qtype, question_len)) = Self::parse_question(&data[12..]) else {
             // Parity with handle_query's per-error debug log — the inline
@@ -264,8 +303,17 @@ impl DnsServer {
             debug!("DNS query: malformed question section — dropped");
             return LocalAnswer::Drop;
         };
+        // Same rule as handle_query: only class IN is served.
+        let qclass = u16::from_be_bytes([data[12 + question_len - 2], data[12 + question_len - 1]]);
+        if qclass != 1 {
+            return LocalAnswer::Answer(Self::build_notimp(id, flags, arcount > 0));
+        }
         if qtype != 1 && qtype != 28 {
-            return LocalAnswer::Upstream; // generic forward always needs upstream
+            // Generic queries escalate to the task path — the remaining
+            // gates there (record-count FORMERR, hickory-parse FORMERR,
+            // BADVERS) may not even reach upstream, and they are not
+            // evaluated on this probe path.
+            return LocalAnswer::Upstream;
         }
 
         let outcome = {
@@ -346,10 +394,21 @@ impl DnsServer {
         outcome
     }
 
-    /// Forward a non-A/AAAA query through the resolver pipeline and emit the
-    /// returned records and response code as a wire-format response. Without an
-    /// upstream response, return SERVFAIL — clients may negative-cache NXDOMAIN
-    /// against the bare name, which would poison subsequent A/AAAA lookups.
+    /// Forward a non-A/AAAA query through the resolver pipeline and relay the
+    /// upstream response verbatim — answer, authority and additional sections
+    /// all travel intact so negative-cache SOAs, MX/SRV glue and upstream
+    /// flag semantics (AA, and AD for clients that asked) survive the hop
+    /// (issue #632). The rewrites are per-hop identity (transaction id,
+    /// opcode, question echo, RD/CD echo, EDNS), plus `recursion_available`
+    /// forced on, the RFC 6840 AD gate, hop-level TSIG/SIG stripping and
+    /// fake-IP SVC hint stripping. Impossible declared record counts are
+    /// FORMERR-ed before the hickory decode can reserve memory for them,
+    /// requests hickory rejects get FORMERR, EDNS versions newer than 0
+    /// get BADVERS, and an upstream extended rcode the client cannot
+    /// express (no EDNS) becomes SERVFAIL. Without
+    /// an upstream response, return SERVFAIL — clients may negative-cache
+    /// NXDOMAIN against the bare name, which would poison subsequent
+    /// A/AAAA lookups.
     async fn handle_generic_forward(
         id: u16,
         query: &[u8],
@@ -361,49 +420,175 @@ impl DnsServer {
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let record_type = RecordType::from(qtype);
         debug!("DNS forward (generic): {} type={:?}", domain, record_type);
-        let lookup = resolver.forward_generic(domain, record_type).await;
+        // Sole caller guarantees this — `question_len` comes from a
+        // successful `parse_question` over `query[12..]`.
+        debug_assert!(12 + question_len <= query.len());
 
-        // Parse the inbound query just to copy its question section verbatim.
-        // If parsing fails we fall back to the hand-rolled NXDOMAIN builder
-        // rather than dropping the packet.
+        // The declared record counts feed a `Vec::with_capacity` inside
+        // the hickory decode. A datagram cannot physically hold more
+        // resource records than `len / 11` (one-byte root name plus the
+        // 10-byte record header), so an impossible count is malformed
+        // input — FORMERR before the decoder reserves megabytes for it.
+        // The wire outcome is identical either way: hickory fails the
+        // same packet at record-read EOF.
+        let arcount = u16::from_be_bytes([query[10], query[11]]);
+        let declared_records = u16::from_be_bytes([query[6], query[7]]) as usize
+            + u16::from_be_bytes([query[8], query[9]]) as usize
+            + arcount as usize;
+        // `query.len() - 12 - question_len` == remaining record-region bytes.
+        if declared_records * 11 > query.len() - 12 - question_len {
+            return Ok(Self::build_formerr(id, flags, arcount > 0));
+        }
+
+        // Parse the inbound query before spending an upstream round-trip:
+        // the question echo, RD/CD request bits and EDNS presence all come
+        // from it. A query hickory rejects where `parse_question` succeeded
+        // (duplicate OPT, OPT outside the additional section, malformed
+        // trailing records — RFC 6891 §6.1.1) is malformed input and gets
+        // FORMERR, never a forwarded lookup.
         let Ok(req) = Message::from_vec(query) else {
-            return Ok(Self::build_nxdomain(id, query, flags, question_len));
+            // The request's EDNS presence is undecodable here — fall back
+            // to the raw ARCOUNT heuristic the preamble uses.
+            return Ok(Self::build_formerr(id, flags, arcount > 0));
         };
 
-        let mut resp = Message::new(id, MessageType::Response, OpCode::Query);
-        resp.metadata.recursion_desired = req.metadata.recursion_desired;
-        resp.metadata.recursion_available = true;
-        resp.add_queries(req.queries.iter().cloned());
+        // Defense in depth: the preamble already drops QR=1, so this arm
+        // is unreachable — kept so the private function cannot silently
+        // forward a response packet if it ever gains another caller.
+        if req.metadata.message_type != MessageType::Query {
+            return Err("response packet cannot be forwarded".into());
+        }
 
-        match lookup {
-            Some(l) => {
-                resp.metadata.response_code = l.metadata.response_code;
-                // In fake-IP mode, drop ipv4hint/ipv6hint from HTTPS/SVCB
-                // answers for faked hosts so an HTTP/3 client cannot read a
+        // RFC 6891 §6.1.3: an EDNS version newer than implemented (0) gets
+        // BADVERS — the extended rcode rides in a version-0 response OPT.
+        if req.edns.as_ref().is_some_and(|e| e.version() > 0) {
+            let mut resp = Message::new(id, MessageType::Response, req.metadata.op_code);
+            resp.metadata.recursion_desired = req.metadata.recursion_desired;
+            resp.metadata.checking_disabled = req.metadata.checking_disabled;
+            resp.metadata.recursion_available = true;
+            resp.metadata.response_code = ResponseCode::BADVERS;
+            resp.add_queries(req.queries.iter().cloned());
+            resp.edns = req.edns.as_ref().map(Self::response_edns);
+            return Ok(resp
+                .to_vec()
+                .unwrap_or_else(|_| Self::build_servfail(id, query, flags, question_len)));
+        }
+
+        // The name sent upstream is the wire-faithful `Name` hickory decoded
+        // from the client's question — a label containing a literal '.'
+        // byte or non-UTF-8 bytes would be re-split or mangled if the
+        // lossy text form in `domain` were re-parsed instead. `domain`
+        // still feeds the text-keyed gates (`domain_gated`/`policy.lookup`)
+        // inside `forward_generic`, matching the A/AAAA arm.
+        let Some(query_name) = req.queries.first().map(|q| q.name.clone()) else {
+            return Ok(Self::build_formerr(id, flags, req.edns.is_some()));
+        };
+        let lookup = resolver
+            .forward_generic(domain, &query_name, record_type)
+            .await;
+
+        let mut resp = match lookup {
+            Some(mut l) => {
+                l.metadata.id = id;
+                // `validate_response` already guarantees this — pinned
+                // anyway since the field drives what we emit.
+                l.metadata.message_type = MessageType::Response;
+                // RFC 1035: the opcode is copied from the request into the
+                // response — `validate_response` guarantees the upstream's
+                // is Query, so echo the client's to keep exotic opcodes
+                // consistent with the A/AAAA builders.
+                l.metadata.op_code = req.metadata.op_code;
+                // RD and CD are request bits — the response must echo the
+                // client's values, not whatever our own forward query sent.
+                l.metadata.recursion_desired = req.metadata.recursion_desired;
+                l.metadata.checking_disabled = req.metadata.checking_disabled;
+                // This server does recursion for the client regardless of
+                // what the upstream asserted about itself.
+                l.metadata.recursion_available = true;
+                // AD asserts "the data authenticated"; RFC 6840 §5.8 only
+                // lets it reach a client that asked for DNSSEC processing
+                // (AD or DO bit). Our upstream query never carries DO, so
+                // the upstream's bit is an unverifiable assertion besides.
+                l.metadata.authentic_data &= req.metadata.authentic_data
+                    || req.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok);
+                l.queries = req.queries.clone();
+                // Hop signatures cannot verify client-side. TSIG/SIG(0)
+                // records arrive inside `additionals` — hickory's
+                // `signature` slot only fills under its `__dnssec`
+                // feature — so strip them there too; a relayed TSIG would
+                // also illegally precede our synthesized OPT.
+                l.signature = None;
+                l.additionals
+                    .retain(|r| !matches!(r.record_type(), RecordType::TSIG | RecordType::SIG));
+                // Drop ipv4hint/ipv6hint from HTTPS/SVCB records whose
+                // owner is a faked name, so an HTTP/3 client cannot read a
                 // real origin IP out of the hint and bypass the fake-IP
-                // routing the tunnel depends on.
-                let strip_hints = resolver.fake_ip_active_for(domain);
+                // routing the tunnel depends on. The gate follows the
+                // RECORD's owner, not the qname: a faked CNAME target leaks
+                // the same way, and unrelated glue keeps its hints. The
+                // ipv6 hint additionally drops whenever the client cannot
+                // use IPv6 anyway.
                 let strip_ipv6_hint = !resolver.ipv6_enabled();
-                for rec in &l.answers {
-                    if strip_hints || strip_ipv6_hint {
-                        resp.add_answer(strip_svc_ip_hints(
-                            rec,
-                            strip_hints,
-                            strip_hints || strip_ipv6_hint,
-                        ));
-                    } else {
-                        resp.add_answer(rec.clone());
+                for rec in l
+                    .answers
+                    .iter_mut()
+                    .chain(&mut l.authorities)
+                    .chain(&mut l.additionals)
+                {
+                    // `strip_svc_ip_hints` rebuilds unconditionally —
+                    // gate on rdata so ordinary records pass through
+                    // untouched (this runs for every generic response
+                    // whenever ipv6 is off, which is the default).
+                    if !matches!(&rec.data, RData::HTTPS(_) | RData::SVCB(_)) {
+                        continue;
+                    }
+                    let strip_v4_hint = resolver.fake_ip_active_for(&record_owner_text(&rec.name));
+                    let strip_v6_hint = strip_v4_hint || strip_ipv6_hint;
+                    if strip_v6_hint {
+                        *rec = strip_svc_ip_hints(rec, strip_v4_hint, strip_v6_hint);
                     }
                 }
+                l
             }
             None => {
+                let mut resp = Message::new(id, MessageType::Response, req.metadata.op_code);
+                resp.metadata.recursion_desired = req.metadata.recursion_desired;
+                resp.metadata.checking_disabled = req.metadata.checking_disabled;
+                resp.metadata.recursion_available = true;
                 resp.metadata.response_code = ResponseCode::ServFail;
+                resp.add_queries(req.queries.iter().cloned());
+                resp
             }
+        };
+
+        // EDNS is strictly per-hop: the upstream's OPT describes our hop to
+        // it, not ours to the client. Replace it with a minimal response
+        // OPT, and only when the inbound query carried one (RFC 6891
+        // §6.1.1). Upstream options (EDE, COOKIE, …) are hop-bound and
+        // dropped; extended-rcode high bits still reach the client —
+        // `to_vec` writes `response_code.high()` into this OPT.
+        resp.edns = req.edns.as_ref().map(Self::response_edns);
+
+        // Without a response OPT the extended rcode's high bits cannot be
+        // expressed and the surviving low nibble lies — BADVERS(16)
+        // masquerades as NOERROR, BADCOOKIE(23) as YXRRSet. Answer SERVFAIL
+        // instead of an rcode the client cannot interpret.
+        if resp.edns.is_none() && resp.metadata.response_code.high() != 0 {
+            resp.metadata.response_code = ResponseCode::ServFail;
         }
 
         Ok(resp
             .to_vec()
-            .unwrap_or_else(|_| Self::build_nxdomain(id, query, flags, question_len)))
+            .unwrap_or_else(|_| Self::build_servfail(id, query, flags, question_len)))
+    }
+
+    /// Minimal per-hop response OPT synthesized from the client's request
+    /// EDNS: version 0, the 2020 DNS-flag-day payload, echoing only DO.
+    fn response_edns(req_edns: &Edns) -> Edns {
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(req_edns.flags().dnssec_ok);
+        edns.set_max_payload(1232);
+        edns
     }
 
     fn parse_question(
@@ -420,6 +605,14 @@ impl DnsServer {
             if len == 0 {
                 pos += 1;
                 break;
+            }
+            // A leading QNAME can never legally carry a compression pointer
+            // or an extended label — both take the top two bits of the
+            // length byte — and treating them as literal label lengths lets
+            // this parser see a different name than hickory does on the
+            // same packet.
+            if len & 0xC0 != 0 {
+                return Err("DNS question label uses pointer/extended encoding".into());
             }
             if pos + 1 + len > data.len() {
                 return Err("DNS label truncated".into());
@@ -561,18 +754,36 @@ impl DnsServer {
         response
     }
 
-    /// Header-only FORMERR (rcode=1) for queries the hand-rolled builders
-    /// cannot answer coherently (e.g. `qdcount > 1`). No question section is
-    /// echoed — clients match the response on ID.
-    fn build_formerr(id: u16, flags: u16) -> Vec<u8> {
+    /// Header-only error response (no question echo — clients match on ID).
+    /// `request_edns` carries a minimal response OPT when the request had
+    /// one (RFC 6891 §6.1.1 — error responses are not exempt, and Windows
+    /// stubs reject OPT-less answers).
+    fn build_header_error(id: u16, flags: u16, rcode: u8, request_edns: bool) -> Vec<u8> {
         let [byte0, byte1] = Self::response_flags(flags);
-        let byte1_rcode = (byte1 & 0xF0) | 0x01; // FORMERR
+        let byte1_rcode = (byte1 & 0xF0) | (rcode & 0x0F);
 
-        let mut response = Vec::with_capacity(12);
+        let mut response = Vec::with_capacity(12 + OPT_RECORD.len());
         response.extend_from_slice(&id.to_be_bytes());
         response.extend_from_slice(&[byte0, byte1_rcode]);
         response.extend_from_slice(&[0x00; 8]); // QD/AN/NS/AR = 0
+        if request_edns {
+            Self::append_opt_record(&mut response, 0);
+        }
         response
+    }
+
+    /// Header-only FORMERR (rcode=1) for queries this server cannot answer
+    /// coherently — `qdcount > 1`, impossible record counts, a packet the
+    /// full hickory parse rejects, or a parsed query with zero questions.
+    fn build_formerr(id: u16, flags: u16, request_edns: bool) -> Vec<u8> {
+        Self::build_header_error(id, flags, 1, request_edns)
+    }
+
+    /// Header-only NOTIMP (rcode=4): the question asks for something a
+    /// forwarding resolver does not serve — a non-IN class or a non-QUERY
+    /// opcode.
+    fn build_notimp(id: u16, flags: u16, request_edns: bool) -> Vec<u8> {
+        Self::build_header_error(id, flags, 4, request_edns)
     }
 
     #[cfg(test)]
@@ -894,7 +1105,27 @@ fn strip_svc_ip_hints(rec: &Record, strip_ipv4: bool, strip_ipv6: bool) -> Recor
         // Not an HTTPS/SVCB record (e.g. a CNAME in the chain) — leave intact.
         _ => return rec.clone(),
     };
-    Record::from_rdata(rec.name.clone(), rec.ttl, new_rdata)
+    let mut stripped = Record::from_rdata(rec.name.clone(), rec.ttl, new_rdata);
+    // `from_rdata` defaults class to IN — preserve the original.
+    stripped.dns_class = rec.dns_class;
+    stripped
+}
+
+/// Text form of a record owner name in the same representation
+/// `parse_question` produces: raw label bytes lossy-UTF-8 joined on '.'.
+/// This is the form the fake-IP pool, hosts trie and skipper key on —
+/// `Name::to_utf8` would IDNA-decode `xn--` labels, so a unicode-form
+/// `hosts:` entry could mask the gate for a wire name the A/AAAA path
+/// still fakes (ADR-0013).
+fn record_owner_text(name: &Name) -> String {
+    let mut out = String::new();
+    for label in name {
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(&String::from_utf8_lossy(label));
+    }
+    out
 }
 
 /// Hex-dump the first `max` bytes of `data` for diagnostics. Allocates —
@@ -912,7 +1143,8 @@ pub fn hex_prefix(data: &[u8], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+    use hickory_proto::op::OpCode;
+    use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, DecodeError};
     use meow_common::DnsMode;
     use std::net::Ipv4Addr;
 
@@ -935,7 +1167,7 @@ mod tests {
         q
     }
 
-    fn https_record_with_hints() -> Record {
+    fn https_record_with_hints_named(name: &str) -> Record {
         use hickory_proto::rr::rdata::svcb::{Alpn, IpHint, SvcParamKey, SvcParamValue, SVCB};
         use hickory_proto::rr::rdata::{A, AAAA, HTTPS};
         use hickory_proto::rr::{Name, RData};
@@ -956,9 +1188,13 @@ mod tests {
                 SvcParamValue::Ipv6Hint(IpHint(vec![AAAA::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)])),
             ),
         ];
-        let name = Name::from_str("example.com.").unwrap();
+        let name = Name::from_str(name).unwrap();
         let svcb = SVCB::new(1, name.clone(), params);
         Record::from_rdata(name, 300, RData::HTTPS(HTTPS(svcb)))
+    }
+
+    fn https_record_with_hints() -> Record {
+        https_record_with_hints_named("example.com.")
     }
 
     #[test]
@@ -1111,6 +1347,62 @@ mod tests {
     }
 
     #[test]
+    fn strip_hints_preserves_record_dns_class() {
+        use hickory_proto::rr::DNSClass;
+
+        // The rebuild path (`Record::from_rdata`) defaults the class to IN —
+        // a record carrying another class must keep it through the strip.
+        let mut rec = https_record_with_hints();
+        rec.dns_class = DNSClass::CH;
+        let stripped = strip_svc_ip_hints(&rec, true, true);
+        assert_eq!(
+            stripped.dns_class,
+            DNSClass::CH,
+            "rebuild must preserve the record's DNS class"
+        );
+    }
+
+    #[test]
+    fn strip_hints_handles_svcb_rdata() {
+        use hickory_proto::rr::rdata::svcb::SvcParamKey;
+        use hickory_proto::rr::RData;
+
+        // The SVCB arm shares the strip logic with HTTPS but is a distinct
+        // rdata variant — pin it so the match arm can't silently pass
+        // SVCB records through unstripped.
+        let mut rec = https_record_with_hints_named("svc.example.com.");
+        let RData::HTTPS(https) = rec.data else {
+            panic!("fixture must be HTTPS");
+        };
+        rec.data = RData::SVCB(https.0);
+
+        let stripped = strip_svc_ip_hints(&rec, true, true);
+        let RData::SVCB(svcb) = &stripped.data else {
+            panic!("expected SVCB rdata");
+        };
+        let keys: Vec<&SvcParamKey> = svcb.svc_params.iter().map(|(k, _)| k).collect();
+        assert!(!keys.contains(&&SvcParamKey::Ipv4Hint));
+        assert!(!keys.contains(&&SvcParamKey::Ipv6Hint));
+        assert!(keys.contains(&&SvcParamKey::Alpn));
+    }
+
+    #[test]
+    fn record_owner_text_keeps_wire_labels_unlike_to_utf8() {
+        // `Name::to_utf8` IDNA-decodes `xn--` labels, but the fake-IP
+        // pool, hosts trie and skipper all key on the raw wire text that
+        // `parse_question` produces — a unicode-form gate key would let
+        // an `xn--` owner's hints leak past `fake_ip_active_for`.
+        let name = Name::from_utf8("bücher.example").unwrap();
+        let wire = record_owner_text(&name);
+        assert_eq!(wire, "xn--bcher-kva.example");
+        assert_ne!(
+            wire,
+            name.to_utf8().trim_end_matches('.'),
+            "the unicode form must NOT be the gate key"
+        );
+    }
+
+    #[test]
     fn parse_question_reads_qname_and_qtype() {
         let q = sample_query(0xbeef, 0x0001);
         let (name, qtype, _) = DnsServer::parse_question_for_test(&q[12..]).unwrap();
@@ -1223,6 +1515,18 @@ mod tests {
         code: ResponseCode,
         answer: Option<Record>,
     ) -> crate::resolver::Resolver {
+        resolver_with_upstream_message(move |response| {
+            response.metadata.response_code = code;
+            if let Some(answer) = answer {
+                response.add_answer(answer);
+            }
+        })
+        .await
+    }
+
+    /// Bind a loopback UDP socket that answers the first query it receives
+    /// with a response shaped by `build`, and return its address.
+    async fn spawn_dns_responder(build: impl FnOnce(&mut Message) + Send + 'static) -> SocketAddr {
         let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = upstream.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1231,16 +1535,22 @@ mod tests {
             let request = Message::from_bytes(&buf[..len]).unwrap();
             let mut response =
                 Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
-            response.metadata.response_code = code;
             response.add_queries(request.queries.iter().cloned());
-            if let Some(answer) = answer {
-                response.add_answer(answer);
-            }
+            build(&mut response);
             upstream
                 .send_to(&response.to_bytes().unwrap(), peer)
                 .await
                 .unwrap();
         });
+        addr
+    }
+
+    /// Spawn a loopback UDP "upstream" that answers the first query it
+    /// receives with a response shaped by `build`, then exits.
+    async fn resolver_with_upstream_message(
+        build: impl FnOnce(&mut Message) + Send + 'static,
+    ) -> crate::resolver::Resolver {
+        let addr = spawn_dns_responder(build).await;
         crate::resolver::Resolver::new(
             vec![addr],
             Vec::new(),
@@ -1321,6 +1631,9 @@ mod tests {
 
     #[tokio::test]
     async fn handle_query_generic_preserves_upstream_response_code() {
+        use hickory_proto::rr::rdata::TXT;
+        use hickory_proto::rr::{Name, RData};
+
         for qtype in [RecordType::TXT, RecordType::MX, RecordType::HTTPS] {
             for code in [
                 ResponseCode::NoError,
@@ -1328,7 +1641,19 @@ mod tests {
                 ResponseCode::ServFail,
                 ResponseCode::Refused,
             ] {
-                let resolver = resolver_with_upstream_rcode(code).await;
+                // A marker record in the upstream additional section proves
+                // the response went through the relay — the local
+                // SERVFAIL/FORMERR branches emit empty sections, so the
+                // ServFail leg cannot pass vacuously.
+                let resolver = resolver_with_upstream_message(move |response| {
+                    response.metadata.response_code = code;
+                    response.add_additional(Record::from_rdata(
+                        Name::from_ascii("marker.example.").unwrap(),
+                        60,
+                        RData::TXT(TXT::new(vec!["upstream-marker".to_string()])),
+                    ));
+                })
+                .await;
                 let query = sample_query(7, u16::from(qtype));
                 let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
                 let response = Message::from_vec(&response).unwrap();
@@ -1339,6 +1664,11 @@ mod tests {
                 assert_eq!(response.metadata.id, 7);
                 assert_eq!(response.queries, Message::from_vec(&query).unwrap().queries);
                 assert!(response.answers.is_empty());
+                assert_eq!(
+                    response.additionals.len(),
+                    1,
+                    "upstream marker survived the relay for rcode {code}"
+                );
             }
         }
     }
@@ -1374,6 +1704,930 @@ mod tests {
             .unwrap();
         let response = Message::from_vec(&response).unwrap();
         assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_forwards_wire_faithful_name() {
+        // A QNAME label containing a literal '.' byte is ONE label on the
+        // wire, and a label may carry bytes that are not valid UTF-8.
+        // Re-parsing the lossy text form would ask the upstream for a
+        // different name than the question echoed back, so the relay
+        // forwards the decoded `Name` itself.
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = upstream.recv_from(&mut buf).await.unwrap();
+            let request = Message::from_bytes(&buf[..len]).unwrap();
+            let _ = tx.send(request.queries[0].name.clone());
+            let mut response =
+                Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+            response.add_queries(request.queries.iter().cloned());
+            response.metadata.response_code = ResponseCode::NoError;
+            upstream
+                .send_to(&response.to_bytes().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        let resolver = crate::resolver::Resolver::new(
+            vec![addr],
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        );
+
+        // QNAME: 3"a.b" 2<0xFF 0xFE> 7"example" 3"com" 0 — the dot lives
+        // INSIDE label 1, and label 2 carries bytes that are not valid
+        // UTF-8 at all. The lossy text form `parse_question` produces
+        // would render it as "a.b.\u{FFFD}\u{FFFD}.example.com" —
+        // re-parsing that would ask the upstream for a different name
+        // than the question echoed back. The relay forwards the decoded
+        // `Name` instead, so the upstream sees the label boundaries and
+        // bytes the client actually sent.
+        let mut query = Vec::new();
+        query.extend_from_slice(&0xBEEFu16.to_be_bytes());
+        query.extend_from_slice(&[0x01, 0x00]); // RD=1
+        query.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        query.push(3);
+        query.extend_from_slice(b"a.b");
+        query.push(2);
+        query.extend_from_slice(&[0xFF, 0xFE]);
+        query.push(7);
+        query.extend_from_slice(b"example");
+        query.push(3);
+        query.extend_from_slice(b"com");
+        query.push(0);
+        query.extend_from_slice(&u16::from(RecordType::TXT).to_be_bytes());
+        query.extend_from_slice(&[0x00, 0x01]);
+
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::NoError,
+            "upstream answered — the relay ran"
+        );
+        // The echoed question must also carry the true wire name.
+        let echoed_labels: Vec<&[u8]> = response.queries[0].name.iter().collect();
+        assert_eq!(echoed_labels[0], b"a.b");
+
+        let upstream_name = rx.await.expect("upstream saw the query");
+        let labels: Vec<&[u8]> = upstream_name.iter().collect();
+        assert_eq!(
+            labels,
+            [b"a.b".as_slice(), &[0xFF, 0xFE], b"example", b"com"],
+            "label boundaries and raw bytes must reach upstream byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_gates_on_text_domain_but_sends_wire_name() {
+        use crate::resolver::FallbackFilter;
+        use crate::upstream::{HostOrIp, NameServerUrl};
+
+        // `forward_generic`'s central invariant: `domain` — the lossy
+        // text form `parse_question` produces — keys the text gates
+        // (fallback-filter domain trie, nameserver-policy), while
+        // `query_name` is the wire-faithful `Name` sent upstream. A
+        // fallback-filter entry matching the TEXT form of a
+        // literal-dot-label name must route the query to the fallback
+        // pool, and the fallback upstream must still see `a.b` as one
+        // label — not two labels re-split from the text.
+        let fallback_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_sock.local_addr().unwrap();
+        let main_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let main_addr = main_sock.local_addr().unwrap();
+
+        // Any datagram reaching the main pool means the gate keyed on
+        // the wrong form.
+        let (hit_tx, mut hit_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            if main_sock.recv_from(&mut buf).await.is_ok() {
+                let _ = hit_tx.send(());
+            }
+        });
+        let (name_tx, name_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = fallback_sock.recv_from(&mut buf).await.unwrap();
+            let request = Message::from_bytes(&buf[..len]).unwrap();
+            let _ = name_tx.send(request.queries[0].name.clone());
+            let mut response =
+                Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+            response.add_queries(request.queries.iter().cloned());
+            response.metadata.response_code = ResponseCode::NoError;
+            fallback_sock
+                .send_to(&response.to_bytes().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+
+        let mut ff_domain = meow_trie::DomainTrie::new();
+        // Exact match against the TEXT form parse_question yields for
+        // the wire name "a.b"."example"."com".
+        ff_domain.insert("a.b.example.com", ());
+        let resolver = crate::resolver::Resolver::new_with_bootstrap(
+            vec![NameServerUrl::Udp {
+                addr: HostOrIp::Ip(main_addr.ip()),
+                port: main_addr.port(),
+            }],
+            vec![NameServerUrl::Udp {
+                addr: HostOrIp::Ip(fallback_addr.ip()),
+                port: fallback_addr.port(),
+            }],
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+            None,
+            Some(FallbackFilter {
+                geoip_enabled: false,
+                geoip_code: "CN".to_string(),
+                ipcidr: vec![],
+                domain: ff_domain,
+                geoip_reader: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // QNAME: 3"a.b" 7"example" 3"com" 0 — one label holding a dot.
+        let mut query = Vec::new();
+        query.extend_from_slice(&0xCAFEu16.to_be_bytes());
+        query.extend_from_slice(&[0x01, 0x00]);
+        query.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        query.push(3);
+        query.extend_from_slice(b"a.b");
+        query.push(7);
+        query.extend_from_slice(b"example");
+        query.push(3);
+        query.extend_from_slice(b"com");
+        query.push(0);
+        query.extend_from_slice(&u16::from(RecordType::TXT).to_be_bytes());
+        query.extend_from_slice(&[0x00, 0x01]);
+
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::NoError,
+            "the fallback tier answered — the text gate routed correctly"
+        );
+        let upstream_name = name_rx.await.expect("fallback upstream saw the query");
+        let labels: Vec<&[u8]> = upstream_name.iter().collect();
+        assert_eq!(
+            labels[0], b"a.b",
+            "the fallback upstream must receive the wire-faithful name"
+        );
+        assert!(
+            hit_rx.try_recv().is_err(),
+            "the domain gate must key on the text form — main pool untouched"
+        );
+    }
+
+    /// Build a wire-format query with an EDNS OPT record attached.
+    fn sample_edns_query(id: u16, qtype: RecordType, dnssec_ok: bool) -> Vec<u8> {
+        sample_edns_query_named(id, "example.com.", qtype, dnssec_ok)
+    }
+
+    fn sample_edns_query_named(id: u16, name: &str, qtype: RecordType, dnssec_ok: bool) -> Vec<u8> {
+        use hickory_proto::op::Query;
+        use hickory_proto::rr::Name;
+
+        let mut q = Message::new(id, MessageType::Query, OpCode::Query);
+        q.metadata.recursion_desired = true;
+        q.add_query(Query::query(Name::from_ascii(name).unwrap(), qtype));
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(dnssec_ok);
+        edns.set_max_payload(1400);
+        q.edns = Some(edns);
+        q.to_vec().unwrap()
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_relays_authority_and_additionals() {
+        use hickory_proto::rr::rdata::{A, MX, SOA};
+        use hickory_proto::rr::{Name, RData};
+
+        let mx = Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::MX(MX::new(10, Name::from_ascii("mail.example.com.").unwrap())),
+        );
+        let soa = Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::SOA(SOA::new(
+                Name::from_ascii("ns1.example.com.").unwrap(),
+                Name::from_ascii("hostmaster.example.com.").unwrap(),
+                1,
+                7200,
+                3600,
+                1209600,
+                300,
+            )),
+        );
+        let glue = Record::from_rdata(
+            Name::from_ascii("mail.example.com.").unwrap(),
+            300,
+            RData::A(A::new(192, 0, 2, 1)),
+        );
+        let expected_soa = soa.clone();
+        let expected_glue = glue.clone();
+        let resolver = resolver_with_upstream_message(move |response| {
+            response.metadata.response_code = ResponseCode::NoError;
+            response.add_answer(mx);
+            response.add_authority(soa);
+            response.add_additional(glue);
+        })
+        .await;
+
+        let query = sample_query(7, u16::from(RecordType::MX));
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+
+        // Assert the upstream path actually answered before checking
+        // sections — a local SERVFAIL emits empty sections and would make
+        // the checks below vacuous.
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(
+            response.authorities.len(),
+            1,
+            "authority section (negative-cache SOA) must be relayed verbatim"
+        );
+        assert_eq!(
+            response.additionals.len(),
+            1,
+            "additional section (MX/SRV glue) must be relayed verbatim"
+        );
+        assert_eq!(response.authorities[0], expected_soa);
+        assert_eq!(response.additionals[0], expected_glue);
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_relays_upstream_flags() {
+        // TC is deliberately left out: the DNS client layer retries
+        // truncated UDP answers over TCP before `handle_generic_forward`
+        // ever sees them (client.rs exchange), so no message with TC set
+        // reaches this path over a UDP-only upstream. Whatever TC a
+        // post-retry message still carries is relayed verbatim like the
+        // rest of the flag word.
+        let resolver = resolver_with_upstream_message(|response| {
+            response.metadata.response_code = ResponseCode::NoError;
+            response.metadata.authoritative = true;
+            response.metadata.authentic_data = true;
+        })
+        .await;
+
+        let query = sample_query(7, u16::from(RecordType::TXT));
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::NoError,
+            "upstream answered — the local SERVFAIL path clears AA anyway"
+        );
+        assert!(response.metadata.authoritative, "AA relayed");
+        assert!(
+            !response.metadata.authentic_data,
+            "AD is gated on the client asking for DNSSEC (RFC 6840 §5.8)"
+        );
+        assert!(response.metadata.recursion_available, "RA=1");
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_passes_ad_when_client_asked() {
+        for (label, query) in [
+            (
+                "DO bit in request EDNS",
+                sample_edns_query(7, RecordType::TXT, true),
+            ),
+            // AD bit set directly in the request flag word.
+            ("AD bit in request flags", {
+                let mut q = sample_query(8, u16::from(RecordType::TXT));
+                q[3] |= 0x20;
+                q
+            }),
+        ] {
+            let resolver = resolver_with_upstream_message(|response| {
+                response.metadata.response_code = ResponseCode::NoError;
+                response.metadata.authentic_data = true;
+            })
+            .await;
+            let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+            let response = Message::from_vec(&response).unwrap();
+            assert!(
+                response.metadata.authentic_data,
+                "{label}: upstream AD must reach a client that asked"
+            );
+        }
+
+        // The gate is `&=`, not assignment: an upstream that never asserted
+        // AD must not have it fabricated just because the client asked.
+        let resolver = resolver_with_upstream_message(|response| {
+            response.metadata.response_code = ResponseCode::NoError;
+            response.metadata.authentic_data = false;
+        })
+        .await;
+        let query = sample_edns_query(9, RecordType::TXT, true);
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            !response.metadata.authentic_data,
+            "AD must not be fabricated when the upstream never asserted it"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_query_notimp_for_non_query_opcode() {
+        // A forwarding resolver serves opcode QUERY only — a Status packet
+        // gets NOTIMP, answered in the preamble without an upstream lookup.
+        // The response still echoes the request's opcode (RFC 1035).
+        let mut q = sample_query(9, u16::from(RecordType::TXT));
+        // 0x87 clears the 4-bit opcode field, preserving QR/AA/TC/RD.
+        q[2] = (q[2] & 0x87) | (2 << 3); // opcode=Status(2)
+        for resolver in [
+            resolver_with_upstream_message(|response| {
+                response.metadata.response_code = ResponseCode::NoError;
+            })
+            .await,
+            empty_resolver(),
+        ] {
+            let response = DnsServer::handle_query(&q, &resolver).await.unwrap();
+            let response = Message::from_vec(&response).unwrap();
+            assert_eq!(
+                response.metadata.response_code,
+                ResponseCode::NotImp,
+                "non-QUERY opcodes get NOTIMP"
+            );
+            assert_eq!(
+                response.metadata.op_code,
+                OpCode::Status,
+                "the response echoes the request's opcode"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_echoes_request_rd_and_cd() {
+        // Upstream claims RD=0/CD=0 (it echoes whatever our forward query
+        // sent); the client asked RD=1, so the response must reflect the
+        // client's request bits, not the upstream hop's.
+        let resolver = resolver_with_upstream_message(|response| {
+            response.metadata.response_code = ResponseCode::NoError;
+            response.metadata.recursion_desired = false;
+            response.metadata.checking_disabled = false;
+        })
+        .await;
+
+        // sample_query sets flags 0x0100 → RD=1, CD=0.
+        let query = sample_query(7, u16::from(RecordType::TXT));
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(response.metadata.recursion_desired, "RD echoes request");
+        assert!(!response.metadata.checking_disabled, "CD echoes request");
+
+        // CD=1 in the request must likewise echo through.
+        let mut cd_query = sample_query(8, u16::from(RecordType::TXT));
+        cd_query[3] |= 0x10; // CD bit
+        let resolver2 = resolver_with_upstream_message(|response| {
+            response.metadata.response_code = ResponseCode::NoError;
+        })
+        .await;
+        let response = DnsServer::handle_query(&cd_query, &resolver2)
+            .await
+            .unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(response.metadata.checking_disabled, "CD=1 echoes request");
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_drops_upstream_edns_when_request_has_none() {
+        let resolver = resolver_with_upstream_message(|response| {
+            response.metadata.response_code = ResponseCode::NoError;
+            let mut edns = Edns::new();
+            edns.set_max_payload(4096);
+            response.edns = Some(edns);
+        })
+        .await;
+
+        // sample_query has ARCOUNT=0 — no OPT record.
+        let query = sample_query(7, u16::from(RecordType::TXT));
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::NoError,
+            "upstream answer must have arrived — SERVFAIL also yields edns=None here"
+        );
+        assert!(
+            response.edns.is_none(),
+            "upstream OPT is hop-bound and must not leak to a non-EDNS client"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_synthesizes_edns_when_request_has_one() {
+        let resolver = resolver_with_upstream_message(|response| {
+            response.metadata.response_code = ResponseCode::NoError;
+            // Upstream OPT advertises a big buffer and DO=0 — none of that
+            // describes our hop to the client.
+            let mut edns = Edns::new();
+            edns.set_max_payload(4096);
+            response.edns = Some(edns);
+        })
+        .await;
+
+        let query = sample_edns_query(7, RecordType::TXT, true);
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::NoError,
+            "upstream answer must have arrived — the SERVFAIL branch synthesizes the same OPT"
+        );
+        let edns = response
+            .edns
+            .expect("request had EDNS → response OPT required (RFC 6891)");
+        assert!(
+            edns.flags().dnssec_ok,
+            "response DO echoes the request's DO bit"
+        );
+        assert_eq!(
+            edns.max_payload(),
+            1232,
+            "synthesized OPT advertises the flag-day payload, not the upstream's hop-bound size"
+        );
+        assert_eq!(edns.version(), 0, "EDNS version 0");
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_badvers_for_newer_edns_version() {
+        // RFC 6891 §6.1.3: a request with EDNS version > 0 gets BADVERS
+        // (extended rcode 16) with a version-0 OPT — never a lookup.
+        use hickory_proto::op::Query;
+        use hickory_proto::rr::Name;
+
+        let mut q = Message::new(7, MessageType::Query, OpCode::Query);
+        q.metadata.recursion_desired = true;
+        q.metadata.checking_disabled = true;
+        q.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::TXT,
+        ));
+        let mut edns = Edns::new();
+        edns.set_version(1);
+        edns.set_dnssec_ok(true);
+        q.edns = Some(edns);
+        let query = q.to_vec().unwrap();
+
+        // No upstream configured — the BADVERS path must not even try.
+        let response = DnsServer::handle_query(&query, &empty_resolver())
+            .await
+            .unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        // BADVERS and BADSIG share wire value 16; hickory decodes it as
+        // BADSIG. The wire encoding is what matters.
+        assert!(
+            matches!(
+                response.metadata.response_code,
+                ResponseCode::BADVERS | ResponseCode::BADSIG
+            ),
+            "extended rcode 16 (BADVERS)"
+        );
+        let edns = response
+            .edns
+            .expect("BADVERS carries a response OPT for an EDNS request");
+        assert_eq!(edns.version(), 0, "BADVERS carries a version-0 OPT");
+        assert_eq!(
+            edns.max_payload(),
+            1232,
+            "BADVERS OPT uses the same synthesized shape as the relay path"
+        );
+        assert!(edns.flags().dnssec_ok, "request DO bit echoes");
+        assert_eq!(response.metadata.id, 7);
+        assert!(
+            response.metadata.recursion_desired
+                && response.metadata.checking_disabled
+                && response.metadata.recursion_available,
+            "request bits echo on the BADVERS path too"
+        );
+        assert_eq!(response.queries.len(), 1, "question echoed");
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_formerr_for_hickory_rejected_request() {
+        // `parse_question` only validates the question; a malformed record
+        // section makes `Message::from_vec` fail — the answer is FORMERR,
+        // and no upstream round-trip is spent on it.
+        //
+        // Case 1: ARCOUNT=1 with truncated record bytes. Note this
+        // particular fixture now trips the impossible-count pre-gate
+        // (1 RR cannot fit in 3 trailing bytes) rather than the hickory
+        // parse — same FORMERR on the wire; kept to pin the OPT echo.
+        let mut q = sample_query(9, u16::from(RecordType::TXT));
+        q[11] = 1; // ARCOUNT = 1
+        q.extend_from_slice(&[0xC0, 0x0C, 0xFF]); // truncated record
+        let response = DnsServer::handle_query(&q, &empty_resolver())
+            .await
+            .unwrap();
+        assert_eq!(response[3] & 0x0F, 1, "RCODE=FORMERR");
+        assert_eq!(&response[0..2], &[0x00, 0x09], "ID echoed");
+        // The request carried an additional record, so the header-only
+        // FORMERR must still carry a minimal response OPT — a 12-byte
+        // header plus the 11-byte canned OPT, nothing more.
+        assert_eq!(
+            response.len(),
+            23,
+            "FORMERR = 12-byte header + minimal response OPT"
+        );
+        let parsed = Message::from_vec(&response).unwrap();
+        assert!(
+            parsed.edns.is_some(),
+            "request had an additional section — the error must echo an OPT"
+        );
+
+        // Case 2: gate-legal counts (one 11-byte record exactly fits the
+        // tail) but malformed CONTENT hickory rejects — an OPT-typed
+        // record in the answer section (OPT is legal only in additional).
+        // This keeps the `Message::from_vec` FORMERR arm itself covered.
+        let mut q = sample_query(10, u16::from(RecordType::TXT));
+        q[7] = 1; // ANCOUNT = 1
+                  // root name + OPT type + class + ttl + rdlen=0 — 11 bytes, the
+                  // record fits the byte budget but fails section validation.
+        q.extend_from_slice(&[
+            0x00, 0x00, 0x29, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        // Both FORMERR producers emit identical bytes, so pin directly
+        // that this fixture reaches the hickory arm, not the count gate.
+        assert!(matches!(
+            Message::from_vec(&q),
+            Err(DecodeError::RecordNotInAdditionalSection(RecordType::OPT))
+        ));
+        let response = DnsServer::handle_query(&q, &empty_resolver())
+            .await
+            .unwrap();
+        assert_eq!(response[3] & 0x0F, 1, "RCODE=FORMERR");
+        assert_eq!(&response[0..2], &[0x00, 0x0A], "ID echoed");
+        assert_eq!(response.len(), 12, "no additional section → no OPT");
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_formerr_for_impossible_record_counts() {
+        // AN/NS/AR counts feed a `Vec::with_capacity` inside the hickory
+        // decode. A record needs at least 11 wire bytes (one-byte root
+        // name + 10-byte record header), so a count that exceeds the
+        // datagram's capacity is malformed input — FORMERR before the
+        // decoder reserves megabytes. (The wire outcome matches what
+        // hickory would produce at record-read EOF; the gate just fails
+        // without the allocation.)
+        let mut q = sample_query(10, u16::from(RecordType::TXT));
+        q[6] = 0xFF;
+        q[7] = 0xFF; // ANCOUNT = 65535
+        let response = DnsServer::handle_query(&q, &empty_resolver())
+            .await
+            .unwrap();
+        assert_eq!(response[3] & 0x0F, 1, "RCODE=FORMERR");
+        assert_eq!(&response[0..2], &[0x00, 0x0A], "ID echoed");
+    }
+
+    #[tokio::test]
+    async fn handle_query_drops_response_packets_silently() {
+        // A stray QR=1 datagram with a well-formed question is a response,
+        // not a query — it must not spend an upstream round-trip, and it
+        // must not be *answered* either: every reply is itself QR=1, so
+        // answering a response would ping-pong forever between two
+        // forwarding resolvers (or self-loop via a spoofed source). Wire
+        // silence is the correct behavior on both the task path and the
+        // inline probe.
+        for qtype in [u16::from(RecordType::TXT), 1] {
+            let mut q = sample_query(9, qtype);
+            q[2] |= 0x80; // QR=1
+            let resolver = empty_resolver();
+            assert!(
+                DnsServer::handle_query(&q, &resolver).await.is_err(),
+                "qtype {qtype}: a response packet must be dropped, not answered"
+            );
+            assert!(
+                matches!(
+                    DnsServer::try_answer_local(&q, &resolver),
+                    LocalAnswer::Drop
+                ),
+                "qtype {qtype}: the inline probe must drop it identically"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_query_notimp_for_non_in_class() {
+        // A CHAOS-class question (version.bind et al.) cannot be forwarded
+        // as IN and echoed back as CH — answer NOTIMP instead of a
+        // mixed-class lie.
+        for qtype in [u16::from(RecordType::TXT), 1] {
+            let mut q = sample_query(11, qtype);
+            let n = q.len();
+            q[n - 2] = 0x00;
+            q[n - 1] = 0x03; // QCLASS CH
+            let response = DnsServer::handle_query(&q, &empty_resolver())
+                .await
+                .unwrap();
+            assert_eq!(
+                response[3] & 0x0F,
+                4,
+                "RCODE=NOTIMP for qclass CH (qtype {qtype})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_query_drops_compressed_qname() {
+        // A leading QNAME cannot legally contain a compression pointer —
+        // there is nothing before it to point at. `parse_question` rejects
+        // the top-two-bits length bytes so it cannot see a different name
+        // than hickory would on the same packet.
+        let mut q = sample_query(12, u16::from(RecordType::TXT));
+        q[12] = 0xC0; // label-length byte becomes a pointer marker
+        assert!(
+            DnsServer::handle_query(&q, &empty_resolver())
+                .await
+                .is_err(),
+            "compressed qname is dropped like other malformed questions"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_servfail_for_extended_rcode_without_edns() {
+        // The extended rcode's high bits only travel inside an OPT record.
+        // A non-EDNS client asking a resolver that answered BADVERS/BADCOOKIE
+        // would otherwise read the meaningless low nibble (BADVERS.low()=0
+        // → NOERROR). SERVFAIL is honest instead.
+        let resolver = resolver_with_upstream_message(|response| {
+            response.metadata.response_code = ResponseCode::BADVERS;
+            // The upstream needs its own OPT for the high bits to reach us
+            // on the wire — without it emit only writes the low nibble.
+            response.edns = Some(Edns::new());
+        })
+        .await;
+
+        // sample_query carries no EDNS → no response OPT can hold rcode_high.
+        let query = sample_query(7, u16::from(RecordType::TXT));
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert!(response.edns.is_none(), "non-EDNS client gets no OPT");
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::ServFail,
+            "an inexpressible extended rcode becomes SERVFAIL, not a lying low nibble"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_drops_tsig_and_sig_records() {
+        // Without hickory's `__dnssec` feature an upstream TSIG rides
+        // through `additionals` — it must not reach the client (the MAC
+        // describes our hop, and a TSIG may not precede the OPT record).
+        use hickory_proto::rr::rdata::tsig::{TsigAlgorithm, TSIG};
+        use hickory_proto::rr::{Name, RData};
+
+        let tsig = Record::from_rdata(
+            Name::from_ascii("key.example.").unwrap(),
+            0,
+            RData::TSIG(TSIG::new(
+                TsigAlgorithm::HmacSha256,
+                0,
+                300,
+                vec![0xAA; 16],
+                0,
+                None,
+                vec![],
+            )),
+        );
+        // A wire SIG(24) decodes as `RData::Unknown` without `__dnssec` —
+        // its `record_type()` is still SIG and must hit the same strip.
+        let sig = Record::from_rdata(
+            Name::from_ascii("sig.example.").unwrap(),
+            0,
+            RData::Unknown {
+                code: RecordType::SIG,
+                rdata: hickory_proto::rr::rdata::NULL::with(vec![0x01, 0x02]),
+            },
+        );
+        // Benign glue must survive — only hop signatures get stripped.
+        let glue = Record::from_rdata(
+            Name::from_ascii("ns.example.com.").unwrap(),
+            300,
+            RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(192, 0, 2, 53))),
+        );
+        let resolver = resolver_with_upstream_message(move |response| {
+            response.metadata.response_code = ResponseCode::NoError;
+            response.add_additional(tsig);
+            response.add_additional(sig);
+            response.add_additional(glue);
+        })
+        .await;
+
+        let query = sample_edns_query(7, RecordType::TXT, false);
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::NoError,
+            "upstream answer must have arrived — SERVFAIL shows empty additionals too"
+        );
+        assert!(
+            response
+                .additionals
+                .iter()
+                .all(|r| !matches!(r.record_type(), RecordType::TSIG | RecordType::SIG)),
+            "upstream TSIG/SIG records must not be relayed to the client"
+        );
+        assert!(
+            response
+                .additionals
+                .iter()
+                .any(|r| matches!(r.data, RData::A(_))),
+            "benign glue records pass the strip untouched"
+        );
+        assert!(
+            response.edns.is_some(),
+            "the per-hop OPT is still synthesized after the strip"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_servfail_echoes_request_cd() {
+        // The no-upstream SERVFAIL branch echoes CD like the relay branch.
+        let mut q = sample_query(8, u16::from(RecordType::TXT));
+        q[3] |= 0x10; // CD=1
+        let response = DnsServer::handle_query(&q, &empty_resolver())
+            .await
+            .unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(response.metadata.checking_disabled, "SERVFAIL echoes CD");
+        assert_eq!(response.queries, Message::from_vec(&q).unwrap().queries);
+    }
+
+    /// Fake-IP mode: HTTPS/SVCB records carrying `ipv4hint`/`ipv6hint`
+    /// leak the real origin IP — the strip must reach records in the
+    /// authority and additional sections, not just the answer section.
+    #[tokio::test]
+    async fn handle_query_generic_strips_svc_hints_across_sections() {
+        use crate::fakeip::MemoryStore;
+        use hickory_proto::rr::rdata::svcb::SvcParamKey;
+        use hickory_proto::rr::RData;
+
+        let addr = spawn_dns_responder(|response| {
+            response.metadata.response_code = ResponseCode::NoError;
+            response.add_answer(https_record_with_hints());
+            response.add_authority(https_record_with_hints());
+            response.add_additional(https_record_with_hints());
+            // An HTTPS record owned by a hosts-mapped (non-faked) name —
+            // its hints are legitimate and must survive the strip.
+            response.add_additional(https_record_with_hints_named("static.test."));
+        })
+        .await;
+        // A hosts-trie mapping is an explicit override: "static.test" is
+        // never faked even in FakeIp mode.
+        let mut hosts = meow_trie::DomainTrie::new();
+        hosts.insert(
+            "static.test",
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99))].into(),
+        );
+        let mut resolver = crate::resolver::Resolver::new(
+            vec![addr],
+            Vec::new(),
+            DnsMode::FakeIp,
+            hosts,
+            true,
+            true,
+        );
+        resolver.set_fakeip_v4(Arc::new(
+            crate::fakeip::Pool::new(
+                "198.18.0.0/16".parse().unwrap(),
+                Arc::new(MemoryStore::new(1024)),
+            )
+            .unwrap(),
+        ));
+
+        let query = sample_query(7, u16::from(RecordType::HTTPS));
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+
+        for (section, records) in [
+            ("answers", &response.answers),
+            ("authorities", &response.authorities),
+        ] {
+            assert_eq!(records.len(), 1, "{section}");
+            let RData::HTTPS(https) = &records[0].data else {
+                panic!("{section}: expected HTTPS rdata");
+            };
+            let keys: Vec<&SvcParamKey> = https.0.svc_params.iter().map(|(k, _)| k).collect();
+            assert!(
+                !keys.contains(&&SvcParamKey::Ipv4Hint) && !keys.contains(&&SvcParamKey::Ipv6Hint),
+                "{section}: ip hints must be stripped in fake-IP mode"
+            );
+            assert!(
+                keys.contains(&&SvcParamKey::Alpn),
+                "{section}: non-hint params are preserved"
+            );
+        }
+
+        // The additionals carry two records: the faked example.com one is
+        // stripped, the hosts-mapped (non-faked) static.test one keeps its
+        // hints — the gate follows the record's owner, not the qname.
+        assert_eq!(response.additionals.len(), 2);
+        for rec in &response.additionals {
+            let RData::HTTPS(https) = &rec.data else {
+                panic!("expected HTTPS rdata");
+            };
+            let keys: Vec<&SvcParamKey> = https.0.svc_params.iter().map(|(k, _)| k).collect();
+            if rec.name.to_utf8() == "example.com." {
+                assert!(
+                    !keys.contains(&&SvcParamKey::Ipv4Hint),
+                    "faked record's hints stripped"
+                );
+            } else {
+                assert_eq!(rec.name.to_utf8(), "static.test.");
+                assert!(
+                    keys.contains(&&SvcParamKey::Ipv4Hint),
+                    "non-faked record keeps its legitimate hints"
+                );
+            }
+        }
+    }
+
+    /// With `ipv6` disabled, only `ipv6hint` is stripped — `ipv4hint`
+    /// stays usable (ADR-0013), and only in the sections that need it.
+    #[tokio::test]
+    async fn handle_query_generic_strips_ipv6_hint_when_ipv6_disabled() {
+        use hickory_proto::rr::rdata::svcb::SvcParamKey;
+        use hickory_proto::rr::RData;
+
+        let addr = spawn_dns_responder(|response| {
+            response.metadata.response_code = ResponseCode::NoError;
+            response.add_answer(https_record_with_hints());
+            response.add_authority(https_record_with_hints());
+            response.add_additional(https_record_with_hints());
+        })
+        .await;
+        let resolver = crate::resolver::Resolver::new(
+            vec![addr],
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            false,
+        );
+
+        let query = sample_query(7, u16::from(RecordType::HTTPS));
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+
+        for (section, records) in [
+            ("answers", &response.answers),
+            ("authorities", &response.authorities),
+            ("additionals", &response.additionals),
+        ] {
+            let RData::HTTPS(https) = &records[0].data else {
+                panic!("{section}: expected HTTPS rdata");
+            };
+            let keys: Vec<&SvcParamKey> = https.0.svc_params.iter().map(|(k, _)| k).collect();
+            assert!(
+                keys.contains(&&SvcParamKey::Ipv4Hint),
+                "{section}: ipv4hint survives when only ipv6 is disabled"
+            );
+            assert!(
+                !keys.contains(&&SvcParamKey::Ipv6Hint),
+                "{section}: ipv6hint stripped when ipv6 is disabled"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_servfail_echoes_request_edns() {
+        // Upstream unreachable → local SERVFAIL; an EDNS-speaking client
+        // still gets the minimal response OPT it requires.
+        let query = sample_edns_query(7, RecordType::TXT, false);
+        let response = DnsServer::handle_query(&query, &empty_resolver())
+            .await
+            .unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(
+            response.edns.is_some(),
+            "SERVFAIL still echoes a response OPT to EDNS clients"
+        );
     }
 
     #[test]
@@ -1668,6 +2922,32 @@ mod tests {
                 "hosts v4-only under AAAA",
                 query_named(0x3333, "myhost.test", 28),
             ),
+            // An EDNS request answered from the hosts arm exercises the
+            // A/AAAA arm's `append_opt_record` path — the OPT echo must
+            // be byte-identical between the inline and task paths.
+            (
+                "hosts A with EDNS",
+                sample_edns_query_named(0x8888, "myhost.test.", RecordType::A, false),
+            ),
+            // The classification gates must answer byte-identically on both
+            // paths too — a non-QUERY opcode and a non-IN class get NOTIMP
+            // (with the EDNS echo). A QR=1 response packet produces wire
+            // silence instead — asserted below since it yields no bytes.
+            ("Status opcode", {
+                let mut q = sample_edns_query(0x5555, RecordType::TXT, false);
+                q[2] = (q[2] & 0x87) | (2 << 3);
+                q
+            }),
+            ("CH qclass", {
+                let mut q = sample_edns_query(0x6666, RecordType::TXT, false);
+                // QCLASS is the last field of the question; with EDNS
+                // attached it is not at the tail — locate it via
+                // parse_question's offset instead.
+                let qlen = DnsServer::question_len_for_test(&q);
+                q[12 + qlen - 2] = 0x00;
+                q[12 + qlen - 1] = 0x03;
+                q
+            }),
         ] {
             let local = answered(DnsServer::try_answer_local(&q, &resolver));
             let full = DnsServer::handle_query(&q, &resolver)
@@ -1675,6 +2955,17 @@ mod tests {
                 .expect("handle_query must succeed");
             assert_eq!(local, full, "{label}: local answer diverged");
         }
+
+        // A QR=1 response packet gets wire silence on both paths — a
+        // FORMERR reply would ping-pong forever between two forwarding
+        // resolvers, so the packet is dropped like a malformed one.
+        let mut q = sample_edns_query(0x7777, RecordType::TXT, false);
+        q[2] |= 0x80; // QR=1
+        assert!(matches!(
+            DnsServer::try_answer_local(&q, &resolver),
+            LocalAnswer::Drop
+        ));
+        assert!(DnsServer::handle_query(&q, &resolver).await.is_err());
     }
 
     /// The fake-IP synthesis branch — the dominant `Decided` path under

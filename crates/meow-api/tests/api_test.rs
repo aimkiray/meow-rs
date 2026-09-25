@@ -3109,6 +3109,153 @@ async fn get_dns_query_returns_known_host() {
     assert_eq!(json["Answer"][0]["data"], "192.0.2.1");
 }
 
+/// GET /dns/query with a non-address `type` relays the upstream `Message`
+/// — response code, flags, and all three record sections — instead of
+/// answering from the address-only A/AAAA pipeline (#632).
+#[tokio::test]
+async fn get_dns_query_txt_relays_upstream_sections_and_flags() {
+    use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+    use hickory_proto::rr::rdata::TXT;
+    use hickory_proto::rr::{Name, RData, Record};
+    use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+
+    // Loopback upstream answering the TXT query with an answer, an
+    // authority SOA, and an additional glue record, so all three
+    // relayed sections are observable.
+    let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        let (len, peer) = upstream.recv_from(&mut buf).await.unwrap();
+        let request = Message::from_bytes(&buf[..len]).unwrap();
+        // The API must forward the FQDN form of the queried name.
+        assert_eq!(
+            request.queries[0].name.to_utf8(),
+            "api.test.",
+            "upstream must see the fqdn-built Name"
+        );
+        let mut response = Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+        response.add_queries(request.queries.iter().cloned());
+        response.metadata.response_code = ResponseCode::NoError;
+        response.metadata.authentic_data = true;
+        response.metadata.recursion_available = true;
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("api.test.").unwrap(),
+            60,
+            RData::TXT(TXT::new(vec!["api-relay".to_string()])),
+        ));
+        response.add_authority(Record::from_rdata(
+            Name::from_ascii("api.test.").unwrap(),
+            300,
+            RData::SOA(hickory_proto::rr::rdata::SOA::new(
+                Name::from_ascii("ns.api.test.").unwrap(),
+                Name::from_ascii("hostmaster.api.test.").unwrap(),
+                7,
+                7200,
+                3600,
+                1209600,
+                300,
+            )),
+        ));
+        response.add_additional(Record::from_rdata(
+            Name::from_ascii("ns.api.test.").unwrap(),
+            60,
+            RData::A(hickory_proto::rr::rdata::A::new(192, 0, 2, 99)),
+        ));
+        upstream
+            .send_to(&response.to_bytes().unwrap(), peer)
+            .await
+            .unwrap();
+    });
+
+    let resolver = Arc::new(Resolver::new(
+        vec![upstream_addr],
+        vec![],
+        DnsMode::Normal,
+        DomainTrie::new(),
+        true,
+        true,
+    ));
+    let tunnel = Tunnel::new(resolver);
+    let mut raw = test_raw_config();
+    raw.dns = Some(serde_yaml::from_str("enable: true").unwrap());
+    let meow_config::RebuildResult { proxies, rules, .. } =
+        meow_config::rebuild_from_raw(&raw).unwrap();
+    tunnel.update_proxies(proxies, Default::default());
+    tunnel.update_rules(rules);
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
+    std::mem::forget(dir);
+    let state = Arc::new(AppState {
+        tunnel,
+        secret: None,
+        config_path,
+        raw_config: Arc::new(RwLock::new(raw)),
+        log_tx: test_log_tx(),
+        proxy_providers: Arc::new(DashMap::new()),
+        provider_dialer_registry: Default::default(),
+        rule_providers: Arc::new(RwLock::new(HashMap::new())),
+        rule_provider_refresh: Default::default(),
+        proxy_provider_refresh: Default::default(),
+        listeners: vec![],
+        external_ui: None,
+        traffic_feed: Default::default(),
+        dns_server: Default::default(),
+    });
+
+    let resp = create_router(state)
+        .oneshot(
+            Request::get("/dns/query?name=api.test&type=TXT")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["Status"], 0, "upstream NOERROR relayed");
+    assert_eq!(json["RA"], true, "upstream flag relayed");
+    // `forward_generic` returns the upstream Message verbatim — the AD
+    // gate lives on the wire path (`handle_generic_forward`), so the API
+    // presents the upstream's AD as-is.
+    assert_eq!(json["AD"], true, "upstream AD relayed");
+    assert_eq!(json["Question"][0]["Name"], "api.test.");
+    assert_eq!(json["Question"][0]["Qtype"], 16);
+    assert_eq!(json["Answer"][0]["data"], "api-relay");
+    assert_eq!(json["Answer"][0]["TTL"], 60);
+    assert_eq!(
+        json["Authority"][0]["type"], 6,
+        "the authority section relays too, not just answers"
+    );
+    assert_eq!(
+        json["Additional"][0]["data"], "192.0.2.99",
+        "the additional section relays too, not just answers"
+    );
+}
+
+/// GET /dns/query with a non-address `type` and no reachable upstream
+/// returns 500 — `forward_generic` yields `None` when every nameserver
+/// pool is empty. An empty-nameserver resolver short-circuits
+/// instantly; no timeout wait is needed.
+#[tokio::test]
+async fn get_dns_query_txt_without_upstream_returns_500() {
+    // `test_state_default` deliberately points at 8.8.8.8 — use a
+    // state whose resolver has NO nameservers instead.
+    let state = test_state_with_hosts_entry();
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/dns/query?name=test.local&type=TXT")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let json = body_json(resp).await;
+    assert_eq!(json["message"], "DNS query failed");
+}
+
 // ── DNS cache flush ───────────────────────────────────────────────
 
 /// POST /cache/dns/flush returns 204.

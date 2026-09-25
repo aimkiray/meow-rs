@@ -5,7 +5,7 @@ use crate::upstream::{HostOrIp, NameServerEntry, NameServerUrl};
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
 use hickory_proto::op::Message;
-use hickory_proto::rr::RecordType;
+use hickory_proto::rr::{Name, RecordType};
 use ipnet::IpNet;
 use meow_common::DnsMode;
 use meow_trie::DomainTrie;
@@ -585,18 +585,24 @@ fn authority_label(addr: &HostOrIp, port: u16, default_port: u16) -> String {
 
 /// Typed-record counterpart of `query_pool_set`: queries a client pool for an
 /// arbitrary `RecordType` (TXT, MX, SRV, HTTPS, …) and returns the first
-/// successful `Message`. Caller copies the answer section into its response.
+/// successful `Message`. Callers relay or consume the whole message — the
+/// server forwards all three sections verbatim, the API serializes them.
+///
+/// `name` is the wire-faithful query name; unlike `query_pool_set` this
+/// races first-Ok-wins — any validated `Message` (including a negative
+/// rcode) answers, so pool semantics differ from the address pipeline's
+/// positive-preference and grace period.
 async fn query_pool_generic(
     clients: &[Arc<DnsClient>],
-    host: &str,
+    name: &Name,
     record_type: RecordType,
 ) -> Option<Message> {
     match clients.len() {
         0 => None,
-        1 => clients[0].query(host, record_type).await.ok(),
+        1 => clients[0].query_name(name, record_type).await.ok(),
         2 => {
-            let f1 = clients[0].query(host, record_type);
-            let f2 = clients[1].query(host, record_type);
+            let f1 = clients[0].query_name(name, record_type);
+            let f2 = clients[1].query_name(name, record_type);
             tokio::pin!(f1);
             tokio::pin!(f2);
             tokio::select! {
@@ -607,7 +613,9 @@ async fn query_pool_generic(
         _ => {
             let futs: Vec<_> = clients
                 .iter()
-                .map(|c| Box::pin(async move { c.query(host, record_type).await.map_err(|_| ()) }))
+                .map(|c| {
+                    Box::pin(async move { c.query_name(name, record_type).await.map_err(|_| ()) })
+                })
                 .collect();
             futures::future::select_ok(futs).await.ok().map(|(m, _)| m)
         }
@@ -1602,34 +1610,52 @@ impl Resolver {
     }
 
     /// Forward a non-A/AAAA query (TXT, MX, SRV, HTTPS, SOA, PTR, …) through
-    /// the same nameserver pipeline as ordinary lookups: domain-gate → policy
-    /// → main → fallback. Returns the upstream `Message` so callers can
-    /// re-emit the answer section verbatim in their response.
+    /// the nameserver tiers — domain-gate → policy → main → fallback — and
+    /// return the upstream `Message` so callers can relay all of its
+    /// sections — answer, authority and additional — to their own client
+    /// with per-hop identity rewritten.
+    ///
+    /// `domain` keys the text-based gates (`domain_gated`, `policy.lookup`)
+    /// in the same form the A/AAAA arm feeds them; `query_name` is the
+    /// wire-faithful `Name` sent upstream. Unlike the address pipeline the
+    /// first pool answer wins outright — a negative rcode from a gated
+    /// tier does not escalate to the next tier.
     ///
     /// Skips the `ip_gated` fallback hop — the fallback-filter's IP-CIDR /
     /// GeoIP gates only apply to address records.
-    pub async fn forward_generic(&self, domain: &str, record_type: RecordType) -> Option<Message> {
+    pub async fn forward_generic(
+        &self,
+        domain: &str,
+        query_name: &Name,
+        record_type: RecordType,
+    ) -> Option<Message> {
         if let Some(ff) = &self.fallback_filter {
             if ff.domain_gated(domain) {
-                return self.try_fallback_generic(domain, record_type).await;
+                return self.try_fallback_generic(query_name, record_type).await;
             }
         }
         if let Some(policy) = &self.policy {
             if let Some(entry) = policy.lookup(domain) {
-                if let Some(l) = query_pool_generic(&entry.nameservers, domain, record_type).await {
+                if let Some(l) =
+                    query_pool_generic(&entry.nameservers, query_name, record_type).await
+                {
                     return Some(l);
                 }
             }
         }
-        if let Some(l) = query_pool_generic(&self.main, domain, record_type).await {
+        if let Some(l) = query_pool_generic(&self.main, query_name, record_type).await {
             return Some(l);
         }
-        self.try_fallback_generic(domain, record_type).await
+        self.try_fallback_generic(query_name, record_type).await
     }
 
-    async fn try_fallback_generic(&self, domain: &str, record_type: RecordType) -> Option<Message> {
+    async fn try_fallback_generic(
+        &self,
+        query_name: &Name,
+        record_type: RecordType,
+    ) -> Option<Message> {
         let fb = self.fallback.as_deref()?;
-        query_pool_generic(fb, domain, record_type).await
+        query_pool_generic(fb, query_name, record_type).await
     }
 
     /// Capture the live reverse (IP → host) table with remaining lifetimes,
@@ -1673,10 +1699,11 @@ impl Resolver {
     /// bypass it.
     ///
     /// The DNS server uses this to strip `ipv4hint` / `ipv6hint` SvcParams
-    /// from HTTPS/SVCB answers for the same host. Those hints carry the
-    /// origin's *real* addresses; an HTTP/3 client that reads them connects
-    /// straight to the real IP, bypassing the fake-IP mapping the tunnel
-    /// relies on for domain-based routing and sniffing.
+    /// from HTTPS/SVCB records — in any response section — for the same
+    /// host. Those hints carry the origin's *real* addresses; an HTTP/3
+    /// client that reads them connects straight to the real IP, bypassing
+    /// the fake-IP mapping the tunnel relies on for domain-based routing
+    /// and sniffing.
     pub fn fake_ip_active_for(&self, host: &str) -> bool {
         if self.mode != DnsMode::FakeIp {
             return false;
