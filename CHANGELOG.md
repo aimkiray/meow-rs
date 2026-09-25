@@ -1088,3 +1088,19 @@ the canonical, in-repo source a release is cut from.
   `GET /dns/query` route relays
   non-A/AAAA queries through the same path and serializes the upstream
   status, flag word, and all three record sections. (#632)
+
+- Snell UDP-over-TCP writes are now cancellation-safe (#625 items 3/15/16).
+  A `write_packet` future dropped mid-frame previously left the AEAD stream
+  torn — the next datagram would append after a half-written v3 frame or
+  clobber undrained v4 pending bytes, silently desyncing every following
+  datagram for the life of the session. The packet conn now poisons on an
+  incomplete frame write (the same `PoisonOnIncomplete` pattern as the
+  trojan/vless packet conns), so later writes — and reads, since the uplink
+  is no longer trustworthy — fail fast and let the tunnel tear the session
+  down. The same tear guard covers the non-poll `write_packet_frame` /
+  `poll_write_packet_frame` entry points: a fresh frame write on a torn
+  stream errors instead of emitting after a torn prefix, while a re-poll
+  resuming an in-flight write (the `PacketFrameProgress` resume token) is
+  unaffected. `read_packet` also reuses one lazily allocated frame buffer
+  per connection instead of allocating a fresh 16 KiB vector per datagram
+  (ADR-0008).

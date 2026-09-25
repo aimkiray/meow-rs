@@ -99,7 +99,7 @@ pub use vmess::VmessAdapter;
 // ─── Stream-desync poison ────────────────────────────────────────────────────
 
 /// Drop guard shared by stream-framed UDP packet conns (trojan, vless,
-/// anytls-uot, kcptun-uot).
+/// anytls-uot, kcptun-uot, snell).
 /// Unless `complete` is set, dropping the guard — via an early `?` return
 /// OR the future being cancelled mid-frame — marks the conn desynced:
 /// consumed read bytes cannot be un-read and a partially written frame
@@ -110,7 +110,8 @@ pub use vmess::VmessAdapter;
     feature = "trojan",
     feature = "vless",
     feature = "anytls",
-    feature = "kcptun"
+    feature = "kcptun",
+    feature = "snell"
 ))]
 pub(crate) struct PoisonOnIncomplete<'a> {
     flag: &'a std::sync::atomic::AtomicBool,
@@ -121,7 +122,8 @@ pub(crate) struct PoisonOnIncomplete<'a> {
     feature = "trojan",
     feature = "vless",
     feature = "anytls",
-    feature = "kcptun"
+    feature = "kcptun",
+    feature = "snell"
 ))]
 impl<'a> PoisonOnIncomplete<'a> {
     pub(crate) fn new(flag: &'a std::sync::atomic::AtomicBool) -> Self {
@@ -136,7 +138,8 @@ impl<'a> PoisonOnIncomplete<'a> {
     feature = "trojan",
     feature = "vless",
     feature = "anytls",
-    feature = "kcptun"
+    feature = "kcptun",
+    feature = "snell"
 ))]
 impl Drop for PoisonOnIncomplete<'_> {
     fn drop(&mut self) {
@@ -146,15 +149,18 @@ impl Drop for PoisonOnIncomplete<'_> {
     }
 }
 
-/// Fail-fast check shared by the stream-framed packet conns. Called at
-/// every `read_packet`/`write_packet` entry AND again after acquiring the
-/// direction lock — an operation parked behind one that was cancelled
-/// mid-frame passed the outer check before the poison store landed.
+/// Fail-fast check shared by the stream-framed packet conns. Every consumer
+/// calls it at `read_packet`/`write_packet` entry; consumers whose parked
+/// operations could otherwise miss the poison re-check after acquiring the
+/// direction lock. Consumers that cannot tear their direction's framing
+/// skip the re-check deliberately (e.g. snell/vless reads — the codec keeps
+/// mid-frame state internally; see call sites).
 #[cfg(any(
     feature = "trojan",
     feature = "vless",
     feature = "anytls",
-    feature = "kcptun"
+    feature = "kcptun",
+    feature = "snell"
 ))]
 pub(crate) fn check_not_desynced(
     flag: &std::sync::atomic::AtomicBool,

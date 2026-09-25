@@ -153,7 +153,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SnellInner<S> {
 /// because the stream lock (and thus `&mut Snell`) is released between polls.
 #[derive(Default)]
 pub struct PacketFrameProgress {
-    /// v4: the frame has been staged into the writer's pending buffer.
+    /// This progress has begun a frame write: on v4 the frame was staged
+    /// into the writer's pending buffer; on v3 it marks that this progress
+    /// owns the codec's staged/pending output (v3 credits `written` only
+    /// after the pending bytes drain, so `written` alone cannot tell a
+    /// mid-drain resume from a fresh write).
     staged: bool,
     /// v3: bytes of `frame` already accepted by the AEAD stream.
     written: usize,
@@ -163,8 +167,10 @@ pub struct PacketFrameProgress {
 ///
 /// On the first `poll_read`, the wrapper consumes the server's status byte
 /// before yielding any relay bytes (`read_reply`). Subsequent reads pass
-/// through directly. The wrapper exposes [`Snell::write_packet_frame`] so
-/// the UDP relay can emit datagram-sized frames atomically.
+/// through directly. The wrapper exposes
+/// [`Snell::poll_write_packet_frame`]/[`Snell::write_packet_frame`] so the
+/// UDP relay can emit one datagram per frame and fail fast on a torn write
+/// (`frame_write_torn` below).
 pub struct Snell<S> {
     inner: SnellInner<S>,
     /// Set to `true` after the reply byte has been consumed once. Reset to
@@ -175,6 +181,14 @@ pub struct Snell<S> {
     /// EOF, this makes a v4/v5 connection eligible for protocol-level reuse
     /// once our own zero-chunk has also been sent.
     peer_half_closed: bool,
+    /// Armed when a packet-frame write starts; cleared only when it runs to
+    /// completion. A future dropped mid-write (or an errored one) leaves the
+    /// AEAD stream mid-frame — a later write would append after the torn
+    /// prefix (v3) or clobber undrained pending bytes (v4), desyncing every
+    /// following datagram permanently. Any such attempt errors instead
+    /// (issue #625 item 16; the conn-level poison for item 3 lives in
+    /// `udp::SnellPacketConn`).
+    frame_write_torn: bool,
 }
 
 impl<S> Snell<S> {
@@ -183,6 +197,7 @@ impl<S> Snell<S> {
             inner: SnellInner::V4(inner),
             reply_consumed: false,
             peer_half_closed: false,
+            frame_write_torn: false,
         }
     }
 
@@ -191,6 +206,7 @@ impl<S> Snell<S> {
             inner: SnellInner::V3(inner),
             reply_consumed: false,
             peer_half_closed: false,
+            frame_write_torn: false,
         }
     }
 
@@ -202,6 +218,7 @@ impl<S> Snell<S> {
             inner: SnellInner::V4(V4Conn::new(inner, psk)),
             reply_consumed: false,
             peer_half_closed: false,
+            frame_write_torn: false,
         }
     }
 
@@ -213,6 +230,7 @@ impl<S> Snell<S> {
             inner: SnellInner::V3(V3Conn::new(inner, psk)),
             reply_consumed: false,
             peer_half_closed: false,
+            frame_write_torn: false,
         }
     }
 
@@ -230,7 +248,56 @@ impl<S> Snell<S> {
     /// Stage a single frame carrying `buf` verbatim as a UDP datagram
     /// payload. v4 uses its packet-frame path to keep one datagram in one
     /// frame; v3 mirrors mihomo and writes through the regular AEAD stream.
+    ///
+    /// Cancellation or failure mid-write tears the AEAD frame on the wire;
+    /// the tear is sticky — subsequent packet-frame writes error instead of
+    /// desyncing the stream (issue #625.16).
+    ///
+    /// An empty `buf` is a valid packet frame but on v4 also reads as a
+    /// zero-chunk half-close to the peer — don't use it for keepalives.
     pub async fn write_packet_frame(&mut self, buf: &[u8]) -> io::Result<usize>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        if buf.len() > MAX_PAYLOAD_LENGTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snell: packet frame too large",
+            ));
+        }
+        self.begin_fresh_frame_write()?;
+        let result = self.write_packet_frame_inner(buf).await;
+        if result.is_ok() {
+            self.frame_write_torn = false;
+        }
+        result
+    }
+
+    /// Entry gate for a brand-new packet-frame write (not a resume of an
+    /// in-progress one — `progress` itself is the resume token). A fresh
+    /// write on a torn stream fails fast; otherwise the write is armed and
+    /// `frame_write_torn` stays set until the frame completes.
+    ///
+    /// Undrained codec-pending bytes are treated as torn even if
+    /// `frame_write_torn` is clear: they can only come from a write that
+    /// bypassed this gate (e.g. the `AsyncWrite` passthrough), and a fresh
+    /// frame would append after them / mis-credit their drain.
+    fn begin_fresh_frame_write(&mut self) -> io::Result<()> {
+        let pending_leftover = match &self.inner {
+            SnellInner::V3(conn) => conn.has_pending_write(),
+            SnellInner::V4(conn) => conn.has_pending_write(),
+        };
+        if self.frame_write_torn || pending_leftover {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "snell: packet conn desynced by an earlier incomplete frame write",
+            ));
+        }
+        self.frame_write_torn = true;
+        Ok(())
+    }
+
+    async fn write_packet_frame_inner(&mut self, buf: &[u8]) -> io::Result<usize>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -247,15 +314,10 @@ impl<S> Snell<S> {
             }
             SnellInner::V4(conn) => {
                 conn.stage_packet_frame(buf)?;
-                // Drain the staged frame to completion.
-                std::future::poll_fn(|cx| {
-                    if conn.has_pending_write() {
-                        Pin::new(&mut *conn).poll_flush(cx)
-                    } else {
-                        Poll::Ready(Ok(()))
-                    }
-                })
-                .await?;
+                // poll_flush drains the staged frame AND flushes the
+                // underlying stream — unconditionally, so a transport-level
+                // flush that pended after `pending` emptied is finished too.
+                std::future::poll_fn(|cx| Pin::new(&mut *conn).poll_flush(cx)).await?;
             }
         }
         Ok(buf.len())
@@ -269,6 +331,11 @@ impl<S> Snell<S> {
     /// v4 stages `frame` as a single AEAD packet frame and drains it; v3
     /// writes through the regular AEAD stream. Both flush before returning
     /// `Ready(Ok(()))`.
+    ///
+    /// Contract: resuming an in-flight write must pass the *same* `frame`
+    /// slice on every poll — `progress` tracks position, not content. A
+    /// different slice on resume mis-credits `written` on v3; on v4 the
+    /// staged frame is fixed at first poll and the new slice is ignored.
     pub fn poll_write_packet_frame(
         &mut self,
         cx: &mut Context<'_>,
@@ -284,8 +351,26 @@ impl<S> Snell<S> {
                 "snell: packet frame too large",
             )));
         }
+        // `progress` doubles as the resume token: `staged`/`written` mark a
+        // poll continuing an in-flight write. A *fresh* progress arriving
+        // while `frame_write_torn` is set means the previous write was
+        // abandoned mid-frame (the codec may still hold undrained bytes) —
+        // refuse it. The conn-level poison flag already catches this in the
+        // packet-conn path; this in-Snell gate covers any future direct
+        // caller (issue #625.16).
+        let resuming = progress.staged || progress.written > 0;
+        if !resuming {
+            if let Err(e) = self.begin_fresh_frame_write() {
+                return Poll::Ready(Err(e));
+            }
+        }
         match &mut self.inner {
             SnellInner::V3(conn) => {
+                // v3 credits `written` only after the staged cipher frame
+                // drains, so a mid-drain resume can arrive with
+                // `written == 0` — `staged` marks that this progress already
+                // entered and owns the codec's pending buffer.
+                progress.staged = true;
                 while progress.written < frame.len() {
                     match Pin::new(&mut *conn).poll_write(cx, &frame[progress.written..]) {
                         Poll::Pending => return Poll::Pending,
@@ -299,22 +384,33 @@ impl<S> Snell<S> {
                         Poll::Ready(Ok(n)) => progress.written += n,
                     }
                 }
-                Pin::new(conn).poll_flush(cx)
+                match Pin::new(conn).poll_flush(cx) {
+                    Poll::Ready(Ok(())) => {
+                        self.frame_write_torn = false;
+                        *progress = PacketFrameProgress::default();
+                        Poll::Ready(Ok(()))
+                    }
+                    other => other,
+                }
             }
             SnellInner::V4(conn) => {
                 if !progress.staged {
-                    conn.stage_packet_frame(frame)?;
-                    progress.staged = true;
-                }
-                if conn.has_pending_write() {
-                    // poll_flush drains the staged frame and flushes the
-                    // underlying stream.
-                    match Pin::new(&mut *conn).poll_flush(cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Ready(Ok(())) => {}
+                    match conn.stage_packet_frame(frame) {
+                        Ok(()) => progress.staged = true,
+                        Err(e) => return Poll::Ready(Err(e)),
                     }
                 }
+                // poll_flush drains the staged frame AND flushes the
+                // underlying stream — call it unconditionally so a resume
+                // after `pending` emptied also finishes a transport flush
+                // that pended on the previous poll.
+                match Pin::new(&mut *conn).poll_flush(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => {}
+                }
+                self.frame_write_torn = false;
+                *progress = PacketFrameProgress::default();
                 Poll::Ready(Ok(()))
             }
         }
@@ -475,6 +571,74 @@ mod tests {
         (Snell::new(a, Arc::clone(&psk)), V4Conn::new(b, psk))
     }
 
+    /// Transport wrapper whose `poll_flush` parks while `blocked` — `duplex`'s
+    /// own flush always succeeds, so without this a test can never reach the
+    /// "codec `pending` drained but transport flush still pending" state.
+    /// `flushes` counts attempts so a resume can prove the flush was retried.
+    /// Manual-poll only: a blocked `poll_flush` never registers the waker, so
+    /// `.await`ing it would hang.
+    struct FlushGate<S> {
+        inner: S,
+        blocked: Arc<std::sync::atomic::AtomicBool>,
+        flushes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S> FlushGate<S> {
+        fn new(
+            inner: S,
+        ) -> (
+            Self,
+            Arc<std::sync::atomic::AtomicBool>,
+            Arc<std::sync::atomic::AtomicUsize>,
+        ) {
+            let blocked = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    inner,
+                    blocked: Arc::clone(&blocked),
+                    flushes: Arc::clone(&flushes),
+                },
+                blocked,
+                flushes,
+            )
+        }
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for FlushGate<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for FlushGate<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.blocked.load(std::sync::atomic::Ordering::Relaxed) {
+                Poll::Pending
+            } else {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
     #[tokio::test]
     async fn write_header_connect_layout() {
         let (mut client, mut peer) = rig();
@@ -511,6 +675,346 @@ mod tests {
         let mut sink = tokio::io::sink();
         let err = write_header(&mut sink, &host, 80, false).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// Issue #625.16: `write_packet_frame` (the non-poll variant kept for
+    /// external/test callers) cancelled mid-write leaves a torn AEAD frame on the
+    /// wire. The tear is sticky — later writes must fail fast instead of
+    /// silently appending after the torn prefix (v3) or clobbering
+    /// undrained pending bytes (v4).
+    #[tokio::test]
+    async fn cancelled_packet_frame_write_tears_conn_v4() {
+        let (a, _b) = tokio::io::duplex(1 << 10);
+        let psk: Arc<[u8]> = Arc::from(b"test-psk".as_slice());
+        let mut client = Snell::new(a, psk);
+
+        // A 4 KiB frame exceeds the 1 KiB duplex buffer — the write pends
+        // mid-frame and the timeout drops the future.
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            client.write_packet_frame(&[0xAA; 4096]),
+        )
+        .await;
+        assert!(cancelled.is_err(), "write must have timed out mid-frame");
+
+        // `within` so a regression that drops the gate hangs-bounded rather
+        // than stalling the suite on the full pipe.
+        let err = within(client.write_packet_frame(b"x")).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert!(
+            err.to_string().contains("desynced"),
+            "write after a cancelled write must fail fast, got {err:?}"
+        );
+    }
+
+    /// Same tear semantics on the v3 codec, where datagrams ride the plain
+    /// AEAD stream — a cancelled write leaves the peer mid-frame.
+    #[tokio::test]
+    async fn cancelled_packet_frame_write_tears_conn_v3() {
+        let (a, _b) = tokio::io::duplex(1 << 10);
+        let psk: Arc<[u8]> = Arc::from(b"test-psk".as_slice());
+        let mut client = Snell::new_v3(a, psk);
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            client.write_packet_frame(&[0xAA; 4096]),
+        )
+        .await;
+        assert!(cancelled.is_err(), "write must have timed out mid-frame");
+
+        let err = within(client.write_packet_frame(b"x")).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert!(
+            err.to_string().contains("desynced"),
+            "write after a cancelled write must fail fast, got {err:?}"
+        );
+    }
+
+    /// The poll variant must refuse a fresh `PacketFrameProgress` on a torn
+    /// stream — the conn-level poison is the primary guard, this is the
+    /// in-codec backstop for any future direct caller.
+    #[test]
+    fn poll_packet_frame_refuses_fresh_progress_on_torn_stream() {
+        for versioned in [false, true] {
+            let (a, _b) = tokio::io::duplex(1 << 10);
+            let psk: Arc<[u8]> = Arc::from(b"test-psk".as_slice());
+            let mut client = if versioned {
+                Snell::new_v3(a, psk)
+            } else {
+                Snell::new(a, psk)
+            };
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+
+            let frame = vec![0xAA; 4096];
+            let mut progress = PacketFrameProgress::default();
+            let poll = client.poll_write_packet_frame(&mut cx, &frame, &mut progress);
+            assert!(
+                matches!(poll, Poll::Pending),
+                "v{}: write must park mid-frame on the tiny pipe, got {poll:?}",
+                if versioned { 3 } else { 4 }
+            );
+
+            // A fresh progress — a NEW write while the first is still
+            // in-flight — must fail fast instead of clobbering the codec's
+            // undrained pending bytes.
+            let mut fresh = PacketFrameProgress::default();
+            match client.poll_write_packet_frame(&mut cx, &frame, &mut fresh) {
+                Poll::Ready(Err(e)) => {
+                    assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+                    assert!(
+                        e.to_string().contains("desynced"),
+                        "v{}: expected desync error, got {e}",
+                        if versioned { 3 } else { 4 }
+                    );
+                }
+                other => panic!(
+                    "v{}: expected desynced error on torn stream, got {other:?}",
+                    if versioned { 3 } else { 4 }
+                ),
+            }
+
+            // Resuming the in-flight write with the same progress is the
+            // legitimate continuation path — it must not be refused.
+            // Strictly `Pending`: the peer half is never read, so the
+            // staged frame can never fully drain — `Ready(Ok)` here would
+            // mean a pending-drop bug cleared the tear early.
+            let poll = client.poll_write_packet_frame(&mut cx, &frame, &mut progress);
+            assert!(
+                matches!(poll, Poll::Pending),
+                "v{}: resume on the undrained pipe must stay Pending, got {poll:?}",
+                if versioned { 3 } else { 4 }
+            );
+        }
+    }
+
+    /// `frame_write_torn` must refuse on its own: park a write on the
+    /// *transport* flush after the codec `pending` buffer has fully drained
+    /// (a state `tokio::io::duplex` alone can never reach — its flush always
+    /// succeeds), abandon the write, and a fresh progress must still fail
+    /// fast even though `pending_leftover` is false.
+    ///
+    /// The same rig pins the unconditional resume `poll_flush`: once the
+    /// gate opens, resuming the original progress must call `poll_flush`
+    /// again — with a `has_pending_write()` shortcut it would return
+    /// `Ready(Ok)` without retrying the pended transport flush.
+    #[test]
+    fn torn_flag_alone_refuses_fresh_write_and_resume_retries_flush() {
+        use std::sync::atomic::Ordering;
+        for versioned in [false, true] {
+            let (a, _b) = tokio::io::duplex(1 << 16);
+            let psk: Arc<[u8]> = Arc::from(b"test-psk".as_slice());
+            let (gate, blocked, flushes) = FlushGate::new(a);
+            let mut client = if versioned {
+                Snell::new_v3(gate, psk)
+            } else {
+                Snell::new(gate, psk)
+            };
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+
+            // Pipe is big enough that the whole staged frame drains into the
+            // transport; only the flush pends. Codec `pending` ends empty.
+            let frame = vec![0xAA; 4096];
+            let mut progress = PacketFrameProgress::default();
+            let poll = client.poll_write_packet_frame(&mut cx, &frame, &mut progress);
+            assert!(
+                matches!(poll, Poll::Pending),
+                "v{}: blocked transport flush must park the write, got {poll:?}",
+                if versioned { 3 } else { 4 }
+            );
+
+            // Abandon the write. Codec pending is empty — only the torn flag
+            // can refuse the fresh write that follows.
+            let mut fresh = PacketFrameProgress::default();
+            match client.poll_write_packet_frame(&mut cx, &frame, &mut fresh) {
+                Poll::Ready(Err(e)) => {
+                    assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+                    assert!(
+                        e.to_string().contains("desynced"),
+                        "v{}: expected desync error, got {e}",
+                        if versioned { 3 } else { 4 }
+                    );
+                }
+                other => panic!(
+                    "v{}: torn flag must refuse fresh progress even with empty codec pending, got {other:?}",
+                    if versioned { 3 } else { 4 }
+                ),
+            }
+
+            // Unblock the transport flush and resume the original progress —
+            // it must retry the flush (a `has_pending_write` shortcut would
+            // return Ready without flushing).
+            blocked.store(false, Ordering::Relaxed);
+            let poll = client.poll_write_packet_frame(&mut cx, &frame, &mut progress);
+            assert!(
+                matches!(poll, Poll::Ready(Ok(()))),
+                "v{}: resume after flush unblocked must complete, got {poll:?}",
+                if versioned { 3 } else { 4 }
+            );
+            assert!(
+                flushes.load(Ordering::Relaxed) >= 2,
+                "v{}: resume must retry the transport flush",
+                if versioned { 3 } else { 4 }
+            );
+        }
+    }
+
+    /// Codec `pending` bytes left by a write that bypassed the frame gate
+    /// (raw `AsyncWrite` passthrough) are treated as torn: a fresh
+    /// `poll_write_packet_frame` must refuse even though `frame_write_torn`
+    /// was never armed.
+    #[test]
+    fn leftover_codec_pending_refuses_fresh_frame_write() {
+        for versioned in [false, true] {
+            let (a, _b) = tokio::io::duplex(1 << 10);
+            let psk: Arc<[u8]> = Arc::from(b"test-psk".as_slice());
+            let mut client = if versioned {
+                Snell::new_v3(a, psk)
+            } else {
+                Snell::new(a, psk)
+            };
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+
+            // Raw AsyncWrite: 4 KiB into a 1 KiB pipe leaves undrained codec
+            // pending bytes — `frame_write_torn` stays clear.
+            let raw = vec![0xAA; 4096];
+            let _ = Pin::new(&mut client).poll_write(&mut cx, &raw);
+
+            let mut fresh = PacketFrameProgress::default();
+            match client.poll_write_packet_frame(&mut cx, b"x", &mut fresh) {
+                Poll::Ready(Err(e)) => {
+                    assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+                    assert!(
+                        e.to_string().contains("desynced"),
+                        "v{}: expected desync error, got {e}",
+                        if versioned { 3 } else { 4 }
+                    );
+                }
+                other => panic!(
+                    "v{}: leftover codec pending must refuse fresh progress, got {other:?}",
+                    if versioned { 3 } else { 4 }
+                ),
+            }
+        }
+    }
+
+    /// A pended frame write resumed with the same progress must deliver the
+    /// frame intact — the peer decodes exactly the original bytes, so
+    /// re-staging, mis-credited `written`, or a skipped drain would corrupt
+    /// the wire image and fail this assertion.
+    #[test]
+    fn resumed_packet_frame_write_completes_with_intact_frame() {
+        for versioned in [false, true] {
+            let (a, b) = tokio::io::duplex(1 << 10);
+            let psk: Arc<[u8]> = Arc::from(b"test-psk".as_slice());
+            let mut client = if versioned {
+                Snell::new_v3(a, Arc::clone(&psk))
+            } else {
+                Snell::new(a, Arc::clone(&psk))
+            };
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let frame = vec![0xAB; 4096];
+            let mut progress = PacketFrameProgress::default();
+            assert!(
+                client
+                    .poll_write_packet_frame(&mut cx, &frame, &mut progress)
+                    .is_pending(),
+                "v{}: frame must park on the tiny pipe",
+                if versioned { 3 } else { 4 }
+            );
+
+            // Interleave: drain the wire from the peer codec, re-poll the
+            // same progress — repeat until the write completes. Both peer
+            // codecs decrypt the packet frame back to the original payload.
+            let mut plain = Vec::new();
+            let mut scratch = [0u8; 1 << 14];
+            let mut completed = false;
+            macro_rules! pump {
+                ($peer:expr) => {
+                    for _ in 0..512 {
+                        if !completed {
+                            match client.poll_write_packet_frame(&mut cx, &frame, &mut progress) {
+                                Poll::Ready(Ok(())) => completed = true,
+                                Poll::Ready(Err(e)) => panic!("resume: {e}"),
+                                Poll::Pending => {}
+                            }
+                        }
+                        // Drain everything the wire currently holds — the
+                        // peer codec buffers partial ciphertext internally
+                        // and yields plaintext once the frame is complete.
+                        loop {
+                            let mut rb = ReadBuf::new(&mut scratch);
+                            match Pin::new(&mut $peer).poll_read(&mut cx, &mut rb) {
+                                Poll::Ready(Ok(())) => {
+                                    if rb.filled().is_empty() {
+                                        break;
+                                    }
+                                    plain.extend_from_slice(rb.filled());
+                                }
+                                Poll::Ready(Err(e)) => panic!("peer read: {e}"),
+                                Poll::Pending => break,
+                            }
+                        }
+                        if completed && plain.len() >= frame.len() {
+                            break;
+                        }
+                    }
+                };
+            }
+            if versioned {
+                let mut peer = V3Conn::new(b, psk);
+                pump!(peer);
+            } else {
+                let mut peer = V4Conn::new(b, psk);
+                pump!(peer);
+            }
+            assert!(
+                completed,
+                "v{}: resumed write never completed",
+                if versioned { 3 } else { 4 }
+            );
+            assert_eq!(
+                plain,
+                frame,
+                "v{}: peer decoded corrupted frame",
+                if versioned { 3 } else { 4 }
+            );
+        }
+    }
+
+    /// Happy-path guard for the non-poll variant: a completed frame write
+    /// clears the tear flag so subsequent writes proceed.
+    #[tokio::test]
+    async fn completed_packet_frame_write_leaves_conn_usable() {
+        let (mut client, mut peer) = rig();
+        within(client.write_packet_frame(b"datagram"))
+            .await
+            .unwrap();
+        within(client.write_packet_frame(b"second")).await.unwrap();
+
+        // Both frames arrive intact and in order — no torn prefixes.
+        let mut got = [0u8; 64];
+        let n = within(peer.read(&mut got)).await.unwrap();
+        assert!(n >= b"datagram".len(), "peer saw {n} bytes");
+    }
+
+    /// Same guard on the v3 codec: two consecutive completed frame writes —
+    /// pins that the v3 completion path clears `frame_write_torn` (a second
+    /// write must not trip the tear gate).
+    #[tokio::test]
+    async fn completed_packet_frame_write_leaves_conn_usable_v3() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let psk: Arc<[u8]> = Arc::from(b"test-psk".as_slice());
+        let mut client = Snell::new_v3(a, Arc::clone(&psk));
+        let mut peer = V3Conn::new(b, psk);
+
+        within(client.write_packet_frame(b"datagram"))
+            .await
+            .unwrap();
+        within(client.write_packet_frame(b"second")).await.unwrap();
+
+        let mut got = [0u8; 64];
+        let n = within(peer.read(&mut got)).await.unwrap();
+        assert!(n >= b"datagram".len(), "peer saw {n} bytes");
     }
 
     #[tokio::test]
@@ -622,6 +1126,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // The rejection happens before the tear flag arms — the conn stays
+        // usable for a normal datagram.
+        within(client.write_packet_frame(b"after")).await.unwrap();
     }
 
     #[tokio::test]
