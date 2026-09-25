@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Below this size, trie probing costs more than it saves for common configs
 /// with early matches. Compile small configs to straight-line ordered IR scan.
@@ -252,6 +252,8 @@ enum ScanOutcome<'a> {
 }
 
 /// Result of a demand-driven (lazy) match attempt.
+#[must_use = "a NeedsEnrichment outcome drops buffered dead-target warnings \
+              unless re-run through CompiledRuleSet::match_rules"]
 pub enum LazyMatchOutcome<'a> {
     /// A rule matched before any slot demanded missing metadata.
     Matched(CompiledMatchResult<'a>),
@@ -275,11 +277,14 @@ fn slot_blocked(slot: &CompiledRuleSlot, input: &MatchInput<'_>) -> bool {
         || (slot.demands_process && process_missing(input.metadata))
 }
 
-/// `dst_ip` is absent but resolvable: there is a hostname to resolve. With
-/// no hostname either, IP predicates simply never match (the strict engine
-/// behaves identically), so the scan must not stop.
+/// `dst_ip` is absent but resolvable: there is a hostname the enricher can
+/// resolve. Enrichment resolves `metadata.host` only
+/// (`TunnelInner::resolve_ip_real`), so the gate must consult `host`, not
+/// `rule_host()` — a `sniff_host`-only connection carries no resolvable
+/// name and IP predicates simply never match there (the strict engine
+/// behaves identically), so the scan must not stop (#625).
 fn ip_missing(input: &MatchInput<'_>) -> bool {
-    input.metadata.dst_ip.is_none() && !input.host.is_empty()
+    input.metadata.dst_ip.is_none() && !input.metadata.host.is_empty()
 }
 
 /// Process info is absent but discoverable: a source socket exists to look
@@ -356,20 +361,30 @@ impl CompiledRuleSet {
         for (rule_index, rule) in rules.iter().enumerate() {
             let rule_type = rule.rule_type();
             let payload = rule.payload();
-            let demands_ip = rule.should_resolve_ip();
-            let demands_process = rule.should_find_process();
+            let mut demands_ip = rule.should_resolve_ip();
+            let mut demands_process = rule.should_find_process();
+
+            // Constant-false pruning: drop rules that can never match, so
+            // they neither occupy scan slots nor force metadata enrichment.
+            // Checked before lowering so a provably-dead rule pays no
+            // compile cost either.
+            if rule.never_matches() {
+                info!(
+                    index = rule_index,
+                    rule_type = %rule_type,
+                    payload = %payload,
+                    adapter = %rule.adapter(),
+                    "rule can never match — pruned"
+                );
+                pruned_never_match += 1;
+                continue;
+            }
+
             // Payload-pure lowering first; then state-carrying native
             // lowering via downcast (Arc handles cloned once at build).
             let op = compile_op(rule_type, payload)
                 .or_else(|| lower_native(rule.as_ref()))
                 .unwrap_or(RuleOp::Fallback);
-
-            // Constant-false pruning: drop rules that can never match, so
-            // they neither occupy scan slots nor force metadata enrichment.
-            if rule.never_matches() {
-                pruned_never_match += 1;
-                continue;
-            }
 
             // Constant folding: logic trees simplify (never-match children
             // erase OR arms and kill AND trees, double negation cancels).
@@ -379,10 +394,24 @@ impl CompiledRuleSet {
             // the dead-rule pass below.
             let op = match fold_op(op) {
                 Folded::Never => {
+                    info!(
+                        index = rule_index,
+                        rule_type = %rule_type,
+                        payload = %payload,
+                        adapter = %rule.adapter(),
+                        "rule folds to never-match — pruned"
+                    );
                     pruned_never_match += 1;
                     continue;
                 }
-                Folded::Always => RuleOp::Match,
+                Folded::Always => {
+                    // An unconditional match reads no metadata: the
+                    // folded-away children's demands are unreachable and
+                    // must not pin the slot's enrichment needs (#625).
+                    demands_ip = false;
+                    demands_process = false;
+                    RuleOp::Match
+                }
                 Folded::Op(op) => op,
             };
 
@@ -1203,10 +1232,26 @@ fn star_rest(payload: &str) -> Option<String> {
 
 /// Ops that are compile-time-provably false on this platform.
 fn op_never_matches(op: &RuleOp) -> bool {
-    // Socket-UID lookup only exists on Linux; `uid_matches` is a constant
-    // `false` everywhere else, so the slot would burn a scan step per
-    // connection without ever matching.
-    matches!(op, RuleOp::Uid(_)) && cfg!(not(target_os = "linux"))
+    match op {
+        // `uid_matches` is a constant `false` off Linux — UID matching is
+        // Linux-only by policy even though e.g. the macOS lookup does
+        // populate `metadata.uid` (Class B per ADR-0002, uid.rs).
+        RuleOp::Uid(_) => cfg!(not(target_os = "linux")),
+        // An empty range set can never contain an address (GEOIP /
+        // SRC-GEOIP / IP-ASN payloads absent from the loaded index land
+        // here when nested inside a live composite).
+        RuleOp::IpRanges { set, .. } => set.is_empty(),
+        // `find_process` is a stub returning `None` outside
+        // linux/macos/windows, so `metadata.process` / `process_path`
+        // stay empty forever there. PROCESS-PATH never matches an empty
+        // path; PROCESS-NAME only does on the empty-payload quirk, which
+        // is preserved, not folded.
+        RuleOp::ProcessPath(_) => !meow_common::process_lookup::PROCESS_LOOKUP_SUPPORTED,
+        RuleOp::ProcessName(payload) => {
+            !meow_common::process_lookup::PROCESS_LOOKUP_SUPPORTED && !payload.is_empty()
+        }
+        _ => false,
+    }
 }
 
 /// Three-valued constant-folding result for a lowered op.
@@ -2464,6 +2509,335 @@ mod tests {
         assert!(!set.needs_ip_resolution());
     }
 
+    /// Provably-dead stub carrying both enrichment demands: the compiler
+    /// must prune it and composites must not aggregate its demands (#625).
+    /// Typed `SubRule` so it can never lower to a native op — this keeps
+    /// the composite on the fallback path where the demand aggregation
+    /// (not `fold_op`) decides the slot's demands.
+    struct DeadDemandingRule;
+    impl Rule for DeadDemandingRule {
+        fn rule_type(&self) -> RuleType {
+            RuleType::SubRule
+        }
+        fn match_metadata(&self, _: &Metadata, _: &RuleMatchHelper) -> bool {
+            false
+        }
+        fn adapter(&self) -> &str {
+            "X"
+        }
+        fn payload(&self) -> &str {
+            "dead"
+        }
+        fn should_resolve_ip(&self) -> bool {
+            true
+        }
+        fn should_find_process(&self) -> bool {
+            true
+        }
+        fn never_matches(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn src_ip_suffix_demands_no_dst_resolution() {
+        use meow_rules::ip_suffix::IpSuffixRule;
+
+        // SRC-IP-SUFFIX matches `src_ip`, which inbounds always carry —
+        // it must not pin `needs_ip_resolution` for every flow (#625).
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(IpSuffixRule::new("0.0.0.1/8", "SrcSuffix", true, false).unwrap()),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(set.slots().len(), 2, "the rule stays; only the demand goes");
+        assert!(!set.needs_ip_resolution());
+
+        // The dst-axis twin still demands resolution without `no-resolve`.
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(IpSuffixRule::new("0.0.0.1/8", "DstSuffix", false, false).unwrap()),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert!(set.needs_ip_resolution());
+    }
+
+    #[test]
+    fn dead_children_do_not_leak_demands_through_composites() {
+        // OR,(dead),(DST-PORT): the dead arm's ip+process demands must not
+        // pin the whole tree's enrichment needs.
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(OrRule::new(
+                vec![
+                    Box::new(DeadDemandingRule),
+                    Box::new(PortRule::new("443", "A", false).unwrap()),
+                ],
+                "OrProxy",
+            )),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(
+            set.slots().len(),
+            2,
+            "the live OR must stay — only the dead arm's demands go"
+        );
+        assert!(!set.needs_ip_resolution());
+        assert!(!set.needs_process_lookup());
+    }
+
+    #[test]
+    fn and_with_dead_child_prunes_even_unlowered() {
+        // A dead GEOSITE (no DB) blocks native lowering — the tree would
+        // stay a Fallback slot forever matching false. Rule-level
+        // `never_matches` prunes it before lowering is even consulted.
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(AndRule::new(
+                vec![
+                    Box::new(GeoSiteRule::new("category-games", "A", None)),
+                    Box::new(PortRule::new("443", "A", false).unwrap()),
+                ],
+                "AndProxy",
+            )),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(
+            set.slots().len(),
+            1,
+            "AND with a provably-dead child must prune to the terminator"
+        );
+        assert!(!set.needs_ip_resolution());
+        assert!(!set.needs_process_lookup());
+    }
+
+    #[test]
+    fn sniff_host_only_metadata_does_not_demand_ip() {
+        // `ip_missing` gates on `metadata.host` — the field enrichment
+        // actually resolves — not `rule_host()` (#625). A connection with
+        // only `sniff_host` set has nothing to resolve, so the lazy scan
+        // must evaluate the demanding slot as a plain non-match instead
+        // of stopping for an enrichment that could never fill `dst_ip`.
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(IpCidrRule::new("10.0.0.0/8", "A", false, false).unwrap()),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        let meta = Metadata {
+            sniff_host: "www.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                LazyMatchOutcome::Matched(_)
+            ),
+            "sniff_host-only input must not stop for IP enrichment"
+        );
+        let result = set
+            .match_rules(&meta, &rules, &|_: &str| true)
+            .expect("must match");
+        assert_eq!(result.adapter_name, "DIRECT");
+
+        // The resolvable case still demand-stops as before.
+        let meta = Metadata {
+            host: "db.internal".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
+            ),
+            "a real host must still trigger IP enrichment"
+        );
+    }
+
+    #[test]
+    fn folded_always_slot_demands_nothing() {
+        // OR,(MATCH),(IP-CIDR demanding): the tree folds to an
+        // unconditional match — the folded-away child's IP demand must
+        // not survive on the slot (#625).
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(OrRule::new(
+                vec![
+                    Box::new(FinalRule::new("ignored")),
+                    Box::new(IpCidrRule::new("10.0.0.0/8", "ignored", false, false).unwrap()),
+                ],
+                "OrProxy",
+            )),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(set.slots().len(), 2);
+        assert!(!set.needs_ip_resolution());
+        assert!(!set.needs_process_lookup());
+
+        // The folded slot still matches unconditionally.
+        let meta = Metadata {
+            host: "db.internal".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let result = set
+            .match_rules(&meta, &rules, &|_: &str| true)
+            .expect("must match");
+        assert_eq!(result.adapter_name, "OrProxy");
+        // And the lazy scan must not stop on it.
+        assert!(
+            matches!(
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                LazyMatchOutcome::Matched(_)
+            ),
+            "an unconditional-match slot must not demand enrichment"
+        );
+    }
+
+    #[test]
+    fn not_of_dead_child_stays_and_demands_nothing() {
+        // NOT,(GEOSITE dead): the composite stays live — the negation of
+        // a never-match is an unconditional match — but the dead child's
+        // demands are gated off. The tree can't lower (dead GEOSITE
+        // blocks lower_native), so it exercises the Fallback path.
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(NotRule::new(
+                Box::new(GeoSiteRule::new("category-games", "A", None)),
+                "NotProxy",
+            )),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(set.slots().len(), 2);
+        assert!(!set.needs_ip_resolution());
+        assert!(!set.needs_process_lookup());
+
+        let result = set
+            .match_rules(&Metadata::default(), &rules, &|_: &str| true)
+            .expect("NOT(dead) must match");
+        assert_eq!(result.adapter_name, "NotProxy");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uid_rule_is_live_on_linux() {
+        use meow_rules::uid::UidRule;
+
+        // The live arm of the platform gate: on Linux a UID rule must
+        // occupy a slot and pin process-lookup demand.
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(UidRule::new("1000", "UidProxy").unwrap()),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(set.slots().len(), 2);
+        assert!(set.needs_process_lookup());
+
+        let hit = Metadata {
+            uid: Some(1000),
+            ..Default::default()
+        };
+        let result = set
+            .match_rules(&hit, &rules, &|_: &str| true)
+            .expect("must match");
+        assert_eq!(result.adapter_name, "UidProxy");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn uid_inside_or_folds_away_off_linux() {
+        use meow_rules::uid::UidRule;
+
+        // OR,(UID dead off-Linux),(DST-PORT live): the UID arm is pruned
+        // from the folded op AND its process demand is filtered at the
+        // rule level — both layers agree.
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(OrRule::new(
+                vec![
+                    Box::new(UidRule::new("1000", "A").unwrap()),
+                    Box::new(PortRule::new("443", "A", false).unwrap()),
+                ],
+                "OrProxy",
+            )),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(set.slots().len(), 2);
+        assert!(
+            matches!(&set.slots()[0].op, RuleOp::DstPort(_)),
+            "the dead UID arm must fold out of the OR"
+        );
+        assert!(!set.needs_process_lookup());
+
+        let hit = Metadata {
+            dst_port: 443,
+            ..Default::default()
+        };
+        let result = set
+            .match_rules(&hit, &rules, &|_: &str| true)
+            .expect("must match");
+        assert_eq!(result.adapter_name, "OrProxy");
+    }
+
+    #[test]
+    fn or_of_all_dead_children_prunes_at_ir() {
+        // OR(dead, dead): `OrRule::never_matches` → the whole composite is
+        // pruned before lowering (#625).
+        let dead = || -> Box<dyn Rule> { Box::new(GeoSiteRule::new("category-games", "A", None)) };
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(OrRule::new(vec![dead(), dead()], "OrProxy")),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(set.slots().len(), 1, "all-dead OR must be pruned");
+        assert!(!set.needs_ip_resolution());
+        assert!(!set.needs_process_lookup());
+        let result = set
+            .match_rules(&Metadata::default(), &rules, &|_: &str| true)
+            .expect("FINAL must match");
+        assert_eq!(result.adapter_name, "DIRECT");
+    }
+
+    #[test]
+    fn sub_rule_dead_block_is_pruned_from_slots() {
+        // A SUB-RULE block whose members are all provably dead can never
+        // fire — the whole top-level rule is pruned, demands included.
+        let block: Vec<Box<dyn Rule>> =
+            vec![Box::new(GeoSiteRule::new("category-games", "A", None))];
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(SubRuleRule::new("BLK", Arc::new(block))),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(set.slots().len(), 1, "all-dead SUB-RULE must be pruned");
+        assert!(!set.needs_ip_resolution());
+        assert!(!set.needs_process_lookup());
+    }
+
+    #[test]
+    fn src_geoip_empty_ranges_pruned_at_ir() {
+        use meow_rules::ip_set::IpRangeSetBuilder;
+        use meow_rules::src_geoip::SrcGeoIpRule;
+
+        // A country absent from the index materialises as an empty set —
+        // the src-axis rule is pruned like the dst-axis variant (#625).
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(SrcGeoIpRule::new(
+                "ZZ",
+                "SrcProxy",
+                Arc::new(IpRangeSetBuilder::new().build()),
+            )),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(set.slots().len(), 1, "empty SRC-GEOIP must be pruned");
+        let result = set
+            .match_rules(&Metadata::default(), &rules, &|_: &str| true)
+            .expect("FINAL must match");
+        assert_eq!(result.adapter_name, "DIRECT");
+    }
+
     #[test]
     fn logic_trees_constant_fold() {
         fn never_rule() -> Box<dyn Rule> {
@@ -3332,6 +3706,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn lazy_match_stops_at_process_demanding_slot() {
         use meow_rules::process::ProcessRule;
@@ -3833,6 +4208,10 @@ mod tests {
         let set = CompiledRuleSet::build(&rules);
 
         assert_eq!(set.len(), 1, "UID op is constant-false off Linux");
+        assert!(
+            !set.needs_process_lookup(),
+            "a dead UID must not pin process-lookup demand"
+        );
         let result = set
             .match_rules(&Metadata::default(), &rules, &|_: &str| true)
             .expect("FINAL must match");

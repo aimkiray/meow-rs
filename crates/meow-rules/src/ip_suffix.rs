@@ -163,7 +163,11 @@ impl Rule for IpSuffixRule {
     }
 
     fn should_resolve_ip(&self) -> bool {
-        !self.no_resolve
+        // Src-axis rules match `src_ip`, which every inbound already
+        // carries — demanding a dst_ip resolution the match never reads
+        // is wasted latency plus a DNS-leak surface (#625). Same shape
+        // as `IpCidrRule`.
+        !self.src && !self.no_resolve
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -277,6 +281,16 @@ mod tests {
         let r = IpSuffixRule::new("0.0.0.1/8", "PROXY", false, false).unwrap();
         assert!(r.should_resolve_ip());
         let r2 = IpSuffixRule::new("0.0.0.1/8", "PROXY", false, true).unwrap();
+        assert!(!r2.should_resolve_ip());
+    }
+
+    #[test]
+    fn src_ip_suffix_does_not_demand_resolution() {
+        // SRC-IP-SUFFIX matches `src_ip` only — without `no-resolve` it
+        // must not demand a dst_ip resolution it never reads (#625).
+        let r = IpSuffixRule::new("0.0.0.1/8", "PROXY", true, false).unwrap();
+        assert!(!r.should_resolve_ip());
+        let r2 = IpSuffixRule::new("0.0.0.1/8", "PROXY", true, true).unwrap();
         assert!(!r2.should_resolve_ip());
     }
 }

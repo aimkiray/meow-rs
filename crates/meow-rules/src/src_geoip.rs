@@ -57,7 +57,39 @@ impl Rule for SrcGeoIpRule {
         &self.country
     }
 
+    fn never_matches(&self) -> bool {
+        // A payload absent from the loaded index materialises as an
+        // empty range set — the rule can never fire (same precedent as
+        // `GeoSiteRule`; #625).
+        self.ranges.is_empty()
+    }
+
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ip_set::IpRangeSetBuilder;
+    use std::net::IpAddr;
+    use std::sync::Arc;
+
+    fn helper() -> RuleMatchHelper {
+        RuleMatchHelper
+    }
+
+    #[test]
+    fn src_geoip_empty_ranges_never_matches() {
+        // A country code absent from the loaded index materialises as an
+        // empty set — the rule is provably dead (#625).
+        let r = SrcGeoIpRule::new("ZZ", "P", Arc::new(IpRangeSetBuilder::new().build()));
+        assert!(r.never_matches());
+        let meta = Metadata {
+            src_ip: Some("10.0.0.1".parse::<IpAddr>().unwrap()),
+            ..Default::default()
+        };
+        assert!(!r.match_metadata(&meta, &helper()));
     }
 }

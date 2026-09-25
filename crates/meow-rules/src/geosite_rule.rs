@@ -198,6 +198,19 @@ mod tests {
         assert!(!GeoSiteRule::new("cn", "DIRECT", Some(db)).should_resolve_ip());
     }
 
+    /// A category absent from a *loaded* DB can never fire — third arm of
+    /// `never_matches` (db present, `resolve_keys` → None).
+    #[test]
+    fn absent_category_never_matches() {
+        let db = db_with(&[("cn", &["baidu.com"])]);
+        let r = GeoSiteRule::new("zz", "DIRECT", Some(Arc::clone(&db)));
+        assert!(r.never_matches());
+        assert!(!r.match_metadata(&meta_host("baidu.com"), &helper()));
+        // Sanity counter-case: a present category stays live.
+        let live = GeoSiteRule::new("cn", "DIRECT", Some(db));
+        assert!(!live.never_matches());
+    }
+
     /// @suffix is preserved for matching and payload output.
     #[test]
     fn at_suffix_preserved_for_matching() {

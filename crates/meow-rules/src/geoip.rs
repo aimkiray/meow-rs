@@ -58,7 +58,49 @@ impl Rule for GeoIpRule {
         !self.no_resolve
     }
 
+    fn never_matches(&self) -> bool {
+        // A payload absent from the loaded index materialises as an
+        // empty range set — the rule can never fire (same precedent as
+        // `GeoSiteRule`; #625).
+        self.ranges.is_empty()
+    }
+
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ip_set::IpRangeSetBuilder;
+    use std::net::IpAddr;
+    use std::sync::Arc;
+
+    fn helper() -> RuleMatchHelper {
+        RuleMatchHelper
+    }
+
+    #[test]
+    fn geoip_empty_ranges_never_matches() {
+        // A country code absent from the loaded index materialises as an
+        // empty set — the rule is provably dead and must not pin a
+        // resolution demand (#625).
+        let r = GeoIpRule::new("ZZ", "P", false, Arc::new(IpRangeSetBuilder::new().build()));
+        assert!(r.never_matches());
+        let meta = Metadata {
+            dst_ip: Some("10.0.0.1".parse::<IpAddr>().unwrap()),
+            ..Default::default()
+        };
+        assert!(!r.match_metadata(&meta, &helper()));
+    }
+
+    #[test]
+    fn geoip_non_empty_ranges_stays_live() {
+        let mut b = IpRangeSetBuilder::new();
+        b.add_v4("10.0.0.0/8".parse().unwrap());
+        let r = GeoIpRule::new("US", "P", false, Arc::new(b.build()));
+        assert!(!r.never_matches());
+        assert!(r.should_resolve_ip());
     }
 }

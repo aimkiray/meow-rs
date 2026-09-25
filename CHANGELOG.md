@@ -1027,3 +1027,25 @@ the canonical, in-repo source a release is cut from.
   `&DashMap` → `&Arc<DashMap>`, and `ProxyProvider` gained a public
   `acquire_initial` (initial-load acquisition with the on-disk cache
   fallback that `refresh` intentionally skips). (#625)
+
+- Dead and src-axis rules no longer pin `needs_ip_resolution` /
+  `needs_process_lookup`. `SRC-IP-SUFFIX` / `SRC-IP-ASN` previously
+  demanded a `dst_ip` resolution the match never reads (every
+  hostname-bearing flow paid a wasted resolve plus a DNS-leak surface);
+  composite rules (`AND`/`OR`/`NOT`/`SUB-RULE`/classical rule-sets)
+  leaked the demands of provably-dead children — e.g. an AND tree with a
+  dead child, a `GEOIP`/`SRC-GEOIP`/`IP-ASN` payload absent from the
+  loaded index, or a `PROCESS-NAME`/`PROCESS-PATH` rule on a platform
+  without `find_process`. Such rules are now pruned at compile time and
+  each prune is logged (rule type, payload, adapter); dead children stop
+  contributing demands to live composites, and a logic tree that folds
+  to an unconditional match keeps no demand at all. One intended,
+  observable consequence: a dead rule can no longer be the sole demand
+  carrier that resolves a hostname a *downstream* `no-resolve` IP rule
+  would have matched against — such flows now evaluate the IP rule
+  without an address. Rules that merely sniff a `sniff_host` without a
+  resolvable `host` also stop triggering a pointless resolution
+  attempt (the enrichment input gate now matches the field that
+  enrichment actually resolves). `LazyMatchOutcome` is `#[must_use]` —
+  dropping a `NeedsEnrichment` silently loses buffered dead-target
+  warnings. (#625)

@@ -74,7 +74,18 @@ impl Rule for IpAsnRule {
     }
 
     fn should_resolve_ip(&self) -> bool {
-        !self.no_resolve
+        // Src-axis rules match `src_ip`, which every inbound already
+        // carries — demanding a dst_ip resolution the match never reads
+        // is wasted latency plus a DNS-leak surface (#625). Same shape
+        // as `IpCidrRule`.
+        !self.src && !self.no_resolve
+    }
+
+    fn never_matches(&self) -> bool {
+        // An ASN absent from the loaded index materialises as an empty
+        // range set — the rule can never fire (same precedent as
+        // `GeoSiteRule`; #625).
+        self.ranges.is_empty()
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -99,5 +110,45 @@ mod tests {
         // Smoke-test the enum variant while fixture-backed construction lives
         // in parser/config tests.
         assert_eq!(RuleType::IpAsn.to_string(), "IP-ASN");
+    }
+
+    #[test]
+    fn src_ip_asn_does_not_demand_resolution() {
+        use crate::ip_set::IpRangeSetBuilder;
+        let mut b = IpRangeSetBuilder::new();
+        b.add_v4("10.0.0.0/8".parse().unwrap());
+        let ranges = std::sync::Arc::new(b.build());
+        // SRC-IP-ASN matches `src_ip` only — it must not demand a dst_ip
+        // resolution it never reads (#625).
+        let src = IpAsnRule::new(
+            13335,
+            "13335",
+            "P",
+            std::sync::Arc::clone(&ranges),
+            true,
+            false,
+        );
+        assert!(!src.should_resolve_ip());
+        let dst = IpAsnRule::new(13335, "13335", "P", ranges, false, false);
+        assert!(dst.should_resolve_ip());
+    }
+
+    #[test]
+    fn ip_asn_empty_ranges_never_matches() {
+        use crate::ip_set::IpRangeSetBuilder;
+        // An ASN absent from the loaded index materialises as an empty
+        // set — the rule is provably dead (#625).
+        let ranges = std::sync::Arc::new(IpRangeSetBuilder::new().build());
+        let dst = IpAsnRule::new(
+            99999,
+            "99999",
+            "P",
+            std::sync::Arc::clone(&ranges),
+            false,
+            false,
+        );
+        assert!(dst.never_matches());
+        let src = IpAsnRule::new(99999, "99999", "P", ranges, true, false);
+        assert!(src.never_matches());
     }
 }

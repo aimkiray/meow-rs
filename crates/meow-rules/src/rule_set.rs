@@ -567,11 +567,17 @@ impl RuleSet for ClassicalRuleSet {
     }
 
     fn should_resolve_ip(&self) -> bool {
-        self.rules.iter().any(|rule| rule.should_resolve_ip())
+        // Dead rules can never fire — their metadata demands must not
+        // leak into the aggregate (#625).
+        self.rules
+            .iter()
+            .any(|rule| !rule.never_matches() && rule.should_resolve_ip())
     }
 
     fn should_find_process(&self) -> bool {
-        self.rules.iter().any(|rule| rule.should_find_process())
+        self.rules
+            .iter()
+            .any(|rule| !rule.never_matches() && rule.should_find_process())
     }
 
     fn matches_domain(&self, domain: &str) -> bool {
@@ -710,7 +716,55 @@ mod tests {
             &ctx,
         );
         assert!(set.should_resolve_ip());
-        assert!(set.should_find_process());
+        // PROCESS-NAME demands the lookup only where find_process is real
+        // (#625 — off the supported platforms the member is dead and the
+        // demand is filtered).
+        assert_eq!(
+            set.should_find_process(),
+            meow_common::process_lookup::PROCESS_LOOKUP_SUPPORTED
+        );
+    }
+
+    #[test]
+    fn classical_rule_set_skips_dead_member_demands() {
+        use crate::domain_suffix::DomainSuffixRule;
+        use crate::geoip::GeoIpRule;
+        use crate::ip_set::IpRangeSetBuilder;
+        use crate::logic::AndRule;
+        use crate::process::ProcessRule;
+        use std::sync::Arc;
+
+        // Provably-dead members must not pin the set's demands. A GEOIP
+        // whose payload is absent from the index carries an empty range
+        // set (dead, but reports an IP demand); an AND tree containing it
+        // is dead while its live PROCESS-NAME child still reports a
+        // process demand (#625).
+        let empty = Arc::new(IpRangeSetBuilder::new().build());
+        let dead_geoip: Box<dyn Rule> = Box::new(GeoIpRule::new("ZZ", "", false, empty));
+        let dead_and: Box<dyn Rule> = Box::new(AndRule::new(
+            vec![
+                Box::new(GeoIpRule::new(
+                    "ZZ",
+                    "",
+                    false,
+                    Arc::new(IpRangeSetBuilder::new().build()),
+                )),
+                Box::new(ProcessRule::new("curl", "")),
+            ],
+            "",
+        ));
+        assert!(dead_geoip.never_matches());
+        assert!(dead_and.never_matches());
+
+        let set = ClassicalRuleSet {
+            rules: vec![
+                dead_geoip,
+                dead_and,
+                Box::new(DomainSuffixRule::new("example.com", "")),
+            ],
+        };
+        assert!(!set.should_resolve_ip());
+        assert!(!set.should_find_process());
     }
 
     #[test]

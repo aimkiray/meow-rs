@@ -112,7 +112,18 @@ impl Rule for ProcessPathRule {
     }
 
     fn should_find_process(&self) -> bool {
-        true
+        // `find_process` has real implementations only where
+        // `PROCESS_LOOKUP_SUPPORTED`; elsewhere `metadata.process_path`
+        // can never be populated, so demanding the lookup is pure cost
+        // (#625).
+        meow_common::process_lookup::PROCESS_LOOKUP_SUPPORTED
+    }
+
+    fn never_matches(&self) -> bool {
+        // Off the supported platforms `find_process` is a stub returning
+        // `None`, so `metadata.process_path` stays empty — and `matches`
+        // is `false` on an empty path for every payload (#625).
+        !meow_common::process_lookup::PROCESS_LOOKUP_SUPPORTED
     }
 }
 
@@ -161,6 +172,22 @@ mod tests {
     fn process_path_empty_process_path_never_matches() {
         let r = ProcessPathRule::new("curl", "DIRECT").unwrap();
         assert!(!r.match_metadata(&meta_path(""), &helper()));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn process_path_live_and_demands_lookup_supported() {
+        let r = ProcessPathRule::new("curl", "DIRECT").unwrap();
+        assert!(!r.never_matches());
+        assert!(r.should_find_process());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn process_path_dead_and_demands_nothing_unsupported() {
+        let r = ProcessPathRule::new("curl", "DIRECT").unwrap();
+        assert!(r.never_matches());
+        assert!(!r.should_find_process());
     }
 
     #[test]

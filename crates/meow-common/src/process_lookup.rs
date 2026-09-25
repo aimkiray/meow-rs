@@ -3,10 +3,21 @@
 //! The rule engine calls [`find_process`] for PROCESS-NAME / PROCESS-PATH /
 //! UID rules. It receives the connection's local (client-side) address and
 //! returns the owning process, if any. Returns `None` on platforms that are
-//! not yet supported (everything except Linux and macOS).
+//! not yet supported (everything except Linux, macOS and Windows).
 
 use crate::network::Network;
 use std::net::SocketAddr;
+
+/// `true` on platforms with a real [`find_process`] implementation
+/// (Linux / macOS / Windows); `false` where it is a stub that always
+/// returns `None`. Rule types use this to gate `should_find_process`
+/// demands and `never_matches` deadness — keep the cfg set in sync with
+/// the `platform` modules below when porting to a new OS.
+pub const PROCESS_LOOKUP_SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+));
 
 #[derive(Debug, Clone, Default)]
 pub struct ProcessInfo {

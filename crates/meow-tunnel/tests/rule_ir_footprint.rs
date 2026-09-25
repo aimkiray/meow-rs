@@ -166,7 +166,7 @@ fn measure_hot_loop(
                     ));
                 }
                 Matcher::LazyIr => {
-                    std::hint::black_box(compiled.match_rules_lazy(
+                    let _ = std::hint::black_box(compiled.match_rules_lazy(
                         std::hint::black_box(metadata),
                         std::hint::black_box(rules),
                         &|_: &str| true,

@@ -72,7 +72,18 @@ impl Rule for UidRule {
     }
 
     fn should_find_process(&self) -> bool {
-        true
+        // UID matching is Linux-only by policy (the parse-time Class B
+        // warn); off Linux the rule is dead, so demanding a process-table
+        // walk per connection would be pure cost (#625).
+        cfg!(target_os = "linux")
+    }
+
+    fn never_matches(&self) -> bool {
+        // `match_metadata` is compiled to a constant `false` off Linux —
+        // the rule is provably dead there even though e.g. the macOS
+        // lookup does populate `metadata.uid` (deadness is a policy
+        // choice, Class B per ADR-0002).
+        cfg!(not(target_os = "linux"))
     }
 }
 
@@ -133,5 +144,22 @@ mod tests {
             !r.match_metadata(&meta, &helper()),
             "UID must never match on non-Linux"
         );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn uid_reports_dead_and_demands_nothing_non_linux() {
+        // A provably-dead rule must not pin process-lookup demand (#625).
+        let r = UidRule::new("1000", "DIRECT").unwrap();
+        assert!(r.never_matches());
+        assert!(!r.should_find_process());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uid_live_and_demands_process_linux() {
+        let r = UidRule::new("1000", "DIRECT").unwrap();
+        assert!(!r.never_matches());
+        assert!(r.should_find_process());
     }
 }

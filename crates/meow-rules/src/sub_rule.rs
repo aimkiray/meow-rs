@@ -91,11 +91,23 @@ impl Rule for SubRuleRule {
     }
 
     fn should_resolve_ip(&self) -> bool {
-        self.block.iter().any(|r| r.should_resolve_ip())
+        // Dead children can never fire — their metadata demands must not
+        // leak into the aggregate (#625).
+        self.block
+            .iter()
+            .any(|r| !r.never_matches() && r.should_resolve_ip())
     }
 
     fn should_find_process(&self) -> bool {
-        self.block.iter().any(|r| r.should_find_process())
+        self.block
+            .iter()
+            .any(|r| !r.never_matches() && r.should_find_process())
+    }
+
+    fn never_matches(&self) -> bool {
+        // An empty or all-dead block can never produce a match —
+        // SUB-RULE falls through when every inner rule misses.
+        self.block.iter().all(|r| r.never_matches())
     }
 
     fn match_and_resolve<'a>(
@@ -287,5 +299,53 @@ mod tests {
             top.match_and_resolve(&m, &helper(), &|_: &str| true),
             Some("LEAF")
         );
+    }
+
+    /// Provably-dead stub carrying both metadata demands: the aggregate
+    /// must not leak them (#625).
+    struct DeadDemandingRule;
+    impl Rule for DeadDemandingRule {
+        fn rule_type(&self) -> RuleType {
+            RuleType::Match
+        }
+        fn match_metadata(&self, _: &Metadata, _: &RuleMatchHelper) -> bool {
+            false
+        }
+        fn adapter(&self) -> &str {
+            "X"
+        }
+        fn payload(&self) -> &str {
+            "dead"
+        }
+        fn should_resolve_ip(&self) -> bool {
+            true
+        }
+        fn should_find_process(&self) -> bool {
+            true
+        }
+        fn never_matches(&self) -> bool {
+            true
+        }
+    }
+
+    /// D1 — an all-dead (or empty) block is provably dead.
+    #[test]
+    fn sub_rule_dead_block_never_matches() {
+        let sub = SubRuleRule::from_rules("BLOCK", vec![Box::new(DeadDemandingRule)]);
+        assert!(sub.never_matches());
+        let empty = SubRuleRule::from_rules("BLOCK", vec![]);
+        assert!(empty.never_matches());
+    }
+
+    /// D2 — dead children's demands do not leak into the aggregate.
+    #[test]
+    fn sub_rule_aggregation_skips_dead_children() {
+        let sub = SubRuleRule::from_rules(
+            "BLOCK",
+            vec![Box::new(DeadDemandingRule), match_rule("DIRECT")],
+        );
+        assert!(!sub.never_matches());
+        assert!(!sub.should_resolve_ip());
+        assert!(!sub.should_find_process());
     }
 }

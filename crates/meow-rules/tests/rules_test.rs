@@ -561,6 +561,7 @@ fn process_match_cases() {
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[test]
 fn process_should_find() {
     let r = ProcessRule::new("chrome", "Proxy");

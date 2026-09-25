@@ -277,7 +277,8 @@ impl RuleProvider {
                 provider = %self.name,
                 "rule-provider refresh changed whether the set needs IP resolution or \
                  process lookup; live RULE-SET rules keep the previous demand flags \
-                 until the next config reload"
+                 until the next config reload (entries requiring the new demand \
+                 cannot fire until then)"
             );
         }
         *self.rules.write() = new_rules;
