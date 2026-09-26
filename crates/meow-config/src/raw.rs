@@ -496,8 +496,8 @@ pub struct RawProxyProvider {
     /// mihomo subscription relies on it.
     pub allow_external_plugin: Option<bool>,
     /// mihomo `proxy:` — route this provider's fetches through a named
-    /// proxy/group. Parsed so it can warn instead of being silently dropped;
-    /// fetch-through-proxy is not implemented for proxy providers.
+    /// proxy/group, resolved against the live route map at fetch time
+    /// (issue #625). `DIRECT` or absent fetches directly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
     /// mihomo `dialer-proxy` — chain every node in this provider through the
@@ -664,6 +664,12 @@ pub struct RawSubscription {
     pub url: String,
     pub interval: Option<u64>,
     pub last_updated: Option<i64>,
+    /// Route this subscription's fetches through the named proxy/group,
+    /// resolved against the live route map at fetch time — the same
+    /// semantics as proxy-provider `proxy:` (issue #625). `DIRECT` or
+    /// absent fetches directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 #[cfg(test)]

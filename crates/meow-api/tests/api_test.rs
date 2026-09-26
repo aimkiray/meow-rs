@@ -1127,6 +1127,7 @@ async fn get_subscriptions_with_data() {
         url: "https://example.com/sub".into(),
         interval: Some(3600),
         last_updated: Some(1000000),
+        proxy: None,
     }]);
     let state = test_state(raw);
     let app = create_router(state);
@@ -1156,6 +1157,7 @@ async fn get_subscriptions_reports_counts() {
         url: "https://example.com".into(),
         interval: None,
         last_updated: None,
+        proxy: None,
     }]);
     // Subscription replaces proxies/groups/rules with remote data
     let mut proxy1 = std::collections::HashMap::new();
@@ -1211,6 +1213,7 @@ async fn delete_subscription_clears_data() {
         url: "https://example.com".into(),
         interval: None,
         last_updated: None,
+        proxy: None,
     }]);
     let mut proxy1 = std::collections::HashMap::new();
     proxy1.insert("name".to_string(), serde_yaml::Value::String("S1".into()));
@@ -1296,6 +1299,7 @@ async fn refresh_subscription_deleted_mid_fetch_returns_404() {
         url: format!("http://{addr}/sub.yaml"),
         interval: None,
         last_updated: None,
+        proxy: None,
     }]);
     let state = test_state(raw);
     let app = create_router(Arc::clone(&state));

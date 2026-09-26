@@ -118,7 +118,7 @@ static files instead.
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/api/subscriptions` | List, with counts and last-updated |
-| `POST` | `/api/subscriptions` | Add `{ name, url, interval? }` and apply |
+| `POST` | `/api/subscriptions` | Add `{ name, url, interval?, proxy? }` and apply |
 | `POST` | `/api/subscriptions/{name}/refresh` | Re-fetch |
 | `DELETE` | `/api/subscriptions/{name}` | Remove and clear its contents → 204 |
 

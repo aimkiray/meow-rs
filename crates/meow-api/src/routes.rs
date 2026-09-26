@@ -1605,6 +1605,7 @@ struct SubscriptionInfo {
     url: String,
     interval: Option<u64>,
     last_updated: Option<i64>,
+    proxy: Option<String>,
     proxy_count: usize,
     group_count: usize,
     rule_count: usize,
@@ -1620,6 +1621,7 @@ async fn get_subscriptions(State(state): State<Arc<AppState>>) -> Json<Vec<Subsc
             url: s.url.clone(),
             interval: s.interval,
             last_updated: s.last_updated,
+            proxy: s.proxy.clone(),
             proxy_count: raw.proxies.as_ref().map_or(0, std::vec::Vec::len),
             group_count: raw.proxy_groups.as_ref().map_or(0, std::vec::Vec::len),
             rule_count: raw.rules.as_ref().map_or(0, std::vec::Vec::len),
@@ -1633,6 +1635,7 @@ struct AddSubscriptionRequest {
     name: String,
     url: String,
     interval: Option<u64>,
+    proxy: Option<String>,
 }
 
 async fn add_subscription(
@@ -1642,9 +1645,17 @@ async fn add_subscription(
     // `strict` follows the daemon's live config — the subscription payload
     // doesn't carry the flag (issue #533).
     let strict = state.raw_config.read().strict.unwrap_or(false);
-    let mut fetched = meow_config::subscription::fetch_subscription(&body.url, strict)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("fetch failed: {e}")))?;
+    // `proxy:` resolves against the live route map — an unknown name fails
+    // the request instead of silently fetching direct (issue #625).
+    let download_proxy = meow_config::internal_http::resolve_download_proxy(
+        &state.provider_dialer_registry,
+        body.proxy.as_deref(),
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let mut fetched =
+        meow_config::subscription::fetch_subscription(&body.url, strict, download_proxy.as_ref())
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("fetch failed: {e}")))?;
     // Resolve DNS-sourced ECH configs BEFORE the mutation lane — this is
     // async network I/O and must not serialize other config commits; the
     // stored snapshot then carries inline `ech-opts.config` so the in-lane
@@ -1680,6 +1691,12 @@ async fn add_subscription(
             url: body.url.clone(),
             interval: body.interval,
             last_updated: Some(now),
+            proxy: body
+                .proxy
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         };
         raw.subscriptions.get_or_insert_with(Vec::new).push(sub);
 
@@ -1739,20 +1756,26 @@ async fn refresh_subscription(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let (url, strict) = {
+    let (url, proxy_name, strict) = {
         let raw = state.raw_config.read();
-        let url = raw
+        let (url, proxy_name) = raw
             .subscriptions
             .as_ref()
             .and_then(|subs| subs.iter().find(|s| s.name == name))
-            .map(|s| s.url.clone())
+            .map(|s| (s.url.clone(), s.proxy.clone()))
             .ok_or_else(|| (StatusCode::NOT_FOUND, "subscription not found".into()))?;
-        (url, raw.strict.unwrap_or(false))
+        (url, proxy_name, raw.strict.unwrap_or(false))
     };
 
-    let mut fetched = meow_config::subscription::fetch_subscription(&url, strict)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("fetch failed: {e}")))?;
+    let download_proxy = meow_config::internal_http::resolve_download_proxy(
+        &state.provider_dialer_registry,
+        proxy_name.as_deref(),
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let mut fetched =
+        meow_config::subscription::fetch_subscription(&url, strict, download_proxy.as_ref())
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("fetch failed: {e}")))?;
     // Same pre-lane ECH resolution as `add_subscription` (issue #533).
     meow_config::ech_dns::preresolve_ech(&mut fetched.proxies, strict)
         .await

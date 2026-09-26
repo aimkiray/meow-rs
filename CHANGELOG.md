@@ -204,6 +204,24 @@ the canonical, in-repo source a release is cut from.
   `docs/tproxy-macos.md`, and the website listeners/transparent-proxy
   guides.
 
+- **Fetch-through-proxy for proxy-providers and subscriptions** (#625 item
+  6). `proxy: <name>` on an HTTP `proxy-provider` — previously parsed,
+  warned, and fetched direct — now routes the download through the named
+  top-level proxy or group, resolved against the live route map at fetch
+  time so the binding follows every `PUT /configs` rebuild (provider-sourced
+  node names are not reachable, same as upstream). `proxy: DIRECT` or an
+  absent field fetches directly — a deliberate divergence from upstream,
+  whose absent field rule-routes the fetch through the tunnel; an
+  unresolvable or whitespace-only name fails the fetch loudly rather than
+  leaking a direct request past a chain the config declared. Providers
+  whose `proxy:` name cannot resolve during the pre-publish startup load
+  are flagged and get one deferred fetch after the initial route map is
+  installed, matching upstream's resolve-per-request model. The same
+  `proxy` key is now accepted on `subscriptions:` entries (meow-rs-specific
+  feature) and on `POST /api/subscriptions`; it is resolved identically on
+  the manual refresh endpoint and the background refresh loop. On a `file`
+  provider the field has no effect and still warns.
+
 ### Changed
 
 - **TCP tracking without an external controller (#626).** Store only

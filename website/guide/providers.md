@@ -174,7 +174,7 @@ Subscriptions are also managed at runtime through the
 
 - `GET /api/subscriptions` — list, with the applied proxy/group/rule counts
   and last-updated times.
-- `POST /api/subscriptions` — add `{ name, url, interval? }` and apply immediately.
+- `POST /api/subscriptions` — add `{ name, url, interval?, proxy? }` and apply immediately.
 - `POST /api/subscriptions/{name}/refresh` — re-fetch.
 - `DELETE /api/subscriptions/{name}` — remove the entry **and empty all three
   sections** — previously-replaced local content is not restored. Note the
