@@ -383,6 +383,19 @@ fn shared_connector(config: &TlsConfig) -> Result<boring::ssl::SslConnector> {
     Ok(map.entry(key).or_insert(built).clone())
 }
 
+/// Fold a bracketed IP literal (`[::1]` — e.g. a `server:` display form
+/// propagated as the default SNI / verification name, issue #701) to the
+/// bare literal: SNI cannot carry it (RFC 6066 §3) and
+/// `X509_VERIFY_PARAM` must see the unbracketed form to take the
+/// `set1_ip`/`iPAddress` SAN path instead of a doomed DNS-name compare.
+/// A non-IP bracketed string stays verbatim.
+pub(super) fn unbracket_ip_literal(name: &str) -> &str {
+    name.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .filter(|s| s.parse::<std::net::IpAddr>().is_ok())
+        .unwrap_or(name)
+}
+
 pub(super) struct BoringInner {
     connector: boring::ssl::SslConnector,
     server_name: String,
@@ -486,8 +499,11 @@ impl BoringInner {
         let connector = shared_connector(config)?;
         Ok(Self {
             connector,
-            server_name,
-            verify_name: config.verify_name.clone(),
+            server_name: unbracket_ip_literal(&server_name).to_owned(),
+            verify_name: config
+                .verify_name
+                .as_deref()
+                .map(|v| unbracket_ip_literal(v).to_owned()),
             cert_pin: config.cert_pin,
             min_version: config.min_version.map(TlsVersion::to_ssl),
             max_version: config.max_version.map(TlsVersion::to_ssl),
@@ -1134,6 +1150,104 @@ mod tests {
                 p.curves_list
             );
         }
+    }
+
+    /// Issue #701: `server: "[::1]"` propagated as the default SNI /
+    /// verification name must arrive unbracketed — SNI cannot carry an IP
+    /// literal (RFC 6066 §3) and the bracketed string would take the
+    /// DNS-name verify path instead of `set_ip`/`iPAddress` SAN.
+    /// A bracketed non-IP stays verbatim: stripping could mint a valid
+    /// name out of one the operator never typed.
+    #[test]
+    fn boring_inner_unbrackets_ip_literal_names() {
+        let inner = BoringInner::new(&TlsConfig::new("[::1]")).expect("build");
+        assert_eq!(inner.server_name, "::1");
+
+        // `verify_name` (name-cert-verify) gets the same fold.
+        let inner = BoringInner::new(&TlsConfig {
+            verify_name: Some("[2001:db8::1]".into()),
+            ..TlsConfig::new("example.com")
+        })
+        .expect("build");
+        assert_eq!(inner.verify_name.as_deref(), Some("2001:db8::1"));
+
+        let inner = BoringInner::new(&TlsConfig::new("[foo]")).expect("build");
+        assert_eq!(inner.server_name, "[foo]", "non-IP bracket stays verbatim");
+    }
+
+    #[test]
+    fn unbracket_ip_literal_table() {
+        // Only a fully-bracketed IP literal folds; everything else —
+        // malformed brackets, non-IP content, fused ports, zone IDs —
+        // stays verbatim.
+        for (input, want) in [
+            ("[::1]", "::1"),
+            ("[1.2.3.4]", "1.2.3.4"),
+            ("::1", "::1"),
+            ("example.com", "example.com"),
+            ("[]", "[]"),
+            ("[foo]", "[foo]"),
+            ("[[::1]]", "[[::1]]"),
+            ("[::1]x", "[::1]x"),
+            ("[::1]:443", "[::1]:443"),
+            ("[fe80::1%eth0]", "[fe80::1%eth0]"),
+        ] {
+            assert_eq!(unbracket_ip_literal(input), want, "{input}");
+        }
+    }
+
+    /// Issue #701, wire-level: with `sni: "[::1]"` the client must (a)
+    /// omit SNI on the wire — RFC 6066 §3 forbids IP literals — and (b)
+    /// verify the peer leaf against its `iPAddress` SAN. Pre-fix both
+    /// failed: the bracketed string was sent as SNI and compared as a
+    /// DNS name.
+    #[tokio::test]
+    async fn bracketed_ip_sni_omits_sni_and_verifies_ip_san() {
+        let (ca, ca_key) = make_cert("Test CA", &CA, None);
+        let (leaf, leaf_key) = make_cert(
+            "v6 loopback",
+            &CertOpts {
+                ips: &["::1"],
+                ..CertOpts::DEFAULT
+            },
+            Some(("Test CA", &ca, &ca_key)),
+        );
+
+        let mut builder =
+            boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls())
+                .expect("acceptor");
+        builder.set_certificate(&leaf).unwrap();
+        builder.set_private_key(&leaf_key).unwrap();
+        let acceptor = builder.build();
+
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = tokio_boring::accept(&acceptor, tcp)
+                .await
+                .expect("server handshake");
+            stream
+                .ssl()
+                .servername(boring::ssl::NameType::HOST_NAME)
+                .map(str::to_owned)
+        });
+
+        let cfg = TlsConfig {
+            additional_roots: vec![ca.to_der().unwrap()],
+            ..TlsConfig::new("[::1]")
+        };
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        BoringInner::new(&cfg)
+            .expect("build")
+            .connect_typed(tcp)
+            .await
+            .unwrap_or_else(|_| panic!("client must verify ::1 against the iPAddress SAN"));
+        assert_eq!(
+            server.await.unwrap(),
+            None,
+            "an IP literal must not be sent as SNI"
+        );
     }
 
     /// Knobs for `make_cert` — keep the common leaf case terse.

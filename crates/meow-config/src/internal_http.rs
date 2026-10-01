@@ -227,10 +227,26 @@ async fn fetch_one(
 
     let conn: Box<dyn meow_transport::Stream> = match proxy {
         Some(proxy) => {
+            // `host_str()` retains IPv6 brackets — fold *only* the
+            // bracketed literal into `dst_ip` so a host-first encoder
+            // does not emit `"[::1]"` as a domain; this path bypasses
+            // `pre_handle_metadata`. A bare literal like `127.0.0.1`
+            // keeps its domain-typed wire form — remote resolvers accept
+            // it and the shape is load-bearing in tests.
+            let literal = if host.starts_with('[') {
+                meow_common::metadata_ip_literal(&host)
+            } else {
+                None
+            };
             let metadata = Metadata {
                 network: Network::Tcp,
                 conn_type: ConnType::Http,
-                host: SmolStr::from(&host),
+                host: if literal.is_none() {
+                    SmolStr::from(&host)
+                } else {
+                    SmolStr::default()
+                },
+                dst_ip: literal,
                 dst_port: port,
                 // Provider/geodata/subscription fetches are housekeeping —
                 // a `lazy` group serving this dial must not count it as use.
@@ -946,6 +962,31 @@ mod tests {
              must not count them as use"
         );
         assert_eq!(meta.conn_type, ConnType::Http);
+    }
+
+    /// Issue #701: a provider URL with a bracketed IPv6 host
+    /// (`http://[::1]/…`) must not reach `dial_tcp` with the bracketed
+    /// string in `metadata.host` — host-first encoders would emit it as
+    /// a domain. The fold puts the typed IP in `dst_ip` and clears
+    /// `host`; this path bypasses `pre_handle_metadata`.
+    #[tokio::test]
+    async fn fetch_via_proxy_folds_bracketed_ipv6_host() {
+        let proxy = Arc::new(CapturingMetaProxy {
+            seen: std::sync::Mutex::new(Vec::new()),
+            health: meow_common::ProxyHealth::new(),
+        });
+        let dyn_proxy: Arc<dyn Proxy> = Arc::<CapturingMetaProxy>::clone(&proxy);
+        let _ = fetch_via_proxy("http://[::1]:8080/rules.yaml", &dyn_proxy).await;
+        let seen = proxy.seen.lock().unwrap();
+        let meta = seen.first().expect("the fetch must reach dial_tcp");
+        assert_eq!(
+            meta.dst_ip,
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        );
+        assert!(
+            meta.host.is_empty(),
+            "the literal must not reach the encoder as a domain"
+        );
     }
 
     /// `resolve_download_proxy` (issue #625): absent/empty/`DIRECT` fetch

@@ -263,11 +263,14 @@ impl TunnelInner {
         // `fixMetadata` parity: an IP literal in `host` IS the
         // destination, not a name — fold it into `dst_ip` so a
         // domain-typed literal cannot slip past the range check below.
-        if metadata.dst_ip.is_none() {
-            if let Some(ip) = metadata_ip_literal(&metadata.host) {
+        // The host is cleared even when `dst_ip` is already set — HTTP
+        // `CONNECT [::1]` fills both fields, and a literal reaching
+        // host-first encoders as a domain is never usable (#701).
+        if let Some(ip) = metadata_ip_literal(&metadata.host) {
+            if metadata.dst_ip.is_none() {
                 metadata.dst_ip = Some(ip);
-                metadata.host = SmolStr::default();
             }
+            metadata.host = SmolStr::default();
         }
         // Unmap `::ffff:a.b.c.d` so a mapped literal still hits the
         // fake-IP range check and v4 rules (`fixMetadata` parity).
@@ -290,10 +293,8 @@ impl TunnelInner {
                     // name — listener-supplied `host`, else a sniffed one
                     // (upstream re-runs `TCPSniff` on exactly this
                     // failure). An IP literal is the stale address in
-                    // disguise: `CONNECT 198.18.0.9` leaves it in `host`.
-                    if metadata_ip_literal(&metadata.host).is_some() {
-                        metadata.host = SmolStr::default();
-                    }
+                    // disguise and was already folded out above, so a
+                    // surviving `host` here is a genuine name.
                     if metadata.host.is_empty()
                         && metadata_ip_literal(&metadata.sniff_host).is_none()
                     {

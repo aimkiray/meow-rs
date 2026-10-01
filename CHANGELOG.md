@@ -438,6 +438,35 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Bracketed IPv6 `server:` fields now work end-to-end** (issue #701).
+  `server: "[::1]"` used to delegate the dial as the literal string
+  `"[::1]"` — an unresolvable "domain" — so both the direct and the
+  `dialer-proxy`-chained TCP legs failed with a DNS error. The
+  `metadata_ip_literal` fold (bare parse → strip brackets → parse) is
+  now applied in `resolve_addrs` (every `connect_tcp_host` dial),
+  `inner_dial_metadata` (the chained front-hop encodes the typed IP
+  instead of a bogus domain), and `DirectAdapter::resolve_targets`
+  (covers wire-derived bracketed forms like a SOCKS5 domain
+  `BND.ADDR`); `relay`'s bespoke bracket strip converged onto the same
+  canonical fold, and a hand-constructed `UdpTarget::Name` carrying a
+  bracketed literal is folded at the `dial_udp_conn` boundary too (the
+  enum fields are public). The proxied internal-fetch path
+  (`proxy-providers`/subscription/geodata URLs behind `proxy:`) folds
+  the URL host the same way — it bypasses `pre_handle_metadata`
+  entirely. Two sibling leaks are closed too: inbound metadata
+  carrying both `dst_ip` and a bracketed `host` (HTTP `CONNECT
+  [::1]:443`) no longer reaches host-first encoders as a domain —
+  `pre_handle_metadata` clears the literal regardless of `dst_ip`
+  (which also lets the snooping `reverse_lookup` backfill a learned
+  name for a literal-only dial, matching upstream DNSMapping
+  semantics) — and
+  a bracketed literal propagated as the default TLS SNI / verification
+  name is unbracketed in the boring backend, so SNI is correctly omitted
+  (RFC 6066 §3) and the certificate is matched against the `iPAddress`
+  SAN instead of a doomed DNS-name compare. `verify_name`
+  (`name-cert-verify`) gets the same fold; a bracketed non-IP string
+  stays verbatim.
+
 - **Windows SCM status polling now scales with the service-advertised
   `wait_hint`** (issue #641). `meow install`/`uninstall` polled service
   status at a fixed 250 ms regardless of the SCM wait hint the pending

@@ -356,7 +356,10 @@ async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpStream> {
 ///
 /// Never returns an empty `Vec`.
 async fn resolve_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    // `metadata_ip_literal` folds bracketed IPv6 display forms (`[::1]`)
+    // into the literal — a `server:`/`BND.ADDR` string may arrive in that
+    // shape and must not fall through to DNS (issue #701).
+    if let Some(ip) = crate::metadata_ip_literal(host) {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
@@ -753,6 +756,25 @@ mod tests {
         assert_eq!(counter.count(), 1, "protector still applies to literal");
 
         clear_socket_protector();
+        clear_host_resolver();
+    }
+
+    /// Issue #701: a bracketed IPv6 display form (`server: "[::1]"`) must
+    /// fold to the literal inside `resolve_addrs` — never reach the
+    /// resolver, which would fail on the bracketed "domain".
+    #[tokio::test]
+    async fn connect_tcp_host_with_bracketed_ipv6_literal_skips_resolver() {
+        let _g = LOCK.lock().await;
+        clear_socket_protector();
+        clear_host_resolver();
+        set_host_resolver(Arc::new(FailingResolver) as Arc<dyn HostResolver>);
+
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let _stream = connect_tcp_host("[::1]", port).await.expect("connect");
+        let _ = accept.await.unwrap();
+
         clear_host_resolver();
     }
 

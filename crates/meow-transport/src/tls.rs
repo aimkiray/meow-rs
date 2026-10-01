@@ -270,10 +270,21 @@ impl TlsLayer {
             ));
         }
 
+        // `server: "[::1]"` propagated as the default server name
+        // (issue #701): fold the bracketed literal once at the funnel so
+        // every backend — boring and REALITY alike — sees the bare form.
+        // SNI cannot carry brackets (RFC 6066 §3) and boring's
+        // verification needs the bare literal for the `iPAddress` SAN
+        // path. `BoringInner` repeats the fold for direct construction.
+        let mut config = config.clone();
+        if let Some(sni) = &mut config.sni {
+            *sni = boring_backend::unbracket_ip_literal(sni).to_owned();
+        }
+
         #[cfg(feature = "reality")]
         if config.reality.is_some() {
             return Ok(Self {
-                backend: TlsBackend::Reality(crate::reality_tls::RealityTlsLayer::new(config)?),
+                backend: TlsBackend::Reality(crate::reality_tls::RealityTlsLayer::new(&config)?),
             });
         }
 
@@ -288,7 +299,7 @@ impl TlsLayer {
             );
         }
 
-        BoringInner::validate(config)?;
+        BoringInner::validate(&config)?;
         tracing::debug!(
             fingerprint = ?config.fingerprint,
             ech = config.ech.is_some(),
@@ -296,7 +307,7 @@ impl TlsLayer {
             "TLS: BoringSSL backend (lazy init)"
         );
         Ok(Self {
-            backend: TlsBackend::Boring(Box::new(LazyBoringInner::new(config.clone()))),
+            backend: TlsBackend::Boring(Box::new(LazyBoringInner::new(config))),
         })
     }
 
