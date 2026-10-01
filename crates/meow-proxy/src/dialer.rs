@@ -523,8 +523,11 @@ use packet_conn_socket::PacketConnSocket;
 /// traffic and be counted as use, keeping the group's probe loop awake
 /// forever (issue #555).
 fn inner_dial_metadata(host: &str, port: u16, internal: bool) -> Metadata {
-    match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => Metadata {
+    // Bracketed IPv6 literals (`server: "[::1]"`) fold to the typed
+    // address too — a bare `parse` would leave them in `host`, where the
+    // front hop treats them as a domain that cannot resolve (issue #701).
+    match meow_common::metadata_ip_literal(host) {
+        Some(ip) => Metadata {
             network: Network::Tcp,
             conn_type: ConnType::Inner,
             dst_ip: Some(ip),
@@ -532,7 +535,7 @@ fn inner_dial_metadata(host: &str, port: u16, internal: bool) -> Metadata {
             internal,
             ..Default::default()
         },
-        Err(_) => Metadata {
+        None => Metadata {
             network: Network::Tcp,
             conn_type: ConnType::Inner,
             host: host.into(),
@@ -599,14 +602,30 @@ impl TcpDialer for ProxyDialer {
                 internal,
                 ..Default::default()
             },
-            UdpTarget::Name { host, port } => Metadata {
-                network: Network::Udp,
-                conn_type: ConnType::Inner,
-                host: host.clone(),
-                dst_port: *port,
-                internal,
-                ..Default::default()
-            },
+            UdpTarget::Name { host, port } => {
+                // Fold a hand-constructed `Name` carrying a bracketed
+                // literal — `UdpTarget::named` already folds, but the
+                // enum fields are public (#701).
+                if let Some(ip) = meow_common::metadata_ip_literal(host) {
+                    Metadata {
+                        network: Network::Udp,
+                        conn_type: ConnType::Inner,
+                        dst_ip: Some(ip),
+                        dst_port: *port,
+                        internal,
+                        ..Default::default()
+                    }
+                } else {
+                    Metadata {
+                        network: Network::Udp,
+                        conn_type: ConnType::Inner,
+                        host: host.clone(),
+                        dst_port: *port,
+                        internal,
+                        ..Default::default()
+                    }
+                }
+            }
         };
         // Capability errors keep their class across the `io::Error`
         // boundary so the adapter can reconstitute `NotSupported`, and
@@ -1328,6 +1347,22 @@ mod tests {
                 port: 8388
             }
         );
+    }
+
+    /// Issue #701: a bracketed IPv6 `server:` folds into `dst_ip` so the
+    /// chained front hop encodes an IP address; a bare parse would leave
+    /// `"[::1]"` in `host`, where it dies as an unresolvable "domain".
+    #[test]
+    fn inner_dial_metadata_folds_bracketed_ipv6_literal() {
+        let m = inner_dial_metadata("[::1]", 443, false);
+        assert_eq!(m.dst_ip, Some("::1".parse().unwrap()));
+        assert_eq!(m.dst_port, 443);
+        assert!(m.host.is_empty());
+        // Non-IP bracketed text stays a name — verbatim (same rule as
+        // UdpTarget::named's [foo] case above).
+        let m = inner_dial_metadata("[foo]", 443, false);
+        assert_eq!(m.dst_ip, None);
+        assert_eq!(&*m.host, "[foo]");
     }
 
     /// `src_matches`: literal targets compare canonically (IPv4-mapped

@@ -84,13 +84,10 @@ fn metadata_for_proxy(proxy: &Arc<dyn Proxy>, internal: bool) -> Metadata {
         // DIRECT's connect_over ignores the metadata anyway.
         (addr, 0)
     };
-    // Strip brackets so `[2001:db8::1]` parses as an IpAddr too.
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    match bare.parse::<std::net::IpAddr>() {
-        Ok(ip) => Metadata {
+    // `metadata_ip_literal` also folds the bracketed form so
+    // `[2001:db8::1]` parses as an IpAddr too (issue #701).
+    match meow_common::metadata_ip_literal(host) {
+        Some(ip) => Metadata {
             network: meow_common::Network::Tcp,
             conn_type: meow_common::ConnType::Inner,
             dst_ip: Some(ip),
@@ -98,7 +95,7 @@ fn metadata_for_proxy(proxy: &Arc<dyn Proxy>, internal: bool) -> Metadata {
             internal,
             ..Default::default()
         },
-        Err(_) => Metadata {
+        None => Metadata {
             network: meow_common::Network::Tcp,
             conn_type: meow_common::ConnType::Inner,
             host: host.into(),

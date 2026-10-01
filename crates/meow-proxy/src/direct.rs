@@ -3,7 +3,7 @@ use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
 use meow_dns::Resolver;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
@@ -105,8 +105,10 @@ impl DirectAdapter {
             return Ok(vec![SocketAddr::new(ip, metadata.dst_port)]);
         }
 
-        // 2. `host` is an IP literal — no DNS needed.
-        if let Ok(ip) = metadata.host.parse::<IpAddr>() {
+        // 2. `host` is an IP literal — no DNS needed. The fold also
+        //    unwraps a bracketed display form (e.g. a SOCKS5 domain
+        //    BND.ADDR of `[::1]`) so it cannot fall into DNS (issue #701).
+        if let Some(ip) = meow_common::metadata_ip_literal(&metadata.host) {
             return Ok(vec![SocketAddr::new(ip, metadata.dst_port)]);
         }
 
@@ -413,7 +415,7 @@ impl ProxyAdapter for DirectAdapter {
         // destination family is unknown (preserves the legacy behaviour).
         let dst_is_v6 = match metadata.dst_ip {
             Some(ip) => ip.is_ipv6(),
-            None => metadata.host.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6()),
+            None => meow_common::metadata_ip_literal(&metadata.host).is_some_and(|ip| ip.is_ipv6()),
         };
         let bind_addr = if dst_is_v6 { "[::]:0" } else { "0.0.0.0:0" };
         let socket = meow_common::bind_udp(bind_addr)
@@ -453,7 +455,7 @@ mod tests {
     use meow_common::DnsMode;
     use meow_dns::HostEntry;
     use meow_trie::DomainTrie;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn fake_dest() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 1)
@@ -810,6 +812,24 @@ mod tests {
         fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
             Vec::new()
         }
+    }
+
+    /// Issue #701: a bracketed IPv6 display form in `metadata.host` (e.g. a
+    /// SOCKS5 domain `BND.ADDR` of `[::1]`, or a `server: "[::1]"` config)
+    /// folds to the literal instead of falling into DNS, where the
+    /// bracketed "domain" can never resolve.
+    #[tokio::test]
+    async fn resolve_targets_folds_bracketed_ipv6_host() {
+        // No resolver injected: without the fold the bracketed "domain"
+        // hits getaddrinfo and fails — the Ok arm below cannot be reached
+        // from DNS on this input.
+        let adapter = DirectAdapter::new();
+        let metadata = tcp_metadata("[::1]", 443);
+        let addrs = adapter
+            .resolve_targets(&metadata)
+            .await
+            .expect("bracketed literal must fold, not resolve");
+        assert_eq!(addrs, vec!["[::1]:443".parse().unwrap()]);
     }
 
     /// #682 end-to-end: a resolver whose upstream fails with EMFILE must

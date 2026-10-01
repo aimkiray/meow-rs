@@ -12,7 +12,7 @@ use meow_dns::fakeip::{MemoryStore, Pool};
 use meow_dns::Resolver;
 use meow_trie::DomainTrie;
 use meow_tunnel::{PreHandleVerdict, Tunnel};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 fn build_fakeip_resolver() -> Arc<Resolver> {
@@ -358,6 +358,47 @@ async fn stale_fakeip_with_host_falls_back_to_name() {
         "stale literal must clear so the adapter resolves the host"
     );
     assert_eq!(md.host.as_str(), "example.test");
+}
+
+/// Issue #701: `CONNECT [::1]:443` fills `host="[::1]"` *and*
+/// `dst_ip=::1` (the HTTP listener parses one bracket-tolerantly and
+/// keeps the other verbatim). The literal must still be folded out —
+/// otherwise host-first encoders emit `"[::1]"` as a domain on the wire
+/// even though the typed IP is right there. A conflicting `dst_ip`
+/// keeps precedence: the literal host is display text, not a name.
+#[tokio::test]
+async fn bracketed_host_literal_cleared_alongside_dst_ip() {
+    let resolver = build_fakeip_resolver();
+    let tunnel = Tunnel::new(resolver);
+    let mut md = Metadata {
+        host: "[::1]".into(),
+        dst_ip: Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        dst_port: 443,
+        network: Network::Tcp,
+        ..Default::default()
+    };
+    assert_eq!(
+        tunnel.inner().pre_handle_metadata(&mut md),
+        PreHandleVerdict::Continue
+    );
+    assert_eq!(md.host.as_str(), "", "a literal is never a domain name");
+    assert_eq!(md.dst_ip, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+    // Same fold for a bare-literal host that disagrees with dst_ip:
+    // dst_ip wins, the literal display string is dropped.
+    let mut md = Metadata {
+        host: "8.8.8.8".into(),
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))),
+        dst_port: 443,
+        network: Network::Tcp,
+        ..Default::default()
+    };
+    assert_eq!(
+        tunnel.inner().pre_handle_metadata(&mut md),
+        PreHandleVerdict::Continue
+    );
+    assert_eq!(md.host.as_str(), "");
+    assert_eq!(md.dst_ip, Some(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))));
 }
 
 #[tokio::test]
