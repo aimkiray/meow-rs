@@ -400,8 +400,9 @@ fn insert_domain_entry(
             }
         }
         DOMAIN_TYPE_DOMAIN => {
+            // v2ray `Domain` (root-domain) == upstream `+.`: apex plus
+            // any-depth subdomains, one insert.
             let pat = format!("+.{value}");
-            let _ = trie.insert(&value, ());
             trie.insert(&pat, ())
         }
         DOMAIN_TYPE_FULL => trie.insert(&value, ()),

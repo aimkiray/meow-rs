@@ -21,9 +21,9 @@ pub struct MatchResult<'a> {
 /// matching the host** (min-index semantics), not the most-specific pattern.
 /// Under first-match-wins ordering this means a trie hit at `T` proves that
 /// no DOMAIN/DOMAIN-SUFFIX rule earlier than `T` matches the host — and a
-/// trie miss proves none matches at all. Suffix rules are indexed under both
-/// `+.pattern` (subdomains) and the bare pattern (the apex domain itself), so
-/// those proofs hold for every host a suffix rule can match.
+/// trie miss proves none matches at all. Suffix rules are indexed under
+/// `+.pattern`, which natively covers the apex domain plus all subdomains,
+/// so those proofs hold for every host a suffix rule can match.
 ///
 /// The adapter and payload are borrowed from the rule slice after lookup,
 /// which keeps the index compact and avoids per-match result allocation.
@@ -69,12 +69,10 @@ impl DomainIndex {
                 if !indexable_pattern(payload) {
                     return false;
                 }
-                // A suffix rule matches the apex domain itself as well as any
-                // subdomain; index both forms so a trie miss proves no suffix
-                // rule matches.
-                let subdomains = self.trie.insert(&format!("+.{payload}"), index);
-                let apex = self.trie.insert(payload, index);
-                subdomains && apex
+                // `+.` covers the apex domain plus any-depth subdomains
+                // (upstream mihomo semantics) in a single insert, so a trie
+                // miss proves no suffix rule matches.
+                self.trie.insert(&format!("+.{payload}"), index)
             }
             RuleType::DomainWildcard => {
                 // Only the dominant `*.domain` shape is expressible: the

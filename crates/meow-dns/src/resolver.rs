@@ -112,7 +112,9 @@ struct MatcherPolicyEntry {
     entry: PolicyEntry,
 }
 
-/// Per-domain nameserver routing: exact matches and `+.` wildcard prefixes.
+/// Per-domain nameserver routing: exact (bare) keys in `exact`, `+.`, `*.`
+/// and `.` prefixed keys in the `wildcard` trie, geosite/rule-set closures
+/// in `matchers`. `lookup` consults them in that order.
 pub struct NameserverPolicy {
     exact: HashMap<String, PolicyEntry>,
     wildcard: DomainTrie<PolicyEntry>,
@@ -157,16 +159,14 @@ impl NameserverPolicy {
         &self.clients
     }
 
-    /// Insert a `+.` wildcard pattern. Also inserts an exact match for the root
-    /// domain since `DomainTrie`'s `+.` semantics don't include the root itself.
+    /// Insert a wildcard-pattern policy key verbatim into the `DomainTrie`:
+    /// `+.x` covers the apex plus any-depth subdomains, `*.x` exactly one
+    /// label, `.x` any-depth subdomains excluding the apex — upstream
+    /// `parseNameServerPolicy` routes all three through one `domainTriePolicy`.
+    /// `+.` natively covers the root domain, so no supplementary exact-map
+    /// entry is needed for any prefix kind.
     pub fn insert_wildcard(&mut self, pattern: &str, entry: PolicyEntry) {
         self.track_clients(&entry);
-        // Insert root domain explicitly: DomainTrie's +. doesn't match root.
-        if let Some(bare) = pattern.strip_prefix("+.") {
-            self.exact
-                .entry(bare.to_string())
-                .or_insert_with(|| entry.clone());
-        }
         self.wildcard.insert(pattern, entry);
     }
 
@@ -3740,10 +3740,110 @@ mod tests {
             "subdomain must match"
         );
         assert!(
+            pol.lookup("a.b.corp.internal").is_some(),
+            "deep subdomain must match (+. covers any depth)"
+        );
+        assert!(
             pol.lookup("corp.internal").is_some(),
             "root domain must match (+. includes root)"
         );
         assert!(pol.lookup("other.example").is_none(), "non-match must miss");
+    }
+
+    // nameserver-policy exact-first precedence: an exact entry beats a `+.`
+    // wildcard at the apex regardless of insertion order (lookup consults the
+    // exact map before the wildcard trie).
+    #[test]
+    fn nameserver_policy_exact_overrides_wildcard_at_apex() {
+        for exact_first in [true, false] {
+            let wildcard_entry = PolicyEntry {
+                nameservers: vec![],
+            };
+            let exact_entry = PolicyEntry {
+                nameservers: vec![],
+            };
+            let mut pol = NameserverPolicy::new();
+            if exact_first {
+                pol.insert_exact("corp.internal".to_string(), exact_entry);
+                pol.insert_wildcard("+.corp.internal", wildcard_entry);
+            } else {
+                pol.insert_wildcard("+.corp.internal", wildcard_entry);
+                pol.insert_exact("corp.internal".to_string(), exact_entry);
+            }
+            // Pointer identity pins the provenance: the apex hit must be the
+            // exact-map slot, not the wildcard trie's.
+            let hit = pol.lookup("corp.internal").expect("apex must match");
+            assert!(
+                std::ptr::eq(hit, pol.exact.get("corp.internal").unwrap()),
+                "exact entry must win over +. wildcard at the apex (exact_first={exact_first})"
+            );
+            assert!(
+                pol.lookup("x.corp.internal").is_some(),
+                "subdomain must still resolve via the wildcard (exact_first={exact_first})"
+            );
+        }
+    }
+
+    // `*.`/`.` keys reach the trie verbatim via insert_wildcard; an exact
+    // entry still wins at every level (exact map is consulted first).
+    #[test]
+    fn nameserver_policy_star_and_dot_wildcards() {
+        let mut pol = NameserverPolicy::new();
+        pol.insert_wildcard(
+            "*.corp.internal",
+            PolicyEntry {
+                nameservers: vec![],
+            },
+        );
+        pol.insert_wildcard(
+            ".eng.internal",
+            PolicyEntry {
+                nameservers: vec![],
+            },
+        );
+        assert!(pol.lookup("a.corp.internal").is_some());
+        assert!(pol.lookup("corp.internal").is_none());
+        assert!(pol.lookup("a.b.corp.internal").is_none());
+        assert!(pol.lookup("a.eng.internal").is_some());
+        assert!(pol.lookup("a.b.eng.internal").is_some());
+        assert!(pol.lookup("eng.internal").is_none());
+
+        // exact beats a `*.` wildcard at depth 1, order-independent.
+        for exact_first in [true, false] {
+            let mut p = NameserverPolicy::new();
+            if exact_first {
+                p.insert_exact(
+                    "a.corp.internal".to_string(),
+                    PolicyEntry {
+                        nameservers: vec![],
+                    },
+                );
+                p.insert_wildcard(
+                    "*.corp.internal",
+                    PolicyEntry {
+                        nameservers: vec![],
+                    },
+                );
+            } else {
+                p.insert_wildcard(
+                    "*.corp.internal",
+                    PolicyEntry {
+                        nameservers: vec![],
+                    },
+                );
+                p.insert_exact(
+                    "a.corp.internal".to_string(),
+                    PolicyEntry {
+                        nameservers: vec![],
+                    },
+                );
+            }
+            let hit = p.lookup("a.corp.internal").expect("depth-1 hit");
+            assert!(
+                std::ptr::eq(hit, p.exact.get("a.corp.internal").unwrap()),
+                "exact entry must win over *. wildcard (exact_first={exact_first})"
+            );
+        }
     }
 
     #[test]

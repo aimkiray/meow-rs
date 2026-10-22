@@ -270,6 +270,19 @@ mod tests {
         let mut meta = make_metadata("www.example.com", 443);
         rt.sniff(&server, &mut meta).await;
         assert_eq!(meta.sniff_host, "www.example.com");
+
+        // The apex is covered by "+.example.com" too (upstream `+.`
+        // semantics include the root) — the same gate bypass applies to the
+        // bare domain.
+        let (mut client, server) = make_stream_pair().await;
+        let hello = build_client_hello("example.com");
+        client.write_all(&hello).await.unwrap();
+        let mut meta = make_metadata("example.com", 443);
+        rt.sniff(&server, &mut meta).await;
+        assert_eq!(
+            meta.sniff_host, "example.com",
+            "+.example.com must force-sniff the apex itself"
+        );
     }
 
     #[tokio::test]
@@ -291,6 +304,19 @@ mod tests {
         assert_eq!(
             meta.sniff_host, "",
             "skip-domain must discard the sniffed result"
+        );
+
+        // The apex is covered by "+.example.com" too (upstream `+.`
+        // semantics include the root) — a sniffed apex hostname is
+        // discarded the same way.
+        let (mut client, server) = make_stream_pair().await;
+        let hello = build_client_hello("example.com");
+        client.write_all(&hello).await.unwrap();
+        let mut meta = make_metadata("", 443);
+        rt.sniff(&server, &mut meta).await;
+        assert_eq!(
+            meta.sniff_host, "",
+            "skip-domain must discard the apex result too"
         );
     }
 
@@ -492,6 +518,19 @@ mod tests {
                 meta_host: "1.2.3.4",
                 meta_port: 80,
                 sniffed: "tracker.ads.example.com",
+                expected_sniff_host: "",
+                expected_host: "1.2.3.4",
+            },
+            // "+." covers the apex too (upstream semantics include the
+            // root): a sniffed apex hostname is discarded like a subdomain.
+            Case {
+                name: "skip_domain_drops_apex",
+                enable: true,
+                override_destination: true,
+                skip_domain: &["+.ads.example.com"],
+                meta_host: "1.2.3.4",
+                meta_port: 80,
+                sniffed: "ads.example.com",
                 expected_sniff_host: "",
                 expected_host: "1.2.3.4",
             },

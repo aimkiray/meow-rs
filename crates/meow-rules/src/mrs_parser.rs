@@ -540,12 +540,34 @@ fn walk_upstream_domain_set(data: &[u8], on_domain: &mut dyn FnMut(&str)) -> Res
         labels,
     };
     let mut current = Vec::new();
-    let mut forward = Vec::new();
+    let mut forward = String::new();
     traversal.traverse(0, 0, &mut current, &mut |reversed: &[u8]| {
         forward.clear();
-        forward.extend(reversed.iter().rev());
-        if let Ok(domain) = std::str::from_utf8(&forward) {
-            on_domain(domain);
+        // Internal keys are reversed domain bytes; a trailing '+' byte is
+        // the suffix-wildcard marker (upstream DomainSetBuilder stores `.x`
+        // and the wildcard half of `+.x` identically as `moc.x.+`). Strip
+        // one trailing '+' before reversing — mirroring upstream
+        // `DomainSet.Foreach`'s `strings.TrimSuffix(key, complexWildcard)`
+        // followed by `utils.Reverse` — so `moc.x.+` decodes to `.x`, not
+        // `+.x`. A genuine upstream `+.x` entry exists as two keys (`moc.x`
+        // and `moc.x.+`) and therefore still decodes to `x` + `.x` with
+        // equal coverage. The '+' strip stays at the BYTE level: '+' is
+        // 0x2B, which can never occur inside a UTF-8 multi-byte sequence
+        // (lead bytes are >= 0xC0, continuation bytes 0x80..=0xBF).
+        let stored = match reversed.split_last() {
+            Some((b'+', rest)) => rest,
+            _ => reversed,
+        };
+        // `utils.Reverse` itself is RUNE-wise — `domain_set.go` documents
+        // that the set is "built with rune-wise reversal, which only
+        // matches byte-wise reversal for ASCII". Decode symmetrically:
+        // validate UTF-8 on the stored key, then reverse `char`s.
+        // Byte-reversing a multi-byte UTF-8 label produces invalid UTF-8,
+        // which is exactly why non-ASCII (IDN) entries were silently
+        // dropped here by `.ok()`.
+        if let Ok(key) = std::str::from_utf8(stored) {
+            forward.extend(key.chars().rev());
+            on_domain(&forward);
         }
     })
 }
@@ -1022,10 +1044,48 @@ mod tests {
     }
 
     fn encode_domain_set(entries: &[&str]) -> Vec<u8> {
-        let mut keys: Vec<Vec<u8>> = entries
+        let byte_entries: Vec<&[u8]> = entries.iter().map(|e| e.as_bytes()).collect();
+        encode_domain_set_bytes(&byte_entries)
+    }
+
+    /// `encode_domain_set` over raw bytes, so fixtures can express internal
+    /// keys that decode to invalid UTF-8 (e.g. a `\xff` label).
+    ///
+    /// Caveats vs a real upstream encoder (DR-A N-3):
+    ///  - Entries are reversed BYTE-wise into internal keys, so a `"+.x"`
+    ///    input yields the single key `moc.x.+` — upstream's encoding of a
+    ///    SUFFIX-ONLY (`.x`) entry, NOT of `+.x`. A genuine upstream `+.x`
+    ///    occupies two keys (`moc.x` + `moc.x.+`); list both `"x"` and
+    ///    `"+.x"` to model it.
+    ///  - Upstream builds keys with a RUNE-wise `utils.Reverse`; for
+    ///    non-ASCII (e.g. IDN) domains use `encode_domain_set_runes` —
+    ///    byte-reversing a multi-byte UTF-8 label does not produce a key a
+    ///    real upstream `DomainSetBuilder` would emit.
+    fn encode_domain_set_bytes(entries: &[&[u8]]) -> Vec<u8> {
+        let keys: Vec<Vec<u8>> = entries
             .iter()
-            .map(|entry| entry.as_bytes().iter().rev().copied().collect())
+            .map(|entry| entry.iter().rev().copied().collect())
             .collect();
+        encode_domain_set_keys(keys)
+    }
+
+    /// `encode_domain_set` variant whose internal keys are RUNE-wise
+    /// reversals of the entry (`entry.chars().rev()` as UTF-8) — exactly
+    /// what upstream `DomainSetBuilder.Insert` produces via `utils.Reverse`.
+    /// Output is identical to `encode_domain_set` for pure-ASCII entries;
+    /// required for non-ASCII domain fixtures. The `"+.x"` → single
+    /// suffix-key caveat documented on `encode_domain_set_bytes` applies
+    /// here too (`"+.x"` rune-reverses to `moc.x.+`).
+    fn encode_domain_set_runes(entries: &[&str]) -> Vec<u8> {
+        let keys: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|entry| entry.chars().rev().collect::<String>().into_bytes())
+            .collect();
+        encode_domain_set_keys(keys)
+    }
+
+    /// Build the set body from already-reversed internal keys.
+    fn encode_domain_set_keys(mut keys: Vec<Vec<u8>>) -> Vec<u8> {
         keys.sort();
 
         let mut leaves = Vec::new();
@@ -1155,13 +1215,21 @@ mod tests {
 
     #[test]
     fn upstream_ruleset_mrs_domain_parses() {
-        let body = encode_domain_set(&["example.com", "+.foo.com"]);
-        let bytes = encode_upstream_mrs(TYPE_DOMAIN, 2, &body);
+        // `encode_domain_set` reverses each entry byte-wise, so `"+.foo.com"`
+        // becomes the single internal key `moc.oof.+` — which is upstream's
+        // encoding of a SUFFIX-ONLY (`.foo.com`) entry, not of `+.foo.com`.
+        // A genuine `+.foo.com` occupies two keys (`moc.oof` + `moc.oof.+`),
+        // produced here by also listing the bare `"foo.com"`.
+        let body = encode_domain_set(&["example.com", "foo.com", "+.foo.com"]);
+        let bytes = encode_upstream_mrs(TYPE_DOMAIN, 3, &body);
         let parsed = parse_upstream_ruleset_mrs(&bytes).unwrap();
         assert_eq!(parsed.behavior, TYPE_DOMAIN);
-        assert_eq!(parsed.count, 2);
+        assert_eq!(parsed.count, 3);
         assert!(parsed.entries.iter().any(|e| e == "example.com"));
-        assert!(parsed.entries.iter().any(|e| e == "+.foo.com"));
+        // `moc.oof` decodes to the apex; `moc.oof.+` decodes to `.foo.com`.
+        assert!(parsed.entries.iter().any(|e| e == "foo.com"));
+        assert!(parsed.entries.iter().any(|e| e == ".foo.com"));
+        assert!(!parsed.entries.iter().any(|e| e == "+.foo.com"));
     }
 
     #[test]
@@ -1367,5 +1435,159 @@ mod tests {
                 .is_err(),
             "byte cap must error"
         );
+    }
+
+    // End-to-end: an internal `moc.x.+` key decodes to `.x.com`, which a
+    // `DomainRuleSet` must treat as suffix-only — subdomains at any depth hit,
+    // the apex itself must NOT (upstream parity; the pre-fix `+.x` decode
+    // over-matched the apex).
+    #[test]
+    fn upstream_domain_set_dot_entry_matches_subdomains_not_apex() {
+        use crate::rule_set::{DomainRuleSet, RuleSet};
+
+        // `encode_domain_set` byte-reverses `"+.x.com"` into the internal key
+        // `moc.x.+` — upstream's encoding of a suffix-only `.x.com` entry.
+        let body = encode_domain_set(&["+.x.com"]);
+        let bytes = encode_upstream_mrs(TYPE_DOMAIN, 1, &body);
+        let parsed = parse_upstream_ruleset_mrs(&bytes).unwrap();
+        assert_eq!(parsed.entries, vec![".x.com".to_string()]);
+
+        let set = DomainRuleSet::from_entries(&parsed.entries);
+        assert_eq!(set.len(), 1);
+        assert!(
+            set.matches_domain("a.x.com"),
+            "one-label subdomain must match .x.com"
+        );
+        assert!(
+            set.matches_domain("a.b.x.com"),
+            "deep subdomain must match .x.com"
+        );
+        assert!(
+            !set.matches_domain("x.com"),
+            "apex must NOT match .x.com (suffix-only decode)"
+        );
+    }
+
+    // Decode-boundary matrix for `parse_upstream_domain_set`'s trailing-`+`
+    // strip. Fixture entries are byte-reversed to form internal keys, so
+    // `"+.x.com"` stores `moc.x.+`, `"+"` stores `+`, etc.
+    #[test]
+    fn upstream_domain_set_plus_marker_decode_boundaries() {
+        struct Case {
+            name: &'static str,
+            entries: &'static [&'static [u8]],
+            expect_entries: &'static [&'static str],
+        }
+
+        let cases = [
+            // Trailing `+` marker: stripped once → `.x.com` (also covered
+            // end-to-end above).
+            Case {
+                name: "trailing_plus_decodes_dot",
+                entries: &[b"+.x.com"],
+                expect_entries: &[".x.com"],
+            },
+            // A bare `+` key loses its only byte → decodes to the empty
+            // string. `from_entries` skips it harmlessly — asserted in
+            // `upstream_domain_set_empty_entry_is_skipped` below.
+            Case {
+                name: "bare_plus_key_decodes_empty",
+                entries: &[b"+"],
+                expect_entries: &[""],
+            },
+            // `++` strips one layer only — mirroring upstream's single
+            // `strings.TrimSuffix` — so the key revives as `+.x.com`.
+            Case {
+                name: "double_plus_strips_once",
+                entries: &[b"++.x.com"],
+                expect_entries: &["+.x.com"],
+            },
+            // A `+` inside the key is not a suffix marker: no strip, the
+            // key round-trips verbatim (the `+` stays inside the label).
+            Case {
+                name: "mid_plus_not_stripped",
+                entries: &[b"x+.com"],
+                expect_entries: &["x+.com"],
+            },
+            // Non-UTF-8 key: `String::from_utf8(...).ok()` drops it; the
+            // sibling valid key still decodes.
+            Case {
+                name: "non_utf8_key_dropped",
+                entries: &[b"\xff.com", b"ok.com"],
+                expect_entries: &["ok.com"],
+            },
+        ];
+
+        for case in cases {
+            let body = encode_domain_set_bytes(case.entries);
+            let bytes = encode_upstream_mrs(TYPE_DOMAIN, case.entries.len(), &body);
+            let parsed = parse_upstream_ruleset_mrs(&bytes)
+                .unwrap_or_else(|e| panic!("case {} failed to parse: {e}", case.name));
+            let expected: Vec<String> = case
+                .expect_entries
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            assert_eq!(parsed.entries, expected, "case {}", case.name);
+        }
+    }
+
+    // A bare `+` key strips to the empty string; `DomainRuleSet::from_entries`
+    // skips empty entries harmlessly — no panic, no phantom match.
+    #[test]
+    fn upstream_domain_set_empty_entry_is_skipped() {
+        use crate::rule_set::{DomainRuleSet, RuleSet};
+
+        let body = encode_domain_set(&["+"]);
+        let bytes = encode_upstream_mrs(TYPE_DOMAIN, 1, &body);
+        let parsed = parse_upstream_ruleset_mrs(&bytes).unwrap();
+        // Record the current decode contract: the key survives as `""`.
+        assert_eq!(parsed.entries, vec!["".to_string()]);
+
+        let set = DomainRuleSet::from_entries(&parsed.entries);
+        assert!(
+            set.is_empty(),
+            "empty entry must be skipped, not counted (len={})",
+            set.len()
+        );
+        assert!(
+            !set.matches_domain("x.com"),
+            "empty rule-set must match nothing"
+        );
+    }
+
+    // Internal keys are rune-wise reversals (upstream `utils.Reverse`), so a
+    // non-ASCII domain is stored as valid UTF-8 — e.g. `bücher.de` becomes
+    // `ed.rehcüb`. The byte-wise encoder cannot emit such keys; use
+    // `encode_domain_set_runes`. Decoding used to byte-reverse the key, which
+    // mangles multi-byte sequences into invalid UTF-8 and silently dropped
+    // the entry via `.ok()` — this fixture locks in the rune-wise fix.
+    //
+    // `["bücher.de", "+.bücher.de"]` rune-reverses to internal keys
+    // `ed.rehcüb` + `ed.rehcüb.+` — upstream's real two-key encoding of a
+    // `+.bücher.de` entry (apex key + suffix-only key).
+    #[test]
+    fn upstream_domain_set_non_ascii_decodes_rune_wise() {
+        use crate::rule_set::{DomainRuleSet, RuleSet};
+
+        let body = encode_domain_set_runes(&["bücher.de", "+.bücher.de"]);
+        let bytes = encode_upstream_mrs(TYPE_DOMAIN, 2, &body);
+        let parsed = parse_upstream_ruleset_mrs(&bytes).unwrap();
+        assert_eq!(
+            parsed.entries,
+            vec!["bücher.de".to_string(), ".bücher.de".to_string()],
+            "keys decode to the apex entry plus the suffix-only entry"
+        );
+
+        // End-to-end: the pair is upstream's `+.bücher.de` — apex AND subs.
+        let set = DomainRuleSet::from_entries(&parsed.entries);
+        assert!(set.matches_domain("bücher.de"), "apex must match");
+        assert!(set.matches_domain("a.bücher.de"), "subdomain must match");
+        assert!(
+            set.matches_domain("a.b.bücher.de"),
+            "deep subdomain must match via the `.` entry"
+        );
+        // The decoded entry stays Unicode — its punycode form does NOT match.
+        assert!(!set.matches_domain("xn--bcher-kva.de"));
     }
 }

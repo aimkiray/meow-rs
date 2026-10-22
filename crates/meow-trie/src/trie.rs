@@ -462,11 +462,15 @@ impl<T: Clone + 'static> DomainTrie<T> {
             return false;
         }
 
+        // Upstream `+.` (domain.go Insert): the apex domain itself plus
+        // subdomains at any depth — i.e. the bare path AND the `""`
+        // dot-wildcard path. Exact + Dot reproduces that; a Star entry would
+        // be redundant because Dot already covers depth >= 1.
         if let Some(rest) = domain.strip_prefix("+.") {
             if rest.is_empty() {
                 return false;
             }
-            self.insert_into_tree(rest, data.clone(), MatchKind::Star);
+            self.insert_into_tree(rest, data.clone(), MatchKind::Exact);
             self.insert_into_tree(rest, data, MatchKind::Dot);
             self.len += 2;
             return true;
@@ -727,7 +731,11 @@ mod proptests {
         fn matches(&self, query: &str) -> bool {
             let q = query.to_lowercase();
             for pat in &self.patterns {
-                if let Some(rest) = pat.strip_prefix("*.") {
+                if let Some(rest) = pat.strip_prefix("+.") {
+                    if q == rest || q.ends_with(&format!(".{rest}")) {
+                        return true;
+                    }
+                } else if let Some(rest) = pat.strip_prefix("*.") {
                     if let Some(prefix) = q.strip_suffix(&format!(".{rest}")) {
                         if !prefix.is_empty() && !prefix.contains('.') {
                             return true;
@@ -757,7 +765,7 @@ mod proptests {
         #[test]
         fn matches_naive_reference(
             patterns in proptest::collection::vec(
-                "[a-z]{1,5}(\\.[a-z]{1,5}){0,3}|\\*\\.[a-z]{1,5}(\\.[a-z]{1,5}){0,2}",
+                "[a-z]{1,5}(\\.[a-z]{1,5}){0,3}|\\*\\.[a-z]{1,5}(\\.[a-z]{1,5}){0,2}|\\+\\.[a-z]{1,5}(\\.[a-z]{1,5}){0,2}|\\.[a-z]{1,5}(\\.[a-z]{1,5}){0,2}",
                 1..=20,
             ),
             queries in proptest::collection::vec(
@@ -783,7 +791,7 @@ mod proptests {
         #[test]
         fn matches_naive_reference_zst(
             patterns in proptest::collection::vec(
-                "[a-z]{1,5}(\\.[a-z]{1,5}){0,3}|\\*\\.[a-z]{1,5}(\\.[a-z]{1,5}){0,2}",
+                "[a-z]{1,5}(\\.[a-z]{1,5}){0,3}|\\*\\.[a-z]{1,5}(\\.[a-z]{1,5}){0,2}|\\+\\.[a-z]{1,5}(\\.[a-z]{1,5}){0,2}|\\.[a-z]{1,5}(\\.[a-z]{1,5}){0,2}",
                 1..=20,
             ),
             queries in proptest::collection::vec(
@@ -812,7 +820,7 @@ mod proptests {
         #[test]
         fn sealed_matches_unsealed(
             patterns in proptest::collection::vec(
-                "[a-z]{1,5}(\\.[a-z]{1,5}){0,3}|\\*\\.[a-z]{1,5}(\\.[a-z]{1,5}){0,2}",
+                "[a-z]{1,5}(\\.[a-z]{1,5}){0,3}|\\*\\.[a-z]{1,5}(\\.[a-z]{1,5}){0,2}|\\+\\.[a-z]{1,5}(\\.[a-z]{1,5}){0,2}|\\.[a-z]{1,5}(\\.[a-z]{1,5}){0,2}",
                 1..=20,
             ),
             queries in proptest::collection::vec(
@@ -872,6 +880,7 @@ mod tests {
     fn test_plus_wildcard() {
         let mut trie = DomainTrie::new();
         trie.insert("+.example.com", 1);
+        assert_eq!(trie.search("example.com"), Some(&1));
         assert_eq!(trie.search("www.example.com"), Some(&1));
         assert_eq!(trie.search("a.b.example.com"), Some(&1));
     }

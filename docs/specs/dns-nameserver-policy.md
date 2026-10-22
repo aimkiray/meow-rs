@@ -32,8 +32,10 @@ In scope:
 
 1. `nameserver_policy: { pattern: [nameservers] }` YAML field parsed
    in `meow-config/src/dns_parser.rs`.
-2. Domain patterns: exact domain and `+.` prefix (sub-domain wildcard:
-   `+.corp.internal` matches `corp.internal` and all subdomains).
+2. Domain patterns: exact (bare) domains and the wildcard prefixes `+.`
+   (apex plus any-depth subdomains), `*.` (exactly one subdomain label),
+   and `.` (any-depth subdomains, apex excluded) — the same four kinds
+   `DomainTrie` accepts everywhere else.
    No `geosite:` or `rule-set:` references in M1 — defer to M1.D-2
    and a later DNS-rules integration spec.
 3. Nameserver URLs per policy entry: same URL syntax as M1.E-1
@@ -91,7 +93,9 @@ Field reference — `nameserver-policy`:
 | Format | Meaning |
 |--------|---------|
 | `"exact.domain": [servers]` | Exact match on `exact.domain`. |
-| `"+.sub.domain": [servers]` | Matches `sub.domain` and all subdomains (`*.sub.domain`). |
+| `"+.sub.domain": [servers]` | Matches `sub.domain` itself and all subdomains at any depth. |
+| `"*.sub.domain": [servers]` | Matches exactly one subdomain label (`a.sub.domain`); neither `sub.domain` nor `a.b.sub.domain`. |
+| `".sub.domain": [servers]` | Matches subdomains at any depth (`a.sub.domain`, `a.b.sub.domain`); never `sub.domain` itself. |
 | `"geosite:<cat>[,<cat>]": [servers]` | Matches domains in the geosite DB category/ies. Requires a loaded geosite DB; skipped with a warning if absent. |
 | `"rule-set:<name>[,<name>]": [servers]` | Matches domains in the named rule-provider. Provider behavior must be `domain` (or `classical`, warned); `ipcidr` is a hard error; a missing provider is a hard error. |
 | Value is a string | Treated as a single-element list. |
@@ -106,7 +110,7 @@ Field reference — `fallback-filter`:
 | `geoip` | bool | `true` | Enable GeoIP gate. If primary result IP is **not** in `geoip-code` country → trigger fallback. |
 | `geoip-code` | string | `"CN"` | Two-letter country code checked by GeoIP gate. |
 | `ipcidr` | `[]string` | `[]` | Additional IP ranges. Primary result IP in any range → trigger fallback. |
-| `domain` | `[]string` | `[]` | Domain patterns (`+.prefix` or exact). Domain match → always trigger fallback, skip primary result entirely. |
+| `domain` | `[]string` | `[]` | Domain patterns (exact, `+.`, `*.`, or `.` — same kinds as `nameserver-policy` keys). Domain match → always trigger fallback, skip primary result entirely. |
 
 **Divergences from upstream** (classified per
 [ADR-0002](../adr/0002-upstream-divergence-policy.md)):
@@ -117,7 +121,7 @@ Field reference — `fallback-filter`:
 | 2 | `dhcp://` nameserver — upstream supports | B | Warn-once at parse time; entry skipped. |
 | 3 | `fallback-filter.geoip: true` with no MMDB — upstream errors at startup | B | We treat as `geoip: false` with `warn!`. Single-resolver configs are valid without a GeoIP DB. NOT a startup error. |
 | 4 | nameserver-policy entry with no valid nameservers (all skipped) → upstream panics | A | Hard parse error: "nameserver-policy entry 'KEY' has no valid nameservers after skipping unsupported prefixes." A policy entry with zero valid nameservers silently routes the configured domain to global nameservers — a potential DNS leakage for internal/corporate domains. Fail loudly. |
-| 5 | fallback-filter `domain` patterns use the same `+.` syntax as nameserver-policy — upstream uses plain glob | — | We match: `+.google.cn` means `google.cn` and all subdomains. Consistent with nameserver-policy patterns. |
+| 5 | fallback-filter `domain` pattern syntax | — | We match upstream: entries feed `DomainSetBuilder.Insert` there, `DomainTrie::insert` here — bare/`+.`/`*.`/`.` all follow the canonical matrix. Consistent with nameserver-policy patterns. |
 
 **Upstream naming note:** upstream Go mihomo calls a similar concept `fake-ip-filter` in some contexts (for the nameserver-policy domain-bypass feature). Our `fallback-filter.domain` is the equivalent mechanism. Users grepping upstream terminology should be aware of this naming difference.
 
@@ -159,7 +163,7 @@ pub struct PolicyEntry {
 pub struct NameserverPolicy {
     // Exact matches: "example.com" → entry
     exact: HashMap<String, PolicyEntry>,
-    // Wildcard matches: trie for "+.corp.internal" patterns
+    // Wildcard matches: trie for "+.", "*.", and "." prefixed patterns
     // Uses DomainTrie from meow-trie (same trie as rule matching)
     wildcard: DomainTrie<PolicyEntry>,
 }
@@ -310,7 +314,7 @@ boilerplate of a manual `FuturesUnordered` loop.
 
 - [ ] Update `RawDns` in `raw.rs` to add `nameserver_policy` and `fallback_filter` fields.
 - [ ] Parse `nameserver-policy` entries in `dns_parser.rs`:
-      — domain key → exact or `+.` wildcard.
+      — domain key → exact (bare) or `+.`/`*.`/`.` wildcard.
       — value string OR list → Vec<String> URLs.
       — warn-once and skip unknown-prefix entries (`geosite:`, `rule-set:`).
 - [ ] Parse `fallback-filter` fields in `dns_parser.rs`.

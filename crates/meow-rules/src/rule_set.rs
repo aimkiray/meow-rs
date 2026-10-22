@@ -344,16 +344,10 @@ impl DomainRuleSetBuilder {
         if entry.is_empty() {
             return Ok(());
         }
-        let inserted = self.trie.insert(entry, ());
-        // `+.foo.com` should match both the bare `foo.com` and any
-        // subdomain (upstream mihomo semantics). `DomainTrie::insert`
-        // only registers the wildcards; also insert the bare host.
-        let bare_inserted = if let Some(rest) = entry.strip_prefix("+.") {
-            self.trie.insert(rest, ())
-        } else {
-            true
-        };
-        if inserted || bare_inserted {
+        // `+.foo.com` covers both the bare `foo.com` and any subdomain
+        // (upstream mihomo semantics) — `DomainTrie::insert` handles both
+        // halves natively, no supplementary bare insert.
+        if self.trie.insert(entry, ()) {
             self.count += 1;
             Ok(())
         } else {

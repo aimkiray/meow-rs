@@ -41,7 +41,7 @@ struct TrieNode {
 
 ### BloomMap (value-bearing path) -- 0% FPR
 
-Used when `T` carries data (e.g. `DomainTrie<(usize, Arc<str>)>` in the
+Used when `T` carries data (e.g. `DomainTrie<usize>` in the
 match engine). Three bloom filters provide fast rejection; three
 `HashMap<String, T>` provide exact value retrieval on hits.
 
@@ -74,8 +74,9 @@ h_i(x) = h1 + i * h2  (mod num_bits)    for i in 0..10
 | Star | `"example.com"` | `"sub.example.com"` (single-label prefix only) | `*.example.com` |
 | Dot | `"example.com"` | `"any.depth.example.com"` (any prefix depth) | `.example.com` |
 
-The `+.example.com` syntax (mihomo convention) inserts **both** star and
-dot entries, plus a bare exact entry for the apex domain.
+The `+.example.com` syntax (mihomo convention) inserts **both** an exact
+entry (the apex itself) and a dot entry (any-depth subdomains) — no star
+entry, no separate bare insert.
 
 ## Trie structure (TrieCheck path)
 
@@ -84,7 +85,7 @@ Labels are stored in reverse order: `google.com` becomes `com -> google`.
 ```
 root
 ├── com
-│   ├── google  [exact ✓, star ✓, dot ✓]   ← +.google.com
+│   ├── google  [exact ✓, dot ✓]           ← +.google.com
 │   │   └── www [exact ✓]                   ← DOMAIN,www.google.com
 │   ├── bilibili [exact ✓, dot ✓]           ← +.bilibili.com
 │   └── example [star ✓]                    ← *.example.com
@@ -99,18 +100,21 @@ search(query):
   labels = query.rsplit('.')           // ["com", "google", "www"]
   n = labels.len()
   node = root
+  best = none
 
   for d in 0..n:
     child = node.children[labels[d]]
-    if child is None -> no match
+    if child is None -> break          // deeper walk impossible; keep best
     node = child
     remaining = n - d - 1
 
-    if remaining == 0 AND node.exact -> match
-    if remaining == 1 AND node.star  -> match    // single-label prefix
-    if remaining > 0  AND node.dot   -> match    // any-depth prefix
+    if remaining == 0 AND node.exact -> return exact   // apex: immediate hit
+    if remaining == 1:
+        if node.star -> best = star                    // single-label prefix
+        elif node.dot -> best = dot                    // dot fallback at depth 1
+    if remaining > 1 AND node.dot -> best = dot        // any-depth prefix
 
-  -> no match
+  -> best   // deepest recorded wildcard wins; none -> no match
 ```
 
 The `remaining == 1` check enforces single-label star semantics:
@@ -129,8 +133,9 @@ DomainRuleSet::from_entries(["example.com", "+.google.com", ...])
   -> first search() call triggers compile() -> TrieCheck
 ```
 
-For `+.domain` entries, `DomainRuleSet` also inserts the bare domain to
-match mihomo semantics (apex + all subdomains).
+`+.domain` entries are covered natively by the trie's exact + dot slots;
+`DomainRuleSet::from_entries` inserts each entry verbatim — apex plus all
+subdomains, per mihomo semantics.
 
 ### GeositeDB
 
@@ -141,7 +146,7 @@ category gets its own independently-sized trie. Supports both MRS
 
 ### Other consumers
 
-- **DomainIndex** (`meow-tunnel/src/match_engine.rs`) -- `DomainTrie<(usize, Arc<str>)>`, uses BloomMap path
+- **DomainIndex** (`meow-tunnel/src/match_engine.rs`) -- `DomainTrie<usize>`, uses BloomMap path
 - **NameserverPolicy** (`meow-dns/src/resolver.rs`) -- `DomainTrie<PolicyEntry>`, uses BloomMap path
 - **FallbackFilter** (`meow-dns/src/resolver.rs`) -- `DomainTrie<()>`, uses TrieCheck path
 - **Fake-IP Skipper** (`meow-dns/src/fakeip.rs`) -- `DomainTrie<()>`, uses TrieCheck path

@@ -81,7 +81,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — DoT (`tls://`) | ✓ | See §DNS. |
 | `dns:` — DoQ (`quic://`) | ✗ | Deferred to M1.E-6/M2. Hard error (not silent). |
 | `dns:` — `default-nameserver` | ✓ | Bootstrap resolver for encrypted upstream hostnames. |
-| `dns:` — `nameserver-policy` | ✓ | Exact, wildcard, and `geosite:` policy keys. |
+| `dns:` — `nameserver-policy` | ✓ | Exact, `+.`/`*.`/`.` wildcard, `geosite:`/`rule-set:` policy keys. |
 | `dns:` — `fallback-filter` | ✓ | GeoIP/IP-CIDR/domain gates. |
 | `dns:` — `hosts` + `use-system-hosts` | ✓ | M1.E-5, wildcards supported. |
 | `dns:` — `fake-ip` mode | ✓ | v4/v6 pools, `fake-ip-filter`, `fake-ip-filter-mode`, `store-fake-ip` JSON persistence. See §fake-ip mode. |
@@ -498,7 +498,7 @@ dns:
   fake-ip-filter:
     - "+.local"
     - "+.lan"
-    - "example.corp"                  # plain entry = suffix match
+    - "example.corp"                  # plain entry = exact match only
   fake-ip-filter-mode: blacklist      # default; whitelist also accepted
   store-fake-ip: true                 # optional: persist mappings across restart
 ```
@@ -507,8 +507,10 @@ dns:
   allocatable is `network + 4`. Effective capacity = `prefix_size − 4`.
   Sequential cursor, wraps on exhaustion and evicts the oldest mapping.
 - **Filter.** `BlackList` (default) routes matched hosts through the real
-  resolver; `WhiteList` does the opposite. Plain entries are treated as
-  suffixes (`example.com` matches `example.com` and any subdomain).
+  resolver; `WhiteList` does the opposite. Plain entries are exact matches
+  (`example.com` matches only `example.com` — same as upstream DomainSet
+  semantics); use `+.example.com` for apex + any-depth subdomains, `*.` for
+  exactly one label, `.` for any-depth subdomains excluding the apex.
 - **AAAA in v4-only configs.** Returns NOERROR-empty so clients fall back
   to IPv4 cleanly. To allocate v6 fake IPs, point `fake-ip-range` at an
   IPv6 prefix (e.g. `fc00::/64`).
@@ -526,12 +528,13 @@ Fully supported (M1.E-5). Wildcard entries:
 
 ```yaml
 hosts:
-  "*.corp.internal": "10.0.0.50"     # + Go syntax also accepted (see below)
-  "+.corp.internal": "10.0.0.50"     # equivalent; stored identically
+  "*.corp.internal": "10.0.0.50"     # single-label wildcard: one sub-label only
+  "+.corp.internal": "10.0.0.50"     # apex + any-depth subdomains (NOT equivalent)
 ```
 
-`*.example.com` is rewritten to `+.example.com` internally at parse time.
-Both syntaxes work in config.
+Both syntaxes work in config and are stored verbatim: `*.` matches exactly
+one subdomain label, `+.` covers the apex plus subdomains at any depth, and
+`.` covers any-depth subdomains excluding the apex.
 
 ---
 

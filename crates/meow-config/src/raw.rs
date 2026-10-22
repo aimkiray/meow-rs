@@ -415,8 +415,9 @@ pub struct RawDns {
     /// If true, `/etc/hosts` is read at startup and merged (lower priority than
     /// top-level `hosts` config entries). No-op + warn on Windows.
     pub use_system_hosts: Option<bool>,
-    /// Per-domain nameserver routing: each key is an exact domain or a `+.`
-    /// wildcard prefix; value is a single server URL or a list of URLs.
+    /// Per-domain nameserver routing: each key is an exact domain or a `+.` /
+    /// `*.` / `.` wildcard prefix; value is a single server URL or a list of
+    /// URLs.
     pub nameserver_policy: Option<HashMap<String, RawNspValue>>,
     /// Controls when the `fallback:` nameservers replace the primary result.
     pub fallback_filter: Option<RawFallbackFilter>,

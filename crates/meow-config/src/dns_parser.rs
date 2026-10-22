@@ -543,7 +543,19 @@ async fn build_nameserver_policy(
                 continue;
             }
 
-            if key_lower.starts_with("+.") {
+            // Upstream `parseNameServerPolicy` (config_config.go) validates
+            // every non-prefixed domain key with `ValidAndSplitDomain` and
+            // feeds it to a single `domainTriePolicy` (`DomainTrie.Insert`),
+            // so `+.`/`*.`/`.`/bare keys all carry wildcard semantics there.
+            // Route all three wildcard prefixes to the trie the same way;
+            // bare keys keep the Exact fast path. meow stays lenient on
+            // degenerate keys: empty rests are dropped by `DomainTrie::insert`
+            // returning false; a mid-string `*` (e.g. `a.*.b`) does not start
+            // with `*.` and stays a literal Exact key (DR-B F4/F15 unchanged).
+            if key_lower.starts_with("+.")
+                || key_lower.starts_with("*.")
+                || key_lower.starts_with('.')
+            {
                 patterns.push(PolicyPattern::Wildcard(key_lower));
             } else if !key_lower.is_empty() {
                 patterns.push(PolicyPattern::Exact(key_lower));
@@ -848,12 +860,7 @@ fn build_fallback_filter(
 
     let mut domain: DomainTrie<()> = DomainTrie::new();
     for s in domain_strs {
-        let pattern = normalize_hosts_wildcard(s);
-        domain.insert(&pattern, ());
-        // DomainTrie's +. doesn't include the root — insert root explicitly.
-        if let Some(bare) = pattern.strip_prefix("+.") {
-            domain.insert(bare, ());
-        }
+        domain.insert(s, ());
     }
 
     // Attempt to load GeoIP MMDB for the geoip gate.
@@ -922,7 +929,7 @@ fn build_hosts_trie(
                 Ok(ip) => HostEntry::Addresses(vec![ip]),
                 Err(_) => {
                     let alias = parse_host_alias(raw, host)?;
-                    aliases.push((normalize_hosts_wildcard(host.trim()), alias.clone()));
+                    aliases.push((host.trim().to_string(), alias.clone()));
                     HostEntry::Alias(alias.into())
                 }
             }
@@ -939,20 +946,16 @@ fn build_hosts_trie(
             }
             HostEntry::Addresses(ips)
         };
-        // Rewrite *.foo → +.foo for DomainTrie wildcard semantics at parse time.
-        let entry = normalize_hosts_wildcard(host.trim());
-        if !trie.insert(&entry, host_entry.clone()) {
+        // Keys go in as written: `*.foo` is a single-label wildcard, `+.foo`
+        // covers the apex plus any-depth subdomains, a bare key is exact.
+        if !trie.insert(host.trim(), host_entry) {
             if strict {
                 return Err(anyhow::anyhow!(
-                    "hosts: '{entry}' is not a valid domain pattern (strict mode)"
+                    "hosts: '{}' is not a valid domain pattern (strict mode)",
+                    host.trim()
                 ));
             }
             warn!("hosts: failed to insert '{}' into trie", host);
-        }
-        // DomainTrie's +. semantics don't include the root domain itself — insert
-        // it explicitly so that "corp.internal" matches "+.corp.internal".
-        if let Some(bare) = entry.strip_prefix("+.") {
-            trie.insert(bare, host_entry);
         }
     }
     reject_host_alias_cycles(&trie, &aliases)?;
@@ -1056,15 +1059,6 @@ async fn parse_system_hosts() -> Vec<(String, Vec<IpAddr>)> {
         }
     }
     out.into_iter().collect()
-}
-
-/// Convert `*.example.com` → `+.example.com` for DomainTrie wildcard semantics.
-fn normalize_hosts_wildcard(s: &str) -> String {
-    if let Some(rest) = s.strip_prefix("*.") {
-        format!("+.{rest}")
-    } else {
-        s.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -1601,20 +1595,25 @@ mod tests {
         assert!(trie.search("corp.example").is_some());
     }
 
-    // *.foo is rewritten to +.foo at parse time.
-    // Upstream: uses plain glob. NOT glob — we use +. semantics (consistent with nameserver-policy).
+    // `*.foo` is a single-label wildcard (upstream mihomo `*` consumes exactly
+    // one label): matches one subdomain label, neither the root nor deeper
+    // subdomains.
     #[test]
-    fn build_hosts_trie_star_wildcard_rewritten() {
+    fn build_hosts_trie_star_wildcard_single_label() {
         let mut map = HashMap::new();
         map.insert("*.corp.internal".to_string(), one("10.0.0.50"));
         let trie = build_hosts_trie(Some(&map), false).unwrap();
         assert!(
             trie.search("foo.corp.internal").is_some(),
-            "subdomain of *.corp.internal must match"
+            "single-label subdomain of *.corp.internal must match"
         );
         assert!(
-            trie.search("corp.internal").is_some(),
-            "root of *.corp.internal must match (+. includes root)"
+            trie.search("corp.internal").is_none(),
+            "root must not match *.corp.internal"
+        );
+        assert!(
+            trie.search("a.b.corp.internal").is_none(),
+            "deep subdomain must not match *.corp.internal"
         );
     }
 
@@ -1738,6 +1737,77 @@ mod tests {
         assert!(pol.lookup("foo.corp.internal").is_some());
         assert!(pol.lookup("corp.internal").is_some());
         assert!(pol.lookup("other.example").is_none());
+    }
+
+    // `*.` policy keys are single-label wildcards (upstream DomainTrie
+    // parity): one subdomain label hits; the apex and deeper levels miss.
+    #[tokio::test]
+    async fn parse_nameserver_policy_star_key_single_label() {
+        use crate::raw::RawNspValue;
+        let mut map = HashMap::new();
+        map.insert(
+            "*.corp.internal".to_string(),
+            RawNspValue::One("192.168.1.53".to_string()),
+        );
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
+            .await
+            .unwrap();
+        assert!(
+            pol.lookup("foo.corp.internal").is_some(),
+            "single-label subdomain of *.corp.internal must hit"
+        );
+        assert!(
+            pol.lookup("corp.internal").is_none(),
+            "apex must not match *.corp.internal"
+        );
+        assert!(
+            pol.lookup("a.b.corp.internal").is_none(),
+            "deep subdomain must not match *.corp.internal"
+        );
+        // (Corner: a literal `lookup("*.corp.internal")` DOES hit — the `*`
+        // query label is consumed by the star slot like any label, matching
+        // upstream `Search`. Not asserted here; degenerate-key coverage is
+        // A3's table.)
+    }
+
+    // `.` policy keys are any-depth suffix wildcards excluding the apex.
+    #[tokio::test]
+    async fn parse_nameserver_policy_dot_key_any_depth_no_apex() {
+        use crate::raw::RawNspValue;
+        let mut map = HashMap::new();
+        map.insert(
+            ".corp.internal".to_string(),
+            RawNspValue::One("192.168.1.53".to_string()),
+        );
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
+            .await
+            .unwrap();
+        assert!(pol.lookup("foo.corp.internal").is_some());
+        assert!(
+            pol.lookup("a.b.corp.internal").is_some(),
+            "deep subdomain must match .corp.internal"
+        );
+        assert!(
+            pol.lookup("corp.internal").is_none(),
+            "apex must not match .corp.internal"
+        );
+    }
+
+    // Bare policy keys stay exact-only alongside the newly wildcarded kinds.
+    #[tokio::test]
+    async fn parse_nameserver_policy_bare_key_stays_exact() {
+        use crate::raw::RawNspValue;
+        let mut map = HashMap::new();
+        map.insert(
+            "corp.internal".to_string(),
+            RawNspValue::One("192.168.1.53".to_string()),
+        );
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
+            .await
+            .unwrap();
+        assert!(pol.lookup("corp.internal").is_some());
+        assert!(pol.lookup("a.corp.internal").is_none());
+        assert!(pol.lookup("a.b.corp.internal").is_none());
     }
 
     // Helper: build an inline rule-provider map from `(name, behavior, payload)`.
@@ -1924,12 +1994,28 @@ mod tests {
         assert!(!ff.domain_gated("www.google.com"));
     }
 
-    // normalize_hosts_wildcard converts *.foo → +.foo.
+    // Fallback-filter domain gate: `*.foo` is a single-label wildcard
+    // (upstream mihomo `*` consumes exactly one label) — one subdomain label
+    // hits, neither the root nor deeper subdomains.
     #[test]
-    fn normalize_wildcard_converts_star() {
-        assert_eq!(normalize_hosts_wildcard("*.example.com"), "+.example.com");
-        assert_eq!(normalize_hosts_wildcard("+.example.com"), "+.example.com");
-        assert_eq!(normalize_hosts_wildcard("example.com"), "example.com");
+    fn build_fallback_filter_domain_gate_star_single_label() {
+        use crate::raw::RawFallbackFilter;
+        let raw = RawFallbackFilter {
+            geoip: Some(false),
+            geoip_code: None,
+            ipcidr: None,
+            domain: Some(vec!["*.fb.test".to_string()]),
+        };
+        let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
+        assert!(
+            ff.domain_gated("a.fb.test"),
+            "single-label subdomain of *.fb.test must match"
+        );
+        assert!(!ff.domain_gated("fb.test"), "root must not match *.fb.test");
+        assert!(
+            !ff.domain_gated("a.b.fb.test"),
+            "deep subdomain must not match *.fb.test"
+        );
     }
 
     // --- nameserver-policy `#PROXY` fragments -----------------------------

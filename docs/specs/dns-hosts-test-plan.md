@@ -15,7 +15,8 @@ spec can be updated.
 **In scope:**
 
 - `use-hosts: bool` toggle (default true) checked at query time.
-- `*.foo` wildcard entries stored as `+.foo` — root and subdomain coverage.
+- `*.foo` wildcard entries stored verbatim — single-label subdomain
+  coverage only (root NOT included; `+.foo` covers root + any depth).
 - Exact host entry takes priority over wildcard for the same parent domain.
 - `use-system-hosts: bool` toggle; `/etc/hosts` parse on Unix; no-op+warn on Windows.
 - `dns.hosts` config entries override `/etc/hosts` entries for the same domain.
@@ -103,9 +104,9 @@ The `system_hosts_path: None` path skips `/etc/hosts` loading entirely
 |---|------|---------|
 | B1 | `wildcard_matches_subdomain` | Entry `*.corp.internal: 10.0.0.50`; query A `foo.corp.internal` → `10.0.0.50`. <br/> Upstream: `component/hosts/hosts.go`. NOT NXDOMAIN. NOT no-answer. |
 | B2 | `wildcard_matches_different_subdomain` | Same `*.corp.internal` entry; query A `bar.corp.internal` → `10.0.0.50`. Guards that wildcard is not key-exact (NOT `foo.corp.internal` hardcoded). |
-| B3 | `wildcard_matches_root_domain` | Entry `*.corp.internal: 10.0.0.50`; query A `corp.internal` → `10.0.0.50`. Root is included per `+.` semantics. NOT NXDOMAIN. |
-| B4 | `wildcard_star_rewritten_to_plus_dot` **[guard-rail]** | Inspect the trie after loading `*.corp.internal`; assert the stored key is `+.corp.internal` NOT `*.corp.internal`. The `*` → `+.` rewrite must happen at parse time, not at query time. |
-| B5 | `wildcard_does_not_match_grandchild_beyond_one_label` | Entry `*.corp.internal`; query A `a.b.corp.internal`. If the DomainTrie `+.` semantics match only one label deep, assert NXDOMAIN / upstream. If `+.` is recursive (matches all depths), assert the hosts value. **Document the actual trie behavior here with a comment citing `meow-trie::search` — do not guess.** |
+| B3 | `wildcard_does_not_match_root_domain` | Entry `*.corp.internal: 10.0.0.50`; query A `corp.internal` → NOT matched by the wildcard (upstream fallback / NXDOMAIN). `*.` is single-label; only `+.corp.internal` includes the root. |
+| B4 | `wildcard_star_stored_verbatim` **[guard-rail]** | Inspect the trie after loading `*.corp.internal`; assert `corp.internal` does NOT match — there is no `*` → `+.` rewrite; the stored form is the single-label `*.` star kind, NOT `+.`. |
+| B5 | `wildcard_does_not_match_grandchild_beyond_one_label` | Entry `*.corp.internal`; query A `a.b.corp.internal` → NOT matched (upstream / NXDOMAIN). Resolved per `meow-trie::search`: `*.` (star) consumes exactly one label; `+.` is the any-depth form. |
 
 ---
 

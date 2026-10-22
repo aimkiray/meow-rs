@@ -609,18 +609,6 @@ fn build_combined_trie() -> DomainTrie<()> {
         trie.insert(domain, ());
     }
 
-    // Also insert bare domains for +. entries (mihomo semantics)
-    for domain in &all_lists {
-        if let Some(rest) = domain.strip_prefix("+.") {
-            trie.insert(rest, ());
-        }
-    }
-    for domain in &cn {
-        if let Some(rest) = domain.strip_prefix("+.") {
-            trie.insert(rest, ());
-        }
-    }
-
     trie
 }
 
@@ -846,9 +834,6 @@ fn bloom_rules_per_category_mismatch_below_1_percent() {
         let mut trie: DomainTrie<()> = DomainTrie::new();
         for domain in domains {
             trie.insert(domain, ());
-            if let Some(rest) = domain.strip_prefix("+.") {
-                trie.insert(rest, ());
-            }
         }
 
         let mut false_positives = 0u64;
@@ -1002,7 +987,6 @@ fn build_trie_from_clash_rules(rules: &[&str]) -> DomainTrie<()> {
         if let Some((domain, is_suffix)) = parse_clash_domain_rule(rule) {
             if is_suffix {
                 trie.insert(&format!("+.{domain}"), ());
-                trie.insert(domain, ());
             } else {
                 trie.insert(domain, ());
             }
@@ -1808,7 +1792,6 @@ fn realworld_combined_all_configs_mismatch_below_1_percent() {
         if let Some((domain, is_suffix)) = parse_clash_domain_rule(rule) {
             if is_suffix {
                 trie.insert(&format!("+.{domain}"), ());
-                trie.insert(domain, ());
             } else {
                 trie.insert(domain, ());
             }
@@ -1818,7 +1801,6 @@ fn realworld_combined_all_configs_mismatch_below_1_percent() {
         if let Some((domain, is_suffix)) = parse_clash_domain_rule(rule) {
             if is_suffix {
                 trie.insert(&format!("+.{domain}"), ());
-                trie.insert(domain, ());
             } else {
                 trie.insert(domain, ());
             }

@@ -758,29 +758,12 @@ impl Skipper {
             if pat.is_empty() {
                 continue;
             }
-            // Plain entries are treated as suffix-match per upstream
-            // (`fake-ip-filter: ["example.com"]` should skip *.example.com).
-            // If the user explicitly prefixed with `+.` or `*.` or `.`,
-            // pass through unchanged.
-            // Plain / `+.` entries match the root domain too — this matches
-            // upstream `fake-ip-filter` semantics where `example.com` skips
-            // both `example.com` and `*.example.com`. `DomainTrie`'s `+.`
-            // wildcard alone does NOT include the root (see
-            // `NameserverPolicy::insert_wildcard`), so we insert the bare
-            // domain explicitly in those cases.
-            let (suffix_pattern, also_insert_bare): (String, Option<&str>) =
-                if let Some(rest) = pat.strip_prefix("+.") {
-                    (pat.to_string(), Some(rest))
-                } else if pat.starts_with("*.") || pat.starts_with('.') {
-                    (pat.to_string(), None)
-                } else {
-                    (format!("+.{pat}"), Some(pat))
-                };
-            let mut ok = trie.insert(&suffix_pattern, ());
-            if let Some(bare) = also_insert_bare {
-                ok = trie.insert(bare, ()) || ok;
-            }
-            if ok {
+            // Entries go in as written, matching upstream fake-ip-filter's
+            // DomainSet semantics: a plain `example.com` is an EXACT match
+            // only (NOT a suffix), `+.` covers the root plus any-depth
+            // subdomains, `*.` covers exactly one label, `.` covers
+            // subdomains at any depth excluding the root.
+            if trie.insert(pat, ()) {
                 inserted += 1;
             } else {
                 warn!("fakeip: skipper ignoring unparsable pattern '{}'", raw);
@@ -1124,14 +1107,15 @@ mod tests {
                 host: "other.test",
                 expect_skip: true,
             },
-            // A plain entry is a suffix match that also covers the root, and
-            // must respect label boundaries (not a raw substring match).
+            // A plain entry is an exact match (upstream DomainSet semantics):
+            // it covers only the root itself, never subdomains, and still
+            // respects label boundaries.
             Case {
                 label: "blacklist/plain/sub",
                 patterns: &["example.com"],
                 mode: SkipperMode::BlackList,
                 host: "foo.example.com",
-                expect_skip: true,
+                expect_skip: false,
             },
             Case {
                 label: "blacklist/plain/root",

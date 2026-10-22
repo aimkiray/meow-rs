@@ -28,8 +28,9 @@ In scope:
    entirely during DNS resolution. The trie is still built at startup; the
    toggle is checked at query time.
 2. Wildcard entries in `dns.hosts`: `"*.example.com": "1.2.3.4"` — matches
-   any single-label subdomain of `example.com`. Uses `DomainTrie` wildcard
-   semantics (same as `+.` in rules: matches root + subdomains).
+   any single-label subdomain of `example.com` (not the root, not deeper
+   levels). Uses `DomainTrie` wildcard semantics verbatim; `+.example.com`
+   is the distinct form that additionally covers the root and any depth.
 3. `use-system-hosts: bool` (default `true`) — read `/etc/hosts` at startup
    and merge entries into the trie (lower priority than `dns.hosts` config
    entries).
@@ -56,7 +57,7 @@ dns:
 
   hosts:
     "localhost": "127.0.0.1"
-    "*.corp.internal": "10.0.0.50"     # wildcard: any subdomain of corp.internal
+    "*.corp.internal": "10.0.0.50"     # wildcard: any single-label subdomain of corp.internal
     "dns.corp.internal": "10.0.0.53"   # exact match takes priority over wildcard
     "dual-stack.example.com":
       - "1.2.3.4"
@@ -124,9 +125,10 @@ fn parse_system_hosts() -> Vec<(String, Vec<IpAddr>)> {
 
 ### Wildcard lookup
 
-`DomainTrie` already supports wildcard semantics via `+.` prefix in rules.
-Hosts wildcard `*.example.com` is stored as `+.example.com` internally
-(with `*` → `+.` rewrite at parse time) and resolves via the trie's existing
+`DomainTrie` already supports wildcard semantics via its `*.`, `+.`, and
+`.` prefixes. Hosts keys are inserted verbatim — `*.example.com` stays a
+single-label `*.` pattern (there is no `*` → `+.` rewrite; configure `+.`
+directly for apex-inclusive coverage) and resolves via the trie's existing
 wildcard lookup. No new trie logic needed.
 
 ## Acceptance criteria
@@ -137,7 +139,8 @@ wildcard lookup. No new trie logic needed.
    upstream nameservers.
 3. `*.corp.internal: 10.0.0.50` → `foo.corp.internal` resolves to
    `10.0.0.50`; `bar.corp.internal` resolves to `10.0.0.50`; `corp.internal`
-   resolves to `10.0.0.50` (root included per `+.` semantics).
+   does NOT match and `a.b.corp.internal` does NOT match (`*.` is
+   single-label; `+.corp.internal` is the form that includes the root).
 4. Exact entry `dns.corp.internal: 10.0.0.53` overrides the wildcard
    `*.corp.internal: 10.0.0.50` for that specific hostname.
 5. `use-system-hosts: true` → `/etc/hosts` entries are included in resolution.
@@ -158,8 +161,9 @@ wildcard lookup. No new trie logic needed.
   Upstream: `dns/resolver.go::hostsTable`. NOT upstream IP returned.
 - `hosts_wildcard_matches_subdomain` — `*.corp.internal: 10.0.0.50`;
   query `foo.corp.internal` → 10.0.0.50. NOT NXDOMAIN.
-- `hosts_wildcard_matches_root` — `*.corp.internal`; query `corp.internal`
-  → 10.0.0.50 (root included). NOT NXDOMAIN.
+- `hosts_wildcard_matches_root` — `+.corp.internal`; query `corp.internal`
+  → the entry's value (root is included only for `+.`). A `*.corp.internal`
+  key must NOT match `corp.internal`.
 - `hosts_exact_overrides_wildcard` — both `*.corp.internal` and
   `dns.corp.internal`; query `dns.corp.internal` → exact match value.
   NOT wildcard value.
@@ -177,7 +181,8 @@ wildcard lookup. No new trie logic needed.
 
 - [ ] Verify `use-hosts` is checked at query time in `Resolver::resolve_ip()`
       (not just at trie-build time).
-- [ ] Rewrite `*.foo` patterns as `+.foo` at `dns.hosts` parse time.
+- [x] Insert `*.foo` / `+.foo` / `.foo` / bare keys verbatim at `dns.hosts`
+      parse time (no `*.` → `+.` rewrite — `*.` is single-label).
 - [ ] Parse multi-value hosts (`[ip1, ip2]`) in `dns_parser.rs`.
 - [ ] Implement `parse_system_hosts()` for Unix; no-op + warn for Windows.
 - [ ] Wire system hosts population in `Resolver::new()` respecting priority.
