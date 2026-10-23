@@ -291,6 +291,7 @@ jobs:
             --test ws_test \
             --test crate_invariants_test \
             --test crate_publish_metadata_test \
+            --test yaml_backend_test \
             --test smux_singbox_integration --retries 2 --no-fail-fast
 
       # `-p meow-api` builds api_test WITHOUT `listener-tun` (meow-app's

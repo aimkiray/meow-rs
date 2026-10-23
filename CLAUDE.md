@@ -202,6 +202,7 @@ cargo test --lib --bin meow --bin meow-bench --bin meow-cli \
   --test subscription_refresh_test \
   --test tls_test --test boring_tls_test --test ws_test --test crate_invariants_test \
   --test crate_publish_metadata_test \
+  --test yaml_backend_test \
   --test smux_singbox_integration
 
 # `-p meow-api` builds api_test WITHOUT `listener-tun` (meow-app's `full`

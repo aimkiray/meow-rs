@@ -80,7 +80,14 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-serde_yaml = "0.9"
+# RUSTSEC-2024-0449: `unsafe-libyaml` — the c2rust translation of libyaml that
+# `serde_yaml` links — was archived by its author on 2024-03-25 and is no
+# longer maintained. `serde_norway` is the maintained fork of the same
+# `serde_yaml` 0.9.34 source with the same public API; the only difference is
+# the libyaml backend, which comes from the maintained `unsafe-libyaml-norway`
+# fork instead of the archived crate. The dependency keeps the name
+# `serde_yaml` so every `serde_yaml::` path in the tree is unaffected.
+serde_yaml = { package = "serde_norway", version = "0.9" }
 
 # Networking
 # anytls is vendored in-tree as `crates/meow-anytls` (lib name `anytls_rs`).
