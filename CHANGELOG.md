@@ -44,6 +44,22 @@ the canonical, in-repo source a release is cut from.
   links the system library instead. An iOS or tvOS embedder that enables
   `logbook` adds `-lsqlite3` to its app's link. Every other target still
   bundles SQLite.
+- **Domain patterns follow mihomo's semantics everywhere** (#795): `x.com`
+  matches only `x.com`, `*.x.com` exactly one label below it, `.x.com`
+  subdomains at any depth but not `x.com`, and `+.x.com` both `x.com` and
+  every subdomain. Some existing configs now match fewer names:
+  - a plain `fake-ip-filter` entry such as `example.com` no longer covers
+    its subdomains; write `+.example.com` for the old behavior;
+  - `*.foo` in `hosts` and `fallback-filter.domain` matches one label only,
+    no longer `foo` itself or deeper names (it was rewritten to `+.foo`);
+  - a `.x.com` entry in an upstream `.mrs` domain rule-set no longer
+    matches `x.com`.
+
+  Others now match what they always should have: `nameserver-policy` keys
+  starting with `*.` or `.` take effect (they silently never matched
+  before), `+.` covers the apex in sniffer `force-domain` / `skip-domain`,
+  and non-ASCII entries in `.mrs` domain rule-sets load instead of being
+  dropped.
 
 ### Security
 
