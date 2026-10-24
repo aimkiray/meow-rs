@@ -1708,7 +1708,13 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
 /// keys), those sections join the comparison — the resolver snapshots
 /// them at build time.
 fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
-    let base = a.dns == b.dns && a.hosts == b.hosts && a.ipv6 == b.ipv6 && a.geodata == b.geodata;
+    // `geox-url` is the top-level alias for `geodata.url.*` — it feeds the
+    // same `parse_geodata` result, so it joins the DNS-input comparison.
+    let base = a.dns == b.dns
+        && a.hosts == b.hosts
+        && a.ipv6 == b.ipv6
+        && a.geodata == b.geodata
+        && a.geox_url == b.geox_url;
     if !base || !(dns_uses_runtime_refs(a) || dns_uses_runtime_refs(b)) {
         return base;
     }
@@ -4495,6 +4501,24 @@ mod tests {
                 && !dns_uses_runtime_refs(&raw_plain)
                 && !dns_uses_runtime_refs(&raw_plain)
         );
+    }
+
+    /// `geox-url` feeds `parse_geodata`, which feeds the DNS build — two
+    /// raws that differ ONLY in `geox-url` must compare unequal, otherwise a
+    /// `PUT /configs` that touches just the alias would be judged unchanged
+    /// and skip the resolver-side geodata reparse.
+    #[test]
+    fn dns_inputs_equal_counts_geox_url() {
+        let raw_a: RawConfig =
+            serde_yaml::from_str("dns:\n  enable: true\n  nameserver:\n    - 223.5.5.5\n").unwrap();
+        let raw_b: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver:\n    - 223.5.5.5\n\
+             geox-url:\n  mmdb: https://cdn.test/Country.mmdb\n",
+        )
+        .unwrap();
+        assert!(!dns_inputs_equal(&raw_a, &raw_b));
+        assert!(!dns_inputs_equal(&raw_b, &raw_a));
+        assert!(dns_inputs_equal(&raw_b, &raw_b));
     }
 
     /// Issue #533 review: `swap_config_and_reconcile_tun` compares the TUN

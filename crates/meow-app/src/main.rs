@@ -629,14 +629,13 @@ type EarlyOutboundBinding = Option<std::convert::Infallible>;
 ///
 /// The binding is per-socket and applied at creation, so any socket opened
 /// before it exists stays unbound for life: the config build's provider /
-/// geodata / ECH fetches, the startup geodata download, provider and
-/// subscription refreshes, health-check probes and DNS upstreams all run
-/// before the TUN listener comes up, and a session they leave open (QUIC,
-/// mux, pooled DNS TCP) re-enters the TUN as soon as the split default
-/// routes go in — looping until it times out. Installing here, between
-/// parsing the raw document and building it, precedes every one of those
-/// sockets; the TUN listener then adopts the binding instead of installing
-/// its own (`TunListener::with_outbound_binding`).
+/// geodata / ECH fetches, provider and subscription refreshes, health-check
+/// probes and DNS upstreams all run before the TUN listener comes up, and a
+/// session they leave open (QUIC, mux, pooled DNS TCP) re-enters the TUN as
+/// soon as the split default routes go in — looping until it times out.
+/// Installing here, between parsing the raw document and building it,
+/// precedes every one of those sockets; the TUN listener then adopts the
+/// binding instead of installing its own (`TunListener::with_outbound_binding`).
 ///
 /// Shares [`meow_api::preinstall_global_route_binding`] with the config
 /// reload paths, so startup and reload agree on when a binding is due: a
@@ -1236,42 +1235,12 @@ async fn run(
         });
     }
 
-    // Fetch any missing geodata DBs on startup (unconditional — independent of
-    // geodata.auto-update). Runs in the background so listener startup is not
-    // blocked; rules are rebuilt and the DNS resolver republished afterward
-    // if anything was downloaded.
-    {
-        let geodata = config.geodata.clone();
-        let tunnel = tunnel.clone();
-        let raw_config = Arc::clone(&raw_config);
-        let rule_providers = Arc::clone(&rule_providers);
-        let proxy_providers = Arc::clone(&proxy_providers);
-        let dns_server = Arc::clone(&dns_server_handle);
-        // Rebuild context mirrors startup: a `--config-string` run had no
-        // backing file, so provider `path:`/fakeip resolution must see the
-        // same `cache_dir: None` here (issue #717). Geodata download
-        // targets resolve under the `-d`/XDG home independently.
-        let cache_dir = config_path
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .map(meow_config::resource_cache_dir_for_config_path);
-        tokio::spawn(async move {
-            meow_app::geodata_fetch::run_on_startup(
-                geodata,
-                tunnel,
-                raw_config,
-                rule_providers,
-                proxy_providers,
-                dns_server,
-                cache_dir,
-            )
-            .await;
-        });
-    }
-
-    // Spawn geodata auto-update task if enabled.
+    // Spawn geodata auto-update task if enabled. `geo_needs` is the
+    // startup snapshot of which DBs the config references — the tick
+    // refreshes only those.
     if config.geodata.auto_update {
         let geodata = config.geodata.clone();
+        let geo_needs = config.geo_needs;
         let tunnel = tunnel.clone();
         let raw_config = Arc::clone(&raw_config);
         let rule_providers = Arc::clone(&rule_providers);
@@ -1288,6 +1257,7 @@ async fn run(
         tokio::spawn(async move {
             meow_app::geodata_fetch::auto_update_loop(
                 geodata,
+                geo_needs,
                 tunnel,
                 raw_config,
                 rule_providers,

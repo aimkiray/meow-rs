@@ -1,5 +1,5 @@
 use crate::internal_http;
-use crate::raw::RawGeoDataConfig;
+use crate::raw::{RawGeoDataConfig, RawGeoXUrl};
 use anyhow::anyhow;
 use meow_common::adapter::Proxy;
 use std::path::{Path, PathBuf};
@@ -26,6 +26,10 @@ pub struct GeoDataConfig {
     pub mmdb_url: String,
     pub asn_url: String,
     pub geosite_url: String,
+    /// `geodata.proxy` verbatim — resolved against the built proxy map by
+    /// `resolve_geodata_download_proxy` at download time (`DIRECT` and the
+    /// other built-in terminal names mean "fetch direct").
+    pub proxy: Option<String>,
 }
 
 impl Default for GeoDataConfig {
@@ -39,15 +43,51 @@ impl Default for GeoDataConfig {
             mmdb_url: DEFAULT_MMDB_URL.to_string(),
             asn_url: DEFAULT_ASN_URL.to_string(),
             geosite_url: DEFAULT_GEOSITE_URL.to_string(),
+            proxy: None,
         }
     }
 }
 
-/// Parse and validate the raw `geodata:` block. Returns `GeoDataConfig::default()`
-/// when the block is absent.
-pub fn parse_geodata(raw: Option<&RawGeoDataConfig>) -> Result<GeoDataConfig, anyhow::Error> {
+/// Parse and validate the raw `geodata:` block plus the top-level
+/// `geox-url:` alias. Returns `GeoDataConfig::default()` when both are
+/// absent — `geox-url` on its own (no `geodata:` block) is enough to
+/// override the download URLs.
+///
+/// URL precedence is per key: `geodata.url.*` > `geox-url.*` > baked-in
+/// default. `geox-url.geoip` is accepted and ignored with a warning —
+/// mihomo points it at `geoip.dat` and meow-rs has no geoip.dat consumer.
+pub fn parse_geodata(
+    raw: Option<&RawGeoDataConfig>,
+    geox: Option<&RawGeoXUrl>,
+) -> Result<GeoDataConfig, anyhow::Error> {
+    if geox.and_then(|g| g.geoip.as_ref()).is_some() {
+        warn!(
+            "geox-url.geoip: meow-rs has no geoip.dat consumer — the key is \
+             ignored. To override the GeoIP MMDB download URL use \
+             `geox-url.mmdb` or `geodata.url.mmdb`"
+        );
+    }
+
+    // `geodata.url.*` wins; `geox-url.*` fills in what it leaves unset;
+    // the baked-in default is last. Each key merges independently.
+    let pick = |explicit: Option<&String>, alias: Option<&String>, default: &str| {
+        explicit
+            .or(alias)
+            .cloned()
+            .unwrap_or_else(|| default.to_string())
+    };
+
     let Some(r) = raw else {
-        return Ok(GeoDataConfig::default());
+        return Ok(GeoDataConfig {
+            mmdb_url: pick(None, geox.and_then(|g| g.mmdb.as_ref()), DEFAULT_MMDB_URL),
+            asn_url: pick(None, geox.and_then(|g| g.asn.as_ref()), DEFAULT_ASN_URL),
+            geosite_url: pick(
+                None,
+                geox.and_then(|g| g.geosite.as_ref()),
+                DEFAULT_GEOSITE_URL,
+            ),
+            ..GeoDataConfig::default()
+        });
     };
 
     // Warn on upstream-only fields (Class B per ADR-0002 §geodata-subsection.md).
@@ -91,15 +131,22 @@ pub fn parse_geodata(raw: Option<&RawGeoDataConfig>) -> Result<GeoDataConfig, an
         geosite_path: r.geosite_path.as_deref().map(PathBuf::from),
         auto_update: r.auto_update,
         auto_update_interval: interval,
-        mmdb_url: urls
-            .and_then(|u| u.mmdb.clone())
-            .unwrap_or_else(|| DEFAULT_MMDB_URL.to_string()),
-        asn_url: urls
-            .and_then(|u| u.asn.clone())
-            .unwrap_or_else(|| DEFAULT_ASN_URL.to_string()),
-        geosite_url: urls
-            .and_then(|u| u.geosite.clone())
-            .unwrap_or_else(|| DEFAULT_GEOSITE_URL.to_string()),
+        mmdb_url: pick(
+            urls.and_then(|u| u.mmdb.as_ref()),
+            geox.and_then(|g| g.mmdb.as_ref()),
+            DEFAULT_MMDB_URL,
+        ),
+        asn_url: pick(
+            urls.and_then(|u| u.asn.as_ref()),
+            geox.and_then(|g| g.asn.as_ref()),
+            DEFAULT_ASN_URL,
+        ),
+        geosite_url: pick(
+            urls.and_then(|u| u.geosite.as_ref()),
+            geox.and_then(|g| g.geosite.as_ref()),
+            DEFAULT_GEOSITE_URL,
+        ),
+        proxy: r.proxy.clone(),
     })
 }
 
@@ -160,7 +207,9 @@ pub async fn download_and_replace(
         info!("auto-update: downloading {} from {}", dest.display(), url);
     }
 
-    let bytes = internal_http::fetch(url, proxy, &[])
+    // Geodata-only opt-in: a failed proxy dial retries direct — see
+    // `internal_http::fetch_or_direct` for the connect-phase-only contract.
+    let bytes = internal_http::fetch_or_direct(url, proxy, &[])
         .await
         .map_err(|e| anyhow!("fetching {url}: {e}"))?;
 
@@ -196,9 +245,13 @@ mod tests {
         RawGeoDataConfig::default()
     }
 
+    fn parse(raw: Option<&RawGeoDataConfig>) -> Result<GeoDataConfig, anyhow::Error> {
+        parse_geodata(raw, None)
+    }
+
     #[test]
     fn absent_block_returns_defaults() {
-        let cfg = parse_geodata(None).unwrap();
+        let cfg = parse(None).unwrap();
         assert!(!cfg.auto_update);
         assert_eq!(cfg.auto_update_interval, 24);
         assert!(cfg.mmdb_path.is_none());
@@ -207,6 +260,7 @@ mod tests {
         assert!(cfg.mmdb_url.contains("country.mmdb"));
         assert!(cfg.asn_url.contains("GeoLite2-ASN"));
         assert!(cfg.geosite_url.contains("geosite.dat"));
+        assert!(cfg.proxy.is_none());
     }
 
     #[test]
@@ -217,7 +271,7 @@ mod tests {
             geosite_path: Some("/custom/geosite.mrs".to_string()),
             ..raw_defaults()
         };
-        let cfg = parse_geodata(Some(&raw)).unwrap();
+        let cfg = parse(Some(&raw)).unwrap();
         assert_eq!(
             cfg.mmdb_path.unwrap().to_str().unwrap(),
             "/custom/Country.mmdb"
@@ -239,10 +293,20 @@ mod tests {
             }),
             ..raw_defaults()
         };
-        let cfg = parse_geodata(Some(&raw)).unwrap();
+        let cfg = parse(Some(&raw)).unwrap();
         assert_eq!(cfg.mmdb_url, "https://example.com/country.mmdb");
         assert!(cfg.asn_url.contains("GeoLite2-ASN")); // default preserved
         assert_eq!(cfg.geosite_url, "https://example.com/geosite.mrs");
+    }
+
+    #[test]
+    fn proxy_passthrough() {
+        let raw = RawGeoDataConfig {
+            proxy: Some("HK 01".to_string()),
+            ..raw_defaults()
+        };
+        let cfg = parse(Some(&raw)).unwrap();
+        assert_eq!(cfg.proxy.as_deref(), Some("HK 01"));
     }
 
     #[test]
@@ -251,7 +315,7 @@ mod tests {
             auto_update_interval: Some(0),
             ..raw_defaults()
         };
-        let err = parse_geodata(Some(&raw)).unwrap_err();
+        let err = parse(Some(&raw)).unwrap_err();
         assert!(
             err.to_string().contains("at least 1 hour"),
             "error should mention minimum interval: {err}"
@@ -265,7 +329,7 @@ mod tests {
             auto_update_interval: None,
             ..raw_defaults()
         };
-        let cfg = parse_geodata(Some(&raw)).unwrap();
+        let cfg = parse(Some(&raw)).unwrap();
         assert_eq!(cfg.auto_update_interval, 24);
     }
 
@@ -279,6 +343,193 @@ mod tests {
             ..raw_defaults()
         };
         // Must not error — warn-only (Class B per ADR-0002).
-        parse_geodata(Some(&raw)).unwrap();
+        parse(Some(&raw)).unwrap();
+    }
+
+    // ── geox-url alias ────────────────────────────────────────────
+
+    /// `geox-url` alone (no `geodata:` block) must still take effect —
+    /// the early return for a missing `geodata:` section must not skip it.
+    #[test]
+    fn geox_url_alone_overrides_defaults() {
+        let geox = RawGeoXUrl {
+            mmdb: Some("https://cdn.test/Country.mmdb".to_string()),
+            asn: Some("https://cdn.test/ASN.mmdb".to_string()),
+            geosite: None,
+            geoip: None,
+        };
+        let cfg = parse_geodata(None, Some(&geox)).unwrap();
+        assert_eq!(cfg.mmdb_url, "https://cdn.test/Country.mmdb");
+        assert_eq!(cfg.asn_url, "https://cdn.test/ASN.mmdb");
+        assert!(
+            cfg.geosite_url.contains("geosite.dat"),
+            "unset keys keep the baked-in default"
+        );
+    }
+
+    /// `geodata.url.*` beats `geox-url.*` per key — keys the explicit
+    /// block leaves unset still fall through to the alias.
+    #[test]
+    fn geodata_url_wins_over_geox_per_key() {
+        let raw = RawGeoDataConfig {
+            url: Some(RawGeoDataUrls {
+                mmdb: Some("https://explicit.test/Country.mmdb".to_string()),
+                asn: None,
+                geosite: None,
+            }),
+            ..raw_defaults()
+        };
+        let geox = RawGeoXUrl {
+            mmdb: Some("https://alias.test/Country.mmdb".to_string()),
+            asn: Some("https://alias.test/ASN.mmdb".to_string()),
+            geosite: Some("https://alias.test/geosite.dat".to_string()),
+            geoip: None,
+        };
+        let cfg = parse_geodata(Some(&raw), Some(&geox)).unwrap();
+        assert_eq!(
+            cfg.mmdb_url, "https://explicit.test/Country.mmdb",
+            "geodata.url.mmdb beats geox-url.mmdb"
+        );
+        assert_eq!(
+            cfg.asn_url, "https://alias.test/ASN.mmdb",
+            "asn falls through to the alias"
+        );
+        assert_eq!(
+            cfg.geosite_url, "https://alias.test/geosite.dat",
+            "geosite falls through to the alias"
+        );
+    }
+
+    /// `geox-url.geoip` must be ignored, not folded into `mmdb` — upstream
+    /// points it at `geoip.dat`, which has no consumer here.
+    #[test]
+    fn geox_url_geoip_is_ignored() {
+        let geox = RawGeoXUrl {
+            geoip: Some("https://alias.test/geoip.dat".to_string()),
+            ..RawGeoXUrl::default()
+        };
+        let cfg = parse_geodata(None, Some(&geox)).unwrap();
+        assert!(
+            cfg.mmdb_url.contains("country.mmdb"),
+            "geoip must not leak into the mmdb URL: {}",
+            cfg.mmdb_url
+        );
+    }
+
+    /// An empty `geox-url:` map changes nothing.
+    #[test]
+    fn empty_geox_url_is_a_noop() {
+        let cfg = parse_geodata(None, Some(&RawGeoXUrl::default())).unwrap();
+        assert_eq!(cfg.mmdb_url, DEFAULT_MMDB_URL);
+        assert_eq!(cfg.asn_url, DEFAULT_ASN_URL);
+        assert_eq!(cfg.geosite_url, DEFAULT_GEOSITE_URL);
+    }
+
+    // ── download_and_replace (geodata-only direct fallback) ────────────
+
+    /// A `Proxy` whose `dial_tcp` always fails — models an unreachable
+    /// upstream so the connect phase itself errors.
+    struct FailingDialProxy {
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for FailingDialProxy {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            _m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported(
+                "failing: connect refused".into(),
+            ))
+        }
+        async fn dial_udp(
+            &self,
+            _m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            Err(meow_common::MeowError::NotSupported(
+                "failing: dial_udp".into(),
+            ))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for FailingDialProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// Serve `response` to every accepted connection — the geodata direct
+    /// fallback dials a second time after the proxy dial fails, so the
+    /// origin must accept more than once.
+    async fn spawn_test_origin(response: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream.write_all(response).await;
+                });
+            }
+        });
+        format!("http://{addr}/Country.mmdb")
+    }
+
+    /// Integration pin for the geodata-only opt-in: a configured download
+    /// proxy whose connect phase fails must NOT sink the download — the
+    /// fetch retries direct (`internal_http::fetch_or_direct`) and the
+    /// file lands on disk.
+    #[tokio::test]
+    async fn download_and_replace_falls_back_to_direct_after_dial_failure() {
+        let url = spawn_test_origin(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc").await;
+        let proxy: Arc<dyn Proxy> = Arc::new(FailingDialProxy {
+            health: meow_common::ProxyHealth::new(),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("Country.mmdb");
+        download_and_replace(&url, &dest, Some(&proxy))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+    }
+
+    /// A working direct fetch still lands without any proxy configured.
+    #[tokio::test]
+    async fn download_and_replace_direct_writes_file() {
+        let url = spawn_test_origin(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nxy").await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("geosite.dat");
+        download_and_replace(&url, &dest, None).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"xy");
     }
 }

@@ -262,7 +262,7 @@ Upstream config keys documented at https://wiki.metacubex.one/. Checking `crates
 | `profile` | `store-selected`, `store-fake-ip`, tracing flags |
 | `experimental` | Various flags (`sniff-tls-sni`, etc.) |
 | `sniffer` | TLS/HTTP sniffer config (SNI, Host header extraction) |
-| `geodata-mode`, `geo-auto-update`, `geox-url`, `geodata-loader` | GeoIP/GeoSite DB management |
+| `geodata-mode`, `geo-auto-update`, `geodata-loader` | GeoIP/GeoSite DB management |
 | `global-client-fingerprint` | Reality/uTLS fingerprint |
 | `global-ua` | User-Agent override for subscription fetch |
 | `keep-alive-interval` | TCP keepalive |
@@ -275,6 +275,13 @@ Upstream config keys documented at https://wiki.metacubex.one/. Checking `crates
 | `proxy-providers` | External proxy lists (http/file) |
 | `tun` | **Excluded** |
 | `dns.store-fake-ip` | Recognised at `dns:` block (JSON persistence). Top-level `profile.store-fake-ip` still missing. |
+
+`geox-url` is **implemented** (removed from the missing list): a top-level
+flat alias for `geodata.url.*` with per-key precedence
+`geodata.url.*` > `geox-url.*` > built-in default. Its `geoip` key is
+accepted but warns and is ignored — upstream points it at `geoip.dat`,
+which meow-rs has no consumer for (the GeoIP MMDB URL lives under
+`geox-url.mmdb` / `geodata.url.mmdb`).
 
 ### DNS section sub-keys
 

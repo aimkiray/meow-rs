@@ -25,7 +25,7 @@ use smol_str::SmolStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::debug;
+use tracing::{debug, warn};
 use url::Url;
 
 const MAX_REDIRECTS: u8 = 5;
@@ -167,7 +167,27 @@ pub async fn fetch_response(
     proxy: Option<&Arc<dyn Proxy>>,
     headers: &[(String, String)],
 ) -> Result<Response> {
-    fetch_capped(url, proxy, headers, MAX_BODY_BYTES).await
+    fetch_capped(url, proxy, headers, MAX_BODY_BYTES, false).await
+}
+
+/// [`fetch`] with an opt-in direct fallback, used only by the geodata
+/// downloader: when the FIRST request's proxy dial fails (connect-phase
+/// only — the `CONNECT_TIMEOUT` bound included), a warn is logged and the
+/// whole fetch restarts with `proxy: None`. Post-dial failures (TLS
+/// handshake, HTTP status, body framing) and dials on redirect hops NEVER
+/// fall back — a mid-chain failure must not silently leak egress past the
+/// proxy the config routed the download through.
+///
+/// Deliberately NOT used by provider/subscription fetches: an explicit
+/// `proxy:` there loud-fails instead of degrading to direct (issue #625).
+pub(crate) async fn fetch_or_direct(
+    url: &str,
+    proxy: Option<&Arc<dyn Proxy>>,
+    headers: &[(String, String)],
+) -> Result<Vec<u8>> {
+    fetch_capped(url, proxy, headers, MAX_BODY_BYTES, true)
+        .await
+        .map(|response| response.body)
 }
 
 /// A terminal 2xx response, after redirects.
@@ -193,18 +213,20 @@ impl Response {
 
 /// [`fetch_response`] with the body cap as a parameter, so tests can
 /// exercise the oversize paths without transferring hundreds of megabytes.
+/// `direct_fallback` is the [`fetch_or_direct`] opt-in described there.
 async fn fetch_capped(
     url: &str,
     proxy: Option<&Arc<dyn Proxy>>,
     headers: &[(String, String)],
     limit: usize,
+    direct_fallback: bool,
 ) -> Result<Response> {
     let mut current = Url::parse(url).map_err(|e| anyhow!("invalid URL '{url}': {e}"))?;
     let mut headers = headers.to_vec();
-    for _ in 0..=MAX_REDIRECTS {
-        match fetch_one(&current, proxy, &headers, limit).await? {
-            Outcome::Body(response) => return Ok(response),
-            Outcome::Redirect(next) => {
+    for attempt in 0..=MAX_REDIRECTS {
+        match fetch_one(&current, proxy, &headers, limit).await {
+            Ok(Outcome::Body(response)) => return Ok(response),
+            Ok(Outcome::Redirect(next)) => {
                 let next = current
                     .join(&next)
                     .map_err(|e| anyhow!("bad redirect Location '{next}': {e}"))?;
@@ -223,6 +245,18 @@ async fn fetch_capped(
                 }
                 current = next;
             }
+            Err(e) => {
+                // Only the very first hop's proxy-dial failure may fall
+                // back: `attempt == 0` guards a mid-redirect dial error
+                // from silently going direct, and `ProxyDialFailed`
+                // confines the retry to the connect phase — TLS, HTTP
+                // status and body errors keep their loud failure.
+                if direct_fallback && attempt == 0 && e.is::<ProxyDialFailed>() {
+                    warn!("{e:#}; falling back to a direct fetch");
+                    return Box::pin(fetch_capped(url, None, &headers, limit, false)).await;
+                }
+                return Err(e);
+            }
         }
     }
     bail!("too many redirects (> {MAX_REDIRECTS}) starting from {url}")
@@ -231,6 +265,27 @@ async fn fetch_capped(
 enum Outcome {
     Body(Response),
     Redirect(String),
+}
+
+/// Marker wrapping a proxy-dial failure from `fetch_one`. It exists so the
+/// [`fetch_or_direct`] opt-in can distinguish "the connect phase through
+/// the configured proxy never got a socket" (eligible for a direct retry)
+/// from every later failure, which stays loud. Display/`source` forward to
+/// the wrapped error, so error messages and downcast chains are unchanged
+/// for callers that never opt in.
+#[derive(Debug)]
+struct ProxyDialFailed(anyhow::Error);
+
+impl std::fmt::Display for ProxyDialFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for ProxyDialFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
 }
 
 async fn fetch_one(
@@ -288,12 +343,12 @@ async fn fetch_one(
             let conn = tokio::time::timeout(CONNECT_TIMEOUT, proxy.dial_tcp(&metadata))
                 .await
                 .map_err(|_| {
-                    anyhow!(
+                    ProxyDialFailed(anyhow!(
                         "dial via proxy '{}' timed out after {CONNECT_TIMEOUT:?}",
                         proxy.name()
-                    )
+                    ))
                 })?
-                .map_err(|e| anyhow!("dial via proxy '{}': {e}", proxy.name()))?;
+                .map_err(|e| ProxyDialFailed(anyhow!("dial via proxy '{}': {e}", proxy.name())))?;
             Box::new(conn)
         }
         None => {
@@ -683,7 +738,7 @@ mod tests {
     async fn response_bytes_capped_rejects_oversize_content_length() {
         let url =
             spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nshort").await;
-        let err = fetch_capped(&url, None, &[], 16).await.unwrap_err();
+        let err = fetch_capped(&url, None, &[], 16, false).await.unwrap_err();
         assert!(
             err.to_string().contains("exceeds max body size"),
             "unexpected error: {err}"
@@ -699,7 +754,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n",
         )
         .await;
-        let err = fetch_capped(&url, None, &[], 8).await.unwrap_err();
+        let err = fetch_capped(&url, None, &[], 8, false).await.unwrap_err();
         assert!(
             err.to_string().contains("exceeds max body size"),
             "unexpected error: {err}"
@@ -709,7 +764,7 @@ mod tests {
     #[tokio::test]
     async fn response_bytes_capped_accepts_body_within_limit() {
         let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello").await;
-        let response = fetch_capped(&url, None, &[], 16).await.unwrap();
+        let response = fetch_capped(&url, None, &[], 16, false).await.unwrap();
         assert_eq!(response.body, b"hello");
     }
 
@@ -1091,5 +1146,303 @@ mod tests {
         // Surrounding whitespace is trimmed before lookup.
         assert!(resolve_download_proxy(&registry, Some(" front ")).is_ok());
         assert!(resolve_download_proxy(&registry, Some("missing")).is_err());
+    }
+
+    /// `Proxy` whose `dial_tcp` fails immediately — models an adapter whose
+    /// upstream is unreachable so the connect phase itself errors.
+    struct FailingDialProxy {
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for FailingDialProxy {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            _m: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported(
+                "failing: connect refused".into(),
+            ))
+        }
+        async fn dial_udp(
+            &self,
+            _m: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            Err(meow_common::MeowError::NotSupported(
+                "failing: dial_udp".into(),
+            ))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for FailingDialProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// `Proxy` that succeeds the first `dial_tcp` and fails the second —
+    /// pins "only the first hop's dial failure may fall back": a mid-chain
+    /// (redirect-hop) dial error must NOT retry the fetch direct.
+    struct FailOnSecondDialProxy {
+        dials: std::sync::atomic::AtomicUsize,
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for FailOnSecondDialProxy {
+        fn name(&self) -> &str {
+            "fail-second"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            _m: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            if self.dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                // First dial "succeeds" — stand up a loopback stream pair
+                // so the request can be written and the redirect read.
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let (server, _) = listener.accept().await.unwrap();
+                // Speak the HTTP/1.1 redirect the test origin would send.
+                tokio::spawn(async move {
+                    let mut server = server;
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = [0u8; 2048];
+                    let _ = server.read(&mut buf).await;
+                    let _ = server
+                        .write_all(
+                            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/next\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await;
+                });
+                return Ok(Box::new(client));
+            }
+            Err(meow_common::MeowError::NotSupported(
+                "fail-second: second dial refused".into(),
+            ))
+        }
+        async fn dial_udp(
+            &self,
+            _m: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            Err(meow_common::MeowError::NotSupported(
+                "fail-second: dial_udp".into(),
+            ))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for FailOnSecondDialProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// The geodata-only fallback: a failed proxy dial on the FIRST hop
+    /// retries the fetch direct and still returns the body.
+    #[tokio::test]
+    async fn fetch_or_direct_falls_back_on_initial_dial_failure() {
+        let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let proxy: Arc<dyn Proxy> = Arc::new(FailingDialProxy {
+            health: meow_common::ProxyHealth::new(),
+        });
+        let body = tokio::time::timeout(
+            Duration::from_secs(5),
+            fetch_or_direct(&url, Some(&proxy), &[]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(body, b"ok");
+    }
+
+    /// Without the opt-in the same failing dial stays a loud error.
+    #[tokio::test]
+    async fn fetch_does_not_fall_back_without_opt_in() {
+        let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let proxy: Arc<dyn Proxy> = Arc::new(FailingDialProxy {
+            health: meow_common::ProxyHealth::new(),
+        });
+        let err = fetch(&url, Some(&proxy), &[]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("dial via proxy"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A dial failure on a REDIRECT hop is mid-chain — it must surface as
+    /// an error rather than restarting the fetch direct (attempt 0 only).
+    #[tokio::test]
+    async fn fetch_or_direct_does_not_fall_back_after_redirect() {
+        let proxy: Arc<dyn Proxy> = Arc::new(FailOnSecondDialProxy {
+            dials: std::sync::atomic::AtomicUsize::new(0),
+            health: meow_common::ProxyHealth::new(),
+        });
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            fetch_or_direct("http://example.invalid/start", Some(&proxy), &[]),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("dial via proxy"),
+            "the second-hop dial failure must stay loud: {err}"
+        );
+    }
+
+    /// A failed proxy dial times out the first hop and still falls back
+    /// when the opt-in is on — the CONNECT_TIMEOUT marker counts as a
+    /// connect-phase failure too.
+    #[tokio::test(start_paused = true)]
+    async fn fetch_or_direct_falls_back_on_dial_timeout() {
+        let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let proxy: Arc<dyn Proxy> = Arc::new(HangingProxy {
+            health: meow_common::ProxyHealth::new(),
+        });
+        let body = fetch_or_direct(&url, Some(&proxy), &[]).await.unwrap();
+        assert_eq!(body, b"ok");
+    }
+
+    /// `Proxy` whose `dial_tcp` SUCCEEDS by connecting to a fixed upstream
+    /// address — models a working proxy whose origin then answers an HTTP
+    /// error.
+    struct StaticDialProxy {
+        addr: std::net::SocketAddr,
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for StaticDialProxy {
+        fn name(&self) -> &str {
+            "static-dial"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            _m: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            let stream = tokio::net::TcpStream::connect(self.addr).await?;
+            Ok(Box::new(stream))
+        }
+        async fn dial_udp(
+            &self,
+            _m: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            Err(meow_common::MeowError::NotSupported(
+                "static-dial: dial_udp".into(),
+            ))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for StaticDialProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// The other arm of "connect-phase only": the dial succeeds but the
+    /// origin answers HTTP 5xx — a post-dial failure, so NO direct retry
+    /// may run. Proof: the fetch URL itself is a healthy origin, so a
+    /// fallback would have returned its body; the 5xx must surface.
+    #[tokio::test]
+    async fn fetch_or_direct_does_not_fall_back_on_http_error() {
+        let bad_url = spawn_raw_http_server(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let good_url =
+            spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let bad_addr = bad_url
+            .strip_prefix("http://")
+            .and_then(|s| s.strip_suffix('/'))
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .unwrap();
+        let proxy: Arc<dyn Proxy> = Arc::new(StaticDialProxy {
+            addr: bad_addr,
+            health: meow_common::ProxyHealth::new(),
+        });
+        let err = fetch_or_direct(&good_url, Some(&proxy), &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("HTTP 500"),
+            "the post-dial 5xx must stay loud, no direct retry: {err}"
+        );
     }
 }

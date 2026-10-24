@@ -138,6 +138,12 @@ pub struct RawGeoDataConfig {
     pub auto_update_interval: Option<u32>,
     /// Download URL overrides. Defaults baked in when absent.
     pub url: Option<RawGeoDataUrls>,
+    /// Outbound to download the databases through: `DIRECT` (or any
+    /// built-in terminal name) fetches direct, a proxy/group name routes
+    /// the download through that adapter. Unset = the default egress
+    /// (last `MATCH` target, else `proxies[0]`). Unknown names warn and
+    /// fall through to the same default.
+    pub proxy: Option<String>,
     // Upstream-only fields accepted for forward-compat; we warn-once and ignore.
     pub geodata_mode: Option<serde_yaml::Value>,
     pub geodata_loader: Option<serde_yaml::Value>,
@@ -151,6 +157,25 @@ pub struct RawGeoDataUrls {
     pub mmdb: Option<String>,
     pub asn: Option<String>,
     pub geosite: Option<String>,
+}
+
+/// Top-level `geox-url:` block (mihomo's flat alias for `geodata.url.*`).
+///
+/// Each key overrides the corresponding baked-in download URL, but loses
+/// to the same key under `geodata.url.*` — precedence is per-key
+/// `geodata.url > geox-url > default`, not block-level.
+///
+/// `geoip` is accepted for config-porting compatibility and warned on:
+/// mihomo maps it to the V2Ray `geoip.dat` artifact and meow-rs has no
+/// geoip.dat consumer — the GeoIP MMDB URL lives under `mmdb` (upstream
+/// `geoip:`-as-MMDB configs should move the value there).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct RawGeoXUrl {
+    pub mmdb: Option<String>,
+    pub asn: Option<String>,
+    pub geosite: Option<String>,
+    pub geoip: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -230,6 +255,10 @@ pub struct RawConfig {
     pub authentication: Option<Vec<String>>,
     pub skip_auth_prefixes: Option<Vec<String>>,
     pub geodata: Option<RawGeoDataConfig>,
+    /// Top-level `geox-url:` — mihomo's flat download-URL alias. Merged
+    /// into [`GeoDataConfig`](crate::GeoDataConfig) by
+    /// `geodata::parse_geodata` below `geodata.url.*`.
+    pub geox_url: Option<RawGeoXUrl>,
     /// TUN inbound (issue #326) — mihomo-compatible `tun:` section.
     /// Requires a build with the `listener-tun` feature.
     pub tun: Option<RawTun>,

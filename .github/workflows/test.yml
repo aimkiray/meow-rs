@@ -284,7 +284,6 @@ jobs:
             --test kcptun_e2e \
             --test pre_resolve_test \
             --test offline_config_test \
-            --test geodata_fetch_test \
             --test subscription_refresh_test \
             --test tls_test \
             --test boring_tls_test \

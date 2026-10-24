@@ -47,6 +47,25 @@ the canonical, in-repo source a release is cut from.
   logbook entry. `--json` prints each member's verdict for scripts that
   prune a front group. A proxy that cannot run over another proxy's
   stream, like hysteria2, is refused (422).
+- **`geodata.proxy`, an egress override for database downloads**: names
+  the outbound geodata fetches ride — a `proxies:` entry or a
+  `proxy-groups:` name (a `select` group dials its persisted or first
+  member), or a built-in terminal name (`DIRECT`, `REJECT`,
+  `REJECT-DROP`, `COMPATIBLE`, `PASS`, `PASS-RULE`, case-insensitive)
+  for direct. Unset, the download takes the config's default egress —
+  the last top-level `MATCH` target — then the first `proxies:` entry;
+  a blank or unknown name warns and falls through to the same default.
+  When the first dial through that proxy fails, the fetch warns and
+  retries once direct — a geodata-only fallback provider and
+  subscription downloads deliberately do not share.
+- **The top-level `geox-url` alias**: mihomo's flat spelling of
+  `geodata.url.*` is now read too, merged per key below the explicit
+  block — `geodata.url.mmdb` beats `geox-url.mmdb`, which beats the
+  baked-in CDN default, and `geox-url` alone (no `geodata:` section)
+  is enough. Its `geoip` key is accepted and ignored with a warning:
+  upstream points it at `geoip.dat`, which meow has no consumer for —
+  the GeoIP MMDB URL lives under `geox-url.mmdb` or
+  `geodata.url.mmdb`.
 
 ### Changed
 
@@ -73,6 +92,35 @@ the canonical, in-repo source a release is cut from.
   before), `+.` covers the apex in sniffer `force-domain` / `skip-domain`,
   and non-ASCII entries in `.mrs` domain rule-sets load instead of being
   dropped.
+- **Geodata downloads are reference-driven now**: meow no longer
+  backfills all three databases at boot — a config that references none
+  of them (no `GEOIP`/`SRC-GEOIP`, `IP-ASN`/`SRC-IP-ASN` or `GEOSITE`
+  rules, no `geosite:` nameserver-policy key, no DNS fallback filter
+  needing geoip) downloads nothing, where it previously fetched some
+  21 MB through whatever happened to be `proxies[0]`. Two edges of the
+  reference set moved: an enabled `dns:` section with `fallback:`
+  nameservers and `fallback-filter.geoip` left at its default `true`
+  now counts the Country MMDB as needed and downloads it when missing;
+  and, as a narrowing, `geosite:` nameserver-policy keys under
+  `dns.enable: false` no longer count, since that policy is never
+  built — the download was already dead weight. Downloads through the
+  default egress follow the `geodata.proxy` / last `MATCH` /
+  `proxies[0]` chain described above instead of always taking the first
+  named proxy. With `geodata.auto-update: true` the periodic refresh
+  likewise re-downloads only the databases the startup config
+  referenced — the referenced set is a startup snapshot a `PUT
+  /configs` does not widen, the Country MMDB is still never a tick
+  target, and an all-false set leaves the tick a no-op.
+
+### Removed
+
+- **The unconditional startup geodata fetch**, from the meow-app
+  library surface: `geodata_fetch::run_on_startup`, `fetch_missing`,
+  `compute_targets` and `GeoTarget` are gone — the boot-time sweep that
+  downloaded every missing database whether or not the config used it.
+  Embedders driving the crate's FFI should drop those calls; startup
+  fetching now happens inside the config build, gated on what the
+  config references.
 
 ### Security
 

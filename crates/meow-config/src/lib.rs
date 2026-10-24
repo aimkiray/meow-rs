@@ -102,6 +102,12 @@ pub struct Config {
     pub auth: Arc<AuthConfig>,
     pub raw: raw::RawConfig,
     pub geodata: GeoDataConfig,
+    /// Which geodata databases this config's rules/DNS reference — computed
+    /// once at build time from the same scan that gates `ensure_geodata`.
+    /// The auto-update loop refreshes only these; it is a startup snapshot
+    /// and does not track later `PUT /configs` changes (same freeze as the
+    /// rebuild path's own geo-download semantics).
+    pub geo_needs: GeoDataNeeds,
 }
 
 pub struct GeneralConfig {
@@ -1188,7 +1194,7 @@ pub async fn parse_dns_from_raw(
     prior_resolver: Option<&meow_dns::Resolver>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<DnsConfig, anyhow::Error> {
-    let geo = geodata::parse_geodata(raw.geodata.as_ref())?;
+    let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
     let empty = rule_provider::PrefetchedPayloads::default();
     let payloads: &rule_provider::PrefetchedPayloads =
         prefetched_payloads.map_or(&empty, Arc::as_ref);
@@ -1713,15 +1719,14 @@ fn is_usable_global_target(name: &str, proxies: &HashMap<SmolStr, Arc<dyn Proxy>
         && proxies.contains_key(name)
 }
 
-/// Find the outbound a config is built around, preserving declaration order.
-/// The final valid `MATCH` target is authoritative; otherwise prefer the first
-/// successfully-built group, then the first successfully-built leaf proxy.
-fn primary_global_target<'a>(
-    raw: &'a raw::RawConfig,
-    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
-) -> Option<&'a str> {
-    let match_target = raw
-        .rules
+/// The target of the LAST top-level `MATCH,<target>` rule — the config's
+/// default egress. A `MATCH` line can only appear at top level (the rule
+/// parser rejects it inside logic rules and classical rule-sets; inside
+/// `sub-rules:` it is a block-local terminator, not the default route), so
+/// a scan of `raw.rules` is complete. Compared case-insensitively — the
+/// rule parser lowercases the rule type before dispatch.
+fn last_match_target(raw: &raw::RawConfig) -> Option<&str> {
+    raw.rules
         .as_deref()
         .unwrap_or(&[])
         .iter()
@@ -1732,7 +1737,17 @@ fn primary_global_target<'a>(
                 return None;
             }
             parts.next()
-        });
+        })
+}
+
+/// Find the outbound a config is built around, preserving declaration order.
+/// The final valid `MATCH` target is authoritative; otherwise prefer the first
+/// successfully-built group, then the first successfully-built leaf proxy.
+fn primary_global_target<'a>(
+    raw: &'a raw::RawConfig,
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+) -> Option<&'a str> {
+    let match_target = last_match_target(raw);
     if let Some(target) = match_target.filter(|target| is_usable_global_target(target, proxies)) {
         return Some(target);
     }
@@ -2960,21 +2975,69 @@ fn parse_sniffer_config(
     }
 }
 
+/// Which geodata databases this config actually references — the union of
+/// the rule-line scan (`GEOIP`/`SRC-GEOIP`, `IP-ASN`/`SRC-IP-ASN`,
+/// `GEOSITE`, including logic-rule and provider-payload occurrences) and
+/// the DNS-side consumers (`geosite:` nameserver-policy keys, the
+/// fallback-filter geoip gate).
+///
+/// Shared by `missing_geodata_downloads` (startup fetch gating) and the
+/// geodata auto-update tick, so "is this DB referenced" is one judgment —
+/// the tick's `GeoDataNeeds` snapshot and the startup download list can
+/// never drift apart.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GeoDataNeeds {
+    /// GeoIP Country MMDB (`Country.mmdb`) — GEOIP rules or the
+    /// fallback-filter geoip gate.
+    pub mmdb: bool,
+    /// GeoLite2-ASN MMDB — IP-ASN rules.
+    pub asn: bool,
+    /// geosite DB (`.dat`/`.mrs`) — GEOSITE rules or `geosite:` policy keys.
+    pub geosite: bool,
+}
+
+/// Compute [`GeoDataNeeds`] from a raw config and its geo scan lines
+/// ([`collect_geo_scan_lines`]). `pub(crate)` — `build_config` stores the
+/// result on [`Config::geo_needs`] for the auto-update loop.
+pub(crate) fn geo_references(raw: &raw::RawConfig, scan_lines: &[String]) -> GeoDataNeeds {
+    GeoDataNeeds {
+        mmdb: scan_lines.iter().any(|l| line_references_geoip(l))
+            || dns_fallback_filter_uses_geoip(raw),
+        asn: scan_lines.iter().any(|l| line_references_asn(l)),
+        geosite: scan_lines.iter().any(|l| line_references_geosite(l))
+            || dns_policy_uses_geosite(raw),
+    }
+}
+
+/// Whether the DNS fallback filter will load the GeoIP MMDB. Mirrors the
+/// `dns_parser::parse_dns` chain: the whole `dns:` block early-returns
+/// unless `enable: true` (the filter is never built), the filter is built
+/// only when `fallback:` nameservers exist, and its geoip gate defaults to
+/// `true` when `fallback-filter` is absent.
+fn dns_fallback_filter_uses_geoip(raw: &raw::RawConfig) -> bool {
+    let Some(dns) = raw.dns.as_ref() else {
+        return false;
+    };
+    if !dns.enable.unwrap_or(false) {
+        return false;
+    }
+    if dns.fallback.as_deref().unwrap_or(&[]).is_empty() {
+        return false;
+    }
+    dns.fallback_filter
+        .as_ref()
+        .and_then(|f| f.geoip)
+        .unwrap_or(true)
+}
+
 /// The geodata files this config's rules reference that are absent on disk —
 /// `(url, destination)` pairs in scan order. Shared between the prefetch-map
 /// gate in `build_config` and [`ensure_geodata`] so both agree on what a
-/// startup actually has to download.
-fn missing_geodata_downloads<'a>(
-    raw: &raw::RawConfig,
-    geo: &'a GeoDataConfig,
-    scan_lines: &[String],
-) -> Vec<(&'a String, PathBuf)> {
-    let needs_geoip = scan_lines.iter().any(|l| line_references_geoip(l));
-    let needs_asn = scan_lines.iter().any(|l| line_references_asn(l));
-    let needs_geosite =
-        scan_lines.iter().any(|l| line_references_geosite(l)) || dns_policy_uses_geosite(raw);
-
-    if !needs_geoip && !needs_asn && !needs_geosite {
+/// startup actually has to download. `needs` is the
+/// [`geo_references`] verdict for this config — computing it once keeps the
+/// "is this DB referenced" judgment in one place.
+fn missing_geodata_downloads(geo: &GeoDataConfig, needs: GeoDataNeeds) -> Vec<(&String, PathBuf)> {
+    if !needs.mmdb && !needs.asn && !needs.geosite {
         return Vec::new();
     }
 
@@ -2985,9 +3048,9 @@ fn missing_geodata_downloads<'a>(
         .clone()
         .unwrap_or_else(default_geosite_path);
 
-    let geoip_missing = needs_geoip && !geoip_path.exists();
-    let asn_missing = needs_asn && !asn_path.exists();
-    let geosite_missing = needs_geosite
+    let geoip_missing = needs.mmdb && !geoip_path.exists();
+    let asn_missing = needs.asn && !asn_path.exists();
+    let geosite_missing = needs.geosite
         && geo.geosite_path.as_ref().map_or_else(
             || {
                 meow_rules::geosite::default_geosite_candidates()
@@ -3008,6 +3071,78 @@ fn missing_geodata_downloads<'a>(
         downloads.push((&geo.geosite_url, geosite_path));
     }
     downloads
+}
+
+/// Built-in terminal adapter names that mean "fetch directly" for geodata
+/// downloads: `DIRECT`/`COMPATIBLE` are the honest answer, and the
+/// Reject-shaped builtins (`REJECT`/`REJECT-DROP`/`PASS`/`PASS-RULE`) can
+/// never complete a dial, so naming them is treated as an explicit "don't
+/// proxy this" rather than a dial-and-fall-back (fail-fast, no warn noise).
+/// The set is [`BUILTIN_ADAPTER_NAMES`] — the built-ins a `proxies:`/
+/// `proxy-groups:` entry cannot shadow — compared case-insensitively like
+/// the rule parser.
+fn is_direct_download_target(name: &str) -> bool {
+    BUILTIN_ADAPTER_NAMES
+        .iter()
+        .any(|t| name.eq_ignore_ascii_case(t))
+}
+
+/// Resolve the outbound geodata downloads ride. `map` is whatever proxy
+/// layer the caller already built — the startup prefetch map or the live
+/// route table; group entries resolve as-is (a `select` group dials its
+/// persisted or first member, `url-test`/`fallback` probe at dial time), so
+/// `map.get(name)` is already "the selector_store choice or first member".
+///
+/// Order — first hit wins:
+///
+/// 1. **`geodata.proxy`** — explicit override. A blank value warns and is
+///    ignored (it's an optional key, not a hard defect); a built-in
+///    terminal name returns `None` (direct); any other name resolves
+///    against `map`, with an unknown name warning and falling through to
+///    the default egress — a typo must not silently leak the download
+///    direct, but it also must not reject an otherwise-valid config.
+/// 2. **Last top-level `MATCH,<target>`** — the config's default egress.
+///    Same terminal-name/`map.get` semantics; a name missing from `map`
+///    warns and falls through.
+/// 3. **`first_named_proxy`** — the legacy `proxies[0]` behavior, kept as
+///    the no-MATCH/no-override fallback.
+pub fn resolve_geodata_download_proxy(
+    raw: &raw::RawConfig,
+    map: &HashMap<SmolStr, Arc<dyn Proxy>>,
+) -> Option<Arc<dyn Proxy>> {
+    // 1. Explicit `geodata.proxy`.
+    if let Some(name) = raw.geodata.as_ref().and_then(|g| g.proxy.as_deref()) {
+        let name = name.trim();
+        if name.is_empty() {
+            warn!("geodata.proxy: blank value ignored; using the default egress");
+        } else if is_direct_download_target(name) {
+            return None;
+        } else if let Some(p) = map.get(name) {
+            return Some(Arc::clone(p));
+        } else {
+            warn!(
+                "geodata.proxy '{name}' is not a known proxy or group; \
+                 falling back to the default egress"
+            );
+        }
+    }
+
+    // 2. The config's default egress — last top-level `MATCH` target.
+    if let Some(target) = last_match_target(raw) {
+        if is_direct_download_target(target) {
+            return None;
+        }
+        if let Some(p) = map.get(target) {
+            return Some(Arc::clone(p));
+        }
+        warn!(
+            "geodata download: MATCH target '{target}' is not a known proxy \
+             or group; falling back to the first named proxy"
+        );
+    }
+
+    // 3. Legacy default — first `proxies:` entry.
+    internal_http::first_named_proxy(raw.proxies.as_deref(), map)
 }
 
 /// Whether the shared prefetch proxy layer is worth building. `http`
@@ -3035,7 +3170,7 @@ fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> boo
         return true;
     }
     let scan = collect_geo_scan_lines(raw, &rule_provider::PrefetchedPayloads::default());
-    !missing_geodata_downloads(raw, geo, &scan).is_empty()
+    !missing_geodata_downloads(geo, geo_references(raw, &scan)).is_empty()
 }
 
 /// Download missing geodata files that the config's rules require.
@@ -3045,14 +3180,18 @@ fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> boo
 /// Unlike GeoIP/ASN, the GEOSITE DB is tolerated as absent — per spec the
 /// rule no-matches at query time rather than failing at parse.
 ///
-/// Downloads ride the first configured proxy through `prefetch` — the shared
-/// pre-registry proxy layer with `dialer-proxy` chains applied (needed in
-/// regions where the CDN is blocked; issue #533). Fetches go direct only
-/// when no layer exists — a config without `proxies:` — since a rejected
-/// layer aborts the build before this runs. Download failures are logged as
-/// warnings — the subsequent parser-context build hard-errors on a missing
-/// GeoIP/ASN file (geosite is tolerated absent, per spec), giving a clear
-/// diagnostic.
+/// Downloads ride the outbound [`resolve_geodata_download_proxy`] picks
+/// through `prefetch` — the shared pre-registry proxy layer with
+/// `dialer-proxy` chains applied (needed in regions where the CDN is
+/// blocked; issue #533): explicit `geodata.proxy` first, then the last
+/// top-level `MATCH` target (the config's default egress), then
+/// `first_named_proxy`. A resolved proxy whose FIRST dial fails retries
+/// direct (`internal_http::fetch_or_direct`); when no layer exists — a
+/// config without `proxies:` — fetches go direct anyway, since a rejected
+/// layer aborts the build before this runs. Download failures are logged
+/// as warnings — the subsequent parser-context build hard-errors on a
+/// missing GeoIP/ASN file (geosite is tolerated absent, per spec), giving
+/// a clear diagnostic.
 async fn ensure_geodata(
     raw: &raw::RawConfig,
     geo: &GeoDataConfig,
@@ -3064,13 +3203,13 @@ async fn ensure_geodata(
         // indexes for structural checks and are fetched only at real startup.
         return;
     }
-    let downloads = missing_geodata_downloads(raw, geo, scan_lines);
+    let downloads = missing_geodata_downloads(geo, geo_references(raw, scan_lines));
     if downloads.is_empty() {
         return;
     }
 
     let proxy: Option<Arc<dyn Proxy>> =
-        prefetch.and_then(|m| internal_http::first_named_proxy(raw.proxies.as_deref(), &m.map));
+        prefetch.and_then(|m| resolve_geodata_download_proxy(raw, &m.map));
 
     for (url, dest) in downloads {
         info!("geodata: downloading {} to {}", url, dest.display());
@@ -3087,7 +3226,7 @@ fn build_parser_context_from_raw(
     raw: &raw::RawConfig,
     provider_payloads: &rule_provider::PrefetchedPayloads,
 ) -> Result<meow_rules::ParserContext, anyhow::Error> {
-    let geo = geodata::parse_geodata(raw.geodata.as_ref())?;
+    let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
     build_parser_context_with_geo(raw, &geo, provider_payloads)
 }
 
@@ -3277,6 +3416,13 @@ fn collect_geosite_categories(lines: &[String]) -> std::collections::HashSet<Str
 }
 
 fn dns_policy_uses_geosite(raw: &raw::RawConfig) -> bool {
+    // `dns.enable: false` (or absent) → `parse_dns` early-returns before the
+    // nameserver-policy is built, so the geosite reference is dead and must
+    // not count as a consumer (same posture as the fallback-filter gate).
+    let enabled = raw.dns.as_ref().and_then(|dns| dns.enable).unwrap_or(false);
+    if !enabled {
+        return false;
+    }
     raw.dns
         .as_ref()
         .and_then(|dns| dns.nameserver_policy.as_ref())
@@ -3913,8 +4059,9 @@ pub async fn build_config(
     }
 
     // Geodata config — parse and validate early so path errors surface before
-    // anything tries to load the DBs.
-    let geodata = geodata::parse_geodata(raw.geodata.as_ref())?;
+    // anything tries to load the DBs. `geox-url` is the mihomo top-level
+    // alias, merged per-key under the explicit `geodata.url.*` values.
+    let geodata = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
 
     // General config
     let mode = match raw.mode.as_deref().unwrap_or("rule").parse::<TunnelMode>() {
@@ -4031,6 +4178,9 @@ pub async fn build_config(
     // must happen before building the parser context, which hard-errors on
     // missing GeoIP/ASN files.
     let geo_scan_lines = collect_geo_scan_lines(&raw, &provider_payloads);
+    // The same reference verdict gates the startup fetch and rides the
+    // Config out to the auto-update loop — one judgment, two consumers.
+    let geo_needs = geo_references(&raw, &geo_scan_lines);
     ensure_geodata(&raw, &geodata, &geo_scan_lines, prefetch_proxies.as_deref()).await;
     drop(geo_scan_lines);
     drop(prefetch_proxies);
@@ -4200,6 +4350,7 @@ pub async fn build_config(
         auth,
         raw,
         geodata,
+        geo_needs,
     })
 }
 
@@ -4423,6 +4574,67 @@ mod dialer_proxy_tests {
         assert_eq!(c_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    /// A `MATCH,<group>` geodata egress resolves to the group adapter as
+    /// built — dialing it lands on the selector's persisted choice, or the
+    /// first member when the store holds nothing (D1: `map.get` is the
+    /// whole answer, no leaf-stripping). The observable is which member's
+    /// listener the dial physically contacts.
+    #[tokio::test]
+    async fn geodata_match_group_dials_persisted_selection() {
+        let (port_b1, b1_hits) = counting_listener().await;
+        let (port_b2, b2_hits) = counting_listener().await;
+
+        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+            "proxies:\n\
+             \x20 - name: B1\n    type: trojan\n    server: 127.0.0.1\n    port: {port_b1}\n    \
+             password: x\n\
+             \x20 - name: B2\n    type: trojan\n    server: 127.0.0.1\n    port: {port_b2}\n    \
+             password: x\n\
+             proxy-groups:\n\
+             \x20 - name: G\n    type: select\n    proxies: [B1, B2]\n\
+             rules:\n  - MATCH,G\n"
+        ))
+        .unwrap();
+        let providers = HashMap::new();
+        let metadata = meow_common::Metadata {
+            network: meow_common::Network::Tcp,
+            host: "example.invalid".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        // Persisted choice `B2` primes the group at build — the resolved
+        // download proxy dials B2, never B1.
+        let dir = tempfile::tempdir().unwrap();
+        let store = meow_proxy::SelectorStore::open(dir.path().join("sel.json"));
+        store.set("G", "B2");
+        let layer = prefetch_proxy_map(&raw, &providers, Some(&store))
+            .expect("layer builds")
+            .expect("proxies configured");
+        let resolved =
+            super::resolve_geodata_download_proxy(&raw, &layer.map).expect("MATCH target resolves");
+        let _ = resolved.dial_tcp(&metadata).await;
+        assert!(
+            hits(&b2_hits) >= 1,
+            "persisted selection B2 must answer the dial"
+        );
+        assert_eq!(hits(&b1_hits), 0, "B1 must not be contacted");
+
+        // A fresh store → the group falls back to its first member.
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty_store = meow_proxy::SelectorStore::open(empty_dir.path().join("sel.json"));
+        let layer = prefetch_proxy_map(&raw, &providers, Some(&empty_store))
+            .expect("layer builds")
+            .expect("proxies configured");
+        let resolved =
+            super::resolve_geodata_download_proxy(&raw, &layer.map).expect("MATCH target resolves");
+        let _ = resolved.dial_tcp(&metadata).await;
+        assert!(
+            hits(&b1_hits) >= 1,
+            "no persisted choice → first member B1 answers"
+        );
+    }
+
     /// The prefetch layer is only built when a startup fetch could ride it:
     /// any non-inline provider (http fetch, or a file payload hiding geo
     /// references) forces it on; otherwise it hinges on geodata the rules
@@ -4603,7 +4815,11 @@ mod dialer_proxy_tests {
 
     /// `ensure_geodata` downloads missing DBs through the same prefetch
     /// layer — dropping its `prefetch` argument would fetch the MMDB URL
-    /// direct, and a bare re-parse would hit A's own listener, not B's.
+    /// direct-first, and a bare re-parse would hit A's own listener, not
+    /// B's. Since the geodata fetch opts into the direct fallback
+    /// (`internal_http::fetch_or_direct`), the failed chain dial is then
+    /// retried direct — the URL listener sees exactly one direct hit AFTER
+    /// the proxy attempt, never instead of it.
     #[tokio::test]
     async fn geodata_download_rides_the_chain() {
         let (port_a, a_hits) = counting_listener().await;
@@ -4626,13 +4842,14 @@ mod dialer_proxy_tests {
         ))
         .unwrap();
 
-        // The download fails (B drops the conn) and the parser-context
-        // build then hard-errors on the still-missing MMDB — only the dial
-        // observables matter here.
+        // The chain dial fails (B drops the conn), the geodata-only direct
+        // fallback then dials the MMDB URL once (still fails — the origin
+        // drops too), and the parser-context build hard-errors on the
+        // still-missing MMDB — only the dial observables matter here.
         let _ = build_config(raw, None).await;
         assert!(
             hits(&b_hits) >= 1,
-            "the geodata download must reach A's front hop B"
+            "the geodata download must reach A's front hop B first"
         );
         assert_eq!(
             hits(&a_hits),
@@ -4641,8 +4858,8 @@ mod dialer_proxy_tests {
         );
         assert_eq!(
             hits(&u_hits),
-            0,
-            "the MMDB URL must not be fetched directly"
+            1,
+            "the failed proxy dial falls back to exactly one direct fetch"
         );
     }
 
@@ -5746,6 +5963,364 @@ mod geoip_context_tests {
         )
         .unwrap();
         assert!(ctx.asn.is_none());
+    }
+
+    // ── geo_references / GeoDataNeeds (the shared need verdict) ────────
+
+    fn needs_of(yaml: &str, scan: &[&str]) -> GeoDataNeeds {
+        let raw: raw::RawConfig = serde_yaml::from_str(yaml).unwrap();
+        let lines: Vec<String> = scan.iter().map(std::string::ToString::to_string).collect();
+        super::geo_references(&raw, &lines)
+    }
+
+    /// Positive: enabled DNS + non-empty `fallback:` + no explicit
+    /// `fallback-filter.geoip` → the filter is built with its geoip gate
+    /// defaulting to true, so the MMDB is a consumer even with no GEOIP
+    /// rule anywhere.
+    #[test]
+    fn fallback_filter_defaults_to_geoip_need() {
+        let needs = needs_of(
+            "dns:\n  enable: true\n  fallback:\n    - tls://8.8.8.8\n",
+            &[],
+        );
+        assert!(needs.mmdb, "default fallback-filter.geoip is true");
+        assert!(!needs.asn && !needs.geosite);
+    }
+
+    #[test]
+    fn fallback_filter_geoip_disabled_dns_is_no_need() {
+        // `dns.enable: false` → `parse_dns` never builds the filter — the
+        // reference is dead and must not download an MMDB.
+        let needs = needs_of(
+            "dns:\n  enable: false\n  fallback:\n    - tls://8.8.8.8\n",
+            &[],
+        );
+        assert!(!needs.mmdb);
+        // Absent `dns:` is the same dead reference.
+        let needs = needs_of("mode: rule\n", &[]);
+        assert!(!needs.mmdb);
+    }
+
+    #[test]
+    fn fallback_filter_geoip_empty_fallback_is_no_need() {
+        // Enabled DNS with no `fallback:` nameservers → no filter is built.
+        let needs = needs_of("dns:\n  enable: true\n", &[]);
+        assert!(!needs.mmdb);
+        let needs = needs_of("dns:\n  enable: true\n  fallback: []\n", &[]);
+        assert!(!needs.mmdb);
+    }
+
+    #[test]
+    fn fallback_filter_geoip_explicit_false_is_no_need() {
+        let needs = needs_of(
+            "dns:\n  enable: true\n  fallback:\n    - tls://8.8.8.8\n  \
+             fallback-filter:\n    geoip: false\n",
+            &[],
+        );
+        assert!(!needs.mmdb);
+    }
+
+    /// The `dns.enable` gate on the nameserver-policy consumer: a
+    /// `geosite:` policy key under disabled DNS must not count, matching
+    /// `parse_dns`'s early return.
+    #[test]
+    fn geosite_policy_disabled_dns_is_no_need() {
+        let needs = needs_of(
+            "dns:\n  enable: false\n  nameserver-policy:\n    \
+             \"geosite:cn\": tls://8.8.8.8\n",
+            &[],
+        );
+        assert!(!needs.geosite);
+        let needs = needs_of(
+            "dns:\n  enable: true\n  nameserver-policy:\n    \
+             \"geosite:cn\": tls://8.8.8.8\n",
+            &[],
+        );
+        assert!(needs.geosite);
+    }
+
+    /// Rule lines still dominate — a GEOIP rule must flag the MMDB need
+    /// regardless of the DNS filter's state.
+    #[test]
+    fn geo_references_union_of_rules_and_dns() {
+        let needs = needs_of("mode: rule\n", &["GEOIP,CN,DIRECT"]);
+        assert!(needs.mmdb);
+        let needs = needs_of("mode: rule\n", &["IP-ASN,13335,PROXY"]);
+        assert!(needs.asn && !needs.mmdb && !needs.geosite);
+        let needs = needs_of("mode: rule\n", &["GEOSITE,cn,PROXY"]);
+        assert!(needs.geosite && !needs.mmdb);
+    }
+
+    /// The acceptance pin: a config whose ONLY MMDB consumer is the DNS
+    /// fallback filter (`dns.enable: true` + non-empty `fallback:` +
+    /// `fallback-filter.geoip` defaulting true) must produce the MMDB in
+    /// `missing_geodata_downloads` — and must trip
+    /// `prefetch_proxy_layer_needed` so the download can ride a proxy even
+    /// with no provider configured. `mmdb-path` points into a tempdir so
+    /// the file is absent.
+    #[test]
+    fn fallback_filter_geoip_triggers_mmdb_download_need() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_mmdb = dir.path().join("absent.mmdb");
+        let geo = GeoDataConfig {
+            mmdb_path: Some(missing_mmdb.clone()),
+            ..GeoDataConfig::default()
+        };
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  fallback:\n    - tls://8.8.8.8\n\
+             proxies:\n  - {name: p, type: direct}\n",
+        )
+        .unwrap();
+
+        let downloads = super::missing_geodata_downloads(&geo, geo_references(&raw, &[]));
+        assert_eq!(
+            downloads.len(),
+            1,
+            "expected exactly the mmdb download: {downloads:?}"
+        );
+        assert_eq!(downloads[0].1, missing_mmdb);
+        assert_eq!(downloads[0].0, &geo.mmdb_url);
+        assert!(
+            prefetch_proxy_layer_needed(&raw, &geo),
+            "a missing referenced DB must force the prefetch proxy layer"
+        );
+
+        // The three dead-reference shapes produce an empty download list —
+        // the needs-level detail lives in the tests above; here the
+        // download verdict itself must be empty.
+        for yaml in [
+            "dns:\n  enable: true\n  fallback:\n    - tls://8.8.8.8\n  \
+             fallback-filter:\n    geoip: false\n",
+            "dns:\n  enable: false\n  fallback:\n    - tls://8.8.8.8\n",
+            "dns:\n  enable: true\n  fallback: []\n",
+        ] {
+            let raw: raw::RawConfig = serde_yaml::from_str(yaml).unwrap();
+            assert!(
+                super::missing_geodata_downloads(&geo, geo_references(&raw, &[])).is_empty(),
+                "{yaml} must produce no downloads"
+            );
+        }
+    }
+
+    /// Serve `body` to every accepted connection — a multi-target
+    /// `ensure_geodata` run dials each reachable origin.
+    async fn spawn_body_origin(
+        body: &'static [u8],
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn({
+            let hits = Arc::clone(&hits);
+            async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                        let mut buf = [0u8; 2048];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                    body.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let _ = stream.write_all(body).await;
+                    });
+                }
+            }
+        });
+        (addr, hits)
+    }
+
+    /// Per-target independence at the startup-fetch level: with several
+    /// referenced DBs missing, one target's failed download must warn and
+    /// move on — never block the rest. The ASN origin serves a body while
+    /// the MMDB URL is unreachable.
+    #[tokio::test]
+    async fn ensure_geodata_one_failure_does_not_block_the_rest() {
+        let (asn_addr, asn_hits) = spawn_body_origin(b"asn-db").await;
+        let dir = tempfile::tempdir().unwrap();
+        let mmdb_target = dir.path().join("absent.mmdb");
+        let asn_target = dir.path().join("asn.mmdb");
+        let geo = GeoDataConfig {
+            mmdb_path: Some(mmdb_target.clone()),
+            asn_path: Some(asn_target.clone()),
+            // Unreachable — refused instantly, the failure must not leak
+            // into the sibling download.
+            mmdb_url: "http://127.0.0.1:1/country.mmdb".to_string(),
+            asn_url: format!("http://{asn_addr}/asn.mmdb"),
+            ..GeoDataConfig::default()
+        };
+        let raw = raw_with_rules(vec![
+            "GEOIP,CN,DIRECT",
+            "IP-ASN,13335,DIRECT",
+            "MATCH,DIRECT",
+        ]);
+        let scan = collect_geo_scan_lines(&raw, &rule_provider::PrefetchedPayloads::default());
+        assert_eq!(
+            super::missing_geodata_downloads(&geo, geo_references(&raw, &scan)).len(),
+            2,
+            "both DBs are referenced and missing"
+        );
+
+        super::ensure_geodata(&raw, &geo, &scan, None).await;
+
+        assert!(
+            asn_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the ASN origin must be dialed despite the MMDB failure"
+        );
+        assert_eq!(std::fs::read(&asn_target).unwrap(), b"asn-db");
+        assert!(
+            !mmdb_target.exists(),
+            "the failed target leaves no partial file"
+        );
+    }
+
+    // ── resolve_geodata_download_proxy ────────────────────────────────
+
+    fn proxy_map(names: &[&str]) -> HashMap<SmolStr, Arc<dyn Proxy>> {
+        names
+            .iter()
+            .map(|n| {
+                // A bare DIRECT adapter wrapped in the standard registry
+                // shell — identity is the map key, not the adapter name.
+                let adapter = meow_proxy::DirectAdapter::new();
+                (
+                    SmolStr::from(*n),
+                    Arc::new(proxy_parser::WrappedProxy::new(Box::new(adapter))) as Arc<dyn Proxy>,
+                )
+            })
+            .collect()
+    }
+
+    fn resolve_geo(yaml: &str, names: &[&str]) -> Option<Arc<dyn Proxy>> {
+        let raw: raw::RawConfig = serde_yaml::from_str(yaml).unwrap();
+        let map = proxy_map(names);
+        super::resolve_geodata_download_proxy(&raw, &map)
+    }
+
+    /// Explicit `geodata.proxy` names a map entry → that adapter.
+    #[test]
+    fn geodata_proxy_named_entry_wins() {
+        let raw: raw::RawConfig =
+            serde_yaml::from_str("geodata:\n  proxy: out\nproxies:\n  - {name: p, type: direct}\n")
+                .unwrap();
+        let map = proxy_map(&["p", "out"]);
+        let resolved =
+            super::resolve_geodata_download_proxy(&raw, &map).expect("named proxy resolves");
+        assert!(Arc::ptr_eq(&resolved, &map["out"]));
+    }
+
+    /// Every built-in terminal name (case-insensitive) means fetch direct.
+    #[test]
+    fn geodata_proxy_terminal_names_fetch_direct() {
+        for name in [
+            "DIRECT",
+            "direct",
+            "Reject",
+            "REJECT-DROP",
+            "pass",
+            "PASS-RULE",
+        ] {
+            let yaml =
+                format!("geodata:\n  proxy: \"{name}\"\nproxies:\n  - {{name: p, type: direct}}\n");
+            assert!(
+                resolve_geo(&yaml, &["p"]).is_none(),
+                "{name} must resolve to direct"
+            );
+        }
+    }
+
+    /// Blank and unknown explicit names fall through to the default egress.
+    #[test]
+    fn geodata_proxy_blank_and_unknown_fall_through() {
+        for val in ["\"\"", "\"   \"", "ghost"] {
+            let yaml = format!(
+                "geodata:\n  proxy: {val}\nproxies:\n  - {{name: p, type: direct}}\n\
+                 rules:\n  - MATCH,DIRECT\n"
+            );
+            // MATCH,DIRECT is the default egress → direct.
+            assert!(
+                resolve_geo(&yaml, &["p"]).is_none(),
+                "proxy {val} must fall through to the MATCH target"
+            );
+        }
+    }
+
+    /// No explicit override → the LAST top-level `MATCH` target wins.
+    #[test]
+    fn geodata_proxy_match_target_is_default_egress() {
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            "proxies:\n  - {name: p, type: direct}\n\
+             rules:\n  - MATCH,early\n  - GEOIP,CN,out\n  - MATCH,out\n",
+        )
+        .unwrap();
+        let map = proxy_map(&["p", "early", "out"]);
+        let resolved =
+            super::resolve_geodata_download_proxy(&raw, &map).expect("MATCH target resolves");
+        assert!(
+            Arc::ptr_eq(&resolved, &map["out"]),
+            "the final MATCH line is the default egress"
+        );
+    }
+
+    /// `MATCH,<terminal>` → direct; `MATCH` vs `match` case-insensitive.
+    #[test]
+    fn geodata_proxy_match_terminal_means_direct() {
+        for m in ["MATCH,DIRECT", "match,reject", "MATCH,PASS-RULE"] {
+            let yaml = format!("proxies:\n  - {{name: p, type: direct}}\nrules:\n  - {m}\n");
+            assert!(resolve_geo(&yaml, &["p"]).is_none(), "{m} → direct");
+        }
+    }
+
+    /// A MATCH target absent from the built map warns and falls through to
+    /// `first_named_proxy` — a typo'd egress must not strand the download.
+    #[test]
+    fn geodata_proxy_missing_match_target_falls_back() {
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            "proxies:\n  - {name: p, type: direct}\nrules:\n  - MATCH,ghost\n",
+        )
+        .unwrap();
+        let map = proxy_map(&["p"]);
+        let resolved = super::resolve_geodata_download_proxy(&raw, &map)
+            .expect("falls back to the first named proxy");
+        assert!(Arc::ptr_eq(&resolved, &map["p"]));
+    }
+
+    /// No override and no MATCH → `proxies[0]` (the legacy default).
+    /// `MATCH,DIRECT` still beats it — the default egress is authoritative.
+    #[test]
+    fn geodata_proxy_no_match_uses_first_named() {
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            "proxies:\n  - {name: p, type: direct}\n  - {name: q, type: direct}\n",
+        )
+        .unwrap();
+        let map = proxy_map(&["p", "q"]);
+        let resolved = super::resolve_geodata_download_proxy(&raw, &map)
+            .expect("first named proxy is the fallback");
+        assert!(Arc::ptr_eq(&resolved, &map["p"]));
+
+        // Empty proxies / empty map → no proxy at all.
+        let raw: raw::RawConfig = serde_yaml::from_str("mode: rule\n").unwrap();
+        let map = proxy_map(&[]);
+        assert!(super::resolve_geodata_download_proxy(&raw, &map).is_none());
+    }
+
+    /// A group name resolves as-is against the map (the map holds the built
+    /// group adapter — no leaf-stripping; the selector's persisted choice
+    /// or first member dials at fetch time).
+    #[test]
+    fn geodata_proxy_group_name_resolves_to_group_adapter() {
+        let raw: raw::RawConfig =
+            serde_yaml::from_str("geodata:\n  proxy: select-group\n").unwrap();
+        let map = proxy_map(&["select-group"]);
+        let resolved = super::resolve_geodata_download_proxy(&raw, &map)
+            .expect("group name resolves to the group adapter");
+        assert!(Arc::ptr_eq(&resolved, &map["select-group"]));
     }
 
     /// Regression for meow-ios#112: YAML anchor merge keys (`<<: *anchor`)

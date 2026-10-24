@@ -3037,3 +3037,40 @@ async fn test_ss_listener_udp_explicit_false() {
     };
     assert!(!ss.udp);
 }
+
+/// `geox-url:` is mihomo's top-level flat alias for `geodata.url.*` — serde
+/// must accept the kebab-case key and merge it per key under any explicit
+/// `geodata.url.*` value.
+#[tokio::test]
+async fn test_geox_url_top_level_alias() {
+    let yaml = r#"
+geox-url:
+  mmdb: https://cdn.test/Country.mmdb
+  asn: https://cdn.test/GeoLite2-ASN.mmdb
+  geosite: https://cdn.test/geosite.dat
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert_eq!(config.geodata.mmdb_url, "https://cdn.test/Country.mmdb");
+    assert_eq!(config.geodata.asn_url, "https://cdn.test/GeoLite2-ASN.mmdb");
+    assert_eq!(config.geodata.geosite_url, "https://cdn.test/geosite.dat");
+}
+
+/// Per-key precedence: an explicit `geodata.url.mmdb` beats `geox-url.mmdb`
+/// while unset keys still fall through to the alias.
+#[tokio::test]
+async fn test_geox_url_loses_to_geodata_url_per_key() {
+    let yaml = r#"
+geodata:
+  url:
+    mmdb: https://explicit.test/Country.mmdb
+geox-url:
+  mmdb: https://alias.test/Country.mmdb
+  geosite: https://alias.test/geosite.dat
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert_eq!(
+        config.geodata.mmdb_url,
+        "https://explicit.test/Country.mmdb"
+    );
+    assert_eq!(config.geodata.geosite_url, "https://alias.test/geosite.dat");
+}
