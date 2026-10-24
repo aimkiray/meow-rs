@@ -506,17 +506,17 @@ async fn interval_refresh_preserves_local_sections() {
         raw.proxies = Some(vec![HashMap::from([
             (
                 "name".to_string(),
-                serde_yaml::Value::String("selfhop".to_string()),
+                serde_json::Value::String("selfhop".to_string()),
             ),
             (
                 "type".to_string(),
-                serde_yaml::Value::String("http".to_string()),
+                serde_json::Value::String("http".to_string()),
             ),
             (
                 "server".to_string(),
-                serde_yaml::Value::String("127.0.0.1".to_string()),
+                serde_json::Value::String("127.0.0.1".to_string()),
             ),
-            ("port".to_string(), serde_yaml::Value::Number(9.into())),
+            ("port".to_string(), serde_json::Value::Number(9.into())),
         ])]);
         raw.rules = Some(vec![
             "DOMAIN,x.test,REJECT".to_string(),

@@ -119,18 +119,25 @@ the canonical, in-repo source a release is cut from.
   maintained `unsafe-libyaml-norway` fork. YAML parsing, including
   anchors, merge keys, tags and error messages, is unchanged. The public
   `meow-config` API surface that exposes a YAML value now names
-  `serde_norway::Value` instead of `serde_yaml::Value`: `RawConfig`'s
-  `proxies`, `firewall`, `udp` and `udp-timeout` passthroughs;
-  `RawGeoDataConfig`'s `geodata-mode`, `geodata-loader` and
-  `geoip-matcher`; `RawTun`'s `inet6-address` (parsed into
-  `TunConfig::inet6_address`) plus its warn-only upstream fields;
-  `RawListener`'s five opaque sub-option fields (`shadow-tls`, `res-tls`,
-  `jls-config`, `kcp-tun`, `mux-option`); `RawProxyProvider`'s
-  `override_`; `SubscriptionData::proxies`; and the functions in the
-  public `proxy_parser`, `ech_dns`, `internal_http` and `subscription`
-  modules that take `serde_yaml::Value`-holding parameters. The two are
-  distinct types: an embedder that reads such a field or calls such a
-  function has to depend on `serde_norway` as well.
+  `serde_json::Value` — the public API is decoupled from the concrete
+  YAML backend: `RawConfig`'s `proxies`, `firewall`, `udp` and
+  `udp-timeout` passthroughs; `RawGeoDataConfig`'s `geodata-mode`,
+  `geodata-loader` and `geoip-matcher`; `RawTun`'s `inet6-address`
+  (parsed into `TunConfig::inet6_address`) plus its warn-only upstream
+  fields; `RawListener`'s five opaque sub-option fields (`shadow-tls`,
+  `res-tls`, `jls-config`, `kcp-tun`, `mux-option`);
+  `RawProxyProvider`'s `override_`; `SubscriptionData::proxies`; and the
+  functions in the public `proxy_parser`, `ech_dns`, `internal_http`
+  and `subscription` modules that take `serde_json::Value`-holding
+  parameters. An embedder reading such a passthrough field or calling
+  such a function sees `serde_json::Value` and no longer needs to
+  depend on the YAML backend crate at all. Routing every YAML value
+  through `serde_json::Value` narrows a few pathological inputs:
+  `!tag` nodes and complex (non-string-scalar) mapping keys on
+  passthrough values now fail to parse; `.inf`/`.nan` literals become
+  `Null`, so a `.nan` on a real-read field such as
+  `tun.inet6-address` is treated as unset where it previously errored;
+  and nested `serde_json::Map` mappings serialise with keys sorted.
 
 ### Removed
 

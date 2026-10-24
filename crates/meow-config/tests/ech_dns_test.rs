@@ -31,7 +31,7 @@ use base64::Engine;
 use meow_config::ech_dns::preresolve_ech;
 #[cfg(feature = "vless")]
 use meow_config::load_config_from_str;
-use serde_yaml::Value;
+use serde_json::Value;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -45,8 +45,8 @@ fn ech_opts(map: &HashMap<String, Value>) -> Option<&Value> {
 
 fn ech_config_str(map: &HashMap<String, Value>) -> Option<String> {
     ech_opts(map)?
-        .as_mapping()?
-        .get(Value::String("config".into()))?
+        .as_object()?
+        .get("config")?
         .as_str()
         .map(std::string::ToString::to_string)
 }

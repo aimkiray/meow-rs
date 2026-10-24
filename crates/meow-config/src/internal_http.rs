@@ -590,7 +590,7 @@ fn decode_chunked(mut input: &[u8], limit: usize) -> Result<Vec<u8>> {
 /// no `name:` field, or if that name isn't in the map (e.g. it failed to
 /// load during proxy construction).
 pub fn first_named_proxy(
-    raw_proxies: Option<&[std::collections::HashMap<String, serde_yaml::Value>]>,
+    raw_proxies: Option<&[std::collections::HashMap<String, serde_json::Value>]>,
     proxies: &std::collections::HashMap<smol_str::SmolStr, Arc<dyn Proxy>>,
 ) -> Option<Arc<dyn Proxy>> {
     let entry = raw_proxies?.first()?;

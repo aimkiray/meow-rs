@@ -388,15 +388,15 @@ impl ProxyProvider {
                 // `OverrideSchema.Apply` writes the string unconditionally,
                 // so an empty override strips node- and provider-level
                 // `dialer-proxy` and the node dials direct.
-                Some(serde_yaml::Value::String(s)) if s.is_empty() => {
+                Some(serde_json::Value::String(s)) if s.is_empty() => {
                     override_dialer = Some(String::new());
                 }
-                Some(serde_yaml::Value::String(s)) if !s.trim().is_empty() => {
+                Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
                     override_dialer = Some(s.trim().to_string());
                 }
                 // `null` unmarshals to a nil `*string` upstream — no write
                 // happens, so the provider/node levels still apply.
-                Some(serde_yaml::Value::Null) | None => {}
+                Some(serde_json::Value::Null) | None => {}
                 // A malformed override must not silently drop the operator's
                 // enforced chain — fail the provider build. Whitespace-only
                 // lands here too: almost surely a typo rather than a
@@ -908,7 +908,7 @@ impl ProxyProvider {
             v => v,
         };
 
-        let mut proxy_maps: Vec<HashMap<String, serde_yaml::Value>> =
+        let mut proxy_maps: Vec<HashMap<String, serde_json::Value>> =
             serde_yaml::from_value(list_val)
                 .map_err(|e| anyhow::anyhow!("provider content is not a proxy list: {e}"))?;
 
@@ -1027,7 +1027,7 @@ impl ProxyProvider {
     /// Class A).
     fn parse_node(
         &self,
-        raw_map: &HashMap<String, serde_yaml::Value>,
+        raw_map: &HashMap<String, serde_json::Value>,
         raw_name: &str,
         declared: &mut Vec<String>,
     ) -> Result<Arc<dyn Proxy>, String> {
@@ -2287,7 +2287,7 @@ header:
         let mut raw = raw_file_provider("nodes.yaml");
         raw.override_ = Some(HashMap::from([(
             "dialer-proxy".to_string(),
-            serde_yaml::Value::String("front".to_string()),
+            serde_json::Value::String("front".to_string()),
         )]));
         let p = ProxyProvider::new(
             "test",
@@ -2356,7 +2356,7 @@ header:
         raw.dialer_proxy = Some("p-hop".to_string());
         raw.override_ = Some(HashMap::from([(
             "dialer-proxy".to_string(),
-            serde_yaml::Value::String("o-hop".to_string()),
+            serde_json::Value::String("o-hop".to_string()),
         )]));
         let registry = meow_proxy::dialer::ProxyRegistry::default();
         let p = ProxyProvider::new(
@@ -2414,7 +2414,7 @@ header:
         raw.dialer_proxy = Some("provider-hop".to_string());
         raw.override_ = Some(HashMap::from([(
             "dialer-proxy".to_string(),
-            serde_yaml::Value::String(String::new()),
+            serde_json::Value::String(String::new()),
         )]));
         let p = ProxyProvider::new(
             "test",
@@ -2595,7 +2595,7 @@ header:
         let mut raw = raw_file_provider("nodes.yaml");
         raw.override_ = Some(HashMap::from([(
             "dialer-proxy".to_string(),
-            serde_yaml::Value::Number(42.into()),
+            serde_json::Value::Number(42.into()),
         )]));
         let err = ProxyProvider::new(
             "test",

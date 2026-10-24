@@ -26,7 +26,7 @@ use base64::Engine;
 use hickory_proto::rr::rdata::svcb::SvcParamValue;
 use hickory_proto::rr::{RData, RecordType};
 use meow_dns::DnsClient;
-use serde_yaml::Value;
+use serde_json::Value;
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::net::SocketAddrV6;
@@ -226,27 +226,23 @@ pub async fn preresolve_ech(
         let Some(ech_opts) = proxy.get_mut("ech-opts") else {
             continue;
         };
-        let Some(ech_map) = ech_opts.as_mapping_mut() else {
+        let Some(ech_map) = ech_opts.as_object_mut() else {
             continue;
         };
 
         let enabled = ech_map
-            .get(Value::String("enable".into()))
-            .and_then(serde_yaml::Value::as_bool)
+            .get("enable")
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         if !enabled {
             continue;
         }
-        if ech_map
-            .get(Value::String("config".into()))
-            .and_then(|v| v.as_str())
-            .is_some()
-        {
+        if ech_map.get("config").and_then(|v| v.as_str()).is_some() {
             continue;
         }
 
         let query_name = ech_map
-            .get(Value::String("query-server-name".into()))
+            .get("query-server-name")
             .and_then(|v| v.as_str())
             .map(String::from)
             .or(server);
@@ -265,7 +261,7 @@ pub async fn preresolve_ech(
                     len = bytes.len(),
                     "ech-opts: fetched ECH config from DNS HTTPS record"
                 );
-                ech_map.insert(Value::String("config".into()), Value::String(b64));
+                ech_map.insert("config".to_string(), Value::String(b64));
             }
             Err(e) => {
                 tracing::warn!(
@@ -298,22 +294,20 @@ pub fn check_ech_defects(proxies: &[HashMap<String, Value>], strict: bool) -> Re
         let has_query_source = server.is_some()
             || proxy
                 .get("ech-opts")
-                .and_then(|v| v.as_mapping())
+                .and_then(|v| v.as_object())
                 .is_some_and(|m| {
-                    m.get(Value::String("query-server-name".into()))
+                    m.get("query-server-name")
                         .and_then(|v| v.as_str())
                         .is_some()
                 });
         let enabled_without_config = proxy
             .get("ech-opts")
-            .and_then(|v| v.as_mapping())
+            .and_then(|v| v.as_object())
             .is_some_and(|m| {
-                m.get(Value::String("enable".into()))
-                    .and_then(serde_yaml::Value::as_bool)
+                m.get("enable")
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false)
-                    && m.get(Value::String("config".into()))
-                        .and_then(|v| v.as_str())
-                        .is_none()
+                    && m.get("config").and_then(|v| v.as_str()).is_none()
             });
         if !enabled_without_config {
             continue;

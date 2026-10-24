@@ -478,12 +478,12 @@ pub fn parse_tun_config(
 /// list form. The device takes a single IPv6 address, so of a list only
 /// the first entry is used; an empty list or empty string is "unset".
 fn parse_inet6_address(
-    raw: Option<&serde_yaml::Value>,
+    raw: Option<&serde_json::Value>,
 ) -> Result<Option<ipnet::Ipv6Net>, anyhow::Error> {
     let cidr = match raw {
-        None | Some(serde_yaml::Value::Null) => return Ok(None),
-        Some(serde_yaml::Value::String(s)) => s.as_str(),
-        Some(serde_yaml::Value::Sequence(entries)) => {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(serde_json::Value::Array(entries)) => {
             if entries.len() > 1 {
                 warn!(
                     "tun.inet6-address: {} entries given; meow-rs assigns one IPv6 \
@@ -493,7 +493,7 @@ fn parse_inet6_address(
             }
             match entries.first() {
                 None => return Ok(None),
-                Some(serde_yaml::Value::String(s)) => s.as_str(),
+                Some(serde_json::Value::String(s)) => s.as_str(),
                 Some(other) => {
                     return Err(anyhow::anyhow!(
                         "tun.inet6-address: expected a CIDR string, got {other:?}"
@@ -1300,7 +1300,7 @@ const MALFORMED_DIALER_PREFIX: &str = "__malformed_dialer_proxy__";
 /// [`reject_group_membership_cycles`] against the finished registry.
 fn apply_dialer_proxies(
     proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
-    raw_proxies: &[HashMap<String, serde_yaml::Value>],
+    raw_proxies: &[HashMap<String, serde_json::Value>],
     raw_groups: &[raw::RawProxyGroup],
     registry: &meow_proxy::dialer::ProxyRegistry,
     ipv6: bool,
@@ -1766,7 +1766,7 @@ fn primary_global_target<'a>(
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .filter_map(|proxy| proxy.get("name").and_then(serde_yaml::Value::as_str))
+        .filter_map(|proxy| proxy.get("name").and_then(serde_json::Value::as_str))
         .find(|name| is_usable_global_target(name, proxies))
 }
 
@@ -1816,7 +1816,7 @@ pub(crate) fn unavailable_placeholder(
 fn insert_parsed_leaves(
     proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
     static_proxy_names: &mut std::collections::HashSet<SmolStr>,
-    raw_proxies: &[HashMap<String, serde_yaml::Value>],
+    raw_proxies: &[HashMap<String, serde_json::Value>],
     ipv6: bool,
     strict: bool,
 ) -> Result<(), anyhow::Error> {
@@ -2758,7 +2758,7 @@ async fn prefetch_rule_provider_payloads_async(
         return rule_provider::PrefetchedPayloads::default();
     };
     let raw_providers = raw_providers.clone();
-    let raw_proxies: Vec<HashMap<String, serde_yaml::Value>> =
+    let raw_proxies: Vec<HashMap<String, serde_json::Value>> =
         raw.proxies.clone().unwrap_or_default();
     spawn_blocking_with_current_dispatcher(move || {
         let default_proxy = prefetch
@@ -4385,16 +4385,16 @@ mod dialer_proxy_tests {
         Arc::new(proxy_parser::WrappedProxy::new(Box::new(direct)))
     }
 
-    fn raw_proxy(name: &str, dialer: Option<&str>) -> HashMap<String, serde_yaml::Value> {
+    fn raw_proxy(name: &str, dialer: Option<&str>) -> HashMap<String, serde_json::Value> {
         let mut m = HashMap::new();
         m.insert(
             "name".to_string(),
-            serde_yaml::Value::String(name.to_string()),
+            serde_json::Value::String(name.to_string()),
         );
         if let Some(d) = dialer {
             m.insert(
                 "dialer-proxy".to_string(),
-                serde_yaml::Value::String(d.to_string()),
+                serde_json::Value::String(d.to_string()),
             );
         }
         m
@@ -4427,7 +4427,7 @@ mod dialer_proxy_tests {
     /// test that actually dials must keep the handle alive for the duration.
     fn apply_chains(
         proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
-        raw_proxies: &[HashMap<String, serde_yaml::Value>],
+        raw_proxies: &[HashMap<String, serde_json::Value>],
     ) -> Result<meow_proxy::dialer::ProxyRegistry, anyhow::Error> {
         apply_chains_with_groups(proxies, raw_proxies, &[])
     }
@@ -4439,7 +4439,7 @@ mod dialer_proxy_tests {
     /// does not matter, only that it exists.
     fn apply_chains_with_groups(
         proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
-        raw_proxies: &[HashMap<String, serde_yaml::Value>],
+        raw_proxies: &[HashMap<String, serde_json::Value>],
         raw_groups: &[raw::RawProxyGroup],
     ) -> Result<meow_proxy::dialer::ProxyRegistry, anyhow::Error> {
         let registry = meow_proxy::dialer::ProxyRegistry::default();
@@ -4452,7 +4452,7 @@ mod dialer_proxy_tests {
         let global_auto_created = !proxies.contains_key("GLOBAL");
         let include_all_proxy_names = raw_proxies
             .iter()
-            .filter_map(|proxy| proxy.get("name").and_then(serde_yaml::Value::as_str))
+            .filter_map(|proxy| proxy.get("name").and_then(serde_json::Value::as_str))
             .map(SmolStr::from)
             .collect();
         reject_group_membership_cycles(
@@ -5041,7 +5041,7 @@ mod dialer_proxy_tests {
         let mut raw = raw_proxy("A", None);
         raw.insert(
             "dialer-proxy".to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(42)),
+            serde_json::Value::Number(serde_json::Number::from(42)),
         );
         // Malformed values are a hard error under `strict` — the lenient
         // fail-at-dial sentinel arm is covered by `strict_mode_tests` at the
@@ -5072,7 +5072,7 @@ mod dialer_proxy_tests {
         let mut raw = raw_proxy("A", None);
         raw.insert(
             "dialer-proxy".to_string(),
-            serde_yaml::Value::String(" B ".to_string()),
+            serde_json::Value::String(" B ".to_string()),
         );
         apply_chains(&mut proxies, &[raw]).expect("a padded name resolves after trim");
         assert!(was_wrapped(&before, &proxies, "A"));
@@ -5089,14 +5089,14 @@ mod dialer_proxy_tests {
         let mut empty = raw_proxy("A", None);
         empty.insert(
             "dialer-proxy".to_string(),
-            serde_yaml::Value::String(String::new()),
+            serde_json::Value::String(String::new()),
         );
         let mut null = raw_proxy("B", None);
-        null.insert("dialer-proxy".to_string(), serde_yaml::Value::Null);
+        null.insert("dialer-proxy".to_string(), serde_json::Value::Null);
         let mut ws = raw_proxy("C", None);
         ws.insert(
             "dialer-proxy".to_string(),
-            serde_yaml::Value::String(" ".to_string()),
+            serde_json::Value::String(" ".to_string()),
         );
 
         apply_chains(&mut proxies, &[empty, null, ws])
@@ -5145,7 +5145,7 @@ mod dialer_proxy_tests {
             .with_max_level(tracing::Level::WARN)
             .finish();
 
-        let raws: Vec<HashMap<String, serde_yaml::Value>> = serde_yaml::from_str(
+        let raws: Vec<HashMap<String, serde_json::Value>> = serde_yaml::from_str(
             "- name: dup\n  type: direct\n- name: dup\n  type: http\n  server: 127.0.0.1\n  port: 9\n- name: dup\n  type: socks5\n  server: 127.0.0.1\n  port: 9\n",
         )
         .unwrap();
@@ -5185,12 +5185,12 @@ mod dialer_proxy_tests {
         let mut first = raw_socks5_proxy("A", Some("front"), false);
         first.insert(
             "port".to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(1111)),
+            serde_json::Value::Number(serde_json::Number::from(1111)),
         );
         let mut last = raw_socks5_proxy("A", None, false);
         last.insert(
             "port".to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(2222)),
+            serde_json::Value::Number(serde_json::Number::from(2222)),
         );
 
         apply_chains(&mut proxies, &[first, last]).expect("the effective block declares no dialer");
@@ -5226,31 +5226,31 @@ mod dialer_proxy_tests {
         name: &str,
         dialer: Option<&str>,
         udp: bool,
-    ) -> HashMap<String, serde_yaml::Value> {
+    ) -> HashMap<String, serde_json::Value> {
         let mut m = HashMap::new();
         m.insert(
             "name".to_string(),
-            serde_yaml::Value::String(name.to_string()),
+            serde_json::Value::String(name.to_string()),
         );
         m.insert(
             "type".to_string(),
-            serde_yaml::Value::String("socks5".to_string()),
+            serde_json::Value::String("socks5".to_string()),
         );
         m.insert(
             "server".to_string(),
-            serde_yaml::Value::String("127.0.0.1".to_string()),
+            serde_json::Value::String("127.0.0.1".to_string()),
         );
         m.insert(
             "port".to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(1080)),
+            serde_json::Value::Number(serde_json::Number::from(1080)),
         );
         if udp {
-            m.insert("udp".to_string(), serde_yaml::Value::Bool(true));
+            m.insert("udp".to_string(), serde_json::Value::Bool(true));
         }
         if let Some(d) = dialer {
             m.insert(
                 "dialer-proxy".to_string(),
-                serde_yaml::Value::String(d.to_string()),
+                serde_json::Value::String(d.to_string()),
             );
         }
         m
@@ -5290,11 +5290,11 @@ mod dialer_proxy_tests {
         name: &str,
         ty: &str,
         dialer: Option<&str>,
-    ) -> HashMap<String, serde_yaml::Value> {
+    ) -> HashMap<String, serde_json::Value> {
         let mut m = raw_socks5_proxy(name, dialer, false);
         m.insert(
             "type".to_string(),
-            serde_yaml::Value::String(ty.to_string()),
+            serde_json::Value::String(ty.to_string()),
         );
         m
     }
@@ -5335,16 +5335,16 @@ mod dialer_proxy_tests {
         let mut raw = raw_typed_proxy("A", "ss", Some("front"));
         raw.insert(
             "cipher".to_string(),
-            serde_yaml::Value::String("aes-256-gcm".to_string()),
+            serde_json::Value::String("aes-256-gcm".to_string()),
         );
         raw.insert(
             "password".to_string(),
-            serde_yaml::Value::String("pw".to_string()),
+            serde_json::Value::String("pw".to_string()),
         );
         // A plugin name that is not one of the built-ins → external subprocess.
         raw.insert(
             "plugin".to_string(),
-            serde_yaml::Value::String("obfs-local-does-not-exist".to_string()),
+            serde_json::Value::String("obfs-local-does-not-exist".to_string()),
         );
 
         // Must not panic and must not spawn: the parse is rejected before
@@ -5367,12 +5367,12 @@ mod dialer_proxy_tests {
         let mut first = raw_socks5_proxy("A", Some("front"), false);
         first.insert(
             "port".to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(1111)),
+            serde_json::Value::Number(serde_json::Number::from(1111)),
         );
         let mut last = raw_socks5_proxy("A", Some("front"), false);
         last.insert(
             "port".to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(2222)),
+            serde_json::Value::Number(serde_json::Number::from(2222)),
         );
 
         apply_chains(&mut proxies, &[first, last]).expect("valid chain applies");
@@ -5515,12 +5515,12 @@ mod dialer_proxy_tests {
         let mut raw_front = raw_socks5_proxy("front", None, false);
         raw_front.insert(
             "port".to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(front_port)),
+            serde_json::Value::Number(serde_json::Number::from(front_port)),
         );
         let mut raw_inner = raw_socks5_proxy("inner", Some("front"), false);
         raw_inner.insert(
             "port".to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(inner_port)),
+            serde_json::Value::Number(serde_json::Number::from(inner_port)),
         );
 
         let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
@@ -7746,7 +7746,7 @@ rules:
     /// lenient just skips ECH (issue #533 review).
     #[tokio::test]
     async fn strict_rejects_ech_enable_with_no_query_source() {
-        let mut proxies = vec![serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(
+        let mut proxies = vec![serde_yaml::from_str::<HashMap<String, serde_json::Value>>(
             "{ name: p, type: ss, ech-opts: { enable: true } }",
         )
         .unwrap()];
@@ -7755,7 +7755,7 @@ rules:
             .expect_err("strict must reject enable:true with no query source");
         assert!(err.contains("p"), "unexpected: {err}");
 
-        let mut proxies = vec![serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(
+        let mut proxies = vec![serde_yaml::from_str::<HashMap<String, serde_json::Value>>(
             "{ name: p, type: ss, ech-opts: { enable: true } }",
         )
         .unwrap()];

@@ -1614,11 +1614,15 @@ fn parse_yaml_payload(raw: &str, strict: bool) -> Result<Vec<String>> {
     if !crate::yaml_within_depth(raw) {
         return Err(anyhow!("rule-set yaml exceeds the nesting-depth limit"));
     }
-    let root: serde_yaml::Value = serde_yaml::from_str(raw).context("rule-set yaml parse error")?;
+    // The whole document is converted up front — intentionally
+    // fail-closed: a `!tag` node or complex mapping key anywhere in the
+    // untrusted remote input rejects the entire ruleset rather than
+    // slipping part of it through.
+    let root: serde_json::Value = serde_yaml::from_str(raw).context("rule-set yaml parse error")?;
     let payload = root
         .get("payload")
         .ok_or_else(|| anyhow!("rule-set yaml missing 'payload' key"))?
-        .as_sequence()
+        .as_array()
         .ok_or_else(|| anyhow!("rule-set 'payload' is not a sequence"))?;
     let mut entries = Vec::with_capacity(payload.len());
     for (i, v) in payload.iter().enumerate() {
@@ -1872,7 +1876,7 @@ mod tests {
     }
 
     fn direct_proxy() -> Arc<dyn Proxy> {
-        let cfg: HashMap<String, serde_yaml::Value> =
+        let cfg: HashMap<String, serde_json::Value> =
             serde_yaml::from_str("name: d\ntype: direct").unwrap();
         crate::proxy_parser::parse_proxy(&cfg, true).unwrap()
     }

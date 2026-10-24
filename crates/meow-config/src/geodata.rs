@@ -337,9 +337,9 @@ mod tests {
     fn upstream_only_fields_do_not_error() {
         // geodata-mode, geodata-loader, geoip-matcher accepted without error.
         let raw = RawGeoDataConfig {
-            geodata_mode: Some(serde_yaml::Value::String("memconservative".to_string())),
-            geodata_loader: Some(serde_yaml::Value::String("standard".to_string())),
-            geoip_matcher: Some(serde_yaml::Value::String("succinct".to_string())),
+            geodata_mode: Some(serde_json::Value::String("memconservative".to_string())),
+            geodata_loader: Some(serde_json::Value::String("standard".to_string())),
+            geoip_matcher: Some(serde_json::Value::String("succinct".to_string())),
             ..raw_defaults()
         };
         // Must not error — warn-only (Class B per ADR-0002).

@@ -145,9 +145,9 @@ pub struct RawGeoDataConfig {
     /// fall through to the same default.
     pub proxy: Option<String>,
     // Upstream-only fields accepted for forward-compat; we warn-once and ignore.
-    pub geodata_mode: Option<serde_yaml::Value>,
-    pub geodata_loader: Option<serde_yaml::Value>,
-    pub geoip_matcher: Option<serde_yaml::Value>,
+    pub geodata_mode: Option<serde_json::Value>,
+    pub geodata_loader: Option<serde_json::Value>,
+    pub geoip_matcher: Option<serde_json::Value>,
 }
 
 /// `geodata.url.*` — download URL overrides.
@@ -203,7 +203,7 @@ pub struct RawConfig {
     pub external_ui_url: Option<String>,
     pub secret: Option<String>,
     pub dns: Option<RawDns>,
-    pub proxies: Option<Vec<HashMap<String, serde_yaml::Value>>>,
+    pub proxies: Option<Vec<HashMap<String, serde_json::Value>>>,
     pub proxy_groups: Option<Vec<RawProxyGroup>>,
     pub proxy_providers: Option<HashMap<String, RawProxyProvider>>,
     pub rules: Option<Vec<String>>,
@@ -269,12 +269,12 @@ pub struct RawConfig {
     /// No top-level `firewall` key exists — captured only to warn on the
     /// plausible mistake (`firewall:` belongs on a `listeners:` tproxy
     /// entry, issue #563).
-    pub firewall: Option<serde_yaml::Value>,
+    pub firewall: Option<serde_json::Value>,
     /// No top-level `udp`/`udp-timeout` keys exist — captured only to
     /// warn on the plausible mistake (`udp:` belongs on a `listeners:`
     /// tproxy entry; `udp-timeout` on `listeners:`/`tun:`, issue #564).
-    pub udp: Option<serde_yaml::Value>,
-    pub udp_timeout: Option<serde_yaml::Value>,
+    pub udp: Option<serde_json::Value>,
+    pub udp_timeout: Option<serde_json::Value>,
 }
 
 /// A `hosts:` map value: one IP/domain alias or a list of IP addresses.
@@ -338,18 +338,18 @@ pub struct RawTun {
     /// a string, or mihomo's list form (the first entry is used). Opts
     /// `auto-route: global` into IPv6 capture (#375); ignored with a
     /// warning in every other mode. Default: none (IPv4 only).
-    pub inet6_address: Option<serde_yaml::Value>,
+    pub inet6_address: Option<serde_json::Value>,
     // Upstream-only fields accepted for forward-compat; warn and ignore.
-    pub stack: Option<serde_yaml::Value>,
-    pub strict_route: Option<serde_yaml::Value>,
-    pub auto_detect_interface: Option<serde_yaml::Value>,
-    pub auto_redirect: Option<serde_yaml::Value>,
-    pub endpoint_independent_nat: Option<serde_yaml::Value>,
-    pub mtu_v6: Option<serde_yaml::Value>,
-    pub route_address: Option<serde_yaml::Value>,
-    pub route_exclude_address: Option<serde_yaml::Value>,
-    pub include_uid: Option<serde_yaml::Value>,
-    pub exclude_uid: Option<serde_yaml::Value>,
+    pub stack: Option<serde_json::Value>,
+    pub strict_route: Option<serde_json::Value>,
+    pub auto_detect_interface: Option<serde_json::Value>,
+    pub auto_redirect: Option<serde_json::Value>,
+    pub endpoint_independent_nat: Option<serde_json::Value>,
+    pub mtu_v6: Option<serde_json::Value>,
+    pub route_address: Option<serde_json::Value>,
+    pub route_exclude_address: Option<serde_json::Value>,
+    pub include_uid: Option<serde_json::Value>,
+    pub exclude_uid: Option<serde_json::Value>,
 }
 
 /// `tun.auto-route` value: mihomo's boolean or a #375 mode string.
@@ -400,11 +400,11 @@ pub struct RawListener {
     // Captured as opaque `Value`s so their mere presence can be warned about
     // (ADR-0002: never silently ignore a mihomo flag) without modelling the
     // full schema. `None` when absent.
-    pub shadow_tls: Option<serde_yaml::Value>,
-    pub res_tls: Option<serde_yaml::Value>,
-    pub jls_config: Option<serde_yaml::Value>,
-    pub kcp_tun: Option<serde_yaml::Value>,
-    pub mux_option: Option<serde_yaml::Value>,
+    pub shadow_tls: Option<serde_json::Value>,
+    pub res_tls: Option<serde_json::Value>,
+    pub jls_config: Option<serde_json::Value>,
+    pub kcp_tun: Option<serde_json::Value>,
+    pub mux_option: Option<serde_json::Value>,
 }
 
 /// Raw `simple-obfs:` block for a shadowsocks listener.
@@ -564,7 +564,7 @@ pub struct RawProxyProvider {
     /// outranks node-level fields). Only `dialer-proxy` is honoured
     /// (issue #489); other keys warn at load time.
     #[serde(rename = "override", skip_serializing_if = "Option::is_none")]
-    pub override_: Option<HashMap<String, serde_yaml::Value>>,
+    pub override_: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -745,9 +745,9 @@ where
 
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
             let mut ports = Vec::new();
-            while let Some(item) = seq.next_element::<serde_yaml::Value>()? {
+            while let Some(item) = seq.next_element::<serde_json::Value>()? {
                 match item {
-                    serde_yaml::Value::Number(n) => {
+                    serde_json::Value::Number(n) => {
                         let p = n
                             .as_u64()
                             .and_then(|v| u16::try_from(v).ok())
@@ -759,7 +759,7 @@ where
                         }
                         ports.push(p);
                     }
-                    serde_yaml::Value::String(s) => {
+                    serde_json::Value::String(s) => {
                         if let Some((start_s, end_s)) = s.split_once('-') {
                             let start: u16 = start_s.trim().parse().map_err(|_| {
                                 de::Error::custom(format!("invalid port range start: {start_s}"))

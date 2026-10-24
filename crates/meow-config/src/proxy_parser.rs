@@ -18,12 +18,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 fn required_port(
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     context: &str,
 ) -> std::result::Result<u16, String> {
     let raw = config
         .get("port")
-        .and_then(serde_yaml::Value::as_u64)
+        .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| format!("{context}: missing port"))?;
     let port = u16::try_from(raw).map_err(|_| format!("{context}: port {raw} exceeds 65535"))?;
     if port == 0 {
@@ -107,7 +107,7 @@ impl Proxy for WrappedProxy {
 }
 
 pub fn parse_proxy(
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let dialer: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
@@ -119,10 +119,10 @@ pub fn parse_proxy(
 /// to a dead placeholder, never dropped. Dropping the requested transport
 /// can make a group select DIRECT, i.e. send the flow out in plaintext.
 /// This check deliberately remains available when the feature is disabled.
-pub(crate) fn node_is_trusttunnel(config: &HashMap<String, serde_yaml::Value>) -> bool {
+pub(crate) fn node_is_trusttunnel(config: &HashMap<String, serde_json::Value>) -> bool {
     config
         .get("type")
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(serde_json::Value::as_str)
         .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("trusttunnel"))
 }
 
@@ -130,7 +130,7 @@ pub(crate) fn node_is_trusttunnel(config: &HashMap<String, serde_yaml::Value>) -
 /// SIP003 executable — i.e. one that would reach `Command::new` during
 /// adapter construction. Gates untrusted node sources (proxy-providers,
 /// subscriptions) before the trusted local path (issue #513).
-pub fn node_selects_external_plugin(config: &HashMap<String, serde_yaml::Value>) -> bool {
+pub fn node_selects_external_plugin(config: &HashMap<String, serde_json::Value>) -> bool {
     #[cfg(feature = "ss")]
     {
         config.get("type").and_then(|v| v.as_str()) == Some("ss")
@@ -158,7 +158,7 @@ pub fn node_selects_external_plugin(config: &HashMap<String, serde_yaml::Value>)
 /// [`meow_proxy::dialer::NamedProxyDialer`] when the node declares
 /// `dialer-proxy` (issue #489).
 pub fn parse_proxy_provider_node(
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     ipv6: bool,
     allow_external_plugin: bool,
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
@@ -183,7 +183,7 @@ pub fn parse_proxy_provider_node(
 /// so that dialer-proxy chaining works for all protocols without requiring
 /// connect_over.
 pub fn parse_proxy_with_dialer(
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
     ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
@@ -216,7 +216,7 @@ pub fn parse_proxy_with_dialer(
                 .ok_or("missing cipher")?;
             let udp = config
                 .get("udp")
-                .and_then(serde_yaml::Value::as_bool)
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             let plugin = config.get("plugin").and_then(|v| v.as_str());
             let plugin_opts_str = config.get("plugin-opts").and_then(serialize_plugin_opts);
@@ -295,11 +295,11 @@ pub fn parse_proxy_with_dialer(
             let sni = config.get("sni").and_then(|v| v.as_str()).unwrap_or("");
             let skip_verify = config
                 .get("skip-cert-verify")
-                .and_then(serde_yaml::Value::as_bool)
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             let udp = config
                 .get("udp")
-                .and_then(serde_yaml::Value::as_bool)
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
 
             #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
@@ -503,7 +503,7 @@ fn feature_gated_proxy_type(proxy_type: &str) -> String {
 #[cfg(feature = "snell")]
 fn parse_snell(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<meow_proxy::SnellAdapter, String> {
     use meow_proxy::{SnellAdapter, SnellObfs, SnellV6Mode, SnellVersion};
@@ -520,11 +520,11 @@ fn parse_snell(
 
     let udp = config
         .get("udp")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let reuse = config
         .get("reuse")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
     // ── Version parsing ──────────────────────────────────────────────────
@@ -663,7 +663,7 @@ fn parse_snell(
 /// upstream: `adapter/outbound/http.go`
 fn parse_http(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<HttpAdapter, String> {
     let server = config
@@ -673,11 +673,11 @@ fn parse_http(
     let port = required_port(config, "http")?;
     let tls = config
         .get("tls")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let skip_cert_verify = config
         .get("skip-cert-verify")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
     // Both username and password must be set, or neither (Class A).
@@ -695,7 +695,7 @@ fn parse_http(
     // CONNECT request, so a giant provider-supplied map is attacker-chosen
     // process memory — same bound as xhttp/http-upgrade (issue #648).
     let extra_headers: Vec<(String, String)> =
-        match config.get("headers").and_then(|v| v.as_mapping()) {
+        match config.get("headers").and_then(|v| v.as_object()) {
             Some(m) => {
                 if m.len() > meow_transport::MAX_EXTRA_HEADERS {
                     return Err(format!(
@@ -705,7 +705,7 @@ fn parse_http(
                     ));
                 }
                 m.iter()
-                    .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
                     .collect()
             }
             None => Vec::new(),
@@ -734,7 +734,7 @@ fn parse_http(
 /// upstream: `adapter/outbound/socks5.go`
 fn parse_socks5(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<Socks5Adapter, String> {
     let server = config
@@ -744,11 +744,11 @@ fn parse_socks5(
     let port = required_port(config, "socks5")?;
     let tls = config
         .get("tls")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let skip_cert_verify = config
         .get("skip-cert-verify")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
     // Both username and password must be set, or neither (Class A).
@@ -766,7 +766,7 @@ fn parse_socks5(
 
     let udp = config
         .get("udp")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
     Ok(Socks5Adapter::new(
@@ -795,7 +795,7 @@ fn parse_socks5(
 /// queries.
 fn parse_direct(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     ipv6: bool,
 ) -> std::result::Result<DirectAdapter, String> {
     use meow_common::DnsMode;
@@ -827,8 +827,8 @@ fn parse_direct(
 
     if let Some(v) = config.get("dns") {
         let entries: Vec<String> = match v {
-            serde_yaml::Value::String(s) => vec![s.clone()],
-            serde_yaml::Value::Sequence(seq) => seq
+            serde_json::Value::String(s) => vec![s.clone()],
+            serde_json::Value::Array(seq) => seq
                 .iter()
                 .map(|e| {
                     e.as_str()
@@ -882,19 +882,19 @@ fn parse_direct(
 #[cfg(feature = "trusttunnel")]
 fn parse_trusttunnel(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let required = |key: &str| {
         config
             .get(key)
-            .and_then(serde_yaml::Value::as_str)
+            .and_then(serde_json::Value::as_str)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| format!("trusttunnel: missing {key}"))
     };
     let boolean = |key: &str, default: bool| -> std::result::Result<bool, String> {
         match config.get(key) {
-            None | Some(serde_yaml::Value::Null) => Ok(default),
+            None | Some(serde_json::Value::Null) => Ok(default),
             Some(value) => value
                 .as_bool()
                 .ok_or_else(|| format!("trusttunnel: {key} must be boolean")),
@@ -912,10 +912,10 @@ fn parse_trusttunnel(
     }
     let nonempty = |field: &str| {
         config.get(field).is_some_and(|value| match value {
-            serde_yaml::Value::Null => false,
-            serde_yaml::Value::String(text) => !text.is_empty(),
-            serde_yaml::Value::Sequence(list) => !list.is_empty(),
-            serde_yaml::Value::Mapping(map) => !map.is_empty(),
+            serde_json::Value::Null => false,
+            serde_json::Value::String(text) => !text.is_empty(),
+            serde_json::Value::Array(list) => !list.is_empty(),
+            serde_json::Value::Object(map) => !map.is_empty(),
             _ => true,
         })
     };
@@ -961,7 +961,7 @@ fn parse_trusttunnel(
     }
     let expected_alpn = if quic { "h3" } else { "h2" };
     if let Some(alpn) = config.get("alpn").filter(|value| !value.is_null()) {
-        if !alpn.as_sequence().is_some_and(|list| {
+        if !alpn.as_array().is_some_and(|list| {
             list.is_empty() || (list.len() == 1 && list[0].as_str() == Some(expected_alpn))
         }) {
             return Err(format!(
@@ -971,7 +971,7 @@ fn parse_trusttunnel(
     }
     let text = |key: &str| -> std::result::Result<Option<&str>, String> {
         match config.get(key) {
-            None | Some(serde_yaml::Value::Null) => Ok(None),
+            None | Some(serde_json::Value::Null) => Ok(None),
             Some(value) => value
                 .as_str()
                 .map(Some)
@@ -995,7 +995,7 @@ fn parse_trusttunnel(
     );
     let number = |key: &str, default: usize| -> std::result::Result<usize, String> {
         match config.get(key) {
-            None | Some(serde_yaml::Value::Null) => Ok(default),
+            None | Some(serde_json::Value::Null) => Ok(default),
             Some(v) => v
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
@@ -1051,15 +1051,15 @@ fn parse_trusttunnel(
         options.app_name = app_name.to_owned();
     }
     let declared: Vec<(String, String)> = match config.get("headers") {
-        None | Some(serde_yaml::Value::Null) => Vec::new(),
+        None | Some(serde_json::Value::Null) => Vec::new(),
         Some(value) => value
-            .as_mapping()
+            .as_object()
             .ok_or("trusttunnel: headers must be a map of name to value")?
             .iter()
             .map(|(key, value)| {
-                let name = key
-                    .as_str()
-                    .ok_or("trusttunnel: header names must be strings")?;
+                // serde_json::Map keys are always strings — a YAML map key
+                // that isn't a string already failed deserialization.
+                let name = key.as_str();
                 let text = value
                     .as_str()
                     .ok_or_else(|| format!("trusttunnel: header '{name}' must be a string"))?;
@@ -1114,7 +1114,7 @@ fn parse_trusttunnel(
 #[cfg(feature = "anytls")]
 fn parse_anytls(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<meow_proxy::AnytlsAdapter, String> {
     let server = config
         .get("server")
@@ -1128,11 +1128,11 @@ fn parse_anytls(
     let sni = config.get("sni").and_then(|v| v.as_str());
     let skip_cert_verify = config
         .get("skip-cert-verify")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let udp = config
         .get("udp")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
     meow_proxy::AnytlsAdapter::new(name, server, port, password, sni, skip_cert_verify, udp)
@@ -1160,7 +1160,7 @@ fn parse_anytls(
 #[cfg(feature = "hysteria2")]
 fn parse_hysteria2(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<meow_proxy::Hy2Adapter, String> {
     use meow_proxy::{Hy2HopInterval, Hy2Obfs, Hy2Options};
 
@@ -1180,11 +1180,11 @@ fn parse_hysteria2(
     let sni = config.get("sni").and_then(|v| v.as_str());
     let skip_cert_verify = config
         .get("skip-cert-verify")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let udp = config
         .get("udp")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
     let up_bps = parse_hy2_bandwidth_field(name, "up", config.get("up"))?;
     let down_bps = parse_hy2_bandwidth_field(name, "down", config.get("down"))?;
@@ -1209,7 +1209,7 @@ fn parse_hysteria2(
     let fingerprint = parse_hy2_fingerprint(name, config.get("fingerprint"))?;
     let fast_open = config
         .get("fast-open")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
     validate_hy2_alpn(name, config.get("alpn"))?;
     reject_unsupported_hy2_options(name, config)?;
@@ -1240,10 +1240,10 @@ const HY2_MIN_HOP_INTERVAL_SECS: u64 = 5;
 const HY2_DEFAULT_HOP_INTERVAL_SECS: u64 = 30;
 
 #[cfg(feature = "hysteria2")]
-fn optional_nonempty_str(config: &HashMap<String, serde_yaml::Value>, key: &str) -> Option<String> {
+fn optional_nonempty_str(config: &HashMap<String, serde_json::Value>, key: &str) -> Option<String> {
     config
         .get(key)
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -1253,7 +1253,7 @@ fn optional_nonempty_str(config: &HashMap<String, serde_yaml::Value>, key: &str)
 fn parse_hy2_bandwidth_field(
     name: &str,
     field: &str,
-    value: Option<&serde_yaml::Value>,
+    value: Option<&serde_json::Value>,
 ) -> std::result::Result<u64, String> {
     let Some(value) = value else {
         return Ok(0);
@@ -1323,7 +1323,7 @@ fn mbps_to_bytes_per_second(mbps: u64) -> u64 {
 #[cfg(feature = "hysteria2")]
 fn hy2_dial_port(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     ports: Option<&str>,
 ) -> std::result::Result<u16, String> {
     let explicit = match config.get("port") {
@@ -1421,7 +1421,7 @@ fn parse_hy2_port_part(name: &str, value: &str) -> std::result::Result<u16, Stri
 #[cfg(feature = "hysteria2")]
 fn parse_hy2_hop_interval(
     name: &str,
-    value: Option<&serde_yaml::Value>,
+    value: Option<&serde_json::Value>,
 ) -> std::result::Result<Option<(u64, u64)>, String> {
     let Some(value) = value else {
         return Ok(None);
@@ -1485,9 +1485,9 @@ fn normalize_hy2_hop_interval(start: u64, end: u64) -> (u64, u64) {
 #[cfg(feature = "hysteria2")]
 fn parse_hy2_fingerprint(
     name: &str,
-    value: Option<&serde_yaml::Value>,
+    value: Option<&serde_json::Value>,
 ) -> std::result::Result<Option<String>, String> {
-    let Some(raw) = value.and_then(serde_yaml::Value::as_str) else {
+    let Some(raw) = value.and_then(serde_json::Value::as_str) else {
         return Ok(None);
     };
     let raw = raw.trim();
@@ -1510,13 +1510,13 @@ fn parse_hy2_fingerprint(
 #[cfg(feature = "hysteria2")]
 fn validate_hy2_alpn(
     name: &str,
-    value: Option<&serde_yaml::Value>,
+    value: Option<&serde_json::Value>,
 ) -> std::result::Result<(), String> {
     let Some(value) = value else {
         return Ok(());
     };
     let mut alpns = Vec::new();
-    if let Some(items) = value.as_sequence() {
+    if let Some(items) = value.as_array() {
         for item in items {
             let alpn = item
                 .as_str()
@@ -1541,7 +1541,7 @@ fn validate_hy2_alpn(
 #[cfg(feature = "hysteria2")]
 fn reject_unsupported_hy2_options(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<(), String> {
     for key in [
         "certificate",
@@ -1574,14 +1574,14 @@ fn reject_unsupported_hy2_options(
 #[cfg(feature = "hysteria2")]
 fn reject_enabled_hy2_map(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     key: &str,
 ) -> std::result::Result<(), String> {
     if let Some(value) = config.get(key) {
         let enabled = value
-            .as_mapping()
-            .and_then(|map| map.get(serde_yaml::Value::String("enable".into())))
-            .and_then(serde_yaml::Value::as_bool)
+            .as_object()
+            .and_then(|map| map.get("enable"))
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
         if enabled {
             return Err(format!(
@@ -1595,7 +1595,7 @@ fn reject_enabled_hy2_map(
 #[cfg(feature = "hysteria2")]
 fn reject_nonzero_hy2_option(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     key: &str,
 ) -> std::result::Result<(), String> {
     if let Some(value) = config.get(key) {
@@ -1636,10 +1636,10 @@ fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, 
 /// the ceiling clamps with a warning (`meow-transport` re-clamps at
 /// connect for programmatic configs — issue #648).
 #[cfg(any(feature = "vless", feature = "vmess"))]
-fn ws_max_early_data(ws_opts: Option<&serde_yaml::Value>) -> usize {
+fn ws_max_early_data(ws_opts: Option<&serde_json::Value>) -> usize {
     ws_opts
         .and_then(|o| o.get("max-early-data"))
-        .and_then(serde_yaml::Value::as_u64)
+        .and_then(serde_json::Value::as_u64)
         .map_or(0, |n| {
             let v = usize::try_from(n).unwrap_or(usize::MAX);
             if v > meow_transport::ws::MAX_WS_EARLY_DATA {
@@ -1686,7 +1686,7 @@ fn ws_max_early_data(ws_opts: Option<&serde_yaml::Value>) -> usize {
 #[cfg(feature = "vless")]
 fn parse_vless(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<VlessAdapter, String> {
     let server = config
@@ -1712,15 +1712,15 @@ fn parse_vless(
 
     let udp = config
         .get("udp")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let tls = config
         .get("tls")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let skip_cert_verify = config
         .get("skip-cert-verify")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let servername = config
         .get("servername")
@@ -1729,7 +1729,7 @@ fn parse_vless(
         .to_string();
     let alpn: Vec<String> = config
         .get("alpn")
-        .and_then(|v| v.as_sequence())
+        .and_then(|v| v.as_array())
         .unwrap_or(&vec![])
         .iter()
         .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
@@ -1897,7 +1897,7 @@ fn parse_vless(
         if let Some(ech_opts) = config.get("ech-opts") {
             let ech_enabled = ech_opts
                 .get("enable")
-                .and_then(serde_yaml::Value::as_bool)
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             if ech_enabled {
                 use meow_transport::tls::EchOpts;
@@ -1992,7 +1992,7 @@ fn parse_vless(
             // (debug) and upstream requires at least one authority value.
             let hosts: Vec<String> = h2_opts
                 .and_then(|o| o.get("host"))
-                .and_then(|v| v.as_sequence())
+                .and_then(|v| v.as_array())
                 .map_or_else(
                     || vec![server.to_string()],
                     |seq| {
@@ -2027,7 +2027,7 @@ fn parse_vless(
                 .or_else(|| Some(server.to_string()));
             let extra_headers: Vec<(String, String)> = match hu_opts
                 .and_then(|o| o.get("headers"))
-                .and_then(|h| h.as_mapping())
+                .and_then(|h| h.as_object())
             {
                 Some(m) => {
                     // Same remotely-supplied header-list bound as xhttp
@@ -2040,7 +2040,7 @@ fn parse_vless(
                     }
                     m.iter()
                         .filter_map(|(k, v)| {
-                            let key = k.as_str()?.to_string();
+                            let key = k.clone();
                             let val = v.as_str()?.to_string();
                             Some((key, val))
                         })
@@ -2140,7 +2140,7 @@ fn parse_vless(
 ))]
 fn parse_mux_options(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<Option<meow_proxy::mux::MuxOptions>, String> {
     let Some(mux_cfg) = mux_config_block(name, config)? else {
         return Ok(None);
@@ -2152,7 +2152,7 @@ fn parse_mux_options(
     // Empty protocol maps to h2mux, matching mihomo's default.
     let protocol_str = match mux_cfg.get("protocol") {
         None => "h2mux",
-        Some(serde_yaml::Value::String(s)) => s.as_str(),
+        Some(serde_json::Value::String(s)) => s.as_str(),
         Some(other) => {
             return Err(format!(
                 "{name}: mux option 'protocol' must be a string, got {other:?}"
@@ -2226,12 +2226,12 @@ fn parse_mux_options(
 ))]
 fn parse_mux_options(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<(), String> {
     if let Some(mux_cfg) = mux_config_block(name, config)? {
         let enabled = mux_cfg
             .get("enabled")
-            .and_then(serde_yaml::Value::as_bool)
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         if enabled {
             tracing::warn!(
@@ -2251,8 +2251,8 @@ fn parse_mux_options(
 ))]
 fn mux_config_block<'a>(
     name: &str,
-    config: &'a HashMap<String, serde_yaml::Value>,
-) -> std::result::Result<Option<&'a serde_yaml::Value>, String> {
+    config: &'a HashMap<String, serde_json::Value>,
+) -> std::result::Result<Option<&'a serde_json::Value>, String> {
     let block = match (config.get("smux"), config.get("mux")) {
         (Some(_), Some(_)) => {
             // Migration-friendly: prefer the canonical key and say so,
@@ -2271,7 +2271,7 @@ fn mux_config_block<'a>(
     };
     // A scalar like `smux: true` must not be treated as "disabled" —
     // the operator clearly tried to enable multiplexing.
-    if !block.is_mapping() {
+    if !block.is_object() {
         return Err(format!(
             "{name}: `smux`/`mux` must be a mapping, got {block:?}"
         ));
@@ -2290,13 +2290,13 @@ fn mux_config_block<'a>(
 ))]
 fn mux_bool_field(
     name: &str,
-    mux_cfg: &serde_yaml::Value,
+    mux_cfg: &serde_json::Value,
     key: &str,
     default: bool,
 ) -> std::result::Result<bool, String> {
     match mux_cfg.get(key) {
         None => Ok(default),
-        Some(serde_yaml::Value::Bool(b)) => Ok(*b),
+        Some(serde_json::Value::Bool(b)) => Ok(*b),
         Some(other) => Err(format!(
             "{name}: mux option '{key}' must be a boolean, got {other:?}"
         )),
@@ -2314,13 +2314,13 @@ fn mux_bool_field(
 ))]
 fn mux_usize_field(
     name: &str,
-    mux_cfg: &serde_yaml::Value,
+    mux_cfg: &serde_json::Value,
     key: &str,
     default: usize,
 ) -> std::result::Result<usize, String> {
     match mux_cfg.get(key) {
         None => Ok(default),
-        Some(serde_yaml::Value::Number(n)) if n.is_u64() => usize::try_from(n.as_u64().unwrap())
+        Some(serde_json::Value::Number(n)) if n.is_u64() => usize::try_from(n.as_u64().unwrap())
             .map_err(|_| format!("{name}: mux option '{key}' is too large")),
         Some(other) => Err(format!(
             "{name}: mux option '{key}' must be a non-negative integer, got {other:?}"
@@ -2329,7 +2329,7 @@ fn mux_usize_field(
 }
 #[cfg(feature = "vless")]
 fn parse_vless_xhttp_config(
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     server: &str,
     servername: &str,
     tls: bool,
@@ -2352,9 +2352,9 @@ fn parse_vless_xhttp_config(
         Some(value) if value.is_string() => {
             vec![value.as_str().expect("checked string").to_string()]
         }
-        Some(value) if value.is_sequence() => value
-            .as_sequence()
-            .expect("checked sequence")
+        Some(value) if value.is_array() => value
+            .as_array()
+            .expect("checked array")
             .iter()
             .map(|item| {
                 item.as_str()
@@ -2381,7 +2381,7 @@ fn parse_vless_xhttp_config(
     }
     let extra_headers: Vec<(String, String)> = match xhttp_opts
         .and_then(|o| o.get("headers"))
-        .and_then(|h| h.as_mapping())
+        .and_then(|h| h.as_object())
     {
         Some(m) => {
             // Bound remotely-supplied header lists — the padding cap below
@@ -2395,7 +2395,7 @@ fn parse_vless_xhttp_config(
             }
             m.iter()
                 .filter_map(|(k, v)| {
-                    let key = k.as_str()?.to_string();
+                    let key = k.clone();
                     let val = v.as_str()?.to_string();
                     Some((key, val))
                 })
@@ -2405,7 +2405,7 @@ fn parse_vless_xhttp_config(
     };
     let no_grpc_header = xhttp_opts
         .and_then(|o| o.get("no-grpc-header"))
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let x_padding_bytes =
         if let Some(padding_val) = xhttp_opts.and_then(|o| o.get("x-padding-bytes")) {
@@ -2430,7 +2430,7 @@ fn parse_vless_xhttp_config(
                     ));
                 }
                 Some((min, max))
-            } else if let Some(seq) = padding_val.as_sequence() {
+            } else if let Some(seq) = padding_val.as_array() {
                 if seq.len() != 2 {
                     return Err("vless: x-padding-bytes array must have 2 elements".into());
                 }
@@ -2563,7 +2563,7 @@ fn default_transport_alpn(network: &str, alpn: Vec<String>) -> Vec<String> {
 #[cfg(feature = "vless")]
 fn parse_vless_reality_opts(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<Option<meow_transport::tls::RealityConfig>, String> {
     let Some(opts) = config.get("reality-opts") else {
         return Ok(None);
@@ -2571,7 +2571,7 @@ fn parse_vless_reality_opts(
 
     let public_key_str = opts
         .get("public-key")
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "vless: reality-opts.public-key is required".to_string())?;
 
     let public_key_bytes = decode_raw_url_base64_lenient(public_key_str)
@@ -2604,8 +2604,8 @@ fn parse_vless_reality_opts(
     // notation like `0x1f` expecting it to be read as literal hex digits
     // know to quote the value instead.
     let short_id_str = match opts.get("short-id") {
-        None | Some(serde_yaml::Value::Null) => String::new(),
-        Some(serde_yaml::Value::Number(n)) => {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::Number(n)) => {
             let coerced = n
                 .as_u64()
                 .map(|u| u.to_string())
@@ -2640,7 +2640,7 @@ fn parse_vless_reality_opts(
 
     let support_x25519_mlkem768 = opts
         .get("support-x25519mlkem768")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
     Ok(Some(meow_transport::tls::RealityConfig {
@@ -2699,27 +2699,27 @@ fn parse_uuid(s: &str) -> std::result::Result<[u8; 16], String> {
 /// `gost-plugin`), and any other map is dotted into its parent key
 /// (`ech-opts: {enable: true}` → `ech-opts.enable=true`).
 #[cfg(feature = "ss")]
-fn serialize_plugin_opts(opts: &serde_yaml::Value) -> Option<String> {
+fn serialize_plugin_opts(opts: &serde_json::Value) -> Option<String> {
     // `;` separates tokens and `=` separates key from value, so neither may
     // appear inside a serialized name or value — otherwise a nested map
     // could smuggle a top-level opt token (e.g. `headers: {X: "a;tls"}`
     // would emit a bare `tls` token).
-    fn push_scalar(parts: &mut Vec<String>, key: &str, v: &serde_yaml::Value) {
+    fn push_scalar(parts: &mut Vec<String>, key: &str, v: &serde_json::Value) {
         let val = match v {
-            serde_yaml::Value::String(s) => s.clone(),
-            serde_yaml::Value::Bool(b) => b.to_string(),
-            serde_yaml::Value::Number(n) => n.to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
             // Sequences join on `,` — not a SIP003 separator, and the list
             // opts that exist (shadow-tls `alpn`) are comma-split downstream.
             // An element containing `,` or `;` would splice extra items or
             // a whole extra token into the serialized value, so drop it.
-            serde_yaml::Value::Sequence(seq) => seq
+            serde_json::Value::Array(seq) => seq
                 .iter()
                 .filter_map(|i| {
                     let s = match i {
-                        serde_yaml::Value::String(s) => s.clone(),
-                        serde_yaml::Value::Bool(b) => b.to_string(),
-                        serde_yaml::Value::Number(n) => n.to_string(),
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        serde_json::Value::Number(n) => n.to_string(),
                         other => {
                             tracing::warn!(
                                 "plugin-opts: dropping non-scalar sequence element under '{key}': {other:?}"
@@ -2751,27 +2751,19 @@ fn serialize_plugin_opts(opts: &serde_yaml::Value) -> Option<String> {
         parts.push(format!("{key}={val}"));
     }
     match opts {
-        serde_yaml::Value::String(s) => Some(s.clone()),
-        serde_yaml::Value::Mapping(map) => {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(map) => {
             let mut parts: Vec<String> = Vec::new();
             for (k, v) in map {
-                let Some(key) = k.as_str() else {
-                    tracing::warn!("plugin-opts: dropping non-string key {k:?}");
-                    continue;
-                };
+                let key = k.as_str();
                 match v {
-                    serde_yaml::Value::Mapping(inner) if key.eq_ignore_ascii_case("headers") => {
+                    serde_json::Value::Object(inner) if key.eq_ignore_ascii_case("headers") => {
                         for (hk, hv) in inner {
-                            let Some(hk) = hk.as_str() else {
-                                tracing::warn!(
-                                    "plugin-opts: dropping non-string header name {hk:?}"
-                                );
-                                continue;
-                            };
+                            let hk = hk.as_str();
                             let hv = match hv {
-                                serde_yaml::Value::String(s) => s.clone(),
-                                serde_yaml::Value::Bool(b) => b.to_string(),
-                                serde_yaml::Value::Number(n) => n.to_string(),
+                                serde_json::Value::String(s) => s.clone(),
+                                serde_json::Value::Bool(b) => b.to_string(),
+                                serde_json::Value::Number(n) => n.to_string(),
                                 other => {
                                     tracing::warn!(
                                         "plugin-opts: dropping non-scalar value for header '{hk}': {other:?}"
@@ -2788,14 +2780,10 @@ fn serialize_plugin_opts(opts: &serde_yaml::Value) -> Option<String> {
                             parts.push(format!("header={hk}:{hv}"));
                         }
                     }
-                    serde_yaml::Value::Mapping(inner) => {
+                    serde_json::Value::Object(inner) => {
                         for (sk, sv) in inner {
-                            match sk.as_str() {
-                                Some(sk) => push_scalar(&mut parts, &format!("{key}.{sk}"), sv),
-                                None => tracing::warn!(
-                                    "plugin-opts: dropping non-string key {sk:?} under '{key}'"
-                                ),
-                            }
+                            let sk = sk.as_str();
+                            push_scalar(&mut parts, &format!("{key}.{sk}"), sv);
                         }
                     }
                     other => push_scalar(&mut parts, key, other),
@@ -2814,7 +2802,7 @@ fn serialize_plugin_opts(opts: &serde_yaml::Value) -> Option<String> {
 #[cfg(feature = "vmess")]
 fn parse_vmess(
     name: &str,
-    config: &HashMap<String, serde_yaml::Value>,
+    config: &HashMap<String, serde_json::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<meow_proxy::VmessAdapter, String> {
     use meow_proxy::vmess::header::Security;
@@ -2840,7 +2828,7 @@ fn parse_vmess(
     // alterId: warn-and-coerce to 0
     let alter_id = config
         .get("alterId")
-        .and_then(serde_yaml::Value::as_u64)
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     if alter_id > 0 {
         tracing::warn!(
@@ -2871,15 +2859,15 @@ fn parse_vmess(
 
     let udp = config
         .get("udp")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let tls = config
         .get("tls")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let skip_cert_verify = config
         .get("skip-cert-verify")
-        .and_then(serde_yaml::Value::as_bool)
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let servername = config
         .get("servername")
@@ -2887,7 +2875,7 @@ fn parse_vmess(
         .unwrap_or(server);
     let alpn: Vec<String> = config
         .get("alpn")
-        .and_then(|v| v.as_sequence())
+        .and_then(|v| v.as_array())
         .unwrap_or(&vec![])
         .iter()
         .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
@@ -3381,12 +3369,12 @@ mod tests {
     use std::net::Ipv6Addr;
 
     fn parse_proxy(
-        config: &HashMap<String, serde_yaml::Value>,
+        config: &HashMap<String, serde_json::Value>,
     ) -> std::result::Result<Arc<dyn Proxy>, String> {
         super::parse_proxy(config, true)
     }
 
-    fn proxy_config(yaml: &str) -> HashMap<String, serde_yaml::Value> {
+    fn proxy_config(yaml: &str) -> HashMap<String, serde_json::Value> {
         serde_yaml::from_str(yaml).unwrap()
     }
 
@@ -3556,17 +3544,17 @@ mod tests {
         // Absent → disabled.
         assert_eq!(ws_max_early_data(None), 0);
         // Boundary: the ceiling itself survives.
-        let at_cap = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+        let at_cap = serde_yaml::from_str::<serde_json::Value>(&format!(
             "max-early-data: {MAX_WS_EARLY_DATA}"
         ))
         .unwrap();
         assert_eq!(ws_max_early_data(Some(&at_cap)), MAX_WS_EARLY_DATA);
         // Above → clamped (not rejected; excess bytes flow as normal frames).
-        let over = serde_yaml::from_str::<serde_yaml::Value>("max-early-data: 99999").unwrap();
+        let over = serde_yaml::from_str::<serde_json::Value>("max-early-data: 99999").unwrap();
         assert_eq!(ws_max_early_data(Some(&over)), MAX_WS_EARLY_DATA);
         // u64::MAX must not wrap the usize conversion.
         let huge =
-            serde_yaml::from_str::<serde_yaml::Value>("max-early-data: 18446744073709551615")
+            serde_yaml::from_str::<serde_json::Value>("max-early-data: 18446744073709551615")
                 .unwrap();
         assert_eq!(ws_max_early_data(Some(&huge)), MAX_WS_EARLY_DATA);
     }
@@ -3592,7 +3580,7 @@ mod tests {
     #[cfg(feature = "ss")]
     #[test]
     fn test_serialize_plugin_opts_map() {
-        let yaml: serde_yaml::Value = serde_yaml::from_str(
+        let yaml: serde_json::Value = serde_yaml::from_str(
             r#"
 mode: websocket
 host: example.com
@@ -3611,7 +3599,7 @@ tls: true
     #[cfg(feature = "ss")]
     #[test]
     fn test_serialize_plugin_opts_string_passthrough() {
-        let yaml = serde_yaml::Value::String("obfs=http;obfs-host=example.com".to_string());
+        let yaml = serde_json::Value::String("obfs=http;obfs-host=example.com".to_string());
         let result = serialize_plugin_opts(&yaml).unwrap();
         assert_eq!(result, "obfs=http;obfs-host=example.com");
     }
@@ -3622,12 +3610,12 @@ tls: true
         // Every empty-ish YAML value must serialize to None. `empty mapping`
         // exercises the `parts.is_empty()` branch; `null` exercises the
         // catch-all arm of serialize_plugin_opts.
-        let cases: [(&str, serde_yaml::Value); 2] = [
+        let cases: [(&str, serde_json::Value); 2] = [
             (
                 "empty mapping",
-                serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                serde_json::Value::Object(serde_json::Map::new()),
             ),
-            ("null", serde_yaml::Value::Null),
+            ("null", serde_json::Value::Null),
         ];
         for (label, yaml) in cases {
             assert!(
@@ -3641,7 +3629,7 @@ tls: true
     #[cfg(feature = "ss")]
     #[test]
     fn test_serialize_plugin_opts_number_value() {
-        let yaml: serde_yaml::Value = serde_yaml::from_str("port: 8080").unwrap();
+        let yaml: serde_json::Value = serde_yaml::from_str("port: 8080").unwrap();
         let result = serialize_plugin_opts(&yaml).unwrap();
         assert_eq!(result, "port=8080");
     }
@@ -3652,15 +3640,17 @@ tls: true
         // gost-plugin takes a `headers` map and an `ech-opts` map
         // (issue #533).  `headers` flattens to repeated `header=K:V`
         // tokens (SIP003 convention); any other nested map is dotted.
-        let yaml: serde_yaml::Value = serde_yaml::from_str(
+        let yaml: serde_json::Value = serde_yaml::from_str(
             "mode: websocket\nheaders:\n  CF-Token: abc\n  Host: edge.example.com\nech-opts:\n  enable: true\n  config: QUJD\n",
         )
         .unwrap();
         let result = serialize_plugin_opts(&yaml).unwrap();
+        // serde_json::Map is a BTreeMap — the emitted opt order is sorted by
+        // key, not YAML document order. SIP003 opts are unordered anyway.
         assert_eq!(
             result,
-            "mode=websocket;header=CF-Token:abc;header=Host:edge.example.com;\
-             ech-opts.enable=true;ech-opts.config=QUJD"
+            "ech-opts.config=QUJD;ech-opts.enable=true;header=CF-Token:abc;\
+             header=Host:edge.example.com;mode=websocket"
         );
     }
 
@@ -3669,15 +3659,16 @@ tls: true
     fn test_serialize_plugin_opts_token_smuggling_guard() {
         // A `;`/`=`/`:` inside a serialized name or value would split into
         // extra SIP003 tokens — entries containing them are dropped.
-        let yaml: serde_yaml::Value = serde_yaml::from_str(
+        let yaml: serde_json::Value = serde_yaml::from_str(
             "mode: websocket\nheaders:\n  \"x;skip-cert-verify\": true\n  Good: ok\n\
              weird;key: v\nfine: a;b\n",
         )
         .unwrap();
         let result = serialize_plugin_opts(&yaml).unwrap();
         let mut tokens = result.split(';');
-        assert_eq!(tokens.next(), Some("mode=websocket"));
+        // BTreeMap key order: `headers` sorts before `mode`.
         assert_eq!(tokens.next(), Some("header=Good:ok"));
+        assert_eq!(tokens.next(), Some("mode=websocket"));
         assert!(tokens.next().is_none(), "smuggled tokens leaked: {result}");
     }
 
@@ -3686,11 +3677,12 @@ tls: true
     fn test_serialize_plugin_opts_headers_case_insensitive() {
         // mapstructure decodes `Headers` onto the `headers` field — match
         // its case-insensitive key handling.
-        let yaml: serde_yaml::Value =
+        let yaml: serde_json::Value =
             serde_yaml::from_str("mode: websocket\nHeaders:\n  X-A: b\n").unwrap();
+        // BTreeMap key order: `Headers` sorts before `mode`.
         assert_eq!(
             serialize_plugin_opts(&yaml).unwrap(),
-            "mode=websocket;header=X-A:b"
+            "header=X-A:b;mode=websocket"
         );
     }
 
@@ -3699,7 +3691,7 @@ tls: true
     fn test_serialize_plugin_opts_sequence_join() {
         // `alpn` arrives as a YAML sequence (upstream `alpn []string`) —
         // joined with `,`, which the shadow-tls parser splits back out.
-        let yaml: serde_yaml::Value =
+        let yaml: serde_json::Value =
             serde_yaml::from_str("alpn:\n  - h2\n  - http/1.1\nversion: 3\n").unwrap();
         assert_eq!(
             serialize_plugin_opts(&yaml).unwrap(),
@@ -3835,7 +3827,7 @@ tls: true
 
     // ─── direct proxy with per-proxy DNS (issue #67) ─────────────────────────
 
-    fn direct_config(yaml: &str) -> HashMap<String, serde_yaml::Value> {
+    fn direct_config(yaml: &str) -> HashMap<String, serde_json::Value> {
         serde_yaml::from_str(yaml).unwrap()
     }
 
@@ -3984,7 +3976,7 @@ tls: true
     // ─── anytls proxy parser (issue #75) ─────────────────────────────────────
 
     #[cfg(feature = "anytls")]
-    fn anytls_config(yaml: &str) -> HashMap<String, serde_yaml::Value> {
+    fn anytls_config(yaml: &str) -> HashMap<String, serde_json::Value> {
         serde_yaml::from_str(yaml).unwrap()
     }
 
@@ -4049,7 +4041,7 @@ tls: true
     // ─── hysteria2 parser ────────────────────────────────────────────────────
 
     #[cfg(feature = "hysteria2")]
-    fn hy2_config(yaml: &str) -> HashMap<String, serde_yaml::Value> {
+    fn hy2_config(yaml: &str) -> HashMap<String, serde_json::Value> {
         serde_yaml::from_str(yaml).unwrap()
     }
 
@@ -4201,16 +4193,16 @@ tls: true
     fn parse_hysteria2_hop_interval_matches_mihomo_floor() {
         assert_eq!(parse_hy2_hop_interval("hy2", None).unwrap(), None);
         assert_eq!(
-            parse_hy2_hop_interval("hy2", Some(&serde_yaml::Value::from(0))).unwrap(),
+            parse_hy2_hop_interval("hy2", Some(&serde_json::Value::from(0))).unwrap(),
             Some((30, 30))
         );
         assert_eq!(
-            parse_hy2_hop_interval("hy2", Some(&serde_yaml::Value::from("1-2"))).unwrap(),
+            parse_hy2_hop_interval("hy2", Some(&serde_json::Value::from("1-2"))).unwrap(),
             Some((5, 5))
         );
         // The ceiling itself stays usable.
         assert_eq!(
-            parse_hy2_hop_interval("hy2", Some(&serde_yaml::Value::from(315360000))).unwrap(),
+            parse_hy2_hop_interval("hy2", Some(&serde_json::Value::from(315360000))).unwrap(),
             Some((315360000, 315360000))
         );
     }
@@ -5113,7 +5105,7 @@ tls: true
     // ─── snell proxy parser ───────────────────────────────────────────────────
 
     #[cfg(feature = "snell")]
-    fn snell_config(yaml: &str) -> HashMap<String, serde_yaml::Value> {
+    fn snell_config(yaml: &str) -> HashMap<String, serde_json::Value> {
         serde_yaml::from_str(yaml).unwrap()
     }
 
@@ -5340,7 +5332,7 @@ tls: true
     }
 
     #[cfg(feature = "ss")]
-    fn external_plugin_ss() -> HashMap<String, serde_yaml::Value> {
+    fn external_plugin_ss() -> HashMap<String, serde_json::Value> {
         proxy_config(
             "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
              plugin: evil-plugin-from-provider\n",
