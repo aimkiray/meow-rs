@@ -1,5 +1,5 @@
 use crate::raw::{RawConfig, RawProxyGroup};
-use serde_yaml::Value;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -316,7 +316,7 @@ pub fn parse_subscription_yaml(
             "subscription YAML exceeds the nesting-depth limit"
         ));
     }
-    let mut root: Value =
+    let mut root: serde_yaml::Value =
         serde_yaml::from_str(text).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     // Expand `<<: *anchor` merge keys so subscriptions that share anchor
     // blocks (rule-anchor patterns, common in upstream mihomo configs) parse.
@@ -327,8 +327,7 @@ pub fn parse_subscription_yaml(
         .ok_or_else(|| anyhow::anyhow!("subscription root is not a mapping"))?;
 
     // Extract proxies
-    let proxies_key = Value::String("proxies".to_string());
-    let proxies_val = mapping.get(&proxies_key).ok_or_else(|| {
+    let proxies_val = mapping.get("proxies").ok_or_else(|| {
         let keys: Vec<String> = mapping
             .keys()
             .filter_map(|k| k.as_str().map(std::string::ToString::to_string))
@@ -341,11 +340,24 @@ pub fn parse_subscription_yaml(
 
     let mut proxies = Vec::new();
     for proxy in proxies_seq {
-        if let Value::Mapping(map) = proxy {
-            let hm: HashMap<String, Value> = map
-                .iter()
-                .filter_map(|(k, v)| k.as_str().map(|ks| (ks.to_string(), v.clone())))
-                .collect();
+        if let serde_yaml::Value::Mapping(_) = proxy {
+            // Re-deserialise the node into the backend-agnostic value type
+            // the public `SubscriptionData.proxies` field exposes. A key
+            // that isn't a string or a value the JSON model can't hold
+            // (e.g. a YAML `!tag`) is a shape defect: hard error under
+            // `strict`, warn-skip otherwise (issue #533).
+            let hm: HashMap<String, Value> = match serde_yaml::from_value(proxy.clone()) {
+                Ok(hm) => hm,
+                Err(e) if strict => {
+                    return Err(anyhow::anyhow!(
+                        "subscription 'proxies' entry failed to convert (strict mode): {e}"
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!("subscription 'proxies' entry failed to convert; skipping: {e}");
+                    continue;
+                }
+            };
             // Subscription content is remote-controlled and lands in the
             // trusted `proxies:` list, where an `ss` node's `plugin:` would
             // reach `Command::new` — drop external-SIP003 nodes here
@@ -394,9 +406,8 @@ pub fn parse_subscription_yaml(
     // doesn't wipe the whole list: strict fails the subscription, lenient
     // warn-skips the entry — a whole-section `from_value` failure used to
     // silently yield `[]`, emptying every group on commit (issue #533).
-    let groups_key = Value::String("proxy-groups".to_string());
     let mut proxy_groups: Vec<RawProxyGroup> = Vec::new();
-    match mapping.get(&groups_key) {
+    match mapping.get("proxy-groups") {
         None => {}
         Some(v) => {
             let Some(seq) = v.as_sequence() else {
@@ -427,9 +438,8 @@ pub fn parse_subscription_yaml(
     // Extract rules — same shape-defect gating as proxies/groups: a
     // non-sequence `rules:` or a non-string entry is a payload defect, not a
     // transient condition (issue #533).
-    let rules_key = Value::String("rules".to_string());
     let mut rules: Vec<String> = Vec::new();
-    match mapping.get(&rules_key) {
+    match mapping.get("rules") {
         None => {}
         Some(v) => {
             let Some(seq) = v.as_sequence() else {

@@ -414,10 +414,10 @@ rules:
 fn rebuild_from_raw_skips_invalid_proxy() {
     let mut raw = minimal_raw_config();
     let mut bad_proxy = HashMap::new();
-    bad_proxy.insert("name".to_string(), serde_yaml::Value::String("bad".into()));
+    bad_proxy.insert("name".to_string(), serde_json::Value::String("bad".into()));
     bad_proxy.insert(
         "type".to_string(),
-        serde_yaml::Value::String("unknown_protocol".into()),
+        serde_json::Value::String("unknown_protocol".into()),
     );
     raw.proxies = Some(vec![bad_proxy]);
     // Should not fail, just skip

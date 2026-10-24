@@ -1537,14 +1537,14 @@ async fn get_subscriptions_reports_counts() {
         applied_rules: vec!["MATCH,G".into()],
     }]);
     let mut proxy1 = std::collections::HashMap::new();
-    proxy1.insert("name".to_string(), serde_yaml::Value::String("S1".into()));
-    proxy1.insert("type".to_string(), serde_yaml::Value::String("ss".into()));
+    proxy1.insert("name".to_string(), serde_json::Value::String("S1".into()));
+    proxy1.insert("type".to_string(), serde_json::Value::String("ss".into()));
     let mut local = std::collections::HashMap::new();
     local.insert(
         "name".to_string(),
-        serde_yaml::Value::String("selfhop".into()),
+        serde_json::Value::String("selfhop".into()),
     );
-    local.insert("type".to_string(), serde_yaml::Value::String("http".into()));
+    local.insert("type".to_string(), serde_json::Value::String("http".into()));
     raw.proxies = Some(vec![proxy1, local]);
     raw.proxy_groups = Some(vec![RawProxyGroup {
         name: "G".into(),
@@ -1604,16 +1604,16 @@ async fn delete_subscription_clears_data() {
         applied_rules: vec!["MATCH,G".into()],
     }]);
     let mut proxy1 = std::collections::HashMap::new();
-    proxy1.insert("name".to_string(), serde_yaml::Value::String("S1".into()));
-    proxy1.insert("type".to_string(), serde_yaml::Value::String("ss".into()));
+    proxy1.insert("name".to_string(), serde_json::Value::String("S1".into()));
+    proxy1.insert("type".to_string(), serde_json::Value::String("ss".into()));
     let mut proxy2 = std::collections::HashMap::new();
     proxy2.insert(
         "name".to_string(),
-        serde_yaml::Value::String("selfhop".into()),
+        serde_json::Value::String("selfhop".into()),
     );
     proxy2.insert(
         "type".to_string(),
-        serde_yaml::Value::String("direct".into()),
+        serde_json::Value::String("direct".into()),
     );
     raw.proxies = Some(vec![proxy1, proxy2]);
     raw.proxy_groups = Some(vec![
@@ -2007,14 +2007,14 @@ async fn add_subscription_merges_with_local_config() {
     let mut selfhop = std::collections::HashMap::new();
     selfhop.insert(
         "name".to_string(),
-        serde_yaml::Value::String("selfhop".into()),
+        serde_json::Value::String("selfhop".into()),
     );
-    selfhop.insert("type".to_string(), serde_yaml::Value::String("http".into()));
+    selfhop.insert("type".to_string(), serde_json::Value::String("http".into()));
     selfhop.insert(
         "server".to_string(),
-        serde_yaml::Value::String("127.0.0.1".into()),
+        serde_json::Value::String("127.0.0.1".into()),
     );
-    selfhop.insert("port".to_string(), serde_yaml::Value::Number(18080.into()));
+    selfhop.insert("port".to_string(), serde_json::Value::Number(18080.into()));
     raw.proxies = Some(vec![selfhop]);
     raw.proxy_groups = Some(vec![RawProxyGroup {
         name: "local-g".into(),
@@ -5466,14 +5466,14 @@ async fn put_configs_carries_subscription_tracking_forward() {
     let mut node = std::collections::HashMap::new();
     node.insert(
         "name".to_string(),
-        serde_yaml::Value::String("node-1".into()),
+        serde_json::Value::String("node-1".into()),
     );
-    node.insert("type".to_string(), serde_yaml::Value::String("http".into()));
+    node.insert("type".to_string(), serde_json::Value::String("http".into()));
     node.insert(
         "server".to_string(),
-        serde_yaml::Value::String("127.0.0.1".into()),
+        serde_json::Value::String("127.0.0.1".into()),
     );
-    node.insert("port".to_string(), serde_yaml::Value::from(9));
+    node.insert("port".to_string(), serde_json::Value::from(9));
     raw.proxies = Some(vec![node]);
     raw.subscriptions = Some(vec![
         RawSubscription {

@@ -54,6 +54,7 @@ meow-proxy = { workspace = true, default-features = false }
 meow-transport = { workspace = true, features = ["tls", "ws", "grpc", "h2", "httpupgrade", "xhttp"] }
 tokio = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

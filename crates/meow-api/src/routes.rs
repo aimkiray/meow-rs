@@ -789,7 +789,7 @@ struct TunFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     inet4_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    inet6_address: Option<serde_yaml::Value>,
+    inet6_address: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_route: Option<RawAutoRoute>,
     #[serde(skip_serializing_if = "Option::is_none")]

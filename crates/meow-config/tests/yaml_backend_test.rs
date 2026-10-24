@@ -16,6 +16,14 @@
 //! so reading it directly (no cargo subprocess) is both the strictest and
 //! the cheapest check: the archived crates must be absent and the
 //! maintained fork must be present.
+//!
+//! A second, complementary assertion pins the *public API* boundary: the
+//! value type `meow-config` hands to embedders is `serde_json::Value`, so
+//! `serde_norway` stays an internal parse backend and swapping it again
+//! stops being a breaking change. `public_api_names_no_yaml_backend_types`
+//! scans every `src/*.rs` and tracks `pub` items across the multi-line
+//! signatures this crate writes one-parameter-per-line, flagging any
+//! `serde_yaml::` inside one — none may exist.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -200,4 +208,142 @@ version = \"0.2.15\"
     assert!(!lock_has_package(unused_patch_lock, ARCHIVED_BACKEND));
     assert!(lock_has_package(unused_patch_lock, MAINTAINED_YAML));
     assert!(lock_has_package(unused_patch_lock, MAINTAINED_BACKEND));
+}
+
+/// Collect the `serde_yaml::` mentions in one source file that sit inside
+/// a public item's declaration, reported as `"{label}:{line}: {text}"`.
+///
+/// Scanning is a two-state machine over physical lines, because this
+/// crate wraps signatures one parameter per line — a `serde_yaml::` leak
+/// is at least as likely to land on a continuation line as on the `pub`
+/// line itself, and a same-line check lets it slip. A non-comment line
+/// that starts with `pub` — `pub fn`, `pub(crate)`, a `pub struct`
+/// field, `pub type`, `pub const`, `pub use`, … — opens a public
+/// signature, and every following line stays part of that signature
+/// until a line closes it: any line containing `{` (a body or field
+/// list opens) or ending with `;` (alias, `use`, or other bare
+/// declaration). The closing line is checked *before* it closes, so the
+/// single-line `pub fn f() -> serde_yaml::Value {` flags too.
+///
+/// Field declarations inside a `pub struct` start with `pub` themselves,
+/// so each opens its own record. Comment and doc lines (`//`, `///`,
+/// `//!`, `/*`, `*`) are exempt, exactly as the old same-line check
+/// exempted them. A flag left set past a `}` errs toward flagging the
+/// next item's head — a guard prefers a rare false positive a human
+/// clears over a leak it cannot see.
+fn yaml_backend_pub_offenders(label: &str, text: &str) -> Vec<String> {
+    let mut offenders = Vec::new();
+    let mut in_pub_signature = false;
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            continue;
+        }
+        if trimmed.starts_with("pub") {
+            in_pub_signature = true;
+        }
+        if in_pub_signature && trimmed.contains("serde_yaml::") {
+            offenders.push(format!("{label}:{}: {trimmed}", index + 1));
+        }
+        // The line is checked for `serde_yaml::` above before `{`/`;`
+        // can close the signature, so a single-line signature whose own
+        // terminator follows the type still flags.
+        if in_pub_signature && (trimmed.contains('{') || trimmed.ends_with(';')) {
+            in_pub_signature = false;
+        }
+    }
+    offenders
+}
+
+/// The crate's public API must not name the YAML backend's types. Every
+/// public value type embedders see is `serde_json::Value`; `serde_yaml`
+/// (serde_norway) is only the internal parse/serialise backend
+/// (`from_str`/`from_value`/`to_string`/`to_value`/`apply_merge`), so a
+/// backend swap is no longer a semver break. Scan `src/*.rs` with
+/// [`yaml_backend_pub_offenders`]; internal uses that never sit inside a
+/// `pub` item (`parse_raw_yaml`'s `let mut value: serde_yaml::Value`
+/// local, test-mod bodies, e.g.) are exempt.
+#[test]
+fn public_api_names_no_yaml_backend_types() {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders: Vec<String> = Vec::new();
+    for entry in
+        fs::read_dir(&src_dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", src_dir.display()))
+    {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        offenders.extend(yaml_backend_pub_offenders(
+            &path.display().to_string(),
+            &text,
+        ));
+    }
+    assert!(
+        offenders.is_empty(),
+        "public API lines must not name serde_yaml:: — the exposed value \
+         type is serde_json::Value:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// `yaml_backend_pub_offenders` must follow a `pub` item across the
+/// one-parameter-per-line wrapping this crate uses — a `serde_yaml::`
+/// continuation line is the regression shape the guard exists for —
+/// without flagging the decoupled `serde_json::` type or non-`pub`
+/// internals such as function bodies and `#[cfg(test)]` mods.
+#[test]
+fn public_signature_scanner_catches_continuation_lines() {
+    // Multi-line `pub fn`: the leak lands on a continuation line.
+    let multiline = "\
+pub fn parse_proxy(
+    raw: &serde_json::Value,
+) -> Result<serde_yaml::Value> {
+    serde_yaml::from_value(raw.clone())
+}
+";
+    let offenders = yaml_backend_pub_offenders("multiline.rs", multiline);
+    assert_eq!(
+        offenders.len(),
+        1,
+        "continuation-line leak missed: {offenders:?}"
+    );
+    assert!(offenders[0].starts_with("multiline.rs:3:"), "{offenders:?}");
+
+    // The closing `{` is checked before it closes the signature, so the
+    // single-line form flags too; a `pub` struct field opens a record of
+    // its own.
+    let single_line = "pub fn f() -> serde_yaml::Value { unimplemented!() }\n";
+    assert_eq!(yaml_backend_pub_offenders("one.rs", single_line).len(), 1);
+    let field = "\
+pub struct Raw {
+    pub payload: serde_yaml::Value,
+}
+";
+    assert_eq!(yaml_backend_pub_offenders("field.rs", field).len(), 1);
+
+    // The same shape naming the decoupled `serde_json::` type stays
+    // clean — and the flag must not bleed into the body, where internal
+    // `serde_yaml::` uses are legitimate.
+    let clean = "\
+pub fn parse_proxy(
+    raw: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    serde_yaml::from_value(raw.clone())
+}
+";
+    assert!(yaml_backend_pub_offenders("clean.rs", clean).is_empty());
+
+    // `serde_yaml::` inside a `#[cfg(test)]` mod is not public API.
+    let test_mod = "\
+#[cfg(test)]
+mod tests {
+    fn parses() {
+        let _: serde_yaml::Value = serde_yaml::from_str(\"a: b\").unwrap();
+    }
+}
+";
+    assert!(yaml_backend_pub_offenders("tests.rs", test_mod).is_empty());
 }

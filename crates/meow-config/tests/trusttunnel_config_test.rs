@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-fn node(extra: &str) -> HashMap<String, serde_yaml::Value> {
+fn node(extra: &str) -> HashMap<String, serde_json::Value> {
     serde_yaml::from_str(&format!(
         "name: fixture\ntype: trusttunnel\nserver: vpn.example.test\nport: 443\nusername: fixture\npassword: test-only\n{extra}"
     ))
@@ -20,7 +20,7 @@ fn disabled_protocol_fails_node_parsing() {
     assert!(error.contains("--features trusttunnel"));
 }
 
-fn unsupported_node() -> HashMap<String, serde_yaml::Value> {
+fn unsupported_node() -> HashMap<String, serde_json::Value> {
     // Enabled builds must reject a TLS policy they do not implement;
     // disabled builds must reject the protocol itself. Either way the name
     // has to stay bound to something that cannot dial, rather than
@@ -426,7 +426,7 @@ mod enabled {
         let mut config = node("");
         config.insert(
             "server".into(),
-            serde_yaml::Value::String("2001:db8::1".into()),
+            serde_json::Value::String("2001:db8::1".into()),
         );
         let proxy = parse_proxy(&config, false).unwrap();
         assert_eq!(proxy.addr(), "[2001:db8::1]:443");
@@ -523,7 +523,7 @@ fn padded_trusttunnel_type_names_explain_the_whitespace_defect() {
     let mut raw = node("");
     raw.insert(
         "type".into(),
-        serde_yaml::Value::String(" TrustTunnel ".into()),
+        serde_json::Value::String(" TrustTunnel ".into()),
     );
     let error = meow_config::proxy_parser::parse_proxy(&raw, false)
         .err()
