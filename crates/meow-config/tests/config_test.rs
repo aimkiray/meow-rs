@@ -737,7 +737,7 @@ proxy-groups:
         "a leaf proxy carries no group display keys"
     );
 
-    let raw: meow_config::raw::RawConfig = serde_yaml::from_str(yaml).unwrap();
+    let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(yaml).unwrap();
     let groups = raw.proxy_groups.unwrap();
     assert_eq!(groups[0].hidden, Some(true));
     assert_eq!(
@@ -746,7 +746,11 @@ proxy-groups:
     );
     let plain = groups.iter().find(|group| group.name == "plain").unwrap();
     assert_eq!((plain.hidden, plain.icon.as_deref()), (None, None));
-    let saved = serde_yaml::to_string(plain).unwrap();
+    let saved = serde_saphyr::to_string_with_options(
+        plain,
+        serde_saphyr::ser_options! { folded_wrap_chars: usize::MAX },
+    )
+    .unwrap();
     assert!(
         !saved.contains("hidden") && !saved.contains("icon"),
         "unset keys stay out of a saved config: {saved}"
@@ -2239,7 +2243,7 @@ async fn test_tproxy_shorthand_keeps_managed_firewall() {
 /// deserialize with the managed default, not `false`.
 #[test]
 fn test_tproxy_spec_deserialization_defaults_firewall_true() {
-    let spec: ListenerSpec = serde_yaml::from_str("!tproxy\nsni: true\n").unwrap();
+    let spec: ListenerSpec = serde_saphyr::from_str("!tproxy\nsni: true\n").unwrap();
     assert_eq!(
         spec,
         ListenerSpec::TProxy {
@@ -2257,9 +2261,10 @@ fn test_tproxy_spec_deserialization_defaults_firewall_true() {
 /// and the snake_case spec field (`udp_timeout`) are different documents.
 #[test]
 fn test_tproxy_spec_deserialization_round_trips_udp() {
-    let spec: ListenerSpec =
-        serde_yaml::from_str("!tproxy\nsni: false\nfirewall: false\nudp: true\nudp_timeout: 30\n")
-            .unwrap();
+    let spec: ListenerSpec = serde_saphyr::from_str(
+        "!tproxy\nsni: false\nfirewall: false\nudp: true\nudp_timeout: 30\n",
+    )
+    .unwrap();
     assert_eq!(
         spec,
         ListenerSpec::TProxy {

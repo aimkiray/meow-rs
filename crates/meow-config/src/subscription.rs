@@ -316,37 +316,34 @@ pub fn parse_subscription_yaml(
             "subscription YAML exceeds the nesting-depth limit"
         ));
     }
-    let mut root: serde_yaml::Value =
-        serde_yaml::from_str(text).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
-    // Expand `<<: *anchor` merge keys so subscriptions that share anchor
-    // blocks (rule-anchor patterns, common in upstream mihomo configs) parse.
-    root.apply_merge()
-        .map_err(|e| anyhow::anyhow!("YAML merge expand error: {e}"))?;
+    // `<<: *anchor` merge keys expand under `MergeKeyPolicy::Merge` (the
+    // shared ingest-options default) so subscriptions that share anchor
+    // blocks (rule-anchor patterns, common in upstream mihomo configs)
+    // parse.
+    let root: Value =
+        crate::parse_yaml_value(text).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     let mapping = root
-        .as_mapping()
+        .as_object()
         .ok_or_else(|| anyhow::anyhow!("subscription root is not a mapping"))?;
 
     // Extract proxies
     let proxies_val = mapping.get("proxies").ok_or_else(|| {
-        let keys: Vec<String> = mapping
-            .keys()
-            .filter_map(|k| k.as_str().map(std::string::ToString::to_string))
-            .collect();
+        let keys: Vec<String> = mapping.keys().cloned().collect();
         anyhow::anyhow!("subscription missing 'proxies' key; found keys: {keys:?}")
     })?;
     let proxies_seq = proxies_val
-        .as_sequence()
+        .as_array()
         .ok_or_else(|| anyhow::anyhow!("'proxies' is not a sequence"))?;
 
     let mut proxies = Vec::new();
     for proxy in proxies_seq {
-        if let serde_yaml::Value::Mapping(_) = proxy {
+        if let Value::Object(_) = proxy {
             // Re-deserialise the node into the backend-agnostic value type
             // the public `SubscriptionData.proxies` field exposes. A key
             // that isn't a string or a value the JSON model can't hold
             // (e.g. a YAML `!tag`) is a shape defect: hard error under
             // `strict`, warn-skip otherwise (issue #533).
-            let hm: HashMap<String, Value> = match serde_yaml::from_value(proxy.clone()) {
+            let hm: HashMap<String, Value> = match serde_json::from_value(proxy.clone()) {
                 Ok(hm) => hm,
                 Err(e) if strict => {
                     return Err(anyhow::anyhow!(
@@ -410,13 +407,13 @@ pub fn parse_subscription_yaml(
     match mapping.get("proxy-groups") {
         None => {}
         Some(v) => {
-            let Some(seq) = v.as_sequence() else {
+            let Some(seq) = v.as_array() else {
                 return Err(anyhow::anyhow!(
                     "subscription 'proxy-groups' is not a sequence"
                 ));
             };
             for entry in seq {
-                match serde_yaml::from_value::<RawProxyGroup>(entry.clone()) {
+                match serde_json::from_value::<RawProxyGroup>(entry.clone()) {
                     Ok(group) => proxy_groups.push(group),
                     Err(e) if strict => {
                         return Err(anyhow::anyhow!(
@@ -442,7 +439,7 @@ pub fn parse_subscription_yaml(
     match mapping.get("rules") {
         None => {}
         Some(v) => {
-            let Some(seq) = v.as_sequence() else {
+            let Some(seq) = v.as_array() else {
                 return Err(anyhow::anyhow!("subscription 'rules' is not a sequence"));
             };
             for entry in seq {
@@ -483,7 +480,7 @@ mod tests {
     }
 
     fn group(name: &str) -> RawProxyGroup {
-        serde_yaml::from_str(&format!("name: {name}\ntype: select\n")).unwrap()
+        serde_saphyr::from_str(&format!("name: {name}\ntype: select\n")).unwrap()
     }
 
     fn sub(name: &str) -> RawSubscription {

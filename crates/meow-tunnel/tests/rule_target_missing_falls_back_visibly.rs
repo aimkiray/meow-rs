@@ -236,7 +236,7 @@ async fn no_rule_matching_still_falls_through_to_direct() {
 async fn udp_flow_skips_a_target_without_udp_support() {
     let yaml =
         "proxies:\n  - name: TCP-ONLY\n    type: http\n    server: 127.0.0.1\n    port: 8080\n";
-    let raw: meow_config::raw::RawConfig = serde_yaml::from_str(yaml).unwrap();
+    let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(yaml).unwrap();
     let res = meow_config::rebuild_from_raw(&raw).expect("http node parses");
 
     let tunnel = Tunnel::new(resolver());

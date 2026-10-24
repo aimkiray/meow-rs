@@ -114,11 +114,10 @@ async fn load_realworld_config_parses_without_error() {
 /// This test only verifies YAML deserialization (no DNS bootstrap / network).
 #[test]
 fn load_realworld_verbatim_config_deserializes() {
-    let mut value: serde_yaml::Value =
-        serde_yaml::from_str(REALWORLD_VERBATIM_YAML).expect("valid YAML");
-    value.apply_merge().expect("merge keys");
-    let raw: meow_config::raw::RawConfig =
-        serde_yaml::from_value(value).expect("verbatim config should deserialize");
+    // `parse_raw_yaml` applies the merge-key policy the production ingest
+    // path uses — the verbatim config exercises `<<:` anchors.
+    let raw: meow_config::raw::RawConfig = meow_config::parse_raw_yaml(REALWORLD_VERBATIM_YAML)
+        .expect("verbatim config should deserialize");
 
     assert!(raw.proxy_groups.is_some());
     let groups = raw.proxy_groups.as_ref().unwrap();

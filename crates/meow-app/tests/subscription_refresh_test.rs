@@ -117,7 +117,7 @@ async fn fixture_at(sub_addr: std::net::SocketAddr) -> Fixture {
     )
     .unwrap();
 
-    let raw: RawConfig = serde_yaml::from_str(&format!(
+    let raw: RawConfig = serde_saphyr::from_str(&format!(
         "mode: rule\n\
          proxy-providers:\n\
          \x20 prov:\n\
@@ -708,7 +708,7 @@ async fn refresh_without_backing_file_applies_in_memory_only() {
     let dir = tempfile::tempdir().unwrap();
     // No `proxy-providers:` — a `file` provider `path:` hard-errors under
     // `cache_dir: None`, which is exactly the strictness contract.
-    let raw: RawConfig = serde_yaml::from_str(&format!(
+    let raw: RawConfig = serde_saphyr::from_str(&format!(
         "mode: rule\n\
          subscriptions:\n\
          \x20 - name: s\n\
@@ -792,7 +792,7 @@ async fn refreshed_trusttunnel_provider_commits_with_a_dead_placeholder() {
     // Stage a redefined provider while its live slot still holds the
     // last-good generation. The new front only exists in the fetched
     // subscription, so the acquisition must use the published route map.
-    let declaration = serde_yaml::from_str(&format!(
+    let declaration = serde_saphyr::from_str(&format!(
         "type: http\nurl: http://{provider_address}/provider\nproxy: front\npath: redefined.yaml\n"
     ))
     .unwrap();

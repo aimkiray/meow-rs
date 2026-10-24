@@ -686,7 +686,7 @@ rules: ['MATCH,PROXY']
 /// list and draws the icon on the group's header.
 #[tokio::test]
 async fn groups_report_hidden_and_icon() {
-    let raw: RawConfig = serde_yaml::from_str(
+    let raw: RawConfig = serde_saphyr::from_str(
         r#"
 mode: rule
 proxies:
@@ -4480,7 +4480,7 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
     ));
     let tunnel = Tunnel::new(resolver);
     let mut raw = test_raw_config();
-    raw.dns = Some(serde_yaml::from_str("enable: true").unwrap());
+    raw.dns = Some(serde_saphyr::from_str("enable: true").unwrap());
     let meow_config::RebuildResult { proxies, rules, .. } =
         meow_config::rebuild_from_raw(&raw).unwrap();
     tunnel.update_proxies(proxies, Default::default());
@@ -4644,7 +4644,7 @@ async fn get_dns_query_txt_relays_upstream_sections_and_flags() {
     ));
     let tunnel = Tunnel::new(resolver);
     let mut raw = test_raw_config();
-    raw.dns = Some(serde_yaml::from_str("enable: true").unwrap());
+    raw.dns = Some(serde_saphyr::from_str("enable: true").unwrap());
     let meow_config::RebuildResult { proxies, rules, .. } =
         meow_config::rebuild_from_raw(&raw).unwrap();
     tunnel.update_proxies(proxies, Default::default());
@@ -6250,7 +6250,7 @@ fn fake_tun_handle() -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBo
 async fn put_configs_tun_param_change_reconciles_running_listener() {
     use base64::Engine as _;
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
     state.tunnel.set_tun_handle(handle).await;
@@ -6312,7 +6312,7 @@ async fn put_configs_tun_param_change_reconciles_running_listener() {
 async fn put_configs_tun_unchanged_does_not_reconcile() {
     use base64::Engine as _;
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
     state.tunnel.set_tun_handle(handle).await;
@@ -6367,7 +6367,7 @@ async fn put_configs_tun_unchanged_does_not_reconcile() {
 async fn put_configs_fake_ip_range_change_moves_the_default_tun_address() {
     use base64::Engine as _;
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
     state.tunnel.set_tun_handle(handle).await;
@@ -6418,7 +6418,7 @@ async fn put_configs_fake_ip_range_change_moves_the_default_tun_address() {
 async fn put_configs_invalid_tun_rejected_before_commit() {
     use base64::Engine as _;
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
     state.tunnel.set_tun_handle(handle).await;
@@ -6524,7 +6524,7 @@ async fn put_configs_invalid_listeners_rejected_before_commit() {
 async fn put_configs_force_invalid_tun_commits_and_rolls_back() {
     use base64::Engine as _;
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
     state.tunnel.set_tun_handle(handle).await;
@@ -6572,7 +6572,7 @@ async fn put_configs_force_invalid_tun_commits_and_rolls_back() {
 async fn put_configs_max_connections_change_reconciles_tun() {
     use base64::Engine as _;
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
     state.tunnel.set_tun_handle(handle).await;
@@ -6669,7 +6669,7 @@ async fn put_configs_tun_enable_on_attempts_spawn() {
 async fn put_configs_tun_enable_off_stops_listener() {
     use base64::Engine as _;
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
     state.tunnel.set_tun_handle(handle).await;
@@ -6710,7 +6710,7 @@ async fn put_configs_tun_enable_off_stops_listener() {
 async fn put_configs_tun_param_change_without_handle_rolls_back() {
     use base64::Engine as _;
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
 
     let yaml = concat!(
@@ -6758,7 +6758,7 @@ async fn put_configs_tun_param_change_without_handle_rolls_back() {
 async fn put_configs_tun_disabled_param_change_no_restart() {
     use base64::Engine as _;
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: false\nmtu: 1500").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: false\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
     state.tunnel.set_tun_handle(handle).await;
@@ -6804,7 +6804,7 @@ async fn put_configs_tun_disabled_param_change_no_restart() {
 async fn put_configs_tun_fake_ip_change_restarts_listener() {
     use base64::Engine as _;
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
     state.tunnel.set_tun_handle(handle).await;
@@ -6893,7 +6893,7 @@ async fn get_configs_json(state: &Arc<AppState>) -> serde_json::Value {
 #[tokio::test]
 async fn patch_configs_tun_disable_stops_listener_and_round_trips() {
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
     state.tunnel.set_tun_handle(handle).await;
@@ -6980,7 +6980,7 @@ async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
 #[tokio::test]
 async fn patch_configs_tun_param_change_restarts_running_listener() {
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
     state.tunnel.set_tun_handle(handle).await;
@@ -7005,7 +7005,7 @@ async fn patch_configs_tun_param_change_restarts_running_listener() {
 async fn patch_configs_tun_merges_over_committed_section() {
     let mut raw = test_raw_config();
     raw.tun = Some(
-        serde_yaml::from_str("enable: false\ndevice: utun9\nmtu: 1500\ndns-hijack: [any:53]")
+        serde_saphyr::from_str("enable: false\ndevice: utun9\nmtu: 1500\ndns-hijack: [any:53]")
             .unwrap(),
     );
     let state = test_state(raw);
@@ -7069,7 +7069,7 @@ async fn patch_configs_tun_ignores_unknown_keys() {
 #[tokio::test]
 async fn patch_configs_without_tun_leaves_tun_untouched() {
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let before = state.raw_config.read().tun.clone();
     let (handle, stopped) = fake_tun_handle();
@@ -7091,7 +7091,7 @@ async fn patch_configs_without_tun_leaves_tun_untouched() {
 #[tokio::test]
 async fn patch_configs_tun_rejects_invalid_section() {
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let before = state.raw_config.read().tun.clone();
     let (handle, stopped) = fake_tun_handle();
@@ -7354,7 +7354,7 @@ async fn state_with_providers(
 ) -> Arc<AppState> {
     let raw: HashMap<String, meow_config::raw::RawProxyProvider> = providers
         .iter()
-        .map(|(name, yaml)| ((*name).to_string(), serde_yaml::from_str(yaml).unwrap()))
+        .map(|(name, yaml)| ((*name).to_string(), serde_saphyr::from_str(yaml).unwrap()))
         .collect();
     let loaded = meow_config::proxy_provider::load_proxy_providers_within(
         &raw,

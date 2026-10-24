@@ -418,7 +418,7 @@ proxies:
     client-fingerprint: chrome
     reality-opts:
       public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
-      short-id: 0011223344556677
+      short-id: "0011223344556677"
       support-x25519mlkem768: false
 "#;
     let config = load_config_from_str(yaml)
@@ -535,17 +535,18 @@ proxies:
 }
 
 /// A leading-zero all-decimal `short-id` (e.g. `short-id: 0012`, unquoted)
-/// is NOT reinterpreted as a YAML number by this parser: the core-schema
-/// int resolver only matches decimal scalars without a leading zero (plain
-/// `0` aside), so `0012` parses as the plain string `"0012"` and takes the
-/// pre-existing `as_str()` branch untouched — the leading zero, and thus the
-/// exact hex-decoded bytes (`0x00 0x12`), are preserved with no coercion and
-/// no warning. This pins that (verified) behavior so a future serde_yaml/
-/// resolver change that started collapsing such literals to numbers would
-/// be caught here rather than silently reintroducing the byte-loss bug the
-/// review finding described.
+/// is a known serde-saphyr divergence: where serde_norway kept `0012` the
+/// string `"0012"` (so the exact hex-decoded bytes `0x00 0x12` survived),
+/// saphyr resolves a leading-zero decimal as the float `12.0`. The
+/// `Number` arm in `parse_vless` only coerces integers (`as_u64`/`as_i64`
+/// reject `12.0`), so the node now fails `must be a hex string` and is
+/// dropped — the correct form is quoting, which keeps the leading zero
+/// through the `as_str()` branch. Pinned so a future resolver change that
+/// alters leading-zero handling is caught here rather than silently
+/// reintroducing (or re-fixing) the byte-loss bug the review finding
+/// described.
 #[tokio::test]
-async fn parse_vless_reality_opts_leading_zero_short_id_preserved_no_warn() {
+async fn parse_vless_reality_opts_leading_zero_short_id_drops_unquoted() {
     let yaml = r#"
 proxies:
   - name: v
@@ -559,20 +560,22 @@ proxies:
       public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
       short-id: 0012
 "#;
-    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
-    let config = result.expect("REALITY VLESS config with leading-zero string short-id must load");
+    let (result, _lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    let config = result.expect("config loads: the bad node is dropped, not fatal");
+    assert!(
+        !config.proxies.contains_key("v"),
+        "unquoted `short-id: 0012` resolves as the float 12.0 and the node is \
+         rejected as `must be a hex string`"
+    );
+
+    // Quoting keeps the leading zero through the `as_str()` branch — the
+    // node registers with the intended `0x00 0x12` bytes.
+    let quoted = yaml.replace("short-id: 0012", "short-id: \"0012\"");
+    let (result, _lines) = with_warn_capture_async(load_config_from_str(&quoted)).await;
+    let config = result.expect("quoted short-id config must load");
     assert!(
         config.proxies.contains_key("v"),
-        "REALITY VLESS proxy with leading-zero short-id must be registered, not dropped"
-    );
-    let warn_count = lines
-        .iter()
-        .filter(|l| l.contains("WARN") && l.contains("short-id"))
-        .count();
-    assert_eq!(
-        warn_count, 0,
-        "`short-id: 0012` parses as a string already (leading zero preserved), so no \
-         numeric-coercion warning should fire; captured lines: {lines:?}"
+        "`short-id: \"0012\"` stays a string and the node registers"
     );
 }
 

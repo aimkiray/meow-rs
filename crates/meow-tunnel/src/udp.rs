@@ -517,7 +517,7 @@ mod tests {
                 let _ = echo.send_to(b"pong!!", peer).await;
             }
         });
-        let raw: meow_config::raw::RawConfig = serde_yaml::from_str(
+        let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(
             "proxy-groups:\n  - {name: Proxy, type: select, proxies: [DIRECT, REJECT]}\n",
         )
         .unwrap();

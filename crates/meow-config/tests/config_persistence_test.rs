@@ -2,6 +2,16 @@ use meow_config::raw::{RawConfig, RawProxyGroup, RawSubscription};
 use meow_config::{rebuild_from_raw, save_raw_config};
 use std::collections::HashMap;
 
+/// Serialize with the same options `save_raw_config` uses (saphyr's default
+/// would re-wrap >80-char scalars into `>`-folded blocks).
+fn to_yaml<T: serde::Serialize>(value: &T) -> String {
+    serde_saphyr::to_string_with_options(
+        value,
+        serde_saphyr::ser_options! { folded_wrap_chars: usize::MAX },
+    )
+    .unwrap()
+}
+
 fn minimal_raw_config() -> RawConfig {
     RawConfig {
         mixed_port: Some(7890),
@@ -27,7 +37,7 @@ fn save_creates_valid_yaml() {
 
     let content = std::fs::read_to_string(&path).unwrap();
     // Should be valid YAML that deserializes back
-    let loaded: RawConfig = serde_yaml::from_str(&content).unwrap();
+    let loaded: RawConfig = serde_saphyr::from_str(&content).unwrap();
     assert_eq!(loaded.mixed_port, Some(7890));
     assert_eq!(loaded.mode, Some("rule".into()));
     assert_eq!(loaded.rules.as_ref().unwrap().len(), 2);
@@ -93,7 +103,7 @@ fn save_roundtrip_with_subscriptions() {
     save_raw_config(path_str, &raw).unwrap();
 
     let content = std::fs::read_to_string(&path).unwrap();
-    let loaded: RawConfig = serde_yaml::from_str(&content).unwrap();
+    let loaded: RawConfig = serde_saphyr::from_str(&content).unwrap();
     let subs = loaded.subscriptions.unwrap();
     assert_eq!(subs.len(), 1);
     assert_eq!(subs[0].name, "provider1");
@@ -122,7 +132,7 @@ fn save_roundtrip_with_proxy_groups() {
     save_raw_config(path_str, &raw).unwrap();
 
     let content = std::fs::read_to_string(&path).unwrap();
-    let loaded: RawConfig = serde_yaml::from_str(&content).unwrap();
+    let loaded: RawConfig = serde_saphyr::from_str(&content).unwrap();
     let groups = loaded.proxy_groups.unwrap();
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].name, "auto");
@@ -210,7 +220,7 @@ fn rebuild_from_raw_with_groups() {
 
 #[test]
 fn auto_global_defaults_to_final_match_group() {
-    let raw: RawConfig = serde_yaml::from_str(
+    let raw: RawConfig = serde_saphyr::from_str(
         r#"
 proxies:
   - {name: "137.15 G | 500.00 G", type: socks5, server: 127.0.0.1, port: 1}
@@ -246,7 +256,7 @@ rules:
 /// are filtered as match-loop signals.
 #[test]
 fn auto_global_excludes_signal_builtins() {
-    let raw: RawConfig = serde_yaml::from_str(
+    let raw: RawConfig = serde_saphyr::from_str(
         r#"
 proxies:
   - {name: "HK 01", type: socks5, server: 127.0.0.1, port: 2}
@@ -288,7 +298,7 @@ rules:
 fn builtin_names_cannot_be_shadowed_by_leaf() {
     // All six built-ins are shadow-proof: a leaf named like one is dropped
     // (warn) — each name must still resolve to the built-in adapter type.
-    let raw: RawConfig = serde_yaml::from_str(
+    let raw: RawConfig = serde_saphyr::from_str(
         r#"
 proxies:
   - {name: "PASS", type: socks5, server: 127.0.0.1, port: 9}
@@ -326,7 +336,7 @@ rules:
 /// the built-in before the shadowing group is dropped.
 #[test]
 fn builtin_names_cannot_be_shadowed_by_group() {
-    let raw: RawConfig = serde_yaml::from_str(
+    let raw: RawConfig = serde_saphyr::from_str(
         r#"
 proxies:
   - {name: "HK 01", type: socks5, server: 127.0.0.1, port: 2}
@@ -348,7 +358,7 @@ rules:
 
 #[test]
 fn auto_global_falls_back_to_first_declared_outbound() {
-    let group_first: RawConfig = serde_yaml::from_str(
+    let group_first: RawConfig = serde_saphyr::from_str(
         r#"
 proxies:
   - {name: "HK 01", type: socks5, server: 127.0.0.1, port: 2}
@@ -368,7 +378,7 @@ rules:
         Some("Proxies")
     );
 
-    let proxy_only: RawConfig = serde_yaml::from_str(
+    let proxy_only: RawConfig = serde_saphyr::from_str(
         r#"
 proxies:
   - {name: "HK 01", type: socks5, server: 127.0.0.1, port: 2}
@@ -389,7 +399,7 @@ rules:
 
 #[test]
 fn user_declared_global_keeps_its_own_default() {
-    let raw: RawConfig = serde_yaml::from_str(
+    let raw: RawConfig = serde_saphyr::from_str(
         r#"
 proxies:
   - {name: "HK 01", type: socks5, server: 127.0.0.1, port: 2}
@@ -430,8 +440,8 @@ fn rebuild_from_raw_skips_invalid_proxy() {
 #[test]
 fn raw_config_serialize_deserialize_roundtrip() {
     let raw = minimal_raw_config();
-    let yaml = serde_yaml::to_string(&raw).unwrap();
-    let loaded: RawConfig = serde_yaml::from_str(&yaml).unwrap();
+    let yaml = to_yaml(&raw);
+    let loaded: RawConfig = serde_saphyr::from_str(&yaml).unwrap();
     assert_eq!(loaded.mixed_port, raw.mixed_port);
     assert_eq!(loaded.mode, raw.mode);
     assert_eq!(loaded.rules, raw.rules);
@@ -449,7 +459,7 @@ fn raw_subscription_serde() {
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
     };
-    let yaml = serde_yaml::to_string(&sub).unwrap();
+    let yaml = to_yaml(&sub);
     assert!(
         !yaml.contains("proxy"),
         "absent proxy must be omitted: {yaml}"
@@ -458,7 +468,7 @@ fn raw_subscription_serde() {
         !yaml.contains("applied-"),
         "empty applied-* sets must be omitted: {yaml}"
     );
-    let loaded: RawSubscription = serde_yaml::from_str(&yaml).unwrap();
+    let loaded: RawSubscription = serde_saphyr::from_str(&yaml).unwrap();
     assert_eq!(loaded.name, "test");
     assert_eq!(loaded.url, "https://example.com");
     assert_eq!(loaded.interval, Some(7200));
@@ -482,18 +492,18 @@ fn raw_subscription_serde_applied_fields() {
         applied_groups: vec!["g".into()],
         applied_rules: vec!["MATCH,DIRECT".into()],
     };
-    let yaml = serde_yaml::to_string(&sub).unwrap();
+    let yaml = to_yaml(&sub);
     assert!(yaml.contains("applied-proxies:"), "{yaml}");
     assert!(yaml.contains("applied-groups:"), "{yaml}");
     assert!(yaml.contains("applied-rules:"), "{yaml}");
-    let loaded: RawSubscription = serde_yaml::from_str(&yaml).unwrap();
+    let loaded: RawSubscription = serde_saphyr::from_str(&yaml).unwrap();
     assert_eq!(loaded.applied_proxies, vec!["node-1", "node-2"]);
     assert_eq!(loaded.applied_groups, vec!["g"]);
     assert_eq!(loaded.applied_rules, vec!["MATCH,DIRECT"]);
 
     // A file written before tracking existed loads with empty sets.
     let legacy: RawSubscription =
-        serde_yaml::from_str("name: t\nurl: https://example.com\n").unwrap();
+        serde_saphyr::from_str("name: t\nurl: https://example.com\n").unwrap();
     assert!(legacy.applied_proxies.is_empty());
     assert!(legacy.applied_groups.is_empty());
     assert!(legacy.applied_rules.is_empty());
@@ -511,9 +521,9 @@ fn raw_subscription_serde_proxy() {
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
     };
-    let yaml = serde_yaml::to_string(&sub).unwrap();
+    let yaml = to_yaml(&sub);
     assert!(yaml.contains("proxy: front"), "{yaml}");
-    let loaded: RawSubscription = serde_yaml::from_str(&yaml).unwrap();
+    let loaded: RawSubscription = serde_saphyr::from_str(&yaml).unwrap();
     assert_eq!(loaded.proxy.as_deref(), Some("front"));
 }
 

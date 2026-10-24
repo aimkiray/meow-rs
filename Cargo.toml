@@ -80,20 +80,15 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-# RUSTSEC-2024-0449: `unsafe-libyaml` — the c2rust translation of libyaml that
-# `serde_yaml` links — was archived by its author on 2024-03-25 and is no
-# longer maintained. `serde_norway` is a maintained hard-fork of `serde_yaml`
-# 0.9.34 with an identical public API and unchanged parsing behaviour; the
-# only material differences are the libyaml backend — the maintained
-# `unsafe-libyaml-norway` fork instead of the archived crate — and the
-# maintainer/repository. The dependency keeps the name `serde_yaml` so every
-# `serde_yaml::` path in the tree is unaffected.
-# `~0.9.42` floors the requirement where it matters: serde_norway only
-# switched to the norway backend in 0.9.41, and 0.9.35–0.9.39 still link the
-# archived `unsafe-libyaml`, so a plain `0.9` bound could re-resolve onto a
-# release that resurrects RUSTSEC-2024-0449. The `~` bound keeps 0.9.42+ fix
-# releases flowing while staying below 0.10.
-serde_yaml = { package = "serde_norway", version = "~0.9.42" }
+# serde-saphyr is the YAML backend: a pure-Rust (`#![forbid(unsafe_code)]`)
+# serde implementation over the `granit-parser` event parser. It replaces
+# `serde_norway`/`unsafe-libyaml-norway` (themselves a fork arrangement for
+# RUSTSEC-2024-0449, the archived `unsafe-libyaml` c2rust backend), so no
+# libyaml-descended crate remains in the tree at all.
+# `~2.0.0` floors the researched release and admits 2.0.x patches while
+# requiring a deliberate bump for a 2.1 that could alter scalar/tag
+# semantics (mirrors the `~0.9.42` precedent).
+serde-saphyr = "~2.0.0"
 # Order-preserving map for `dns.nameserver-policy` — the YAML document
 # order IS the lookup priority (mihomo `parseNameServerPolicy` parity), so
 # a plain `HashMap` cannot carry it. `serde` deserializes in document order.

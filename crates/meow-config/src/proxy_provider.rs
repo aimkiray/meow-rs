@@ -885,18 +885,16 @@ impl ProxyProvider {
                 "provider YAML exceeds the nesting-depth limit"
             ));
         }
-        let mut doc: serde_yaml::Value = serde_yaml::from_str(content)
+        // `<<:` merge keys expand under `MergeKeyPolicy::Merge` (the
+        // shared ingest-options default) — remote payloads legitimately
+        // carry anchors, and an unexpanded merge would silently drop the
+        // merged `dialer-proxy` into a literal `<<` key (the one field
+        // whose loss converts to a silent direct dial). Same treatment as
+        // the main config and subscription parsers: a failed merge is a
+        // parse failure, so the whole payload is dropped rather than
+        // risking nodes losing their chained front hop.
+        let doc: serde_json::Value = crate::parse_yaml_value(content)
             .map_err(|e| anyhow::anyhow!("provider YAML is malformed: {e}"))?;
-        // Expand `<<:` merge keys — remote payloads legitimately carry
-        // anchors, and an unexpanded merge silently drops the merged
-        // `dialer-proxy` into a literal `<<` key (the one field whose loss
-        // converts to a silent direct dial). Same treatment as the main
-        // config and subscription parsers. A failed merge leaves the doc
-        // partially expanded, so treat it like the parse failure above:
-        // drop the whole payload rather than risk nodes losing their
-        // chained front hop.
-        doc.apply_merge()
-            .map_err(|e| anyhow::anyhow!("provider YAML merge keys failed to expand: {e}"))?;
 
         // Accept both `proxies: [...]` wrapper and a bare list. A
         // `Value::Null` document is an empty or comments-only file — treat
@@ -904,12 +902,12 @@ impl ProxyProvider {
         // external tool mid-rewrite doesn't hard-fail strict mode
         // (parity with the missing-file acquisition path, issue #533).
         let list_val = match doc.get("proxies").cloned().unwrap_or_else(|| doc.clone()) {
-            serde_yaml::Value::Null => serde_yaml::Value::Sequence(Vec::new()),
+            serde_json::Value::Null => serde_json::Value::Array(Vec::new()),
             v => v,
         };
 
         let mut proxy_maps: Vec<HashMap<String, serde_json::Value>> =
-            serde_yaml::from_value(list_val)
+            serde_json::from_value(list_val)
                 .map_err(|e| anyhow::anyhow!("provider content is not a proxy list: {e}"))?;
 
         // Pre-resolve any DNS-sourced ECH configs into inline base64 — keeps
@@ -1799,7 +1797,7 @@ header:
   Authorization: "Bearer token123"
   X-Custom: "value"
 "#;
-        let raw: RawProxyProvider = serde_yaml::from_str(yaml).unwrap();
+        let raw: RawProxyProvider = serde_saphyr::from_str(yaml).unwrap();
         let headers = raw.header.unwrap();
         assert_eq!(
             headers.get("Authorization"),
@@ -1826,7 +1824,7 @@ header:
   Authorization:
     - 'token 1231231'
 "#;
-        let raw: RawProxyProvider = serde_yaml::from_str(yaml).unwrap();
+        let raw: RawProxyProvider = serde_saphyr::from_str(yaml).unwrap();
         let headers = raw.header.unwrap();
         assert_eq!(
             headers.get("User-Agent"),
@@ -1847,7 +1845,7 @@ header:
     fn raw_proxy_provider_no_header_defaults_empty() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "type: file\npath: proxies.yaml\n";
-        let raw: RawProxyProvider = serde_yaml::from_str(yaml).unwrap();
+        let raw: RawProxyProvider = serde_saphyr::from_str(yaml).unwrap();
         assert!(raw.header.is_none());
         let p = ProxyProvider::new("p", &raw, Some(dir.path()), true, false, Default::default())
             .unwrap();
@@ -2614,8 +2612,8 @@ header:
     }
 
     /// A `dialer-proxy` arriving via a YAML merge key must be honoured —
-    /// without `apply_merge` the merged field lands on a literal `<<` key
-    /// and the node silently dials direct.
+    /// without merge-key expansion the merged field lands on a literal `<<`
+    /// key and the node silently dials direct.
     #[tokio::test]
     async fn provider_node_merge_key_dialer_proxy_is_honoured() {
         let dir = tempfile::tempdir().unwrap();

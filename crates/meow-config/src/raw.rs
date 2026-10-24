@@ -489,14 +489,12 @@ impl RawNspValue {
 /// A YAML-literal duplicate key is a hard parse error, not a fold:
 /// every production ingest path (`-f`/`-t`, `--config-string`,
 /// `PUT /configs`) funnels through [`crate::parse_raw_yaml`], whose
-/// serde_norway `Value` layer rejects the document with
-/// `duplicate entry with key "…"` before this map is built. The
+/// serde-saphyr parser rejects the document with
+/// `duplicate mapping key: …` before this map is built. The
 /// `IndexMap::insert` fold — first position kept, last value wins, the
 /// same collapse mihomo's `orderedmap.Set` produces — only decides
-/// duplicates from non-literal sources: a programmatically built map
-/// (or `serde_yaml::from_str::<RawConfig>`, a test-only path with no
-/// production caller), or segments of one comma-mixed key expanding
-/// in place.
+/// duplicates from non-literal sources: a programmatically built map,
+/// or segments of one comma-mixed key expanding in place.
 ///
 /// Warning: `IndexMap`'s `PartialEq` is order-INSENSITIVE — `==` cannot
 /// tell a pure key reorder apart from identity. Any comparison where
@@ -903,7 +901,11 @@ mod tests {
 
     #[test]
     fn subscription_proxy_normalization_matrix() {
-        let parse = |yaml: &str| serde_yaml::from_str::<RawSubscription>(yaml).unwrap().proxy;
+        let parse = |yaml: &str| {
+            serde_saphyr::from_str::<RawSubscription>(yaml)
+                .unwrap()
+                .proxy
+        };
 
         assert_eq!(parse("name: s\nurl: http://x\n"), None);
         assert_eq!(parse("name: s\nurl: http://x\nproxy: null\n"), None);
@@ -922,8 +924,9 @@ mod tests {
             Some("DIRECT"),
             "DIRECT stays a value — it is resolved, not erased, at fetch time"
         );
-        let err = serde_yaml::from_str::<RawSubscription>("name: s\nurl: http://x\nproxy: '   '\n")
-            .expect_err("whitespace-only proxy must fail the parse");
+        let err =
+            serde_saphyr::from_str::<RawSubscription>("name: s\nurl: http://x\nproxy: '   '\n")
+                .expect_err("whitespace-only proxy must fail the parse");
         assert!(
             err.to_string().contains("whitespace-only"),
             "unexpected: {err}"
@@ -935,51 +938,51 @@ mod tests {
         // issue #390: docs promise `expected-status: 204` (integer); it used
         // to fail with "invalid type: integer `204`, expected a string".
         let group: RawProxyGroup =
-            serde_yaml::from_str("name: auto\ntype: url-test\nexpected-status: 204\n").unwrap();
+            serde_saphyr::from_str("name: auto\ntype: url-test\nexpected-status: 204\n").unwrap();
         assert_eq!(group.expected_status.as_deref(), Some("204"));
 
         let hc: RawHealthCheck =
-            serde_yaml::from_str("enable: true\nexpected-status: 204\n").unwrap();
+            serde_saphyr::from_str("enable: true\nexpected-status: 204\n").unwrap();
         assert_eq!(hc.expected_status.as_deref(), Some("204"));
     }
 
     #[test]
     fn expected_status_accepts_string_forms() {
         let group: RawProxyGroup =
-            serde_yaml::from_str("name: auto\ntype: url-test\nexpected-status: \"200-299\"\n")
+            serde_saphyr::from_str("name: auto\ntype: url-test\nexpected-status: \"200-299\"\n")
                 .unwrap();
         assert_eq!(group.expected_status.as_deref(), Some("200-299"));
 
         let hc: RawHealthCheck =
-            serde_yaml::from_str("enable: true\nexpected-status: \"204\"\n").unwrap();
+            serde_saphyr::from_str("enable: true\nexpected-status: \"204\"\n").unwrap();
         assert_eq!(hc.expected_status.as_deref(), Some("204"));
     }
 
     #[test]
     fn expected_status_absent_is_none() {
-        let group: RawProxyGroup = serde_yaml::from_str("name: auto\ntype: url-test\n").unwrap();
+        let group: RawProxyGroup = serde_saphyr::from_str("name: auto\ntype: url-test\n").unwrap();
         assert_eq!(group.expected_status, None);
 
-        let hc: RawHealthCheck = serde_yaml::from_str("enable: true\n").unwrap();
+        let hc: RawHealthCheck = serde_saphyr::from_str("enable: true\n").unwrap();
         assert_eq!(hc.expected_status, None);
     }
 
     #[test]
     fn tcp_connect_timeout_parses_from_kebab_yaml() {
-        let raw: RawConfig = serde_yaml::from_str("tcp-connect-timeout: 10\n").unwrap();
+        let raw: RawConfig = serde_saphyr::from_str("tcp-connect-timeout: 10\n").unwrap();
         assert_eq!(raw.tcp_connect_timeout, Some(10));
     }
 
     #[test]
     fn tcp_connect_timeout_defaults_to_none() {
-        let raw: RawConfig = serde_yaml::from_str("mixed-port: 7890\n").unwrap();
+        let raw: RawConfig = serde_saphyr::from_str("mixed-port: 7890\n").unwrap();
         assert_eq!(raw.tcp_connect_timeout, None);
     }
 
     #[test]
     fn sniff_port_range_at_bound_is_accepted() {
         let raw: RawConfig =
-            serde_yaml::from_str("sniffer:\n  sniff:\n    TLS:\n      ports: [\"0-65535\"]\n")
+            serde_saphyr::from_str("sniffer:\n  sniff:\n    TLS:\n      ports: [\"0-65535\"]\n")
                 .unwrap();
         assert_eq!(
             raw.sniffer
@@ -995,7 +998,7 @@ mod tests {
     fn sniff_port_list_rejects_cumulative_expansion() {
         // Two full ranges = 131,072 entries — same primitive hy2's
         // `MAX_HOP_PORT_ENTRIES` already bounds (issue #648 review).
-        let err = serde_yaml::from_str::<RawConfig>(
+        let err = serde_saphyr::from_str::<RawConfig>(
             "sniffer:\n  sniff:\n    TLS:\n      ports: [\"0-65535\", \"0-1\"]\n",
         )
         .unwrap_err();
@@ -1007,7 +1010,7 @@ mod tests {
             .map(|p| p.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let err = serde_yaml::from_str::<RawConfig>(&format!(
+        let err = serde_saphyr::from_str::<RawConfig>(&format!(
             "sniffer:\n  sniff:\n    TLS:\n      ports: [{many}]\n"
         ))
         .unwrap_err();
@@ -1023,7 +1026,7 @@ mod tests {
             use std::fmt::Write as _;
             let _ = write!(yaml, "    K{i}:\n      ports: [80]\n");
         }
-        let err = serde_yaml::from_str::<RawConfig>(&yaml).unwrap_err();
+        let err = serde_saphyr::from_str::<RawConfig>(&yaml).unwrap_err();
         assert!(err.to_string().contains("exceeds 32"), "msg: {err}");
     }
 
@@ -1034,7 +1037,7 @@ mod tests {
             use std::fmt::Write as _;
             let _ = write!(yaml, "    K{i}:\n      ports: [80]\n");
         }
-        let raw: RawConfig = serde_yaml::from_str(&yaml).unwrap();
+        let raw: RawConfig = serde_saphyr::from_str(&yaml).unwrap();
         assert_eq!(raw.sniffer.and_then(|s| s.sniff).map(|m| m.len()), Some(32));
     }
 
@@ -1049,7 +1052,7 @@ mod tests {
             let _ = write!(yaml, "    K{i}:\n      ports: [80]\n");
         }
         yaml.push_str("    K32:\n      ports: [notaport]\n");
-        let err = serde_yaml::from_str::<RawConfig>(&yaml).unwrap_err();
+        let err = serde_saphyr::from_str::<RawConfig>(&yaml).unwrap_err();
         assert!(err.to_string().contains("exceeds 32"), "msg: {err}");
     }
 }

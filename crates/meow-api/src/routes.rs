@@ -4516,7 +4516,7 @@ mod tests {
     #[test]
     fn runtime_refs_force_dns_rebuild_on_identical_inputs() {
         let raw_with_tag: RawConfig =
-            serde_yaml::from_str("dns:\n  enable: true\n  nameserver:\n    - tcp://1.1.1.1#P\n")
+            serde_saphyr::from_str("dns:\n  enable: true\n  nameserver:\n    - tcp://1.1.1.1#P\n")
                 .unwrap();
         // Identical raw on both sides — dns_inputs_equal says unchanged, but
         // the proxy ref must override (its adapters' cell died in the swap).
@@ -4538,14 +4538,14 @@ mod tests {
             "nameserver:\n    - 223.5.5.5\n  proxy-server-nameserver:\n    - tls://223.5.5.5?proxy=P\n",
         ] {
             let raw: RawConfig =
-                serde_yaml::from_str(&format!("dns:\n  enable: true\n  {field}")).unwrap();
+                serde_saphyr::from_str(&format!("dns:\n  enable: true\n  {field}")).unwrap();
             assert!(
                 dns_uses_proxy_refs(&raw),
                 "{field} must register as a proxy runtime ref"
             );
         }
         // Policy URLs check the same pair of spellings.
-        let raw_policy: RawConfig = serde_yaml::from_str(
+        let raw_policy: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver:\n    - 223.5.5.5\n  nameserver-policy:\n    'geosite:cn':\n      - tls://1.1.1.1?proxy=P\n",
         )
         .unwrap();
@@ -4553,7 +4553,7 @@ mod tests {
 
         // rule-set: policy refs also force a rebuild — the matcher holds
         // provider Arcs that must track the committed generation's set.
-        let raw_with_ruleset: RawConfig = serde_yaml::from_str(
+        let raw_with_ruleset: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver-policy:\n    'rule-set:cn':\n      - 223.5.5.5\nrule-providers:\n  cn:\n    type: inline\n    behavior: domain\n    payload: [example.cn]\n",
         )
         .unwrap();
@@ -4565,7 +4565,8 @@ mod tests {
         assert!(!unchanged, "a `rule-set:` policy ref must force a rebuild");
 
         let raw_plain: RawConfig =
-            serde_yaml::from_str("dns:\n  enable: true\n  nameserver:\n    - 223.5.5.5\n").unwrap();
+            serde_saphyr::from_str("dns:\n  enable: true\n  nameserver:\n    - 223.5.5.5\n")
+                .unwrap();
         assert!(!dns_uses_runtime_refs(&raw_plain));
         assert!(
             dns_inputs_equal(&raw_plain, &raw_plain)
@@ -4581,8 +4582,9 @@ mod tests {
     #[test]
     fn dns_inputs_equal_counts_geox_url() {
         let raw_a: RawConfig =
-            serde_yaml::from_str("dns:\n  enable: true\n  nameserver:\n    - 223.5.5.5\n").unwrap();
-        let raw_b: RawConfig = serde_yaml::from_str(
+            serde_saphyr::from_str("dns:\n  enable: true\n  nameserver:\n    - 223.5.5.5\n")
+                .unwrap();
+        let raw_b: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver:\n    - 223.5.5.5\n\
              geox-url:\n  mmdb: https://cdn.test/Country.mmdb\n",
         )
@@ -4599,11 +4601,11 @@ mod tests {
     /// resolver.
     #[test]
     fn dns_inputs_equal_sees_nameserver_policy_key_order() {
-        let raw_a: RawConfig = serde_yaml::from_str(
+        let raw_a: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver-policy:\n    '+.a.example': 1.1.1.1\n    '+.b.example': 2.2.2.2\n",
         )
         .unwrap();
-        let raw_b: RawConfig = serde_yaml::from_str(
+        let raw_b: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver-policy:\n    '+.b.example': 2.2.2.2\n    '+.a.example': 1.1.1.1\n",
         )
         .unwrap();
@@ -4611,13 +4613,13 @@ mod tests {
         assert!(!dns_inputs_equal(&raw_a, &raw_b));
         assert!(!dns_inputs_equal(&raw_b, &raw_a));
         // Same order, same content → equal.
-        let raw_c: RawConfig = serde_yaml::from_str(
+        let raw_c: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver-policy:\n    '+.a.example': 1.1.1.1\n    '+.b.example': 2.2.2.2\n",
         )
         .unwrap();
         assert!(dns_inputs_equal(&raw_a, &raw_c));
         // Same order, different value → not equal.
-        let raw_d: RawConfig = serde_yaml::from_str(
+        let raw_d: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver-policy:\n    '+.a.example': 1.1.1.1\n    '+.b.example': 9.9.9.9\n",
         )
         .unwrap();
@@ -4676,7 +4678,7 @@ mod tests {
 
         let mk = |name: &str| {
             let def: RawProxyProvider =
-                serde_yaml::from_str("type: http\nurl: http://127.0.0.1:1/x.yaml").unwrap();
+                serde_saphyr::from_str("type: http\nurl: http://127.0.0.1:1/x.yaml").unwrap();
             Arc::new(
                 ProxyProvider::new(name, &def, None, false, false, Default::default()).unwrap(),
             )
@@ -4869,7 +4871,7 @@ mod tests {
         });
 
         let dialer_registry = meow_proxy::dialer::ProxyRegistry::default();
-        let def: RawProxyProvider = serde_yaml::from_str(&format!(
+        let def: RawProxyProvider = serde_saphyr::from_str(&format!(
             "type: http\nurl: http://127.0.0.1:{port}/x.yaml\nproxy: ghost"
         ))
         .unwrap();
@@ -5034,7 +5036,7 @@ mod outbound_flush_tests {
         )
         .unwrap();
         let def: meow_config::raw::RawProxyProvider =
-            serde_yaml::from_str("type: file\npath: members.yaml").unwrap();
+            serde_saphyr::from_str("type: file\npath: members.yaml").unwrap();
         let provider = Arc::new(
             ProxyProvider::new(
                 "p",

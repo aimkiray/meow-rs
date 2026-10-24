@@ -89,12 +89,10 @@ fn measure<T>(f: impl FnOnce() -> T) -> (T, AllocSnapshot) {
 }
 
 fn load_raw_fixture() -> RawConfig {
-    let mut value: serde_yaml::Value =
-        serde_yaml::from_str(ECH_PRESSURE_CONFIG).expect("fixture config must be valid YAML");
-    value
-        .apply_merge()
-        .expect("fixture config merge keys must expand");
-    serde_yaml::from_value(value).expect("fixture config must deserialize as RawConfig")
+    // `parse_raw_yaml` applies the merge-key policy the production ingest
+    // path uses — the fixture exercises `<<:` anchors.
+    meow_config::parse_raw_yaml(ECH_PRESSURE_CONFIG)
+        .expect("fixture config must deserialize as RawConfig")
 }
 
 fn fixture_cases() -> Vec<Metadata> {

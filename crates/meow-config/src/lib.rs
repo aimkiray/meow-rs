@@ -752,10 +752,11 @@ pub async fn load_config_from_str(content: &str) -> Result<Config, anyhow::Error
 }
 
 /// Upper bound on YAML document nesting for remote-controlled documents.
-/// `serde_yaml` deserializes `Value` recursively — a document of `[[[[…` or
-/// of ever-deepening indentation recurses one stack frame per level and can
-/// overflow a blocking-thread stack well inside the fetch-size caps
-/// (issue #533 review). Two cheap over-approximations bound the depth:
+/// `serde_saphyr` deserializes `serde_json::Value` recursively — a document
+/// of `[[[[…` or of ever-deepening indentation recurses one stack frame per
+/// level and can overflow a blocking-thread stack well inside the
+/// fetch-size caps (issue #533 review). Two cheap over-approximations bound
+/// the depth up front:
 ///
 /// - flow nesting: unclosed `[`/`{` count. Brackets inside scalars count
 ///   too — a false positive needs >128 unclosed openers in one document,
@@ -765,6 +766,12 @@ pub async fn load_config_from_str(content: &str) -> Result<Config, anyhow::Error
 ///   indentation; a false positive needs a single line indented past 256
 ///   spaces (e.g. inside a literal block scalar), which no real config
 ///   produces.
+///
+/// This stays a coarse pre-filter: the *effective* depth bound is the
+/// `budget.max_depth` enforced by [`yaml_options`] inside the parser, and
+/// the parse itself runs on a dedicated large-stack thread
+/// (`meow_common::yaml::run_on_parse_stack`) so the budget always trips
+/// before the descend can overflow whatever stack the caller had left.
 const MAX_YAML_DEPTH: usize = 128;
 
 pub(crate) fn yaml_within_depth(doc: &str) -> bool {
@@ -785,14 +792,86 @@ pub(crate) fn yaml_within_depth(doc: &str) -> bool {
         .all(|l| l.len() - l.trim_start_matches(' ').len() <= MAX_YAML_DEPTH * 2)
 }
 
-/// Parse a Clash/mihomo YAML document into [`raw::RawConfig`], expanding YAML
-/// anchor merge keys (`<<: *anchor`) before deserialisation.
+/// Shared serde-saphyr options for every untrusted-document ingest point
+/// (`parse_raw_yaml`, subscription/proxy-provider/rule-set payloads). Each
+/// field pins the semantics the previous backend (serde_norway) provided:
 ///
-/// `serde_yaml` resolves anchors, but it does not by itself substitute merge
-/// keys into the surrounding mapping; without [`serde_yaml::Value::apply_merge`]
-/// the `<<` key reaches the typed deserialiser and the merged fields look
-/// "missing". Upstream mihomo configs (e.g. `rule-anchor` patterns) rely on
-/// this expansion — see meow-ios#112.
+/// - `strict_booleans`: only `true`/`false` spellings resolve as booleans —
+///   saphyr's default would additionally read `yes/no/on/off/y/n` (YAML 1.1)
+///   as bools, where norway kept them strings. Residual: saphyr still
+///   case-folds `TrUe`/`nUll` — a divergence from *both* serde_norway
+///   and mihomo's yaml.v3, whose resolve tables only accept the fixed
+///   `true`/`True`/`TRUE`-style spellings and keep them strings.
+/// - `reject_unsupported_tags`: a `!tag` node fails the document instead of
+///   being silently detagged — norway errored the same way when a
+///   `Value::Tagged` reached a `serde_json::Value`/struct target.
+/// - `ignore_binary_tag_for_string`: a `!!binary`-tagged scalar still
+///   delivers as a plain string, matching norway.
+/// - `non_finite_float_policy: PassThrough`: `.inf`/`-.inf`/`.nan` map to
+///   `null` inside `serde_json::Value` subtrees and to the IEEE values in
+///   typed `f64` fields — norway's exact behaviour.
+/// - `budget.max_depth`: saphyr's `serde_json::Value` deserializer
+///   recurses one stack frame per nesting level, so the depth bound must
+///   trip inside the parser before the descend overflows — the value is
+///   `meow_common::yaml::MAX_DEPTH` (32), the single definition meow-cli's
+///   config parse shares so every front-end enforces the same contract.
+///   The budget is only a real guard because every parse below runs on a
+///   dedicated `meow_common::yaml::PARSE_STACK_SIZE` thread: on the 1 MiB
+///   main thread the fatal depth measured ≈25 — *below* 32 — so an inline
+///   parse let deep documents abort the process before the budget could
+///   fire (migration review F1). `yaml_within_depth` stays as the cheap
+///   pre-filter for absurd inputs.
+/// - `merge_keys`/`duplicate_keys` stay at their defaults
+///   (`Merge`/`Error`): merge expansion replaces `Value::apply_merge` with
+///   identical precedence, and duplicate keys failing closed is deliberate
+///   hardening over norway's silent last-wins.
+///
+/// Stays crate-private: backend types must never sit in a `pub` signature
+/// (`serde_json::Value` is the public value namespace), so sibling modules
+/// ingest through [`parse_yaml_value`] below.
+fn yaml_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        strict_booleans: true,
+        reject_unsupported_tags: true,
+        ignore_binary_tag_for_string: true,
+        non_finite_float_policy: serde_saphyr::NonFiniteFloatPolicy::PassThrough,
+        budget: serde_saphyr::budget! { max_depth: meow_common::yaml::MAX_DEPTH },
+    }
+}
+
+/// Shared YAML→[`serde_json::Value`] ingest under [`yaml_options`] —
+/// subscription, provider and rule-set payloads all parse through this so
+/// the option profile lives in exactly one place and no sibling module
+/// names a backend type.
+pub(crate) fn parse_yaml_value(content: &str) -> Result<serde_json::Value, anyhow::Error> {
+    // Dedicated parse thread, same as `parse_raw_yaml`: the budget above
+    // only guards depth while the descend's frames still fit — on a small
+    // caller stack they do not (see `meow_common::yaml`).
+    let value = meow_common::yaml::run_on_parse_stack(content, |doc| {
+        serde_saphyr::from_str_with_options(doc, yaml_options())
+    })
+    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))?;
+    Ok(value?)
+}
+
+/// Shared serde-saphyr serializer options for every config-emission point.
+/// `folded_wrap_chars: usize::MAX` disables saphyr's default 80-column
+/// `>`-folded block style: serde_norway never re-wrapped long scalars, and a
+/// folded emission would be a noisy byte-level change to saved configs.
+fn yaml_ser_options() -> serde_saphyr::SerializerOptions {
+    serde_saphyr::ser_options! {
+        folded_wrap_chars: usize::MAX,
+    }
+}
+
+/// Parse a Clash/mihomo YAML document into [`raw::RawConfig`], expanding YAML
+/// anchor merge keys (`<<: *anchor`) as part of deserialization.
+///
+/// `serde_saphyr` resolves anchors and, under the default
+/// `MergeKeyPolicy::Merge`, substitutes merge keys into the surrounding
+/// mapping with explicit keys taking precedence — the same expansion
+/// `serde_yaml::Value::apply_merge` used to perform. Upstream mihomo
+/// configs (e.g. `rule-anchor` patterns) rely on this — see meow-ios#112.
 /// Shared YAML→[`raw::RawConfig`] entry — nesting-depth guard plus
 /// merge-key expansion. Every untrusted config ingest point (config file,
 /// subscription/provider payloads, and `PUT /configs`) must use this so a
@@ -804,9 +883,18 @@ pub fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
             "YAML document exceeds {MAX_YAML_DEPTH} levels of nesting"
         ));
     }
-    let mut value: serde_yaml::Value = serde_yaml::from_str(content)?;
-    value.apply_merge()?;
-    Ok(serde_yaml::from_value(value)?)
+    // The descend runs on a dedicated `PARSE_STACK_SIZE` thread so the
+    // `budget.max_depth` above always trips before the recursion can
+    // overflow — callers reach here on the 1 MiB main thread (config test,
+    // startup, `--config-string`) where the fatal depth measured ≈25,
+    // below the 32-level budget (migration review F1). The join is a
+    // synchronous block on paths that already parsed inline — startup and
+    // reload — so nothing downstream changes. See `meow_common::yaml`.
+    let raw = meow_common::yaml::run_on_parse_stack(content, |doc| {
+        serde_saphyr::from_str_with_options(doc, yaml_options())
+    })
+    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))?;
+    Ok(raw?)
 }
 
 /// Unique-per-call scratch sibling for atomic write-then-rename saves —
@@ -834,7 +922,7 @@ pub(crate) fn unique_scratch_path(path: &Path) -> PathBuf {
 /// `key: null` for every unset `Option` field, so a saved file is
 /// noisier than the hand-edited original (pre-existing shape).
 pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
-    let yaml = serde_yaml::to_string(raw)?;
+    let yaml = serde_saphyr::to_string_with_options(raw, yaml_ser_options())?;
     // Scratch files orphaned by a crash between create and rename
     // accumulate forever otherwise — sweep stale ones on each save
     // (issue #621).
@@ -867,7 +955,7 @@ pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::E
 /// Same ordering contract: callers persisting a committed config should hold
 /// the `CONFIG_MUTATION` lane so file order follows commit order (issue #543).
 pub async fn save_raw_config_async(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
-    let yaml = serde_yaml::to_string(raw)?;
+    let yaml = serde_saphyr::to_string_with_options(raw, yaml_ser_options())?;
     // Same crash-leftover sweep as the sync variant (issue #621), off the
     // async worker since it walks the config dir.
     {
@@ -921,14 +1009,14 @@ mod save_scratch_tests {
         let path_str = path.to_string_lossy().into_owned();
 
         let a: raw::RawConfig =
-            serde_yaml::from_str("mode: rule\nlog-level: info\nrules:\n  - MATCH,DIRECT\n")
+            serde_saphyr::from_str("mode: rule\nlog-level: info\nrules:\n  - MATCH,DIRECT\n")
                 .unwrap();
-        let b: raw::RawConfig = serde_yaml::from_str(
+        let b: raw::RawConfig = serde_saphyr::from_str(
             "mode: global\nlog-level: debug\nipv6: true\nrules:\n  - MATCH,REJECT\n",
         )
         .unwrap();
-        let ser_a = serde_yaml::to_string(&a).unwrap();
-        let ser_b = serde_yaml::to_string(&b).unwrap();
+        let ser_a = serde_saphyr::to_string_with_options(&a, yaml_ser_options()).unwrap();
+        let ser_b = serde_saphyr::to_string_with_options(&b, yaml_ser_options()).unwrap();
 
         std::thread::scope(|s| {
             for raw in [&a, &b] {
@@ -961,7 +1049,7 @@ mod save_scratch_tests {
     fn save_preserves_nameserver_policy_key_order() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             "mode: rule\ndns:\n  nameserver-policy:\n    '+.first.example': 1.1.1.1\n    'second.example': 2.2.2.2\n    'rule-set:x': 3.3.3.3\nrules:\n  - MATCH,DIRECT\n",
         )
         .unwrap();
@@ -975,7 +1063,7 @@ mod save_scratch_tests {
             "saved document must keep the policy key order:\n{saved}"
         );
         // And a reload of the saved file yields the same order.
-        let reloaded: raw::RawConfig = serde_yaml::from_str(&saved).unwrap();
+        let reloaded: raw::RawConfig = serde_saphyr::from_str(&saved).unwrap();
         let map = reloaded.dns.unwrap().nameserver_policy.unwrap();
         let keys: Vec<&String> = map.keys().collect();
         assert_eq!(keys, ["+.first.example", "second.example", "rule-set:x"]);
@@ -984,7 +1072,7 @@ mod save_scratch_tests {
     #[test]
     fn failed_save_leaves_no_scratch() {
         let dir = tempfile::tempdir().unwrap();
-        let raw: raw::RawConfig = serde_yaml::from_str("mode: rule\n").unwrap();
+        let raw: raw::RawConfig = serde_saphyr::from_str("mode: rule\n").unwrap();
 
         // Rename step fails: `as-dir.bak` is a non-empty directory, so the
         // backup rotate fails silently and `as-dir` stays put — the final
@@ -1016,7 +1104,7 @@ mod save_scratch_tests {
         let ro = dir.path().join("ro");
         std::fs::create_dir(&ro).unwrap();
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let raw: raw::RawConfig = serde_yaml::from_str("mode: rule\n").unwrap();
+        let raw: raw::RawConfig = serde_saphyr::from_str("mode: rule\n").unwrap();
 
         let path = ro.join("config.yaml").to_string_lossy().into_owned();
         assert!(save_raw_config(&path, &raw).is_err());
@@ -4553,7 +4641,7 @@ mod dialer_proxy_tests {
     /// stay `Some` forever.
     #[test]
     fn dropped_build_leaves_no_registry_cycle() {
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             "proxies:\n  - name: A\n    type: direct\n    dialer-proxy: B\n  - name: B\n    type: direct\n",
         )
         .unwrap();
@@ -4616,7 +4704,7 @@ mod dialer_proxy_tests {
         let (port_b, b_hits) = counting_listener().await;
         let (port_c, c_hits) = counting_listener().await;
 
-        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+        let raw: raw::RawConfig = serde_saphyr::from_str(&format!(
             "proxies:\n\
              \x20 - name: A\n    type: trojan\n    server: 127.0.0.1\n    port: {port_a}\n    \
              password: x\n    dialer-proxy: B\n\
@@ -4664,7 +4752,7 @@ mod dialer_proxy_tests {
         let (port_b1, b1_hits) = counting_listener().await;
         let (port_b2, b2_hits) = counting_listener().await;
 
-        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+        let raw: raw::RawConfig = serde_saphyr::from_str(&format!(
             "proxies:\n\
              \x20 - name: B1\n    type: trojan\n    server: 127.0.0.1\n    port: {port_b1}\n    \
              password: x\n\
@@ -4723,10 +4811,10 @@ mod dialer_proxy_tests {
     fn prefetch_layer_gate_tracks_real_need() {
         let geo = GeoDataConfig::default();
         let one_proxy = "proxies:\n  - {name: p, type: direct}\n";
-        let no_providers: raw::RawConfig = serde_yaml::from_str(one_proxy).unwrap();
+        let no_providers: raw::RawConfig = serde_saphyr::from_str(one_proxy).unwrap();
 
         // Fetchable provider → build it even with no geo references.
-        let with_http: raw::RawConfig = serde_yaml::from_str(&format!(
+        let with_http: raw::RawConfig = serde_saphyr::from_str(&format!(
             "{one_proxy}rule-providers:\n  rs:\n    type: http\n    behavior: domain\n    url: http://x/y\n    path: ./rs.yaml"
         ))
         .unwrap();
@@ -4734,14 +4822,14 @@ mod dialer_proxy_tests {
 
         // A `file` provider counts too — its payload can carry geo keys the
         // raw scan cannot see yet.
-        let with_file: raw::RawConfig = serde_yaml::from_str(&format!(
+        let with_file: raw::RawConfig = serde_saphyr::from_str(&format!(
             "{one_proxy}rule-providers:\n  rs:\n    type: file\n    behavior: domain\n    path: ./rs.yaml"
         ))
         .unwrap();
         assert!(prefetch_proxy_layer_needed(&with_file, &geo));
 
         // Inline-only, rules free of geo references → nothing to fetch.
-        let inline_only: raw::RawConfig = serde_yaml::from_str(&format!(
+        let inline_only: raw::RawConfig = serde_saphyr::from_str(&format!(
             "{one_proxy}rule-providers:\n  rs:\n    type: inline\n    behavior: domain\n    payload: ['.example.com']"
         ))
         .unwrap();
@@ -4749,7 +4837,7 @@ mod dialer_proxy_tests {
         assert!(!prefetch_proxy_layer_needed(&no_providers, &geo));
 
         // No `proxies:` at all → the layer can never exist.
-        let empty_proxies: raw::RawConfig = serde_yaml::from_str(
+        let empty_proxies: raw::RawConfig = serde_saphyr::from_str(
             "rule-providers:\n  rs:\n    type: http\n    behavior: domain\n    url: http://x/y\n    path: ./rs.yaml",
         )
         .unwrap();
@@ -4762,7 +4850,7 @@ mod dialer_proxy_tests {
             mmdb_path: Some(dir.path().join("absent.mmdb")),
             ..geo.clone()
         };
-        let geoip_rules: raw::RawConfig = serde_yaml::from_str(&format!(
+        let geoip_rules: raw::RawConfig = serde_saphyr::from_str(&format!(
             "{one_proxy}rule-providers:\n  rs:\n    type: inline\n    behavior: domain\n    payload: ['.example.com']\n\
              rules:\n  - GEOIP,CN,DIRECT"
         ))
@@ -4795,7 +4883,7 @@ mod dialer_proxy_tests {
             }
         });
 
-        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+        let raw: raw::RawConfig = serde_saphyr::from_str(&format!(
             "proxies:\n\
              \x20 - name: A\n    type: trojan\n    server: 127.0.0.1\n    port: 9\n    \
              password: x\n    dialer-proxy: B\n\
@@ -4831,7 +4919,7 @@ mod dialer_proxy_tests {
         let (port_b, b_hits) = counting_listener().await;
         let (port_u, u_hits) = counting_listener().await;
 
-        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+        let raw: raw::RawConfig = serde_saphyr::from_str(&format!(
             "proxies:\n\
              \x20 - name: A\n    type: trojan\n    server: 127.0.0.1\n    port: {port_a}\n    \
              password: x\n    dialer-proxy: B\n\
@@ -4872,7 +4960,7 @@ mod dialer_proxy_tests {
     async fn rejected_layer_fails_before_any_fetch() {
         let (port_u, u_hits) = counting_listener().await;
 
-        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+        let raw: raw::RawConfig = serde_saphyr::from_str(&format!(
             "proxies:\n\
              \x20 - name: A\n    type: trojan\n    server: 127.0.0.1\n    port: 9\n    \
              password: x\n    dialer-proxy: ghost\n\
@@ -4908,7 +4996,7 @@ mod dialer_proxy_tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("absent.mmdb");
 
-        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+        let raw: raw::RawConfig = serde_saphyr::from_str(&format!(
             "proxies:\n\
              \x20 - name: A\n    type: trojan\n    server: 127.0.0.1\n    port: {port_a}\n    \
              password: x\n    dialer-proxy: B\n\
@@ -5228,7 +5316,7 @@ mod dialer_proxy_tests {
             .with_max_level(tracing::Level::WARN)
             .finish();
 
-        let raws: Vec<HashMap<String, serde_json::Value>> = serde_yaml::from_str(
+        let raws: Vec<HashMap<String, serde_json::Value>> = serde_saphyr::from_str(
             "- name: dup\n  type: direct\n- name: dup\n  type: http\n  server: 127.0.0.1\n  port: 9\n- name: dup\n  type: socks5\n  server: 127.0.0.1\n  port: 9\n",
         )
         .unwrap();
@@ -5658,7 +5746,7 @@ mod dialer_proxy_tests {
     /// handle while probes recorded results on the other.
     #[test]
     fn dialer_proxy_member_shares_health_with_group_selection() {
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             r#"
 proxies:
   - name: member
@@ -6051,7 +6139,7 @@ mod geoip_context_tests {
     // ── geo_references / GeoDataNeeds (the shared need verdict) ────────
 
     fn needs_of(yaml: &str, scan: &[&str]) -> GeoDataNeeds {
-        let raw: raw::RawConfig = serde_yaml::from_str(yaml).unwrap();
+        let raw: raw::RawConfig = serde_saphyr::from_str(yaml).unwrap();
         let lines: Vec<String> = scan.iter().map(std::string::ToString::to_string).collect();
         super::geo_references(&raw, &lines)
     }
@@ -6149,7 +6237,7 @@ mod geoip_context_tests {
             mmdb_path: Some(missing_mmdb.clone()),
             ..GeoDataConfig::default()
         };
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  fallback:\n    - tls://8.8.8.8\n\
              proxies:\n  - {name: p, type: direct}\n",
         )
@@ -6177,7 +6265,7 @@ mod geoip_context_tests {
             "dns:\n  enable: false\n  fallback:\n    - tls://8.8.8.8\n",
             "dns:\n  enable: true\n  fallback: []\n",
         ] {
-            let raw: raw::RawConfig = serde_yaml::from_str(yaml).unwrap();
+            let raw: raw::RawConfig = serde_saphyr::from_str(yaml).unwrap();
             assert!(
                 super::missing_geodata_downloads(&geo, geo_references(&raw, &[])).is_empty(),
                 "{yaml} must produce no downloads"
@@ -6281,7 +6369,7 @@ mod geoip_context_tests {
     }
 
     fn resolve_geo(yaml: &str, names: &[&str]) -> Option<Arc<dyn Proxy>> {
-        let raw: raw::RawConfig = serde_yaml::from_str(yaml).unwrap();
+        let raw: raw::RawConfig = serde_saphyr::from_str(yaml).unwrap();
         let map = proxy_map(names);
         super::resolve_geodata_download_proxy(&raw, &map)
     }
@@ -6289,9 +6377,10 @@ mod geoip_context_tests {
     /// Explicit `geodata.proxy` names a map entry → that adapter.
     #[test]
     fn geodata_proxy_named_entry_wins() {
-        let raw: raw::RawConfig =
-            serde_yaml::from_str("geodata:\n  proxy: out\nproxies:\n  - {name: p, type: direct}\n")
-                .unwrap();
+        let raw: raw::RawConfig = serde_saphyr::from_str(
+            "geodata:\n  proxy: out\nproxies:\n  - {name: p, type: direct}\n",
+        )
+        .unwrap();
         let map = proxy_map(&["p", "out"]);
         let resolved =
             super::resolve_geodata_download_proxy(&raw, &map).expect("named proxy resolves");
@@ -6337,7 +6426,7 @@ mod geoip_context_tests {
     /// No explicit override → the LAST top-level `MATCH` target wins.
     #[test]
     fn geodata_proxy_match_target_is_default_egress() {
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             "proxies:\n  - {name: p, type: direct}\n\
              rules:\n  - MATCH,early\n  - GEOIP,CN,out\n  - MATCH,out\n",
         )
@@ -6364,7 +6453,7 @@ mod geoip_context_tests {
     /// `first_named_proxy` — a typo'd egress must not strand the download.
     #[test]
     fn geodata_proxy_missing_match_target_falls_back() {
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             "proxies:\n  - {name: p, type: direct}\nrules:\n  - MATCH,ghost\n",
         )
         .unwrap();
@@ -6378,7 +6467,7 @@ mod geoip_context_tests {
     /// `MATCH,DIRECT` still beats it — the default egress is authoritative.
     #[test]
     fn geodata_proxy_no_match_uses_first_named() {
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             "proxies:\n  - {name: p, type: direct}\n  - {name: q, type: direct}\n",
         )
         .unwrap();
@@ -6388,7 +6477,7 @@ mod geoip_context_tests {
         assert!(Arc::ptr_eq(&resolved, &map["p"]));
 
         // Empty proxies / empty map → no proxy at all.
-        let raw: raw::RawConfig = serde_yaml::from_str("mode: rule\n").unwrap();
+        let raw: raw::RawConfig = serde_saphyr::from_str("mode: rule\n").unwrap();
         let map = proxy_map(&[]);
         assert!(super::resolve_geodata_download_proxy(&raw, &map).is_none());
     }
@@ -6399,7 +6488,7 @@ mod geoip_context_tests {
     #[test]
     fn geodata_proxy_group_name_resolves_to_group_adapter() {
         let raw: raw::RawConfig =
-            serde_yaml::from_str("geodata:\n  proxy: select-group\n").unwrap();
+            serde_saphyr::from_str("geodata:\n  proxy: select-group\n").unwrap();
         let map = proxy_map(&["select-group"]);
         let resolved = super::resolve_geodata_download_proxy(&raw, &map)
             .expect("group name resolves to the group adapter");
@@ -6422,8 +6511,9 @@ rule-providers:
         let providers = raw.rule_providers.expect("rule-providers present");
         let cn = providers.get("cn_domain").expect("cn_domain entry");
         // After merge expansion the anchor's `type` and `behavior` fields are
-        // materialised on the typed struct — without `apply_merge` these would
-        // appear missing and deserialisation would fail with `missing field`.
+        // materialised on the typed struct — without the parser's merge-key
+        // policy these would appear missing and deserialisation would fail
+        // with `missing field`.
         assert_eq!(cn.provider_type, "http");
         assert_eq!(cn.behavior, "domain");
         assert_eq!(cn.format.as_deref(), Some("mrs"));
@@ -6703,7 +6793,7 @@ mod provider_path_safety_tests {
     #[test]
     fn rebuild_rejects_rule_provider_path_escaping_cache_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             r#"
 rule-providers:
   x:
@@ -6729,7 +6819,7 @@ rules:
         // fail the rebuild loudly (rule-provider parity) instead of the
         // provider being warn-skipped and its groups silently degrading.
         let dir = tempfile::tempdir().unwrap();
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             r#"
 proxy-providers:
   evil:
@@ -6765,7 +6855,7 @@ rules:
         //
         // Here there is no containment root at all, so a caller-named file
         // path is a hard error.
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             r#"
 rule-providers:
   x:
@@ -6801,7 +6891,7 @@ rules:
             "payload:\n  - '+.ads.example'\n",
         )
         .unwrap();
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             r#"
 rule-providers:
   ads:
@@ -6855,7 +6945,7 @@ rules:
             "payload:\n  - '+.ads.example'\n",
         )
         .unwrap();
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             r#"
 rule-providers:
   ads:
@@ -6881,7 +6971,7 @@ rules:
 
         // A candidate that drops `rule-providers:` empties the registry.
         let raw_bare: raw::RawConfig =
-            serde_yaml::from_str("rules:\n  - \"MATCH,DIRECT\"\n").unwrap();
+            serde_saphyr::from_str("rules:\n  - \"MATCH,DIRECT\"\n").unwrap();
         let result = rebuild_from_raw_with_resolver(
             &raw_bare,
             None,
@@ -6895,7 +6985,7 @@ rules:
 
         // A failing build returns Err — the caller never commits, so the
         // live registry (seeded above via a good build) stays untouched.
-        let raw_ok: raw::RawConfig = serde_yaml::from_str(
+        let raw_ok: raw::RawConfig = serde_saphyr::from_str(
             "rule-providers:\n  ads:\n    type: file\n    behavior: domain\n    format: yaml\n    path: ads.yaml\nrules:\n  - RULE-SET,ads,REJECT\n  - \"MATCH,DIRECT\"\n",
         )
         .unwrap();
@@ -6904,7 +6994,7 @@ rules:
                 .expect("rebuild ok");
         *live.write() = result.rule_providers;
         let raw_bad: raw::RawConfig =
-            serde_yaml::from_str("rules:\n  - SUB-RULE,(MATCH,DIRECT),missing\n").unwrap();
+            serde_saphyr::from_str("rules:\n  - SUB-RULE,(MATCH,DIRECT),missing\n").unwrap();
         assert!(rebuild_from_raw_with_resolver(
             &raw_bad,
             None,
@@ -6926,7 +7016,7 @@ rules:
     /// check is against the provider object, not a snapshot.
     #[test]
     fn rebuild_result_rule_providers_match_the_matcher_generation() {
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             r#"
 rule-providers:
   doms:
@@ -6962,7 +7052,7 @@ rules:
     #[test]
     fn rebuild_rejects_traversal_in_rule_provider_path() {
         let dir = tempfile::tempdir().unwrap();
-        let raw: raw::RawConfig = serde_yaml::from_str(
+        let raw: raw::RawConfig = serde_saphyr::from_str(
             r#"
 rule-providers:
   x:
@@ -6989,7 +7079,7 @@ mod strict_mode_tests {
     use super::*;
 
     fn raw_config(yaml: &str) -> raw::RawConfig {
-        serde_yaml::from_str(yaml).unwrap()
+        serde_saphyr::from_str(yaml).unwrap()
     }
 
     const BASE: &str = r#"
@@ -7115,7 +7205,7 @@ rules:
             .expect_err("absurd tun.udp-timeout must be rejected");
         assert!(err.to_string().contains("udp-timeout"), "unexpected: {err}");
 
-        let raw_l: raw::RawListener = serde_yaml::from_str(
+        let raw_l: raw::RawListener = serde_saphyr::from_str(
             "name: t\ntype: tproxy\nport: 7893\nudp: true\nfirewall: false\n\
              udp-timeout: 18446744073709551615\n",
         )
@@ -7499,7 +7589,7 @@ rules:
     #[test]
     fn strict_use_fails_when_candidate_removes_provider() {
         let live_def: raw::RawProxyProvider =
-            serde_yaml::from_str("type: http\nurl: http://127.0.0.1:1/x.yaml").unwrap();
+            serde_saphyr::from_str("type: http\nurl: http://127.0.0.1:1/x.yaml").unwrap();
         let live_provider =
             ProxyProvider::new("airport", &live_def, None, false, false, Default::default())
                 .unwrap();
@@ -7762,7 +7852,7 @@ rule-providers:
             "proxies:\n  - { name: ok, type: ss, server: 127.0.0.1, port: 8388, cipher: aes-128-gcm, password: x }\n  - { name: broken, type: nosuchtype }\n",
         )
         .unwrap();
-        let def: raw::RawProxyProvider = serde_yaml::from_str(&format!(
+        let def: raw::RawProxyProvider = serde_saphyr::from_str(&format!(
             "type: file\npath: '{}'",
             dir.path().join("nodes.yaml").display()
         ))
@@ -7829,19 +7919,23 @@ rules:
     /// lenient just skips ECH (issue #533 review).
     #[tokio::test]
     async fn strict_rejects_ech_enable_with_no_query_source() {
-        let mut proxies = vec![serde_yaml::from_str::<HashMap<String, serde_json::Value>>(
-            "{ name: p, type: ss, ech-opts: { enable: true } }",
-        )
-        .unwrap()];
+        let mut proxies = vec![
+            serde_saphyr::from_str::<HashMap<String, serde_json::Value>>(
+                "{ name: p, type: ss, ech-opts: { enable: true } }",
+            )
+            .unwrap(),
+        ];
         let err = ech_dns::preresolve_ech(&mut proxies, true)
             .await
             .expect_err("strict must reject enable:true with no query source");
         assert!(err.contains("p"), "unexpected: {err}");
 
-        let mut proxies = vec![serde_yaml::from_str::<HashMap<String, serde_json::Value>>(
-            "{ name: p, type: ss, ech-opts: { enable: true } }",
-        )
-        .unwrap()];
+        let mut proxies = vec![
+            serde_saphyr::from_str::<HashMap<String, serde_json::Value>>(
+                "{ name: p, type: ss, ech-opts: { enable: true } }",
+            )
+            .unwrap(),
+        ];
         ech_dns::preresolve_ech(&mut proxies, false)
             .await
             .expect("lenient skips ECH silently");
@@ -8047,7 +8141,7 @@ rules:
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("empty.yaml"), "# nothing here\n").unwrap();
         let raw: raw::RawProxyProvider =
-            serde_yaml::from_str("type: file\npath: empty.yaml\n").unwrap();
+            serde_saphyr::from_str("type: file\npath: empty.yaml\n").unwrap();
         let provider = ProxyProvider::new("p", &raw, Some(&dir), false, true, Default::default())
             .expect("file provider constructs");
         provider
@@ -8119,9 +8213,13 @@ pub fn extract_health_check_specs(
 #[cfg(test)]
 mod yaml_depth_tests {
     //! Remote YAML (subscriptions, provider payloads, PUT /configs) must not
-    //! drive serde_yaml's recursive Value deserializer past a bounded depth —
-    //! `[[[[…` or ever-deepening indentation overflows a blocking-thread
-    //! stack inside the fetch-size caps (issue #533 review).
+    //! drive the recursive `serde_json::Value` deserializer past a bounded
+    //! depth — `[[[[…` or ever-deepening indentation overflows a
+    //! blocking-thread stack inside the fetch-size caps (issue #533 review).
+    //! This module's `yaml_within_depth` is the cheap pre-filter; the hard
+    //! bound is `yaml_options`' `budget.max_depth` inside the parser, made
+    //! reachable from any caller stack by the dedicated parse thread
+    //! (`meow_common::yaml::run_on_parse_stack`).
     use super::yaml_within_depth;
 
     #[test]
@@ -8173,7 +8271,7 @@ mod dns_provider_sharing_tests {
             "dns:\n  enable: true\n  nameserver:\n    - 127.0.0.1\n  nameserver-policy:\n    rule-set:p: 127.0.0.1\nrule-providers:\n  p:\n    type: file\n    behavior: {behavior}\n    path: '{}'\nrules:\n  - MATCH,DIRECT\n",
             path.display()
         );
-        serde_yaml::from_str(&yaml).unwrap()
+        serde_saphyr::from_str(&yaml).unwrap()
     }
 
     /// Issue #543 — the DNS rebuild must share the commit's prefetched
@@ -8265,7 +8363,7 @@ mod dns_provider_sharing_tests {
         std::fs::write(&file, b"payload:\n  - GEOIP,CN,DIRECT\n").unwrap();
         let mut raw = dns_raw_with_file_provider(&file, "classical");
         raw.geodata =
-            Some(serde_yaml::from_str("mmdb-path: /nonexistent-543/Country.mmdb").unwrap());
+            Some(serde_saphyr::from_str("mmdb-path: /nonexistent-543/Country.mmdb").unwrap());
         let proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
 
         let mut payloads = rule_provider::PrefetchedPayloads::new();
@@ -8322,7 +8420,7 @@ mod dns_provider_sharing_tests {
             }
         });
 
-        let raw: raw::RawConfig = serde_yaml::from_str(&format!(
+        let raw: raw::RawConfig = serde_saphyr::from_str(&format!(
             "rule-providers:\n  p:\n    type: http\n    behavior: domain\n    url: http://127.0.0.1:{port}/p.yaml\nrules:\n  - RULE-SET,p,DIRECT\n"
         ))
         .unwrap();

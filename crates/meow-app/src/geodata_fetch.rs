@@ -377,7 +377,7 @@ mod tests {
     /// resolver generation on the tunnel.
     #[tokio::test]
     async fn republish_dns_for_geo_dbs_swaps_resolver_generation() {
-        let raw: RawConfig = serde_yaml::from_str(
+        let raw: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n",
         )
         .unwrap();
@@ -433,7 +433,7 @@ mod tests {
     /// new generation without a rebind.
     #[tokio::test]
     async fn republish_dns_for_geo_dbs_swaps_live_server_slot() {
-        let raw: RawConfig = serde_yaml::from_str(
+        let raw: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  listen: 127.0.0.1:0\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n",
         )
         .unwrap();
@@ -522,7 +522,7 @@ mod tests {
         )
         .unwrap();
 
-        let raw: RawConfig = serde_yaml::from_str(&format!(
+        let raw: RawConfig = serde_saphyr::from_str(&format!(
             "geodata:\n  geosite-path: '{}'\n\
              dns:\n  enable: true\n  nameserver:\n    - rcode://success\n  \
              nameserver-policy:\n    \"geosite:testcat\": rcode://name_error\n\
@@ -605,7 +605,7 @@ mod tests {
     /// (`rule-set:gone` has no declared provider → deterministic `Err`).
     #[tokio::test]
     async fn republish_dns_for_geo_dbs_parse_failure_keeps_resolver() {
-        let raw: RawConfig = serde_yaml::from_str(
+        let raw: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver:\n    - rcode://success\n  \
              nameserver-policy:\n    \"rule-set:gone\": rcode://success\n\
              rules:\n  - MATCH,DIRECT\n",
@@ -659,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn republish_dns_for_geo_dbs_preserves_fake_ip_pool() {
         let dir = tempfile::tempdir().unwrap();
-        let raw: RawConfig = serde_yaml::from_str(
+        let raw: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  \
              fake-ip-range: 198.18.0.1/16\n  nameserver:\n    - rcode://success\n\
              rules:\n  - MATCH,DIRECT\n",
@@ -727,7 +727,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Both proxies are `type: direct` so the chained dial completes a
         // real loopback TCP connection when the front hop resolves.
-        let raw: RawConfig = serde_yaml::from_str(
+        let raw: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver:\n    - \"tcp://127.0.0.1:9#chained\"\n\
              proxies:\n  - {name: hop, type: direct}\n  \
              - {name: chained, type: direct, dialer-proxy: hop}\n\
@@ -878,7 +878,7 @@ mod tests {
         .unwrap();
         let asn_target = dir.path().join("asn.mmdb");
 
-        let raw: RawConfig = serde_yaml::from_str(&format!(
+        let raw: RawConfig = serde_saphyr::from_str(&format!(
             "geodata:\n  geosite-path: '{}'\n\
              dns:\n  enable: true\n  nameserver:\n    - rcode://success\n  \
              nameserver-policy:\n    \"geosite:testcat\": rcode://name_error\n\
@@ -1029,7 +1029,7 @@ mod tests {
         )
         .unwrap();
 
-        let raw: RawConfig = serde_yaml::from_str(
+        let raw: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver:\n    - rcode://success\n\
              rules:\n  - MATCH,DIRECT\n",
         )
@@ -1092,7 +1092,7 @@ mod tests {
         let asn_target = dir.path().join("asn.mmdb");
         let geosite_target = dir.path().join("geosite.mrs");
 
-        let raw: RawConfig = serde_yaml::from_str("rules:\n  - GEOIP,CN,DIRECT\n").unwrap();
+        let raw: RawConfig = serde_saphyr::from_str("rules:\n  - GEOIP,CN,DIRECT\n").unwrap();
         let resolver = Arc::new(meow_dns::Resolver::new(
             vec!["127.0.0.1:53".parse().unwrap()],
             vec![],

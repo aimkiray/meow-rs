@@ -278,8 +278,10 @@ Three additions to `.github/workflows/test.yml`:
 1. **YAML key iteration order for duplicate-name resolution.** The spec
    says "config-file order is the deterministic iteration order." This
    requires the `proxy-providers:` map to preserve insertion order.
-   `serde_norway` 0.9 (consumed under the `serde_yaml` dependency name)
-   uses `IndexMap` by default which preserves order;
+   `serde-saphyr` 2.0 (crate path `serde_saphyr`) feeds mapping
+   passthroughs into `serde_json::Value`, whose default `Map` is a
+   `BTreeMap` — keys come out sorted, so iteration is deterministic but
+   not document order;
    if the raw struct uses `HashMap`, the duplicate-name winner is
    non-deterministic. Confirm the raw struct uses `IndexMap` (or
    `BTreeMap` for sorted-key determinism) before I1/I2 can be

@@ -2043,7 +2043,7 @@ mod tests {
         .unwrap();
 
         let provider_registry = meow_proxy::dialer::ProxyRegistry::default();
-        let raw: meow_config::raw::RawConfig = serde_yaml::from_str(
+        let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(
             "proxy-providers:\n  prov:\n    type: file\n    path: nodes.yaml\n",
         )
         .unwrap();

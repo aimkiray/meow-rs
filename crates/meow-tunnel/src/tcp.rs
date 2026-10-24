@@ -1075,7 +1075,7 @@ mod tests {
     /// left a dashboard unable to tell which node a flow actually uses.
     #[tokio::test]
     async fn tracked_chain_names_each_group_selection_leaf_first() {
-        let raw: meow_config::raw::RawConfig = serde_yaml::from_str(
+        let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(
             "proxies:
   - {name: HK-01, type: socks5, server: 127.0.0.1, port: 1}
   - {name: JP-01, type: socks5, server: 127.0.0.1, port: 2}

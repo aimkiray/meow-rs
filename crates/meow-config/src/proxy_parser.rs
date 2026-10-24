@@ -2595,11 +2595,12 @@ fn parse_vless_reality_opts(
     // (#408). Note this only round-trips cleanly when the short-id happens to
     // be all decimal digits, e.g. `0x1f` parses as the number 31 and becomes
     // `"31"`, not `"1f"` — the same lossy coercion mihomo performs. (An
-    // all-decimal literal with a leading zero like `0012` is *not* affected:
-    // YAML's core-schema int resolver only matches decimal scalars without a
-    // leading zero, so `0012` parses as the plain string `"0012"` and never
-    // reaches this branch at all — verified by
-    // `parse_vless_reality_opts_leading_zero_short_id_preserved_no_warn`.)
+    // all-decimal literal with a leading zero like `0012` resolves as the
+    // float `12.0` under serde-saphyr and *does* reach this branch — but the
+    // `as_u64`/`as_i64` arms reject a non-integer `Number`, so the node
+    // fails `must be a hex string` rather than silently losing the leading
+    // zero; quoting is the fix — verified by
+    // `parse_vless_reality_opts_leading_zero_short_id_drops_unquoted`.)
     // We warn on the Number coercion (see below) so operators who wrote a
     // notation like `0x1f` expecting it to be read as literal hex digits
     // know to quote the value instead.
@@ -3375,7 +3376,7 @@ mod tests {
     }
 
     fn proxy_config(yaml: &str) -> HashMap<String, serde_json::Value> {
-        serde_yaml::from_str(yaml).unwrap()
+        serde_saphyr::from_str(yaml).unwrap()
     }
 
     #[cfg(feature = "vless")]
@@ -3544,17 +3545,17 @@ mod tests {
         // Absent → disabled.
         assert_eq!(ws_max_early_data(None), 0);
         // Boundary: the ceiling itself survives.
-        let at_cap = serde_yaml::from_str::<serde_json::Value>(&format!(
+        let at_cap = serde_saphyr::from_str::<serde_json::Value>(&format!(
             "max-early-data: {MAX_WS_EARLY_DATA}"
         ))
         .unwrap();
         assert_eq!(ws_max_early_data(Some(&at_cap)), MAX_WS_EARLY_DATA);
         // Above → clamped (not rejected; excess bytes flow as normal frames).
-        let over = serde_yaml::from_str::<serde_json::Value>("max-early-data: 99999").unwrap();
+        let over = serde_saphyr::from_str::<serde_json::Value>("max-early-data: 99999").unwrap();
         assert_eq!(ws_max_early_data(Some(&over)), MAX_WS_EARLY_DATA);
         // u64::MAX must not wrap the usize conversion.
         let huge =
-            serde_yaml::from_str::<serde_json::Value>("max-early-data: 18446744073709551615")
+            serde_saphyr::from_str::<serde_json::Value>("max-early-data: 18446744073709551615")
                 .unwrap();
         assert_eq!(ws_max_early_data(Some(&huge)), MAX_WS_EARLY_DATA);
     }
@@ -3580,7 +3581,7 @@ mod tests {
     #[cfg(feature = "ss")]
     #[test]
     fn test_serialize_plugin_opts_map() {
-        let yaml: serde_json::Value = serde_yaml::from_str(
+        let yaml: serde_json::Value = serde_saphyr::from_str(
             r#"
 mode: websocket
 host: example.com
@@ -3629,7 +3630,7 @@ tls: true
     #[cfg(feature = "ss")]
     #[test]
     fn test_serialize_plugin_opts_number_value() {
-        let yaml: serde_json::Value = serde_yaml::from_str("port: 8080").unwrap();
+        let yaml: serde_json::Value = serde_saphyr::from_str("port: 8080").unwrap();
         let result = serialize_plugin_opts(&yaml).unwrap();
         assert_eq!(result, "port=8080");
     }
@@ -3640,7 +3641,7 @@ tls: true
         // gost-plugin takes a `headers` map and an `ech-opts` map
         // (issue #533).  `headers` flattens to repeated `header=K:V`
         // tokens (SIP003 convention); any other nested map is dotted.
-        let yaml: serde_json::Value = serde_yaml::from_str(
+        let yaml: serde_json::Value = serde_saphyr::from_str(
             "mode: websocket\nheaders:\n  CF-Token: abc\n  Host: edge.example.com\nech-opts:\n  enable: true\n  config: QUJD\n",
         )
         .unwrap();
@@ -3659,7 +3660,7 @@ tls: true
     fn test_serialize_plugin_opts_token_smuggling_guard() {
         // A `;`/`=`/`:` inside a serialized name or value would split into
         // extra SIP003 tokens — entries containing them are dropped.
-        let yaml: serde_json::Value = serde_yaml::from_str(
+        let yaml: serde_json::Value = serde_saphyr::from_str(
             "mode: websocket\nheaders:\n  \"x;skip-cert-verify\": true\n  Good: ok\n\
              weird;key: v\nfine: a;b\n",
         )
@@ -3678,7 +3679,7 @@ tls: true
         // mapstructure decodes `Headers` onto the `headers` field — match
         // its case-insensitive key handling.
         let yaml: serde_json::Value =
-            serde_yaml::from_str("mode: websocket\nHeaders:\n  X-A: b\n").unwrap();
+            serde_saphyr::from_str("mode: websocket\nHeaders:\n  X-A: b\n").unwrap();
         // BTreeMap key order: `Headers` sorts before `mode`.
         assert_eq!(
             serialize_plugin_opts(&yaml).unwrap(),
@@ -3692,7 +3693,7 @@ tls: true
         // `alpn` arrives as a YAML sequence (upstream `alpn []string`) —
         // joined with `,`, which the shadow-tls parser splits back out.
         let yaml: serde_json::Value =
-            serde_yaml::from_str("alpn:\n  - h2\n  - http/1.1\nversion: 3\n").unwrap();
+            serde_saphyr::from_str("alpn:\n  - h2\n  - http/1.1\nversion: 3\n").unwrap();
         assert_eq!(
             serialize_plugin_opts(&yaml).unwrap(),
             "alpn=h2,http/1.1;version=3"
@@ -3828,7 +3829,7 @@ tls: true
     // ─── direct proxy with per-proxy DNS (issue #67) ─────────────────────────
 
     fn direct_config(yaml: &str) -> HashMap<String, serde_json::Value> {
-        serde_yaml::from_str(yaml).unwrap()
+        serde_saphyr::from_str(yaml).unwrap()
     }
 
     #[test]
@@ -3977,7 +3978,7 @@ tls: true
 
     #[cfg(feature = "anytls")]
     fn anytls_config(yaml: &str) -> HashMap<String, serde_json::Value> {
-        serde_yaml::from_str(yaml).unwrap()
+        serde_saphyr::from_str(yaml).unwrap()
     }
 
     // The upstream `anytls-rs` Client constructor spawns a background pool
@@ -4042,7 +4043,7 @@ tls: true
 
     #[cfg(feature = "hysteria2")]
     fn hy2_config(yaml: &str) -> HashMap<String, serde_json::Value> {
-        serde_yaml::from_str(yaml).unwrap()
+        serde_saphyr::from_str(yaml).unwrap()
     }
 
     #[cfg(feature = "hysteria2")]
@@ -5109,7 +5110,7 @@ tls: true
 
     #[cfg(feature = "snell")]
     fn snell_config(yaml: &str) -> HashMap<String, serde_json::Value> {
-        serde_yaml::from_str(yaml).unwrap()
+        serde_saphyr::from_str(yaml).unwrap()
     }
 
     #[cfg(feature = "snell")]
@@ -5441,7 +5442,7 @@ tls: true
     #[test]
     fn provider_allow_external_plugin_uses_kebab_case() {
         let raw: crate::raw::RawProxyProvider =
-            serde_yaml::from_str("type: file\npath: p.yaml\nallow-external-plugin: true\n")
+            serde_saphyr::from_str("type: file\npath: p.yaml\nallow-external-plugin: true\n")
                 .unwrap();
         assert_eq!(raw.allow_external_plugin, Some(true));
     }

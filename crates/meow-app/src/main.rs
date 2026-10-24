@@ -1944,7 +1944,7 @@ mod tests {
         }
 
         fn raw_with_tun(yaml: &str) -> Arc<RwLock<RawConfig>> {
-            let raw: RawConfig = serde_yaml::from_str(yaml).unwrap();
+            let raw: RawConfig = serde_saphyr::from_str(yaml).unwrap();
             Arc::new(RwLock::new(raw))
         }
 

@@ -41,7 +41,7 @@ async fn counting_listener() -> (SocketAddr, Arc<AtomicUsize>) {
 /// `A` chains through the leaf proxy `B`; `C` chains through the group `G2`
 /// (which holds `B`); `G` is a select group over `A`.
 fn config(port_a: u16, port_b: u16, port_c: u16) -> RawConfig {
-    serde_yaml::from_str(&format!(
+    serde_saphyr::from_str(&format!(
         r#"
 mixed-port: 17890
 mode: rule
@@ -196,7 +196,7 @@ fn group_dialer_routing_back_is_a_config_error() {
         // auto-created all-members one.
         ("GLOBAL", "  - name: GLOBAL\n    type: select\n    proxies: [ghost-node]"),
     ] {
-        let raw: RawConfig = serde_yaml::from_str(&format!(
+        let raw: RawConfig = serde_saphyr::from_str(&format!(
             r#"
 mixed-port: 17890
 proxies:
@@ -233,7 +233,7 @@ rules:
 /// must fail at build time rather than on the first dial.
 #[test]
 fn dialer_to_unbuilt_group_is_a_config_error() {
-    let raw: RawConfig = serde_yaml::from_str(
+    let raw: RawConfig = serde_saphyr::from_str(
         r#"
 mixed-port: 17890
 proxies:
@@ -272,7 +272,7 @@ async fn provider_fetch_through_chained_download_proxy_resolves() {
     let (server_b, b_accepts) = counting_listener().await;
     let (server_a, _a_accepts) = counting_listener().await;
 
-    let raw: RawConfig = serde_yaml::from_str(&format!(
+    let raw: RawConfig = serde_saphyr::from_str(&format!(
         r#"
 mixed-port: 17890
 proxies:
@@ -318,7 +318,7 @@ rules:
 /// group keeps no chain verdicts.
 #[test]
 fn an_automatic_dialer_group_is_seeded_with_its_chains() {
-    let raw: RawConfig = serde_yaml::from_str(
+    let raw: RawConfig = serde_saphyr::from_str(
         r#"
 mixed-port: 17890
 proxies:

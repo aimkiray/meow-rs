@@ -1248,7 +1248,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_server_nameserver_builds_dedicated_resolver() {
-        let raw: RawConfig = serde_yaml::from_str(
+        let raw: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver:\n    - 1.1.1.1\n  proxy-server-nameserver:\n    - 223.5.5.5\n",
         )
         .unwrap();
@@ -1272,7 +1272,7 @@ mod tests {
     #[tokio::test]
     async fn no_proxy_server_nameserver_leaves_proxy_resolver_none() {
         let raw: RawConfig =
-            serde_yaml::from_str("dns:\n  enable: true\n  nameserver:\n    - 1.1.1.1\n").unwrap();
+            serde_saphyr::from_str("dns:\n  enable: true\n  nameserver:\n    - 1.1.1.1\n").unwrap();
         let cfg = parse_dns(
             &raw,
             None,
@@ -1291,7 +1291,7 @@ mod tests {
     async fn proxy_server_nameserver_ignored_when_dns_disabled() {
         // mihomo: ProxyServerHostResolver is nil whenever the DNS section is
         // off — proxy server hostnames fall back to the system resolver.
-        let raw: RawConfig = serde_yaml::from_str(
+        let raw: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: false\n  proxy-server-nameserver:\n    - 223.5.5.5\n",
         )
         .unwrap();
@@ -1321,7 +1321,7 @@ mod tests {
         let yaml = |ns: &str| {
             format!("dns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver:\n    - {ns}\n")
         };
-        let raw: RawConfig = serde_yaml::from_str(&yaml("1.1.1.1")).unwrap();
+        let raw: RawConfig = serde_saphyr::from_str(&yaml("1.1.1.1")).unwrap();
         let cfg = parse_dns(
             &raw,
             None,
@@ -1340,7 +1340,7 @@ mod tests {
 
         // Reload with a different nameserver: same fake-ip range → the
         // same pool object is reused.
-        let raw2: RawConfig = serde_yaml::from_str(&yaml("8.8.8.8")).unwrap();
+        let raw2: RawConfig = serde_saphyr::from_str(&yaml("8.8.8.8")).unwrap();
         let cfg2 = parse_dns(
             &raw2,
             None,
@@ -1373,7 +1373,7 @@ mod tests {
                 "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: {range}\n  nameserver:\n    - 1.1.1.1\n"
             )
         };
-        let raw: RawConfig = serde_yaml::from_str(&yaml("198.18.0.1/16")).unwrap();
+        let raw: RawConfig = serde_saphyr::from_str(&yaml("198.18.0.1/16")).unwrap();
         let cfg = parse_dns(
             &raw,
             None,
@@ -1391,7 +1391,7 @@ mod tests {
             .unwrap();
         let ip = old_pool.lookup("a.example");
 
-        let raw2: RawConfig = serde_yaml::from_str(&yaml("198.19.0.1/16")).unwrap();
+        let raw2: RawConfig = serde_saphyr::from_str(&yaml("198.19.0.1/16")).unwrap();
         let cfg2 = parse_dns(
             &raw2,
             None,
@@ -1423,7 +1423,7 @@ mod tests {
             )
         };
         let range: ipnet::IpNet = "198.18.0.1/16".parse().unwrap();
-        let raw: RawConfig = serde_yaml::from_str(&yaml("1.1.1.1", "true")).unwrap();
+        let raw: RawConfig = serde_saphyr::from_str(&yaml("1.1.1.1", "true")).unwrap();
         let cfg = parse_dns(
             &raw,
             None,
@@ -1441,7 +1441,7 @@ mod tests {
 
         // persist → persist: same pool object — no second FileStore
         // opened on fakeip-v4.json.
-        let raw2: RawConfig = serde_yaml::from_str(&yaml("8.8.8.8", "true")).unwrap();
+        let raw2: RawConfig = serde_saphyr::from_str(&yaml("8.8.8.8", "true")).unwrap();
         let cfg2 = parse_dns(
             &raw2,
             None,
@@ -1459,7 +1459,7 @@ mod tests {
 
         // persist → memory: the flag flipped, so the pool must not be
         // reused.
-        let raw3: RawConfig = serde_yaml::from_str(&yaml("8.8.8.8", "false")).unwrap();
+        let raw3: RawConfig = serde_saphyr::from_str(&yaml("8.8.8.8", "false")).unwrap();
         let cfg3 = parse_dns(
             &raw3,
             None,
@@ -1490,7 +1490,7 @@ mod tests {
                 "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: {range}\n  nameserver:\n    - 1.1.1.1\n"
             )
         };
-        let raw: RawConfig = serde_yaml::from_str(&yaml("198.18.0.1/16")).unwrap();
+        let raw: RawConfig = serde_saphyr::from_str(&yaml("198.18.0.1/16")).unwrap();
         let cfg = parse_dns(
             &raw,
             None,
@@ -1509,7 +1509,7 @@ mod tests {
         let ip = pool_v4.lookup("a.example");
 
         // Same network+prefix, different spelling → same pool object.
-        let raw2: RawConfig = serde_yaml::from_str(&yaml("198.18.0.0/16")).unwrap();
+        let raw2: RawConfig = serde_saphyr::from_str(&yaml("198.18.0.0/16")).unwrap();
         let cfg2 = parse_dns(
             &raw2,
             None,
@@ -1530,7 +1530,7 @@ mod tests {
         ));
 
         // Same network base, different prefix length → fresh pool.
-        let raw3: RawConfig = serde_yaml::from_str(&yaml("198.18.0.0/15")).unwrap();
+        let raw3: RawConfig = serde_saphyr::from_str(&yaml("198.18.0.0/15")).unwrap();
         let cfg3 = parse_dns(
             &raw3,
             None,
@@ -1551,7 +1551,7 @@ mod tests {
 
         // Family switch v4 → v6: the new resolver's v6 pool is fresh and
         // no v4 pool is installed on it (the old resolver keeps its own).
-        let raw4: RawConfig = serde_yaml::from_str(&yaml("fc00::/64")).unwrap();
+        let raw4: RawConfig = serde_saphyr::from_str(&yaml("fc00::/64")).unwrap();
         let cfg4 = parse_dns(
             &raw4,
             None,
@@ -1584,7 +1584,7 @@ mod tests {
         let dir_b = tempfile::tempdir().unwrap();
         let yaml = "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  store-fake-ip: true\n  nameserver:\n    - 1.1.1.1\n";
         let range: ipnet::IpNet = "198.18.0.1/16".parse().unwrap();
-        let raw: RawConfig = serde_yaml::from_str(yaml).unwrap();
+        let raw: RawConfig = serde_saphyr::from_str(yaml).unwrap();
 
         let cfg = parse_dns(
             &raw,
@@ -1641,7 +1641,7 @@ mod tests {
         .unwrap();
         let yaml = "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  store-fake-ip: true\n  nameserver:\n    - 1.1.1.1\n";
         let range: ipnet::IpNet = "198.18.0.1/16".parse().unwrap();
-        let raw: RawConfig = serde_yaml::from_str(yaml).unwrap();
+        let raw: RawConfig = serde_saphyr::from_str(yaml).unwrap();
 
         let cfg = parse_dns(
             &raw,
@@ -2329,19 +2329,25 @@ mod tests {
     }
 
     // IndexMap-layer pin: a duplicate key folds to its first position
-    // with the LAST value — mihomo `OrderedMap.Set` semantics. This goes
-    // through `from_str::<RawConfig>` on purpose: every production
-    // ingest path uses `parse_raw_yaml`, whose serde_norway `Value`
-    // layer rejects a literal duplicate key (`duplicate entry`) before
-    // the map exists — the fold below is only reachable from
-    // non-literal sources.
+    // with the LAST value — mihomo `OrderedMap.Set` semantics. This
+    // builds the `IndexMap` programmatically on purpose: every production
+    // ingest path uses `parse_raw_yaml`, whose parser rejects a literal
+    // duplicate key before the map exists — the fold below is only
+    // reachable from non-literal sources.
     #[tokio::test]
     async fn parse_nameserver_policy_duplicate_key_folds_last_value_wins() {
-        let raw: crate::raw::RawConfig = serde_yaml::from_str(
-            "dns:\n  enable: true\n  nameserver-policy:\n    '+.dup.example': rcode://success\n    '+.dup.example':\n      - rcode://success\n      - rcode://name_error\n",
-        )
-        .expect("duplicate keys must parse");
-        let map = raw.dns.unwrap().nameserver_policy.unwrap();
+        let mut map: crate::raw::RawNameserverPolicy = indexmap::IndexMap::new();
+        map.insert(
+            "+.dup.example".to_string(),
+            crate::raw::RawNspValue::One("rcode://success".to_string()),
+        );
+        map.insert(
+            "+.dup.example".to_string(),
+            crate::raw::RawNspValue::Many(vec![
+                "rcode://success".to_string(),
+                "rcode://name_error".to_string(),
+            ]),
+        );
         assert_eq!(map.len(), 1, "the duplicate key must fold");
         assert_eq!(
             map.get("+.dup.example").unwrap().as_urls().len(),
@@ -2360,11 +2366,11 @@ mod tests {
     // permanently reshuffling the document on every save.
     #[test]
     fn nameserver_policy_key_order_survives_save_roundtrip() {
-        let raw: crate::raw::RawConfig = serde_yaml::from_str(
+        let raw: crate::raw::RawConfig = serde_saphyr::from_str(
             "dns:\n  nameserver-policy:\n    '+.first.example': 1.1.1.1\n    'second.example': 2.2.2.2\n    'rule-set:x': 3.3.3.3\n",
         )
         .unwrap();
-        let yaml = serde_yaml::to_string(&raw).unwrap();
+        let yaml = serde_saphyr::to_string_with_options(&raw, crate::yaml_ser_options()).unwrap();
         let i_first = yaml.find("+.first.example").unwrap();
         let i_second = yaml.find("second.example").unwrap();
         let i_third = yaml.find("rule-set:x").unwrap();
@@ -2373,7 +2379,7 @@ mod tests {
             "keys must serialize in document order:\n{yaml}"
         );
         // A reparse of the saved document keeps the same order.
-        let raw2: crate::raw::RawConfig = serde_yaml::from_str(&yaml).unwrap();
+        let raw2: crate::raw::RawConfig = serde_saphyr::from_str(&yaml).unwrap();
         let map2 = raw2.dns.unwrap().nameserver_policy.unwrap();
         let keys: Vec<&String> = map2.keys().collect();
         assert_eq!(keys, ["+.first.example", "second.example", "rule-set:x"]);
@@ -2988,7 +2994,7 @@ mod tests {
         // One `#Proxy`-SNI encrypted entry per field — every one must
         // warn exactly once (`fallback-filter.geoip: false` only keeps
         // an unrelated missing-MMDB warn out of the capture).
-        let raw: RawConfig = serde_yaml::from_str(
+        let raw: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver:\n    - tls://8.8.4.4#Proxy\n  fallback:\n    - https://8.8.4.4/dns-query#Proxy\n  fallback-filter:\n    geoip: false\n  proxy-server-nameserver:\n    - tls://1.1.1.1#Proxy\n",
         )
         .unwrap();

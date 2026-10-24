@@ -38,6 +38,10 @@ pub mod sniffer;
 pub mod socket_protect;
 pub mod traffic;
 pub mod tunnel_mode;
+// Shared YAML-ingest guard used by meow-config and meow-cli — internal
+// plumbing, not part of this published crate's documented API surface.
+#[doc(hidden)]
+pub mod yaml;
 
 pub use adapter::{
     reset_sessions_reachable, DelayHistory, GroupDisplay, ProviderSlot, Proxy, ProxyAdapter,

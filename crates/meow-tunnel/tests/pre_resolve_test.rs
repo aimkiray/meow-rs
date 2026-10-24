@@ -31,7 +31,7 @@ async fn pre_resolve_populates_dst_ip_for_ipcidr_rule() {
     // A rule scan skips a match whose target is absent from the registry
     // (issue #513), so publish a `PROXY` entry the rule can resolve to.
     let cfg: meow_config::raw::RawConfig =
-        serde_yaml::from_str("proxies:\n  - name: PROXY\n    type: direct\n").unwrap();
+        serde_saphyr::from_str("proxies:\n  - name: PROXY\n    type: direct\n").unwrap();
     let res = meow_config::rebuild_from_raw(&cfg).unwrap();
     tunnel.update_proxies(res.proxies, res.dialer_registry);
 

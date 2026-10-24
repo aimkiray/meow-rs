@@ -536,15 +536,16 @@ mod tests {
             .strip_prefix("---\n")
             .and_then(|rest| rest.split_once("\n---\n"))
             .expect("SKILL.md opens with a `---` frontmatter block");
-        let front: serde_yaml::Mapping = serde_yaml::from_str(front).unwrap();
+        let front: serde_json::Value = serde_saphyr::from_str(front).unwrap();
+        let front = front.as_object().expect("frontmatter is a mapping");
         for key in front.keys() {
-            let key = key.as_str().unwrap_or_default();
+            let key = key.as_str();
             assert!(
                 FIELDS.contains(&key),
                 "`{key}` is not an Agent Skills field"
             );
         }
-        let field = |key: &str| front.get(key).and_then(serde_yaml::Value::as_str);
+        let field = |key: &str| front.get(key).and_then(serde_json::Value::as_str);
 
         // The directory: crates/meow-cli/skills/meow-cli/.
         assert_eq!(field("name"), Some("meow-cli"));

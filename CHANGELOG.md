@@ -141,14 +141,15 @@ the canonical, in-repo source a release is cut from.
   referenced — the referenced set is a startup snapshot a `PUT
   /configs` does not widen, the Country MMDB is still never a tick
   target, and an all-false set leaves the tick a no-op.
-- **The YAML parser comes from `serde_norway`**: the config parser links
-  `serde_norway` 0.9.42 instead of `serde_yaml` 0.9.34, which pulls the
-  archived `unsafe-libyaml` (RUSTSEC-2024-0449). `serde_norway` is a
-  hard-fork of `serde_yaml` 0.9.34 with an identical public API and
-  unchanged parsing behavior; its libyaml backend now comes from the
-  maintained `unsafe-libyaml-norway` fork. YAML parsing, including
-  anchors, merge keys, tags and error messages, is unchanged. The public
-  `meow-config` API surface that exposes a YAML value now names
+- **The YAML parser is `serde-saphyr`**: the config parser links
+  `serde-saphyr` 2.0.0 — a pure-Rust serde YAML implementation over the
+  `granit-parser` event parser with `#![forbid(unsafe_code)]` — instead of
+  `serde_yaml` 0.9.34's archived `unsafe-libyaml` (RUSTSEC-2024-0449) and
+  the `serde_norway`/`unsafe-libyaml-norway` fork arrangement that
+  replaced it. No libyaml-descended crate remains in the dependency tree,
+  so RUSTSEC-2024-0449 stays resolved permanently. YAML anchors and merge
+  keys (`<<:`) still expand with explicit keys taking precedence. The
+  public `meow-config` API surface that exposes a YAML value names
   `serde_json::Value` — the public API is decoupled from the concrete
   YAML backend: `RawConfig`'s `proxies`, `firewall`, `udp` and
   `udp-timeout` passthroughs; `RawGeoDataConfig`'s `geodata-mode`,
@@ -168,6 +169,32 @@ the canonical, in-repo source a release is cut from.
   `Null`, so a `.nan` on a real-read field such as
   `tun.inet6-address` is treated as unset where it previously errored;
   and nested `serde_json::Map` mappings serialise with keys sorted.
+  The serde-saphyr ingest profile narrows and shifts a few further
+  pathological inputs: documents nested deeper than 32 levels are
+  rejected by an in-parser budget (the cheap pre-filter still trips at
+  128 — the tighter bound exists because the recursive `Value` descend
+  overflows a debug stack before the old limit could); duplicate mapping
+  keys now error instead of silently keeping the last value; `!tag`
+  nodes in untrusted documents fail closed at every ingest point
+  (including lenient subscription refreshes, which used to skip only the
+  one entry); a `<<: null` merge key silently merges nothing — an empty
+  map — where the old `apply_merge` errored; scalar resolution
+  case-folds `TrUe`/`fAlSe`/`nUll`, resolves a leading-zero decimal such
+  as `0123` as the float `123.0`, reads `1_000` as a number, and resolves
+  an overflowing literal like `1e999` to `Null` like `.inf`/`.nan`; a
+  non-string mapping key in a `serde_json::Value` position (`{1: x}`)
+  coerces to a string; and saved configs may quote strings that spell
+  YAML-1.1 booleans (`on`, `yes`) and use double quotes — a byte diff,
+  semantically identical. Relative to yaml.v3 (mihomo's parser) these
+  residuals split both ways: the case-folded `TrUe`/`fAlSe`/`nUll`
+  spellings diverge from *both* yaml.v3 and serde_norway — yaml.v3's
+  resolve table accepts only the fixed `true`/`True`/`TRUE`-style
+  spellings, so the mixed-case forms stay strings there exactly as they
+  did under norway — `0123` is a three-way split (yaml.v3 reads octal
+  83, norway a string, saphyr `123.0`), and the genuine convergences on
+  yaml.v3/mihomo are `1_000` reading as a number and the map-form
+  external-tag enum (a `tproxy:` block), both of which yaml.v3 accepts
+  as saphyr does.
 - **`nameserver-policy` key order is now the lookup priority** (mihomo
   `parseNameServerPolicy`/`makePolicy` parity): the policy is a
   document-ordered arm list — a run of consecutive domain keys (`bare`,
@@ -195,7 +222,7 @@ the canonical, in-repo source a release is cut from.
   it keep the precedence they get once it loads. A YAML-literal duplicate
   key is a hard parse error (`duplicate entry with key "…"`) — every
   ingest path goes through `parse_raw_yaml`, which rejects it at the
-  serde_norway `Value` layer before the map is built; the
+  parser layer before the map is built; the
   first-position/last-value fold (mihomo `orderedmap.Set` parity) only
   decides duplicates from non-literal sources, such as a
   programmatically built map or the expanded segments of a comma-mixed

@@ -291,7 +291,7 @@ fn save_config_works_in_writable_subdir_of_readonly_parent() {
 
     // Verify the updated config was written
     let content = std::fs::read_to_string(&config_path).unwrap();
-    let loaded: RawConfig = serde_yaml::from_str(&content).unwrap();
+    let loaded: RawConfig = serde_saphyr::from_str(&content).unwrap();
     assert_eq!(loaded.mixed_port, Some(8080));
 }
 

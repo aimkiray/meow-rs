@@ -36,7 +36,7 @@ use serde_json::Value;
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 fn yaml_map(s: &str) -> HashMap<String, Value> {
-    serde_yaml::from_str(s).expect("yaml fixture must parse")
+    serde_saphyr::from_str(s).expect("yaml fixture must parse")
 }
 
 fn ech_opts(map: &HashMap<String, Value>) -> Option<&Value> {

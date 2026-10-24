@@ -192,16 +192,40 @@ fn read_config(path: &Path) -> anyhow::Result<ConfigKeys> {
 }
 
 fn parse_config(text: &str) -> anyhow::Result<ConfigKeys> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(text)?;
+    // Only `external-controller` and `secret` are read; serde skips every
+    // other top-level key without materialising it. The option profile
+    // mirrors meow-config's untrusted-ingest profile so the CLI parses the
+    // file exactly as the daemon does (`secret: on` stays "on" on both).
+    #[derive(serde::Deserialize)]
+    struct ConfigDoc {
+        #[serde(rename = "external-controller")]
+        external_controller: Option<serde_json::Value>,
+        secret: Option<serde_json::Value>,
+    }
+    // `run_on_parse_stack` still wraps the descend — `IgnoredAny` recurses
+    // too, and the guard keeps one defence shape across both front-ends.
+    let doc: ConfigDoc = meow_common::yaml::run_on_parse_stack(text, |doc| {
+        serde_saphyr::from_str_with_options(
+            doc,
+            serde_saphyr::options! {
+                strict_booleans: true,
+                reject_unsupported_tags: true,
+                ignore_binary_tag_for_string: true,
+                non_finite_float_policy: serde_saphyr::NonFiniteFloatPolicy::PassThrough,
+                budget: serde_saphyr::budget! { max_depth: meow_common::yaml::MAX_DEPTH },
+            },
+        )
+    })
+    .map_err(|e| anyhow!("cannot spawn YAML parse thread: {e}"))??;
     // A number is a valid YAML secret (`secret: 123456`); read scalars as text.
-    let scalar = |key: &str| match doc.get(key)? {
-        serde_yaml::Value::String(text) => Some(text.clone()),
-        serde_yaml::Value::Number(number) => Some(number.to_string()),
+    let scalar = |value: Option<serde_json::Value>| match value? {
+        serde_json::Value::String(text) => Some(text),
+        serde_json::Value::Number(number) => Some(number.to_string()),
         _ => None,
     };
     Ok(ConfigKeys {
-        controller: scalar("external-controller").filter(|address| !address.is_empty()),
-        secret: scalar("secret"),
+        controller: scalar(doc.external_controller).filter(|address| !address.is_empty()),
+        secret: scalar(doc.secret),
     })
 }
 
@@ -250,6 +274,33 @@ mod tests {
 
         let keys = parse_config("external-controller: ''\n").unwrap();
         assert!(keys.controller.is_none() && keys.secret.is_none());
+    }
+
+    /// `strict_booleans` mirrors the daemon: YAML 1.1 spellings stay
+    /// strings, so `secret: on` reaches the API as "on" instead of
+    /// silently dropping to None and 401-ing every request.
+    #[test]
+    fn yaml11_boolean_spellings_stay_string_secrets() {
+        for spelling in ["on", "yes", "no", "off", "y", "n"] {
+            let keys = parse_config(&format!("secret: {spelling}\n")).unwrap();
+            assert_eq!(keys.secret.as_deref(), Some(spelling), "{spelling}");
+        }
+    }
+
+    /// Sections the CLI never reads deserialize as `IgnoredAny`: values
+    /// that would alter or fail a full `serde_json::Value` ingest cannot
+    /// drag the two-key read down on a config the daemon accepts.
+    #[test]
+    fn unrelated_sections_do_not_break_the_key_read() {
+        let keys = parse_config(
+            "external-controller: 127.0.0.1:9090\n\
+             secret: s3cret\n\
+             proxies:\n  - {name: n, latency: .inf}\n\
+             blob: !!binary aGk=\n",
+        )
+        .unwrap();
+        assert_eq!(keys.controller.as_deref(), Some("127.0.0.1:9090"));
+        assert_eq!(keys.secret.as_deref(), Some("s3cret"));
     }
 
     #[test]

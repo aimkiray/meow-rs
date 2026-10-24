@@ -35,7 +35,7 @@ fn tunnel_with_targets(resolver: Arc<Resolver>, names: &[&str]) -> Tunnel {
             .collect::<Vec<_>>()
             .join("\n")
     );
-    let cfg: meow_config::raw::RawConfig = serde_yaml::from_str(&raw).unwrap();
+    let cfg: meow_config::raw::RawConfig = serde_saphyr::from_str(&raw).unwrap();
     let res = meow_config::rebuild_from_raw(&cfg).unwrap();
     let tunnel = Tunnel::new(resolver);
     tunnel.update_proxies(res.proxies, res.dialer_registry);

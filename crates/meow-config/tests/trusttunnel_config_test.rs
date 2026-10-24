@@ -2,8 +2,18 @@
 
 use std::collections::HashMap;
 
+/// Serialize with the same options `save_raw_config` uses (saphyr's default
+/// would re-wrap >80-char scalars into `>`-folded blocks).
+fn to_yaml<T: serde::Serialize>(value: &T) -> String {
+    serde_saphyr::to_string_with_options(
+        value,
+        serde_saphyr::ser_options! { folded_wrap_chars: usize::MAX },
+    )
+    .unwrap()
+}
+
 fn node(extra: &str) -> HashMap<String, serde_json::Value> {
-    serde_yaml::from_str(&format!(
+    serde_saphyr::from_str(&format!(
         "name: fixture\ntype: trusttunnel\nserver: vpn.example.test\nport: 443\nusername: fixture\npassword: test-only\n{extra}"
     ))
     .unwrap()
@@ -219,32 +229,22 @@ async fn whitespace_type_still_lands_on_the_fail_closed_path() {
 }
 
 fn provider_document() -> String {
-    serde_yaml::to_string(&serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter(
-        [(
-            serde_yaml::Value::String("proxies".into()),
-            serde_yaml::Value::Sequence(vec![
-                serde_yaml::from_str("name: sibling\ntype: http\nserver: 127.0.0.1\nport: 8080\n")
-                    .unwrap(),
-                serde_yaml::to_value(unsupported_node()).unwrap(),
-            ]),
-        )],
-    )))
-    .unwrap()
+    let sibling: serde_json::Value =
+        serde_saphyr::from_str("name: sibling\ntype: http\nserver: 127.0.0.1\nport: 8080\n")
+            .unwrap();
+    to_yaml(&serde_json::json!({
+        "proxies": [
+            sibling,
+            serde_json::to_value(unsupported_node()).unwrap(),
+        ]
+    }))
 }
 
 fn file_provider(path: &std::path::Path) -> meow_config::raw::RawProxyProvider {
-    serde_yaml::from_value(serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter(
-        [
-            (
-                serde_yaml::Value::String("type".into()),
-                serde_yaml::Value::String("file".into()),
-            ),
-            (
-                serde_yaml::Value::String("path".into()),
-                serde_yaml::Value::String(path.to_str().unwrap().into()),
-            ),
-        ],
-    )))
+    serde_json::from_value(serde_json::json!({
+        "type": "file",
+        "path": path.to_str().unwrap(),
+    }))
     .unwrap()
 }
 
@@ -252,7 +252,7 @@ fn file_provider(path: &std::path::Path) -> meow_config::raw::RawProxyProvider {
 async fn unsupported_node_stays_bound_so_its_group_cannot_select_direct() {
     let document = format!(
         "{}proxy-groups:\n  - name: PROXY\n    type: select\n    proxies: [fixture, DIRECT]\nrules: ['MATCH,PROXY']\n",
-        serde_yaml::to_string(&HashMap::from([("proxies", vec![unsupported_node()])])).unwrap()
+        to_yaml(&HashMap::from([("proxies", vec![unsupported_node()])]))
     );
     // The hole this closes is the group falling back to DIRECT — which
     // needs the name bound to a dead node, not the whole file rejected.
@@ -362,7 +362,7 @@ async fn missing_provider_source_keeps_existing_offline_bootstrap_behavior() {
 
 #[cfg(feature = "trusttunnel")]
 mod enabled {
-    use super::node;
+    use super::{node, to_yaml};
     use meow_common::AdapterType;
     use meow_config::proxy_parser::{parse_proxy, parse_proxy_provider_node};
     use meow_proxy::dialer::{DirectDialer, TcpDialer};
@@ -372,11 +372,10 @@ mod enabled {
     async fn valid_node_survives_full_load_and_rebuild() {
         let document = format!(
             "{}rules: ['MATCH,fixture']\n",
-            serde_yaml::to_string(&std::collections::HashMap::from([(
+            to_yaml(&std::collections::HashMap::from([(
                 "proxies",
                 vec![node("")]
             )]))
-            .unwrap()
         );
         let config = meow_config::load_config_from_str(&document).await.unwrap();
         assert_eq!(

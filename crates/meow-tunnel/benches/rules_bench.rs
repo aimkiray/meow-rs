@@ -32,13 +32,10 @@ struct BenchCase {
 }
 
 fn load_fixture_rules() -> Vec<Box<dyn Rule>> {
-    let mut value: serde_yaml::Value =
-        serde_yaml::from_str(ECH_PRESSURE_CONFIG).expect("fixture config must be valid YAML");
-    value
-        .apply_merge()
-        .expect("fixture config merge keys must expand");
-    let raw: RawConfig =
-        serde_yaml::from_value(value).expect("fixture config must deserialize as RawConfig");
+    // `parse_raw_yaml` applies the merge-key policy the production ingest
+    // path uses — the fixture exercises `<<:` anchors.
+    let raw: RawConfig = meow_config::parse_raw_yaml(ECH_PRESSURE_CONFIG)
+        .expect("fixture config must deserialize as RawConfig");
     let rules = meow_config::rebuild_from_raw(&raw)
         .expect("fixture config rules must rebuild")
         .rules;

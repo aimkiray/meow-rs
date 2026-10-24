@@ -1617,8 +1617,10 @@ fn parse_yaml_payload(raw: &str, strict: bool) -> Result<Vec<String>> {
     // The whole document is converted up front — intentionally
     // fail-closed: a `!tag` node or complex mapping key anywhere in the
     // untrusted remote input rejects the entire ruleset rather than
-    // slipping part of it through.
-    let root: serde_json::Value = serde_yaml::from_str(raw).context("rule-set yaml parse error")?;
+    // slipping part of it through (`reject_unsupported_tags` in the
+    // shared ingest options backs this at the parser level).
+    let root: serde_json::Value =
+        crate::parse_yaml_value(raw).context("rule-set yaml parse error")?;
     let payload = root
         .get("payload")
         .ok_or_else(|| anyhow!("rule-set yaml missing 'payload' key"))?
@@ -1877,7 +1879,7 @@ mod tests {
 
     fn direct_proxy() -> Arc<dyn Proxy> {
         let cfg: HashMap<String, serde_json::Value> =
-            serde_yaml::from_str("name: d\ntype: direct").unwrap();
+            serde_saphyr::from_str("name: d\ntype: direct").unwrap();
         crate::proxy_parser::parse_proxy(&cfg, true).unwrap()
     }
 
@@ -2337,7 +2339,7 @@ header:
   Authorization:
     - 'token 1231231'
 "#;
-        let raw: RawRuleProvider = serde_yaml::from_str(yaml).unwrap();
+        let raw: RawRuleProvider = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(
             provider_headers(&raw),
             vec![
@@ -2357,7 +2359,7 @@ url: "https://example.com/list.yaml"
 header:
   Authorization: "Bearer token123"
 "#;
-        let raw: RawRuleProvider = serde_yaml::from_str(yaml).unwrap();
+        let raw: RawRuleProvider = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(
             provider_headers(&raw),
             vec![("Authorization".to_string(), "Bearer token123".to_string())]
