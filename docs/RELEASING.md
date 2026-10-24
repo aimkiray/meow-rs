@@ -169,10 +169,12 @@ anything can depend on it:
 |------|-------|-------|
 | `anytls-rs` | Vendored as `crates/meow-anytls` (lib name `anytls_rs`), published with the workspace | Upstream lacks `Stream::close()`. Opt-in via `meow-proxy`'s `anytls` feature. |
 | `lwip` | Vendored as `crates/meow-lwip` (lib name `lwip`), published with the workspace at the shared version | Upstream `lwip` is **not** a substitute: the fork rewrites the Rust layer (single-owner core) and carries the `poll_next` UAF, `poll_flush` deadlock, FIN_WAIT_2 leak and livelock fixes. Required by `listener-tun`, which is in `meow-app`'s default `full` bundle. Only the files build.rs consumes are vendored (`old-src/`, `src/api/err.c`, `rust/`) — re-check that list when syncing a newer fork commit. `meow-lwip 0.3.15`, published once from the fork repo before vendoring, is superseded by the workspace-versioned releases. |
-| `serde_yaml` | Consumed as `serde_norway` from crates.io, under the `serde_yaml` dependency name | `serde_yaml` 0.9.34 is deprecated and links `unsafe-libyaml`, whose repository was archived in 2024 (RUSTSEC-2024-0449). `serde_norway` is the maintained fork of the same 0.9.34 source with the same public API; its libyaml backend comes from the maintained `unsafe-libyaml-norway` fork. The dependency is renamed in `[workspace.dependencies]` so every `serde_yaml::` path in the tree keeps working — a rename, not a fork, so nothing has to be vendored or published here. |
+| `serde_norway` | Third-party maintained fork consumed straight from crates.io — renamed in `[workspace.dependencies]` to be used under the `serde_yaml` dependency name. A rename of someone else's registry fork is not an own fork, so nothing here has to be vendored or published | `serde_yaml` 0.9.34 links `unsafe-libyaml`, whose repository was archived in 2024 (RUSTSEC-2024-0449). `serde_norway` is a maintained hard-fork of `serde_yaml` 0.9.34 with an identical public API and unchanged parsing behaviour; its libyaml backend comes from the maintained `unsafe-libyaml-norway` fork. The rename keeps every `serde_yaml::` path in the tree working. |
 
 If you need a newer fork change, publish it to crates.io first, then bump the
-version here — never point `[workspace.dependencies]` at a git rev.
+version here — never point `[workspace.dependencies]` at a git rev. For
+`serde_norway` the registry leg is already done by its maintainer, so a bump
+is just the `~0.9.42` requirement in the workspace manifest.
 
 ## Publishing locally
 

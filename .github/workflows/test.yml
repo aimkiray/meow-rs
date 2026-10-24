@@ -495,7 +495,7 @@ jobs:
             --test tls_test \
             --test boring_tls_test \
             --test ws_test \
-            --test crate_publish_metadata_test --retries 2 --no-fail-fast
+            --test crate_publish_metadata_test --test yaml_backend_test --retries 2 --no-fail-fast
 
       # TUN inbound tests: `listener-tun` is not a default feature, so the
       # workspace --lib leg above never compiles or runs the tun module's
@@ -566,7 +566,7 @@ jobs:
             --test tls_test \
             --test boring_tls_test \
             --test ws_test \
-            --test crate_publish_metadata_test --retries 2 --no-fail-fast
+            --test crate_publish_metadata_test --test yaml_backend_test --retries 2 --no-fail-fast
 
       # `listener-tun` is not a default feature; this leg runs the tun
       # module's tests — notably the macOS regression guard that an unset

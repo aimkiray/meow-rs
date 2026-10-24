@@ -82,12 +82,18 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 # RUSTSEC-2024-0449: `unsafe-libyaml` — the c2rust translation of libyaml that
 # `serde_yaml` links — was archived by its author on 2024-03-25 and is no
-# longer maintained. `serde_norway` is the maintained fork of the same
-# `serde_yaml` 0.9.34 source with the same public API; the only difference is
-# the libyaml backend, which comes from the maintained `unsafe-libyaml-norway`
-# fork instead of the archived crate. The dependency keeps the name
-# `serde_yaml` so every `serde_yaml::` path in the tree is unaffected.
-serde_yaml = { package = "serde_norway", version = "0.9" }
+# longer maintained. `serde_norway` is a maintained hard-fork of `serde_yaml`
+# 0.9.34 with an identical public API and unchanged parsing behaviour; the
+# only material differences are the libyaml backend — the maintained
+# `unsafe-libyaml-norway` fork instead of the archived crate — and the
+# maintainer/repository. The dependency keeps the name `serde_yaml` so every
+# `serde_yaml::` path in the tree is unaffected.
+# `~0.9.42` floors the requirement where it matters: serde_norway only
+# switched to the norway backend in 0.9.41, and 0.9.35–0.9.39 still link the
+# archived `unsafe-libyaml`, so a plain `0.9` bound could re-resolve onto a
+# release that resurrects RUSTSEC-2024-0449. The `~` bound keeps 0.9.42+ fix
+# releases flowing while staying below 0.10.
+serde_yaml = { package = "serde_norway", version = "~0.9.42" }
 
 # Networking
 # anytls is vendored in-tree as `crates/meow-anytls` (lib name `anytls_rs`).
