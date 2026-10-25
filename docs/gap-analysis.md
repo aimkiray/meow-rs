@@ -170,9 +170,10 @@ Upstream `dns/` directory covers client/server/policy/middleware with numerous t
 | UDP/TCP plain DNS (client)  | Yes      | Yes  | OK (hickory) |
 | UDP server                  | Yes      | Yes  | OK |
 | TCP server                  | Yes      | Partial | `hickory-server` supports it; verify wire-up |
-| DNS over HTTPS (DoH) client | Yes      | No   | **Gap** |
-| DNS over TLS (DoT) client   | Yes      | No   | **Gap** |
+| DNS over HTTPS (DoH) client | Yes      | Yes  | OK — `https://host/path` entries |
+| DNS over TLS (DoT) client   | Yes      | Yes  | OK — `tls://host` entries |
 | DNS over QUIC (DoQ) client  | Yes      | No   | **Gap** |
+| DNS exchange via proxy      | Yes      | Yes  | OK — `#PROXY` on plain entries; `?proxy=NAME` on `tls://`/`https://` (issue #67, ADR-0012) |
 | DoH server (serve DoH)      | Yes      | No   | **Gap** |
 | DHCP-based auto DNS         | Yes      | No   | **Gap** |
 | System DNS integration      | Yes      | No   | **Gap** — posix/windows |

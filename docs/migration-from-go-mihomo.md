@@ -107,6 +107,8 @@ These fields parse without error but behave differently from Go mihomo:
 | `skip-auth-prefixes` with invalid CIDR | Silently dropped | Hard parse error | A |
 | `dns.nameserver: quic://...` | Supported | Hard error with roadmap pointer | A |
 | `dns.nameserver: sdns://...` | Warn-drop (silent) | Hard error | A |
+| `dns.nameserver: tls://…#NAME` / `https://…#NAME` | `#` is SNI | Same — `#` is SNI. When `NAME` matches a configured proxy, a warning points out the routing intent was probably `?proxy=NAME`, the spelling that tunnels the exchange through that adapter (`tls://8.8.8.8#dns.google?proxy=JP` for SNI + proxy together). | — |
+| `dns.nameserver: udp/tcp entry with ?…` | Accepted — `url.Parse` keeps the query and it is silently ignored (semantic drift, not a rejection) | Hard error (`InvalidParams`) — `?` sections exist only on `tls://`/`https://`; plain entries keep `#PROXY`. | A |
 | `dns.default-nameserver: tls://...` | Allowed (bootstrap loop risk) | Hard error | A |
 | `dns.default-nameserver` absent with encrypted hostname upstream | Fails at first query | Hard error at load | A |
 | `nameserver-policy` entry with all URLs stripped | Runtime panic | Hard parse error at load | A |

@@ -126,3 +126,51 @@ resolver before swapping the route table so no query observes a dead cell.
 5. Cycle detection on the `dns:` graph.
 6. Integration test with a stub `Proxy` adapter.
 7. Remove feature flag; update config reference docs.
+
+## Addendum (issue #67 phase 2): encrypted DNS through a proxy
+
+The `#PROXY` fragment slot is taken on encrypted entries — `#X` on
+`tls://`/`https://` is SNI (mihomo semantics), so proxy routing there
+uses the canonical `?proxy=NAME` parameter section this ADR reserved:
+
+- `tls://dns.google?proxy=PROXY-JP` — DoT dialed via `PROXY-JP`
+- `https://dns.google/dns-query?proxy=PROXY-JP` — DoH via `PROXY-JP`
+- `tls://8.8.8.8#dns.google?proxy=PROXY-JP` — explicit SNI *and* proxy
+
+`?` sections are legal **only** on `tls://`/`https://`. Using the
+entry's *last* `?` as the boundary: when **any** `&`-separated segment
+of the tail is a `proxy=` key, the `?` section is a parameter section —
+an `&`-separated `k=v` list whose sole defined key is `proxy`
+(unknown/duplicate keys, empty values, and values containing `#?&` fail
+with `InvalidParams`, so `?a=b&proxy=P` errors on the unknown `a`
+rather than silently dropping the proxy tag). When no `&`-separated
+segment is a `proxy=` key, the `?` section is not a parameter section
+and stays part of the URL path verbatim (`https://dns.google/
+dns-query{?name}`-style templates are unaffected). Plain/UDP entries
+keep `#PROXY` and must not carry `?`.
+
+*Revised on review (r15/I1) from the initial spec wording — "a `?` tail
+that does not start with `proxy=` stays in the path" — to per-segment
+detection: a `proxy=` key in any `&` segment marks the section, so a
+tail like `?a=b&proxy=P` is a hard `InvalidParams`, not a path.*
+
+Wire-wise the proxy dial happens first, then the ordinary encrypted
+stack runs over the returned stream: `proxy.dial_tcp()` →
+`TlsLayer::connect_typed` → RFC 7766 length-prefixed framing (DoT) or
+an HTTP/1.1 POST `application/dns-message` (DoH). A proxied *hostname*
+upstream is resolved remotely by the proxy — `Metadata` carries
+`host=<domain>`, `dst_ip=None`, `internal=true` — so no local bootstrap
+lookup is needed (the resolver skips bootstrap collection for proxied
+hostname entries). `default-nameserver` still rejects every proxy
+spelling: it is the bootstrap path itself.
+
+Recursion protection is a tokio task-local fence: `proxy_dial` marks
+the task (`meow_common::dns_via_proxy_dial_scope`), and a
+`Resolver::resolve_ips` re-entry under that mark short-circuits to
+hosts/cache/system instead of re-running the upstream pipeline — the
+pipeline may be waiting on the very dial the inner lookup feeds.
+
+Migration aid: `#X` on an encrypted entry that names a configured
+proxy logs a warning pointing at `?proxy=X` (mihomo-style
+`tls://8.8.8.8#PROXY` configs were silently downgraded to SNI-only
+before).

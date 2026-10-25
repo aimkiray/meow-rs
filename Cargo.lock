@@ -2548,6 +2548,7 @@ name = "meow-dns"
 version = "0.26.1"
 dependencies = [
  "async-trait",
+ "boring",
  "dashmap",
  "futures",
  "hickory-proto",
@@ -2559,6 +2560,7 @@ dependencies = [
  "meow-trie",
  "parking_lot",
  "rand 0.9.5",
+ "rcgen 0.13.2",
  "serde",
  "serde_json",
  "smallvec",
@@ -2566,7 +2568,9 @@ dependencies = [
  "sysinfo",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-boring",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

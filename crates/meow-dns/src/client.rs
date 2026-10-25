@@ -24,10 +24,7 @@ use meow_common::atomic::{AtomicU, Uint};
 use std::sync::atomic::Ordering;
 
 #[cfg(feature = "encrypted")]
-use meow_transport::{
-    tls::{TlsConfig, TlsLayer},
-    Transport as _,
-};
+use meow_transport::tls::{TlsConfig, TlsLayer};
 
 /// Default per-query timeout (matches the hickory-resolver value previously
 /// used in `Resolver::build_*`).
@@ -229,6 +226,17 @@ pub struct DnsClient {
     transport: Transport,
     timeout: Duration,
     proxy: Option<DnsProxy>,
+    /// The `(hostname, port)` a proxied exchange must ask the adapter to
+    /// dial — set when the upstream's address is a hostname, which is left
+    /// to the proxy for *remote* resolution (mihomo `newDNSDialer`
+    /// semantics). `None` means the transport's `SocketAddr` is the dial
+    /// target. See [`Resolver::build_single_resolver_with_proxy`].
+    proxy_target: Option<(Arc<str>, u16)>,
+    /// Extra CA roots (DER) for the DoT/DoH TLS handshake — empty in
+    /// production; test code injects a self-signed chain here instead of
+    /// disabling verification. See [`Self::with_tls_additional_roots`].
+    #[cfg(feature = "encrypted")]
+    tls_extra_roots: Vec<Vec<u8>>,
     label: Option<Arc<str>>,
     /// Idle direct `tcp://` connections. Streams are checked out for the whole
     /// exchange and returned only after the DNS response is fully validated.
@@ -404,6 +412,21 @@ enum Transport {
     },
 }
 
+impl Transport {
+    /// The socket address a *direct* dial (or an IP-literal proxy dial)
+    /// would target. A hostname upstream routed via proxy stores a
+    /// placeholder here — `proxy_dial` consults `proxy_target` first and
+    /// never reaches this.
+    fn dial_addr(&self) -> SocketAddr {
+        match self {
+            Self::Udp { addr } | Self::Tcp { addr } => *addr,
+            #[cfg(feature = "encrypted")]
+            Self::Dot { addr, .. } | Self::Doh { addr, .. } => *addr,
+            Self::RCode { .. } => unreachable!("rcode transport has no dial address"),
+        }
+    }
+}
+
 impl DnsClient {
     /// Plain DNS over UDP.
     pub fn udp(addr: SocketAddr) -> Self {
@@ -411,6 +434,9 @@ impl DnsClient {
             transport: Transport::Udp { addr },
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
+            proxy_target: None,
+            #[cfg(feature = "encrypted")]
+            tls_extra_roots: Vec::new(),
             label: None,
             tcp_pool: TcpPool::new(),
         }
@@ -422,6 +448,9 @@ impl DnsClient {
             transport: Transport::Tcp { addr },
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
+            proxy_target: None,
+            #[cfg(feature = "encrypted")]
+            tls_extra_roots: Vec::new(),
             label: None,
             tcp_pool: TcpPool::new(),
         }
@@ -433,6 +462,9 @@ impl DnsClient {
             transport: Transport::RCode { code },
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
+            proxy_target: None,
+            #[cfg(feature = "encrypted")]
+            tls_extra_roots: Vec::new(),
             label: None,
             tcp_pool: TcpPool::new(),
         }
@@ -448,6 +480,9 @@ impl DnsClient {
             },
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
+            proxy_target: None,
+            #[cfg(feature = "encrypted")]
+            tls_extra_roots: Vec::new(),
             label: None,
             tcp_pool: TcpPool::new(),
         }
@@ -464,6 +499,9 @@ impl DnsClient {
             },
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
+            proxy_target: None,
+            #[cfg(feature = "encrypted")]
+            tls_extra_roots: Vec::new(),
             label: None,
             tcp_pool: TcpPool::new(),
         }
@@ -478,13 +516,42 @@ impl DnsClient {
     /// Route this client's exchanges through `proxy` (issue #67 phase 2).
     ///
     /// When set:
-    /// - TCP / DoT / DoH exchanges use `proxy.dial_tcp` instead of opening
-    ///   a direct TCP connection.
+    /// - TCP exchanges use `proxy.dial_tcp` instead of opening a direct
+    ///   TCP connection.
+    /// - DoT / DoH exchanges dial `proxy.dial_tcp` and run the TLS
+    ///   handshake over the returned [`meow_common::ProxyConn`] via
+    ///   [`TlsLayer::connect_typed`].
     /// - UDP exchanges fall through to TCP-over-proxy, since most proxy
     ///   adapters can't relay arbitrary UDP. The fallback matches the
     ///   semantics in ADR-0012.
     pub fn with_proxy(mut self, proxy: DnsProxy) -> Self {
         self.proxy = Some(proxy);
+        self
+    }
+
+    /// Set the `(host, port)` pair a proxied exchange asks the adapter to
+    /// dial — used when the upstream's configured address is a hostname:
+    /// the proxy performs the *remote* resolution, so no local bootstrap
+    /// lookup of the upstream name is needed (mihomo `newDNSDialer`
+    /// semantics). Only meaningful together with [`Self::with_proxy`].
+    pub(crate) fn with_proxy_target(mut self, host: Arc<str>, port: u16) -> Self {
+        self.proxy_target = Some((host, port));
+        self
+    }
+
+    /// Trust `der`-encoded CA certificates *in addition to* the webpki
+    /// roots for the DoT/DoH handshake — test hook so in-process TLS
+    /// upstreams can present a self-signed chain without disabling
+    /// verification.
+    ///
+    /// Compiled only into test and debug builds: `#[doc(hidden)]` alone
+    /// still shipped the widening hook in release binaries, where nothing
+    /// may extend the DoT/DoH trust set (r15 review M2). Integration
+    /// tests call it under `debug_assertions`; release strips it.
+    #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
+    #[doc(hidden)]
+    pub fn with_tls_additional_roots(mut self, der: Vec<u8>) -> Self {
+        self.tls_extra_roots.push(der);
         self
     }
 
@@ -525,7 +592,18 @@ impl DnsClient {
             label.to_string()
         } else {
             match &self.transport {
-                Transport::Udp { addr } | Transport::Tcp { addr } => socket_label(*addr, 53),
+                Transport::Udp { addr } | Transport::Tcp { addr } => match &self.proxy_target {
+                    // Hostname upstream via proxy: the placeholder
+                    // `addr` is meaningless — report the real target.
+                    Some((host, port)) => {
+                        if *port == 53 {
+                            host.to_string()
+                        } else {
+                            format!("{host}:{port}")
+                        }
+                    }
+                    None => socket_label(*addr, 53),
+                },
                 Transport::RCode { code } => format!("rcode:{code:?}"),
                 #[cfg(feature = "encrypted")]
                 Transport::Dot { addr, sni, .. } => {
@@ -557,8 +635,12 @@ impl DnsClient {
                 }
             }
         };
-        if self.proxy.is_some() {
-            label.push_str("#PROXY");
+        if let Some(proxy) = &self.proxy {
+            // Spelling-agnostic suffix: `#PROXY` would echo the plain-form
+            // spelling onto `?proxy=` entries. `via <name>` also reports
+            // the adapter actually dialed (r15 review I4).
+            label.push_str(" via ");
+            label.push_str(proxy.name());
         }
         label
     }
@@ -849,35 +931,152 @@ impl DnsClient {
         Ok(response)
     }
 
+    /// Open one proxied TCP stream to this client's dial target.
+    ///
+    /// The [`Metadata`] carries the canonical DNS-via-proxy shape: for an
+    /// IP upstream `host` is the address string and `dst_ip` is `Some`;
+    /// for a hostname upstream ([`Self::with_proxy_target`]) `host` is the
+    /// domain and `dst_ip` is `None` so the adapter forwards the domain to
+    /// the remote side (mihomo `newDNSDialer` semantics).
+    ///
+    /// The whole `dial_tcp` runs inside
+    /// [`meow_common::socket_protect::IN_DNS_VIA_PROXY_DIAL`]: a
+    /// resolver-injected adapter (`DirectAdapter` with `resolve_ips`) that
+    /// resolves its own dial target inside this dial re-enters
+    /// `Resolver::resolve_ips`, and the fence makes that re-entry answer
+    /// locally/system-side instead of re-running the upstream pipeline
+    /// that issued this query in the first place (self-deadlock
+    /// otherwise — see socket_protect.rs).
+    async fn proxy_dial(
+        &self,
+        proxy: &DnsProxy,
+    ) -> Result<Box<dyn meow_common::ProxyConn>, ClientError> {
+        use meow_common::{ConnType, Metadata, Network};
+        let (host, dst_ip, dst_port) = match &self.proxy_target {
+            Some((host, port)) => (smol_str::SmolStr::from(host.as_ref()), None, *port),
+            None => {
+                let addr = self.transport.dial_addr();
+                (
+                    smol_str::SmolStr::from(addr.ip().to_string()),
+                    Some(addr.ip()),
+                    addr.port(),
+                )
+            }
+        };
+        let metadata = Metadata {
+            network: Network::Tcp,
+            conn_type: ConnType::Inner,
+            host,
+            dst_ip,
+            dst_port,
+            // DNS-via-proxy exchanges are resolver housekeeping — a `lazy`
+            // group serving this dial must not count it as use.
+            internal: true,
+            ..Default::default()
+        };
+        meow_common::socket_protect::dns_via_proxy_dial_scope(proxy.dial_tcp(&metadata))
+            .await
+            // `into_io_error` keeps the innermost `Io` verbatim: an
+            // errno-bearing dial failure (EMFILE under local fd pressure)
+            // must not be flattened into a context-only `Other` before it
+            // reaches the resolver's classifier (#682) — and
+            // `Unsupported` refusals keep their kind.
+            .map_err(|e| ClientError::Io(e.into_io_error("dns-via-proxy dial")))
+    }
+
+    /// One plain-TCP-over-proxy exchange (UDP proxied upstreams also land
+    /// here — see [`Self::with_proxy`]).
+    async fn proxy_tcp_exchange(
+        &self,
+        proxy: &DnsProxy,
+        wire: &[u8],
+    ) -> Result<Vec<u8>, ClientError> {
+        let mut stream = self.proxy_dial(proxy).await?;
+        write_lp(&mut stream, wire).await?;
+        read_lp(&mut stream).await
+    }
+
+    /// Run the TLS handshake for a DoT/DoH exchange over `inner` — a
+    /// direct `TcpStream` or a proxied `ProxyConn` — and pin the result.
+    /// `Pin<Box<_>>` keeps the `Unpin` bound regardless of whether
+    /// `tokio_boring::SslStream<S>` itself is `Unpin`.
+    #[cfg(feature = "encrypted")]
+    async fn tls_connect_pinned<S>(
+        &self,
+        tls: &TlsLayer,
+        inner: S,
+    ) -> Result<Pin<Box<tokio_boring::SslStream<S>>>, ClientError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
+        tls.connect_typed(inner)
+            .await
+            .map(Box::pin)
+            .map_err(tls_connect_error::<S>)
+    }
+
+    /// DoT exchange over an already-dialed stream (direct TCP or proxy
+    /// conn) — RFC 7858: TLS, then RFC 7766 length-prefixed framing.
+    #[cfg(feature = "encrypted")]
+    async fn dot_exchange_on<S>(
+        &self,
+        inner: S,
+        sni: &str,
+        wire: &[u8],
+    ) -> Result<Vec<u8>, ClientError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
+        let tls = tls_layer(sni, "dot", &self.tls_extra_roots)?;
+        let mut stream = self.tls_connect_pinned(&tls, inner).await?;
+        write_lp(&mut stream, wire).await?;
+        read_lp(&mut stream).await
+    }
+
+    /// DoH exchange over an already-dialed stream — RFC 8484 HTTP/1.1
+    /// POST `application/dns-message`.
+    #[cfg(feature = "encrypted")]
+    async fn doh_exchange_on<S>(
+        &self,
+        inner: S,
+        sni: &str,
+        path: &str,
+        wire: &[u8],
+    ) -> Result<Vec<u8>, ClientError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
+        let tls = tls_layer(sni, "http/1.1", &self.tls_extra_roots)?;
+        let mut stream = self.tls_connect_pinned(&tls, inner).await?;
+        doh_http_exchange(&mut stream, sni, path, wire).await
+    }
+
     async fn exchange(
         &self,
         wire: &[u8],
         expected: &ExpectedResponse,
     ) -> Result<Message, ClientError> {
         if let Some(proxy) = self.proxy.as_ref() {
-            let addr = match &self.transport {
-                Transport::Udp { addr } | Transport::Tcp { addr } => *addr,
+            let response = match &self.transport {
+                Transport::Udp { .. } | Transport::Tcp { .. } => {
+                    self.proxy_tcp_exchange(proxy, wire).await?
+                }
                 Transport::RCode { .. } => {
                     return Err(ClientError::Protocol(
                         "rcode transport should not perform network exchange",
                     ));
                 }
                 #[cfg(feature = "encrypted")]
-                Transport::Dot { .. } | Transport::Doh { .. } => {
-                    // DoT/DoH-over-proxy needs TLS layered on a Box<dyn
-                    // ProxyConn>; the upstream tokio_rustls TlsConnector
-                    // is generic over the IO stream but the call sites
-                    // here aren't wired yet. ADR-0012 marks it
-                    // follow-up. Refuse so misconfiguration is loud.
-                    return Err(ClientError::Tls(
-                        "DoT/DoH routing through a proxy is not implemented yet \
-                        (issue #67 phase 2 follow-up); use plain udp:// or tcp:// for \
-                        a #PROXY-tagged nameserver"
-                            .to_string(),
-                    ));
+                Transport::Dot { sni, .. } => {
+                    let conn = self.proxy_dial(proxy).await?;
+                    self.dot_exchange_on(conn, sni, wire).await?
+                }
+                #[cfg(feature = "encrypted")]
+                Transport::Doh { sni, path, .. } => {
+                    let conn = self.proxy_dial(proxy).await?;
+                    self.doh_exchange_on(conn, sni, path, wire).await?
                 }
             };
-            let response = proxy_tcp_exchange(proxy, addr, wire).await?;
             return decode_validated_response(&response, expected);
         }
         match &self.transport {
@@ -888,12 +1087,14 @@ impl DnsClient {
             )),
             #[cfg(feature = "encrypted")]
             Transport::Dot { addr, sni } => {
-                let response = dot_exchange(*addr, sni, wire).await?;
+                let tcp = factory().connect_tcp(*addr).await?;
+                let response = self.dot_exchange_on(tcp, sni, wire).await?;
                 decode_validated_response(&response, expected)
             }
             #[cfg(feature = "encrypted")]
             Transport::Doh { addr, sni, path } => {
-                let response = doh_exchange(*addr, sni, path, wire).await?;
+                let tcp = factory().connect_tcp(*addr).await?;
+                let response = self.doh_exchange_on(tcp, sni, path, wire).await?;
                 decode_validated_response(&response, expected)
             }
         }
@@ -957,33 +1158,16 @@ fn socket_label(addr: SocketAddr, default_port: u16) -> String {
     }
 }
 
-async fn proxy_tcp_exchange(
-    proxy: &DnsProxy,
-    addr: SocketAddr,
-    wire: &[u8],
-) -> Result<Vec<u8>, ClientError> {
-    use meow_common::{ConnType, Metadata, Network};
-    let metadata = Metadata {
-        network: Network::Tcp,
-        conn_type: ConnType::Inner,
-        host: smol_str::SmolStr::from(addr.ip().to_string()),
-        dst_ip: Some(addr.ip()),
-        dst_port: addr.port(),
-        // DNS-via-proxy exchanges are resolver housekeeping — a `lazy`
-        // group serving this dial must not count it as use.
-        internal: true,
-        ..Default::default()
-    };
-    let mut stream = proxy
-        .dial_tcp(&metadata)
-        .await
-        // `into_io_error` keeps the innermost `Io` verbatim: an errno-bearing
-        // dial failure (EMFILE under local fd pressure) must not be flattened
-        // into a context-only `Other` before it reaches the resolver's
-        // classifier (#682) — and `Unsupported` refusals keep their kind.
-        .map_err(|e| e.into_io_error("dns-via-proxy dial"))?;
-    write_lp(&mut stream, wire).await?;
-    read_lp(&mut stream).await
+#[cfg(feature = "encrypted")]
+fn tls_connect_error<S>(err: meow_transport::tls::ConnectTypedError<S>) -> ClientError {
+    // `into_transport` keeps `Handshake`'s inner io error (raw errno)
+    // intact — ENOBUFS/EMFILE at the socket layer must reach the
+    // resolver's local-resource classification (#680/#682) instead of
+    // being flattened into a context-less `Tls` string.
+    match err.into_transport() {
+        meow_transport::TransportError::Io(io_err) => ClientError::Io(io_err),
+        other => ClientError::Tls(other.to_string()),
+    }
 }
 
 fn ip_from_record(rec: &Record) -> Option<IpAddr> {
@@ -1269,19 +1453,57 @@ async fn read_lp<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>, ClientEr
     Ok(buf)
 }
 
+/// The HTTP/1.1 half of a DoH exchange — shared by the direct and
+/// proxied paths, which differ only in how `stream` was dialed.
+///
+/// Sends a minimal `POST path` with `application/dns-message` and
+/// `Connection: close`, then reads the response to EOF (bounded by
+/// [`MAX_DOH_RESPONSE_BYTES`]) and returns the DNS body.
 #[cfg(feature = "encrypted")]
-async fn dot_exchange(addr: SocketAddr, sni: &str, wire: &[u8]) -> Result<Vec<u8>, ClientError> {
-    let tls = tls_layer(sni, "dot")?;
-    let tcp = factory().connect_tcp(addr).await?;
-    let mut stream = tls.connect(Box::new(tcp)).await.map_err(|e| match e {
-        // `TransportError::Io` still carries the raw errno (#680);
-        // stringifying it here would re-flatten an `EMFILE`-class
-        // handshake failure into a context-less `Tls` (#682).
-        meow_transport::TransportError::Io(io_err) => ClientError::Io(io_err),
-        other => ClientError::Tls(other.to_string()),
-    })?;
-    write_lp(&mut stream, wire).await?;
-    read_lp(&mut stream).await
+async fn doh_http_exchange<S>(
+    stream: &mut Pin<Box<tokio_boring::SslStream<S>>>,
+    sni: &str,
+    path: &str,
+    wire: &[u8],
+) -> Result<Vec<u8>, ClientError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    let head = format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         User-Agent: meow-rs\r\n\
+         Accept: application/dns-message\r\n\
+         Content-Type: application/dns-message\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        host = sni,
+        len = wire.len(),
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(wire).await?;
+    stream.flush().await?;
+
+    let all = read_bounded_http_response(stream).await?;
+    let split = find_subseq(&all, b"\r\n\r\n")
+        .ok_or(ClientError::Protocol("doh: missing header terminator"))?;
+    let head_bytes = &all[..split];
+    let body = &all[split + 4..];
+    let head_str =
+        std::str::from_utf8(head_bytes).map_err(|_| ClientError::Protocol("doh: bad headers"))?;
+    let status_line = head_str
+        .lines()
+        .next()
+        .ok_or(ClientError::Protocol("doh: empty response"))?;
+    // "HTTP/1.1 200 OK" — extract the status code.
+    let mut parts = status_line.split_whitespace();
+    let _version = parts.next();
+    let status = parts.next().unwrap_or("");
+    if status != "200" {
+        return Err(ClientError::Protocol("doh: non-200 status"));
+    }
+    Ok(body.to_vec())
 }
 
 /// Maximum DoH response size (HTTP/1.1 headers + DNS body), in bytes.
@@ -1323,66 +1545,6 @@ where
 }
 
 #[cfg(feature = "encrypted")]
-async fn doh_exchange(
-    addr: SocketAddr,
-    sni: &str,
-    path: &str,
-    wire: &[u8],
-) -> Result<Vec<u8>, ClientError> {
-    let tls = tls_layer(sni, "http/1.1")?;
-    let tcp = factory().connect_tcp(addr).await?;
-    let mut stream = tls.connect(Box::new(tcp)).await.map_err(|e| match e {
-        // `TransportError::Io` still carries the raw errno (#680);
-        // stringifying it here would re-flatten an `EMFILE`-class
-        // handshake failure into a context-less `Tls` (#682).
-        meow_transport::TransportError::Io(io_err) => ClientError::Io(io_err),
-        other => ClientError::Tls(other.to_string()),
-    })?;
-
-    // Minimal HTTP/1.1 POST. Connection: close so the server EOFs and we can
-    // read-to-end without parsing chunked transfer-encoding.
-    let head = format!(
-        "POST {path} HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         User-Agent: meow-rs\r\n\
-         Accept: application/dns-message\r\n\
-         Content-Type: application/dns-message\r\n\
-         Content-Length: {len}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        host = sni,
-        len = wire.len(),
-    );
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(wire).await?;
-    stream.flush().await?;
-
-    // Read the full HTTP/1.1 response with a bounded buffer. `Connection:
-    // close` means the server EOFs after the body, so reading to EOF is
-    // correct — but we cap the total to `MAX_DOH_RESPONSE_BYTES` so a
-    // misbehaving upstream cannot stream an unbounded body into memory.
-    let all = read_bounded_http_response(&mut stream).await?;
-    let split = find_subseq(&all, b"\r\n\r\n")
-        .ok_or(ClientError::Protocol("doh: missing header terminator"))?;
-    let head_bytes = &all[..split];
-    let body = &all[split + 4..];
-    let head_str =
-        std::str::from_utf8(head_bytes).map_err(|_| ClientError::Protocol("doh: bad headers"))?;
-    let status_line = head_str
-        .lines()
-        .next()
-        .ok_or(ClientError::Protocol("doh: empty response"))?;
-    // "HTTP/1.1 200 OK" — extract the status code.
-    let mut parts = status_line.split_whitespace();
-    let _version = parts.next();
-    let status = parts.next().unwrap_or("");
-    if status != "200" {
-        return Err(ClientError::Protocol("doh: non-200 status"));
-    }
-    Ok(body.to_vec())
-}
-
-#[cfg(feature = "encrypted")]
 fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
@@ -1398,10 +1560,15 @@ fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// `(fingerprint, curves, alpn, skip_cert_verify)`, so this is a hash
 /// lookup plus a refcount bump per query — negligible next to the fresh
 /// TCP + TLS handshake each exchange performs.
+///
+/// `extra_roots` is empty in production; the test-only
+/// [`DnsClient::with_tls_additional_roots`] hook fills it so in-process
+/// upstreams can present self-signed chains.
 #[cfg(feature = "encrypted")]
-fn tls_layer(sni: &str, alpn: &str) -> Result<TlsLayer, ClientError> {
+fn tls_layer(sni: &str, alpn: &str, extra_roots: &[Vec<u8>]) -> Result<TlsLayer, ClientError> {
     let config = TlsConfig {
         alpn: vec![alpn.to_owned()],
+        additional_roots: extra_roots.to_vec(),
         ..TlsConfig::new(sni)
     };
     TlsLayer::new(&config).map_err(|e| ClientError::Tls(format!("invalid SNI '{sni}': {e}")))
@@ -2432,7 +2599,10 @@ mod tests {
             health: meow_common::ProxyHealth::new(),
         });
         let dyn_proxy: DnsProxy = std::sync::Arc::<CapturingMetaProxy>::clone(&proxy);
-        let _ = proxy_tcp_exchange(&dyn_proxy, "8.8.8.8:53".parse().unwrap(), b"\x00").await;
+        let client = DnsClient::tcp("8.8.8.8:53".parse().unwrap()).with_proxy(dyn_proxy);
+        let _ = client
+            .exchange(b"\x00", &expected("probe.test", RecordType::A, 1))
+            .await;
         let seen = proxy.seen.lock().unwrap();
         let meta = seen.first().expect("the exchange must reach dial_tcp");
         assert!(
@@ -2524,9 +2694,12 @@ mod tests {
         let proxy: DnsProxy = std::sync::Arc::new(ErrnoProxy {
             health: meow_common::ProxyHealth::new(),
         });
-        let err = proxy_tcp_exchange(&proxy, "8.8.8.8:53".parse().unwrap(), b"\x00")
+        let client = DnsClient::tcp("8.8.8.8:53".parse().unwrap()).with_proxy(proxy);
+        let err = client
+            .proxy_dial(client.proxy.as_ref().unwrap())
             .await
-            .unwrap_err();
+            .err()
+            .expect("the EMFILE mock must fail the dial");
         let ClientError::Io(e) = err else {
             panic!("expected Io, got {err:?}");
         };
