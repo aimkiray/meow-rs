@@ -101,6 +101,34 @@ Field reference — `nameserver-policy`:
 | Value is a string | Treated as a single-element list. |
 | Value is a list | Multiple nameservers for this policy; first responding wins. |
 
+**Lookup order — document order is the priority** (mihomo
+`parseNameServerPolicy` + `makePolicy` parity): the policy is a sequence of
+"arms" in the order the keys are written. A run of consecutive domain keys
+(`bare`, `+.`, `*.`, `.`) merges into one domain-trie arm; each
+`geosite:`/`rule-set:` key appends a matcher arm and closes the open domain
+block. A query walks the arms top-down and the first match wins — so a
+`rule-set:` or `geosite:` key written before a domain key shadows it. Within
+one domain-trie arm the usual specificity rules decide (exact > `*.` > `.`
+at the deepest node); two keys landing on the SAME trie slot — e.g. `x` and
+`+.x`, which both write `x`'s exact slot — resolve to the document-last
+writer (mihomo `setData` overwrite). A YAML-literal duplicate key is a
+hard parse error (`duplicate entry with key "…"`): every ingest path
+(`-f`/`-t`, `--config-string`, `PUT /configs`) funnels through
+`parse_raw_yaml`, whose serde_norway `Value` layer rejects the document
+before the policy map is built. The first-position/last-value fold
+(mihomo `orderedmap.Set`) only decides duplicates from non-literal
+sources — a programmatically built map, or the expanded segments of one
+comma-mixed key. A `<<:` merge key appends the anchor's entries at the
+END of the map no matter where the `<<:` line is written, and an
+explicit key overrides a merged same-name key — merged entries are
+therefore always the lowest-priority arms, so a merged
+`rule-set:`/`geosite:` key can never shadow an explicit domain key.
+Caveat: `apply_merge` removes the `<<:` key with `swap_remove`, so a
+`<<:` line written before the last explicit line permutes the order of
+the remaining explicit keys — keep `<<:` first in the map or order
+matters beyond "merged keys rank last". Bare-key lookups are
+case-insensitive: the query is folded before the match.
+
 Nameserver URL format: identical to M1.E-1 (`udp://`, `tcp://`, `https://`, `tls://`).
 
 Field reference — `fallback-filter`:
@@ -160,18 +188,25 @@ pub struct PolicyEntry {
     nameservers: Vec<TokioResolver>,   // one per URL, pre-built at startup
 }
 
+enum PolicyArm {
+    // A run of consecutive domain keys merged into one trie.
+    Domains(DomainTrie<PolicyEntry>),
+    // One geosite:/rule-set: matcher closure.
+    Matcher(MatcherPolicyEntry),
+}
+
 pub struct NameserverPolicy {
-    // Exact matches: "example.com" → entry
-    exact: HashMap<String, PolicyEntry>,
-    // Wildcard matches: trie for "+.", "*.", and "." prefixed patterns
-    // Uses DomainTrie from meow-trie (same trie as rule matching)
-    wildcard: DomainTrie<PolicyEntry>,
+    // Document order — the lookup priority.
+    arms: Vec<PolicyArm>,
 }
 
 impl NameserverPolicy {
     pub fn lookup(&self, domain: &str) -> Option<&PolicyEntry> {
-        if let Some(e) = self.exact.get(domain) { return Some(e); }
-        self.wildcard.search(domain)
+        // First matching arm wins.
+        self.arms.iter().find_map(|arm| match arm {
+            PolicyArm::Domains(trie) => trie.search(domain),
+            PolicyArm::Matcher(m) => (m.matcher)(domain).then_some(&m.entry),
+        })
     }
 }
 ```

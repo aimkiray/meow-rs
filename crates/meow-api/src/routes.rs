@@ -1703,14 +1703,38 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
 /// resolver build. Compared structurally (the `Raw*` types derive
 /// `PartialEq`; map sections are order-insensitive, list sections keep
 /// list order — same semantics the JSON comparison had, without building
-/// a DOM per commit). When a `dns:` section references
+/// a DOM per commit) — with one exception: `nameserver-policy` key order
+/// IS semantic (document order = lookup priority), but `IndexMap`'s `==`
+/// cannot see it, so that map gets a pairwise order-sensitive pass below.
+/// When a `dns:` section references
 /// proxies/rule-providers (`#name` nameserver tags, `rule-set:` policy
 /// keys), those sections join the comparison — the resolver snapshots
 /// them at build time.
 fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
+    // A pure key reorder of `nameserver-policy` must read as a change —
+    // `a.dns == b.dns` alone is order-insensitive for this section.
+    let nsp_equal = {
+        let pa = a.dns.as_ref().and_then(|d| d.nameserver_policy.as_ref());
+        let pb = b.dns.as_ref().and_then(|d| d.nameserver_policy.as_ref());
+        match (pa, pb) {
+            (None, None) => true,
+            (Some(ma), Some(mb)) => {
+                ma.len() == mb.len()
+                    && ma
+                        .iter()
+                        .zip(mb.iter())
+                        .all(|((ka, va), (kb, vb))| ka == kb && va == vb)
+            }
+            // `(None, Some)` / `(Some, None)` — even `None` vs
+            // `Some(empty)` — reads as a change: a conservative rebuild,
+            // the same Option-diff semantics the derived `==` had.
+            _ => false,
+        }
+    };
     // `geox-url` is the top-level alias for `geodata.url.*` — it feeds the
     // same `parse_geodata` result, so it joins the DNS-input comparison.
-    let base = a.dns == b.dns
+    let base = nsp_equal
+        && a.dns == b.dns
         && a.hosts == b.hosts
         && a.ipv6 == b.ipv6
         && a.geodata == b.geodata
@@ -4519,6 +4543,38 @@ mod tests {
         assert!(!dns_inputs_equal(&raw_a, &raw_b));
         assert!(!dns_inputs_equal(&raw_b, &raw_a));
         assert!(dns_inputs_equal(&raw_b, &raw_b));
+    }
+
+    /// `nameserver-policy` key order IS semantic — document order is the
+    /// lookup priority — but `IndexMap`'s `==` is order-insensitive, so
+    /// `dns_inputs_equal` compares that map pairwise. A `PUT /configs`
+    /// that only reorders the policy keys must still rebuild the
+    /// resolver.
+    #[test]
+    fn dns_inputs_equal_sees_nameserver_policy_key_order() {
+        let raw_a: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver-policy:\n    '+.a.example': 1.1.1.1\n    '+.b.example': 2.2.2.2\n",
+        )
+        .unwrap();
+        let raw_b: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver-policy:\n    '+.b.example': 2.2.2.2\n    '+.a.example': 1.1.1.1\n",
+        )
+        .unwrap();
+        // Same keys, same values, different document order → not equal.
+        assert!(!dns_inputs_equal(&raw_a, &raw_b));
+        assert!(!dns_inputs_equal(&raw_b, &raw_a));
+        // Same order, same content → equal.
+        let raw_c: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver-policy:\n    '+.a.example': 1.1.1.1\n    '+.b.example': 2.2.2.2\n",
+        )
+        .unwrap();
+        assert!(dns_inputs_equal(&raw_a, &raw_c));
+        // Same order, different value → not equal.
+        let raw_d: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver-policy:\n    '+.a.example': 1.1.1.1\n    '+.b.example': 9.9.9.9\n",
+        )
+        .unwrap();
+        assert!(!dns_inputs_equal(&raw_a, &raw_d));
     }
 
     /// Issue #533 review: `swap_config_and_reconcile_tun` compares the TUN

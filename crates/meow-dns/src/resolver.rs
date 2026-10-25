@@ -112,14 +112,31 @@ struct MatcherPolicyEntry {
     entry: PolicyEntry,
 }
 
-/// Per-domain nameserver routing: exact (bare) keys in `exact`, `+.`, `*.`
-/// and `.` prefixed keys in the `wildcard` trie, geosite/rule-set closures
-/// in `matchers`. `lookup` consults them in that order.
+/// One arm of a [`NameserverPolicy`]: either a run of consecutive domain
+/// keys merged into a single trie, or one `geosite:`/`rule-set:` matcher
+/// closure — the direct translation of mihomo `makePolicy`'s
+/// `domainTriePolicy` / `domainMatcherPolicy` pair.
+enum PolicyArm {
+    Domains(DomainTrie<PolicyEntry>),
+    Matcher(MatcherPolicyEntry),
+}
+
+/// Per-domain nameserver routing as a DOCUMENT-ORDERED arm list (mihomo
+/// `makePolicy` parity): consecutive domain keys (`bare`, `+.`, `*.`,
+/// `.`) share one `PolicyArm::Domains` trie; each `geosite:`/`rule-set:`
+/// key appends a `PolicyArm::Matcher` and closes the open domain block.
+/// [`NameserverPolicy::lookup`] scans the arms in order and the first
+/// match wins — a matcher written before a domain key shadows it.
+///
+/// Within one domain arm, trie specificity decides between keys on
+/// different slots (exact > `*.` > `.` at the deepest matching node); two
+/// keys colliding on the SAME slot resolve to the document-last writer
+/// (`insert_overwrite` — mihomo `node.setData` parity). Queries are
+/// case-folded by the trie's CI path, so a bare key matches an
+/// uppercase query — the old exact-`HashMap` lookup missed those.
 pub struct NameserverPolicy {
-    exact: HashMap<String, PolicyEntry>,
-    wildcard: DomainTrie<PolicyEntry>,
-    matchers: Vec<MatcherPolicyEntry>,
-    /// Every client inserted under any pattern — the wildcard trie cannot
+    arms: Vec<PolicyArm>,
+    /// Every client inserted under any arm — the domain tries cannot
     /// be iterated, and [`Resolver::reset_connections`] must reach each
     /// policy upstream's connection pool (issue #695).
     clients: Vec<Arc<DnsClient>>,
@@ -134,16 +151,25 @@ impl Default for NameserverPolicy {
 impl NameserverPolicy {
     pub fn new() -> Self {
         Self {
-            exact: HashMap::new(),
-            wildcard: DomainTrie::new(),
-            matchers: Vec::new(),
+            arms: Vec::new(),
             clients: Vec::new(),
         }
     }
 
+    /// Compatibility shim kept from the pre-arm-list API: despite the
+    /// name there is no separate exact tier any more — the key is
+    /// normalized into the CURRENT domain arm's [`DomainTrie`] via
+    /// `insert_overwrite`, so `+.x`/`*.x`/`.x`/bare inputs are all
+    /// accepted here exactly as through [`Self::insert_wildcard`]. The
+    /// historic exact-map → wildcard-trie → matcher-list layering is
+    /// gone; only the published signatures remain.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the `String` parameter is part of the published signature, kept for API compatibility — the domain arm's trie only consumes `&str` labels"
+    )]
     pub fn insert_exact(&mut self, domain: String, entry: PolicyEntry) {
         self.track_clients(&entry);
-        self.exact.insert(domain, entry);
+        self.open_domain_arm().insert_overwrite(&domain, entry);
     }
 
     fn track_clients(&mut self, entry: &PolicyEntry) {
@@ -159,33 +185,49 @@ impl NameserverPolicy {
         &self.clients
     }
 
-    /// Insert a wildcard-pattern policy key verbatim into the `DomainTrie`:
-    /// `+.x` covers the apex plus any-depth subdomains, `*.x` exactly one
-    /// label, `.x` any-depth subdomains excluding the apex — upstream
-    /// `parseNameServerPolicy` routes all three through one `domainTriePolicy`.
-    /// `+.` natively covers the root domain, so no supplementary exact-map
-    /// entry is needed for any prefix kind.
+    /// Insert a wildcard-pattern policy key into the current domain arm's
+    /// `DomainTrie`: `+.x` covers the apex plus any-depth subdomains,
+    /// `*.x` exactly one label, `.x` any-depth subdomains excluding the
+    /// apex — upstream `parseNameServerPolicy` routes all three (and bare
+    /// keys) through one `domainTriePolicy`.
+    ///
+    /// Like [`Self::insert_exact`], the method name survives for API
+    /// compatibility only: the historic exact/wildcard/matcher layering
+    /// is gone and every pattern kind — bare, `+.`, `*.`, `.` — is
+    /// normalized into the open domain arm's trie by the same
+    /// `insert_overwrite` path, so either method accepts any key.
     pub fn insert_wildcard(&mut self, pattern: &str, entry: PolicyEntry) {
         self.track_clients(&entry);
-        self.wildcard.insert(pattern, entry);
+        self.open_domain_arm().insert_overwrite(pattern, entry);
+    }
+
+    /// The open domain arm: the last arm when it is a `Domains` block,
+    /// else a freshly pushed one — mihomo `makePolicy` flushes the pending
+    /// trie into an arm when a matcher policy arrives.
+    fn open_domain_arm(&mut self) -> &mut DomainTrie<PolicyEntry> {
+        if !matches!(self.arms.last(), Some(PolicyArm::Domains(_))) {
+            self.arms.push(PolicyArm::Domains(DomainTrie::new()));
+        }
+        let Some(PolicyArm::Domains(trie)) = self.arms.last_mut() else {
+            unreachable!("a Domains arm was just pushed");
+        };
+        trie
     }
 
     pub fn insert_matcher(&mut self, matcher: NameserverPolicyMatcher, entry: PolicyEntry) {
         self.track_clients(&entry);
-        self.matchers.push(MatcherPolicyEntry { matcher, entry });
+        self.arms
+            .push(PolicyArm::Matcher(MatcherPolicyEntry { matcher, entry }));
     }
 
+    /// First-match-wins scan over the document-ordered arms: a `Domains`
+    /// arm answers with a trie `search` (which case-folds the query), a
+    /// `Matcher` arm calls its closure.
     pub fn lookup(&self, domain: &str) -> Option<&PolicyEntry> {
-        if let Some(e) = self.exact.get(domain) {
-            return Some(e);
-        }
-        if let Some(e) = self.wildcard.search(domain) {
-            return Some(e);
-        }
-        self.matchers
-            .iter()
-            .find(|entry| (entry.matcher)(domain))
-            .map(|entry| &entry.entry)
+        self.arms.iter().find_map(|arm| match arm {
+            PolicyArm::Domains(trie) => trie.search(domain),
+            PolicyArm::Matcher(entry) => (entry.matcher)(domain).then_some(&entry.entry),
+        })
     }
 }
 
@@ -2211,8 +2253,8 @@ mod tests {
     }
 
     /// Issue #695: `reset_connections` reaches every upstream the resolver
-    /// can query — main, fallback, and a nameserver-policy client reachable
-    /// only through the (non-iterable) wildcard trie.
+    /// can query — main, fallback, and a nameserver-policy client held
+    /// only inside the (non-iterable) domain-arm trie.
     #[tokio::test]
     async fn reset_connections_reaches_main_fallback_and_policy_pools() {
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -3711,6 +3753,21 @@ mod tests {
         assert!(!ff.ip_gated(&[clean]), "clean IP must not be gated");
     }
 
+    /// A `PolicyEntry` with `n` dummy upstream clients — `nameservers.len()`
+    /// is the probe that identifies which entry won a lookup.
+    fn policy_entry(n: usize) -> PolicyEntry {
+        PolicyEntry {
+            nameservers: (0..n)
+                .map(|i| {
+                    Arc::new(DnsClient::udp(SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        1000 + i as u16,
+                    )))
+                })
+                .collect(),
+        }
+    }
+
     // nameserver-policy exact match.
     // Upstream: dns/resolver.go::PolicyResolver. NOT global nameservers when exact match exists.
     #[tokio::test]
@@ -3750,42 +3807,38 @@ mod tests {
         assert!(pol.lookup("other.example").is_none(), "non-match must miss");
     }
 
-    // nameserver-policy exact-first precedence: an exact entry beats a `+.`
-    // wildcard at the apex regardless of insertion order (lookup consults the
-    // exact map before the wildcard trie).
+    // nameserver-policy same-slot collision: `x` and `+.x` both write the
+    // trie's Exact slot for `x`, so the document-LAST key wins the apex —
+    // mihomo `node.setData` overwrite parity. Subdomains still resolve via
+    // the `+.x` Dot slot regardless of which key came last.
     #[test]
-    fn nameserver_policy_exact_overrides_wildcard_at_apex() {
+    fn nameserver_policy_same_slot_conflict_last_writer_wins() {
         for exact_first in [true, false] {
-            let wildcard_entry = PolicyEntry {
-                nameservers: vec![],
-            };
-            let exact_entry = PolicyEntry {
-                nameservers: vec![],
-            };
             let mut pol = NameserverPolicy::new();
             if exact_first {
-                pol.insert_exact("corp.internal".to_string(), exact_entry);
-                pol.insert_wildcard("+.corp.internal", wildcard_entry);
+                pol.insert_exact("corp.internal".to_string(), policy_entry(1));
+                pol.insert_wildcard("+.corp.internal", policy_entry(2));
             } else {
-                pol.insert_wildcard("+.corp.internal", wildcard_entry);
-                pol.insert_exact("corp.internal".to_string(), exact_entry);
+                pol.insert_wildcard("+.corp.internal", policy_entry(2));
+                pol.insert_exact("corp.internal".to_string(), policy_entry(1));
             }
-            // Pointer identity pins the provenance: the apex hit must be the
-            // exact-map slot, not the wildcard trie's.
+            // `nameservers.len()` pins the provenance: the apex hit must be
+            // the entry the document-last key carried into the Exact slot.
             let hit = pol.lookup("corp.internal").expect("apex must match");
-            assert!(
-                std::ptr::eq(hit, pol.exact.get("corp.internal").unwrap()),
-                "exact entry must win over +. wildcard at the apex (exact_first={exact_first})"
+            let want = if exact_first { 2 } else { 1 };
+            assert_eq!(
+                hit.nameservers.len(),
+                want,
+                "the document-last key must win the shared Exact slot (exact_first={exact_first})"
             );
             assert!(
                 pol.lookup("x.corp.internal").is_some(),
-                "subdomain must still resolve via the wildcard (exact_first={exact_first})"
+                "subdomain must still resolve via the +. Dot slot (exact_first={exact_first})"
             );
         }
     }
 
-    // `*.`/`.` keys reach the trie verbatim via insert_wildcard; an exact
-    // entry still wins at every level (exact map is consulted first).
+    // `*.`/`.` keys reach the arm's trie verbatim via insert_wildcard.
     #[test]
     fn nameserver_policy_star_and_dot_wildcards() {
         let mut pol = NameserverPolicy::new();
@@ -3808,40 +3861,23 @@ mod tests {
         assert!(pol.lookup("a.b.eng.internal").is_some());
         assert!(pol.lookup("eng.internal").is_none());
 
-        // exact beats a `*.` wildcard at depth 1, order-independent.
+        // `a.corp.internal` (bare) and `*.corp.internal` live on DIFFERENT
+        // trie slots, so arm-internal specificity still applies regardless
+        // of write order: the leaf exact beats the one-label star.
         for exact_first in [true, false] {
             let mut p = NameserverPolicy::new();
             if exact_first {
-                p.insert_exact(
-                    "a.corp.internal".to_string(),
-                    PolicyEntry {
-                        nameservers: vec![],
-                    },
-                );
-                p.insert_wildcard(
-                    "*.corp.internal",
-                    PolicyEntry {
-                        nameservers: vec![],
-                    },
-                );
+                p.insert_exact("a.corp.internal".to_string(), policy_entry(1));
+                p.insert_wildcard("*.corp.internal", policy_entry(2));
             } else {
-                p.insert_wildcard(
-                    "*.corp.internal",
-                    PolicyEntry {
-                        nameservers: vec![],
-                    },
-                );
-                p.insert_exact(
-                    "a.corp.internal".to_string(),
-                    PolicyEntry {
-                        nameservers: vec![],
-                    },
-                );
+                p.insert_wildcard("*.corp.internal", policy_entry(2));
+                p.insert_exact("a.corp.internal".to_string(), policy_entry(1));
             }
             let hit = p.lookup("a.corp.internal").expect("depth-1 hit");
-            assert!(
-                std::ptr::eq(hit, p.exact.get("a.corp.internal").unwrap()),
-                "exact entry must win over *. wildcard (exact_first={exact_first})"
+            assert_eq!(
+                hit.nameservers.len(),
+                1,
+                "the exact slot must still beat the *. slot (exact_first={exact_first})"
             );
         }
     }
@@ -3855,6 +3891,90 @@ mod tests {
         pol.insert_matcher(Arc::new(|domain| domain.ends_with(".cn")), entry);
         assert!(pol.lookup("example.cn").is_some());
         assert!(pol.lookup("example.com").is_none());
+    }
+
+    // The policy is an arm list in document order: consecutive domain keys
+    // merge into one Domains arm; a matcher key flushes it and starts its
+    // own arm (mihomo `makePolicy` parity).
+    #[test]
+    fn nameserver_policy_arms_follow_document_order() {
+        let mut pol = NameserverPolicy::new();
+        pol.insert_exact("a.example".to_string(), policy_entry(1));
+        pol.insert_wildcard("+.b.example", policy_entry(1));
+        pol.insert_matcher(Arc::new(|d: &str| d.ends_with(".cn")), policy_entry(1));
+        pol.insert_exact("c.example".to_string(), policy_entry(1));
+        assert_eq!(pol.arms.len(), 3);
+        assert!(matches!(&pol.arms[0], PolicyArm::Domains(_)));
+        assert!(matches!(&pol.arms[1], PolicyArm::Matcher(_)));
+        assert!(matches!(&pol.arms[2], PolicyArm::Domains(_)));
+        // Arm 0's trie holds BOTH leading domain keys.
+        let PolicyArm::Domains(trie) = &pol.arms[0] else {
+            panic!("arm 0 must be the domain block");
+        };
+        assert!(trie.search("a.example").is_some());
+        assert!(trie.search("x.b.example").is_some());
+        let PolicyArm::Domains(trie) = &pol.arms[2] else {
+            panic!("arm 2 must be a fresh domain block");
+        };
+        assert!(trie.search("c.example").is_some());
+        assert!(trie.search("a.example").is_none());
+    }
+
+    // A matcher arm written before a domain key shadows it — the arm scan
+    // is document order, first match wins. This is the behavior change the
+    // arm refactor exists for: the old exact→wildcard→matchers chain could
+    // never let a matcher outrank a domain key.
+    #[test]
+    fn nameserver_policy_matcher_arm_shadows_later_domain_keys() {
+        let mut pol = NameserverPolicy::new();
+        pol.insert_matcher(
+            Arc::new(|d: &str| d.ends_with(".shadow.example")),
+            policy_entry(1),
+        );
+        pol.insert_wildcard("+.shadow.example", policy_entry(2));
+        let hit = pol.lookup("x.shadow.example").expect("matcher must hit");
+        assert_eq!(
+            hit.nameservers.len(),
+            1,
+            "the earlier matcher arm must shadow the later domain key"
+        );
+
+        let mut pol = NameserverPolicy::new();
+        pol.insert_wildcard("+.shadow.example", policy_entry(2));
+        pol.insert_matcher(
+            Arc::new(|d: &str| d.ends_with(".shadow.example")),
+            policy_entry(1),
+        );
+        let hit = pol.lookup("x.shadow.example").expect("wildcard must hit");
+        assert_eq!(
+            hit.nameservers.len(),
+            2,
+            "the earlier domain arm must win once order flips"
+        );
+    }
+
+    // Two matcher arms overlapping one domain: the document-first arm wins.
+    #[test]
+    fn nameserver_policy_matcher_arms_first_match_wins() {
+        let mut pol = NameserverPolicy::new();
+        pol.insert_matcher(Arc::new(|d: &str| d == "x.example"), policy_entry(1));
+        pol.insert_matcher(Arc::new(|d: &str| d.ends_with(".example")), policy_entry(2));
+        let hit = pol.lookup("x.example").expect("both matchers cover it");
+        assert_eq!(hit.nameservers.len(), 1, "the first matcher arm must win");
+    }
+
+    // Bare keys live in the domain arm's trie now, so a case-variant query
+    // case-folds onto the lowercased key — the retired exact `HashMap` did
+    // a case-sensitive `get` and missed `CORP.EXAMPLE` (latent bug, fixed
+    // by routing bare keys through the trie's CI search).
+    #[test]
+    fn nameserver_policy_bare_key_lookup_case_folds() {
+        let mut pol = NameserverPolicy::new();
+        pol.insert_exact("Corp.Example".to_string(), policy_entry(1));
+        assert!(pol.lookup("corp.example").is_some());
+        assert!(pol.lookup("CORP.EXAMPLE").is_some());
+        assert!(pol.lookup("Corp.Example").is_some());
+        assert!(pol.lookup("a.corp.example").is_none());
     }
 
     #[tokio::test]

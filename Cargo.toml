@@ -94,6 +94,10 @@ serde_json = "1"
 # release that resurrects RUSTSEC-2024-0449. The `~` bound keeps 0.9.42+ fix
 # releases flowing while staying below 0.10.
 serde_yaml = { package = "serde_norway", version = "~0.9.42" }
+# Order-preserving map for `dns.nameserver-policy` — the YAML document
+# order IS the lookup priority (mihomo `parseNameServerPolicy` parity), so
+# a plain `HashMap` cannot carry it. `serde` deserializes in document order.
+indexmap = { version = "2.14", features = ["serde"] }
 
 # Networking
 # anytls is vendored in-tree as `crates/meow-anytls` (lib name `anytls_rs`).

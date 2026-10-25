@@ -138,6 +138,44 @@ the canonical, in-repo source a release is cut from.
   `Null`, so a `.nan` on a real-read field such as
   `tun.inet6-address` is treated as unset where it previously errored;
   and nested `serde_json::Map` mappings serialise with keys sorted.
+- **`nameserver-policy` key order is now the lookup priority** (mihomo
+  `parseNameServerPolicy`/`makePolicy` parity): the policy is a
+  document-ordered arm list — a run of consecutive domain keys (`bare`,
+  `+.`, `*.`, `.`) merges into one domain-trie arm and each
+  `geosite:`/`rule-set:` key appends a matcher arm — and a query takes
+  the first matching arm, so a `rule-set:`/`geosite:` key written before
+  a domain key now shadows it where previously every domain key silently
+  outranked every matcher. Inside one domain arm the usual trie
+  specificity still decides (exact > `*.` > `.` at the deepest node),
+  but two keys landing on the same trie slot — e.g. `x` versus `+.x`,
+  which both write `x`'s exact slot — now resolve to the document-last
+  writer, so the apex of `+.x` no longer always loses to a bare `x`:
+  previously the bare `x` held fixed exact-tier priority (the exact
+  map was consulted before the wildcard trie) regardless of key order.
+  What was genuinely arbitrary — wildcard keys colliding on one slot
+  (`+.x` versus `.x`) and the order among `geosite:`/`rule-set:`
+  matchers — fell to hash-map iteration order, a per-startup coin
+  toss the document order now fixes as well. A YAML-literal duplicate
+  key is a hard parse error (`duplicate entry with key "…"`) — every
+  ingest path goes through `parse_raw_yaml`, which rejects it at the
+  serde_norway `Value` layer before the map is built; the
+  first-position/last-value fold (mihomo `orderedmap.Set` parity) only
+  decides duplicates from non-literal sources, such as a
+  programmatically built map or the expanded segments of a comma-mixed
+  key. Two latent defects fall out of the change: a
+  bare-key policy entry now matches a case-variant query (`CORP.EXAMPLE`
+  hits a `corp.example` key — the old exact map compared
+  case-sensitively), and the save path (`save_raw_config` — e.g.
+  `POST /api/config/save`, or the subscription-refresh persist) writes
+  the section back in document order instead of
+  reshuffling it on every save. For embedders: `RawDns::nameserver_policy`
+  is now `Option<RawNameserverPolicy>` (`IndexMap<String, RawNspValue>`)
+  instead of `Option<HashMap<..>>`, and note that `IndexMap`'s `==` is
+  order-insensitive — the DNS-rebuild comparison in meow-api compares it
+  pairwise. The `NameserverPolicy::insert_exact`/`insert_wildcard`
+  compatibility shims now normalize every pattern kind (`+.x`, padded or
+  uppercase input) into the open domain arm where they used to
+  literal-store it.
 
 ### Removed
 

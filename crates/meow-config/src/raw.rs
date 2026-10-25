@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -444,10 +445,11 @@ pub struct RawDns {
     /// If true, `/etc/hosts` is read at startup and merged (lower priority than
     /// top-level `hosts` config entries). No-op + warn on Windows.
     pub use_system_hosts: Option<bool>,
-    /// Per-domain nameserver routing: each key is an exact domain or a `+.` /
-    /// `*.` / `.` wildcard prefix; value is a single server URL or a list of
-    /// URLs.
-    pub nameserver_policy: Option<HashMap<String, RawNspValue>>,
+    /// Per-domain nameserver routing: each key is an exact domain, a `+.` /
+    /// `*.` / `.` wildcard prefix, or a `geosite:`/`rule-set:` matcher;
+    /// value is a single server URL or a list of URLs. **Document order is
+    /// the lookup priority** — see [`RawNameserverPolicy`].
+    pub nameserver_policy: Option<RawNameserverPolicy>,
     /// Controls when the `fallback:` nameservers replace the primary result.
     pub fallback_filter: Option<RawFallbackFilter>,
 }
@@ -468,6 +470,30 @@ impl RawNspValue {
         }
     }
 }
+
+/// The raw `nameserver-policy:` map, kept in YAML document order: that
+/// order IS the lookup priority. The built `NameserverPolicy` walks its
+/// arms in this order and the first match wins (mihomo
+/// `parseNameServerPolicy` parity — a `rule-set:`/`geosite:` key written
+/// before a domain key shadows it).
+///
+/// A YAML-literal duplicate key is a hard parse error, not a fold:
+/// every production ingest path (`-f`/`-t`, `--config-string`,
+/// `PUT /configs`) funnels through [`crate::parse_raw_yaml`], whose
+/// serde_norway `Value` layer rejects the document with
+/// `duplicate entry with key "…"` before this map is built. The
+/// `IndexMap::insert` fold — first position kept, last value wins, the
+/// same collapse mihomo's `orderedmap.Set` produces — only decides
+/// duplicates from non-literal sources: a programmatically built map
+/// (or `serde_yaml::from_str::<RawConfig>`, a test-only path with no
+/// production caller), or segments of one comma-mixed key expanding
+/// in place.
+///
+/// Warning: `IndexMap`'s `PartialEq` is order-INSENSITIVE — `==` cannot
+/// tell a pure key reorder apart from identity. Any comparison where
+/// order matters (e.g. `dns_inputs_equal` in meow-api) must compare
+/// `iter()` pairwise instead.
+pub type RawNameserverPolicy = IndexMap<String, RawNspValue>;
 
 /// `fallback-filter` YAML block.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]

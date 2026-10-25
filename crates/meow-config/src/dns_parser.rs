@@ -417,10 +417,16 @@ pub fn dns_needs_rule_providers(raw: &crate::raw::RawConfig) -> bool {
 /// lookup so background refreshes take effect automatically.
 /// Other prefixed patterns (anything with `:`) warn once and skip.
 ///
+/// `map` is a [`crate::raw::RawNameserverPolicy`]: its iteration order is
+/// the YAML document order, which IS the lookup priority — domain keys
+/// merge into the open `Domains` arm, `geosite:`/`rule-set:` keys append
+/// `Matcher` arms, and the first matching arm wins (mihomo
+/// `parseNameServerPolicy` + `makePolicy` parity).
+///
 /// An entry with no valid nameservers after skipping → hard error.
 /// Class A per ADR-0002: DNS leakage risk for internal/corporate domains.
 async fn build_nameserver_policy(
-    map: &HashMap<String, crate::raw::RawNspValue>,
+    map: &crate::raw::RawNameserverPolicy,
     geosite: Option<&Arc<meow_rules::geosite::GeositeDB>>,
     bootstrap_clients: &[Arc<DnsClient>],
     proxy_registry: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
@@ -1073,6 +1079,16 @@ mod tests {
         HostsValue::Many(ss.iter().map(std::string::ToString::to_string).collect())
     }
 
+    /// Build a `RawNameserverPolicy` from `(key, value)` pairs in the given
+    /// document order — key order IS the lookup priority, so list them the
+    /// way a YAML document would declare them.
+    fn nsp_map(entries: &[(&str, crate::raw::RawNspValue)]) -> crate::raw::RawNameserverPolicy {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
     fn addresses(entry: &HostEntry) -> &[IpAddr] {
         match entry {
             HostEntry::Addresses(ips) => ips,
@@ -1660,11 +1676,10 @@ mod tests {
     #[tokio::test]
     async fn parse_nameserver_policy_geosite_prefix_without_db_skips() {
         use crate::raw::RawNspValue;
-        let mut map = HashMap::new();
-        map.insert(
-            "geosite:cn".to_string(),
+        let map = nsp_map(&[(
+            "geosite:cn",
             RawNspValue::One("rcode://success".to_string()),
-        );
+        )]);
         let result =
             build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false).await;
         assert!(result.is_ok(), "geosite: prefix must not hard-error");
@@ -1683,11 +1698,10 @@ mod tests {
         db.insert("private", "lan");
         let db = Arc::new(db);
 
-        let mut map = HashMap::new();
-        map.insert(
-            "geosite:cn,private".to_string(),
+        let map = nsp_map(&[(
+            "geosite:cn,private",
             RawNspValue::One("rcode://success".to_string()),
-        );
+        )]);
         let pol = build_nameserver_policy(
             &map,
             Some(&db),
@@ -1708,12 +1722,11 @@ mod tests {
     #[tokio::test]
     async fn parse_nameserver_policy_all_invalid_urls_errors() {
         use crate::raw::RawNspValue;
-        let mut map = HashMap::new();
         // quic:// is explicitly rejected by the URL parser (QuicNotSupported error).
-        map.insert(
-            "corp.example".to_string(),
+        let map = nsp_map(&[(
+            "corp.example",
             RawNspValue::Many(vec!["quic://bad.example".to_string()]),
-        );
+        )]);
         let result =
             build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false).await;
         assert!(
@@ -1726,11 +1739,10 @@ mod tests {
     #[tokio::test]
     async fn parse_nameserver_policy_wildcard_inserted() {
         use crate::raw::RawNspValue;
-        let mut map = HashMap::new();
-        map.insert(
-            "+.corp.internal".to_string(),
+        let map = nsp_map(&[(
+            "+.corp.internal",
             RawNspValue::One("192.168.1.53".to_string()),
-        );
+        )]);
         let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
             .await
             .unwrap();
@@ -1744,11 +1756,10 @@ mod tests {
     #[tokio::test]
     async fn parse_nameserver_policy_star_key_single_label() {
         use crate::raw::RawNspValue;
-        let mut map = HashMap::new();
-        map.insert(
-            "*.corp.internal".to_string(),
+        let map = nsp_map(&[(
+            "*.corp.internal",
             RawNspValue::One("192.168.1.53".to_string()),
-        );
+        )]);
         let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
             .await
             .unwrap();
@@ -1774,11 +1785,10 @@ mod tests {
     #[tokio::test]
     async fn parse_nameserver_policy_dot_key_any_depth_no_apex() {
         use crate::raw::RawNspValue;
-        let mut map = HashMap::new();
-        map.insert(
-            ".corp.internal".to_string(),
+        let map = nsp_map(&[(
+            ".corp.internal",
             RawNspValue::One("192.168.1.53".to_string()),
-        );
+        )]);
         let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
             .await
             .unwrap();
@@ -1797,11 +1807,10 @@ mod tests {
     #[tokio::test]
     async fn parse_nameserver_policy_bare_key_stays_exact() {
         use crate::raw::RawNspValue;
-        let mut map = HashMap::new();
-        map.insert(
-            "corp.internal".to_string(),
+        let map = nsp_map(&[(
+            "corp.internal",
             RawNspValue::One("192.168.1.53".to_string()),
-        );
+        )]);
         let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
             .await
             .unwrap();
@@ -1846,11 +1855,10 @@ mod tests {
             "domain",
             vec!["example.cn".to_string(), "+.cn".to_string()],
         )]);
-        let mut map = HashMap::new();
-        map.insert(
-            "rule-set:cn".to_string(),
+        let map = nsp_map(&[(
+            "rule-set:cn",
             RawNspValue::One("rcode://success".to_string()),
-        );
+        )]);
         let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
             .await
             .unwrap();
@@ -1864,11 +1872,10 @@ mod tests {
     async fn parse_nameserver_policy_rule_set_missing_provider_errors() {
         use crate::raw::RawNspValue;
         let providers = HashMap::new();
-        let mut map = HashMap::new();
-        map.insert(
-            "rule-set:missing".to_string(),
+        let map = nsp_map(&[(
+            "rule-set:missing",
             RawNspValue::One("rcode://success".to_string()),
-        );
+        )]);
         let result =
             build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false).await;
         assert!(result.is_err());
@@ -1881,11 +1888,10 @@ mod tests {
     async fn parse_nameserver_policy_rule_set_ipcidr_behavior_errors() {
         use crate::raw::RawNspValue;
         let providers = inline_rule_providers(&[("ips", "ipcidr", vec!["10.0.0.0/8".to_string()])]);
-        let mut map = HashMap::new();
-        map.insert(
-            "rule-set:ips".to_string(),
+        let map = nsp_map(&[(
+            "rule-set:ips",
             RawNspValue::One("rcode://success".to_string()),
-        );
+        )]);
         let result =
             build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false).await;
         assert!(result.is_err());
@@ -1902,11 +1908,10 @@ mod tests {
             "classical",
             vec!["DOMAIN-SUFFIX,google.com".to_string()],
         )]);
-        let mut map = HashMap::new();
-        map.insert(
-            "rule-set:cls".to_string(),
+        let map = nsp_map(&[(
+            "rule-set:cls",
             RawNspValue::One("rcode://success".to_string()),
-        );
+        )]);
         let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
             .await
             .unwrap();
@@ -1922,11 +1927,10 @@ mod tests {
             ("a", "domain", vec!["a.example".to_string()]),
             ("b", "domain", vec!["b.example".to_string()]),
         ]);
-        let mut map = HashMap::new();
-        map.insert(
-            "rule-set:a,b".to_string(),
+        let map = nsp_map(&[(
+            "rule-set:a,b",
             RawNspValue::One("rcode://success".to_string()),
-        );
+        )]);
         let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
             .await
             .unwrap();
@@ -1940,15 +1944,219 @@ mod tests {
     async fn parse_nameserver_policy_rule_set_case_sensitive_provider_name() {
         use crate::raw::RawNspValue;
         let providers = inline_rule_providers(&[("CN", "domain", vec!["example.cn".to_string()])]);
-        let mut map = HashMap::new();
-        map.insert(
-            "rule-set:CN".to_string(),
+        let map = nsp_map(&[(
+            "rule-set:CN",
             RawNspValue::One("rcode://success".to_string()),
-        );
+        )]);
         let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
             .await
             .unwrap();
         assert!(pol.lookup("example.cn").is_some());
+    }
+
+    // Document order IS the lookup priority: two `rule-set:` keys covering
+    // the same domain resolve to the FIRST key's entry. The len probe —
+    // p1 carries one URL, p2 two — identifies the winner, and building the
+    // same map twice must give the same answer (HashMap iteration order
+    // made this a per-startup coin toss before).
+    #[tokio::test]
+    async fn parse_nameserver_policy_rule_set_document_order_picks_winner() {
+        use crate::raw::RawNspValue;
+        let providers = inline_rule_providers(&[
+            ("p1", "domain", vec!["+.shared.example".to_string()]),
+            ("p2", "domain", vec!["+.shared.example".to_string()]),
+        ]);
+        let map = nsp_map(&[
+            (
+                "rule-set:p1",
+                RawNspValue::One("rcode://success".to_string()),
+            ),
+            (
+                "rule-set:p2",
+                RawNspValue::Many(vec![
+                    "rcode://success".to_string(),
+                    "rcode://name_error".to_string(),
+                ]),
+            ),
+        ]);
+        for _ in 0..2 {
+            let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
+                .await
+                .unwrap();
+            let hit = pol.lookup("x.shared.example").expect("must match");
+            assert_eq!(
+                hit.nameservers.len(),
+                1,
+                "rule-set:p1 is written first → its single-URL entry must win"
+            );
+        }
+
+        // Flipping the document order flips the winner — the reversal is
+        // the proof the order is consumed, not just incidentally stable.
+        let reversed = nsp_map(&[
+            (
+                "rule-set:p2",
+                RawNspValue::Many(vec![
+                    "rcode://success".to_string(),
+                    "rcode://name_error".to_string(),
+                ]),
+            ),
+            (
+                "rule-set:p1",
+                RawNspValue::One("rcode://success".to_string()),
+            ),
+        ]);
+        let pol = build_nameserver_policy(&reversed, None, &[], &HashMap::new(), &providers, false)
+            .await
+            .unwrap();
+        let hit = pol.lookup("x.shared.example").expect("must match");
+        assert_eq!(
+            hit.nameservers.len(),
+            2,
+            "rule-set:p2 written first → its two-URL entry must win"
+        );
+    }
+
+    // A `rule-set:` key written BEFORE a `+.` key shadows it — matcher
+    // arms rank by document order, not below domain keys (mihomo
+    // `makePolicy` arm-list parity).
+    #[tokio::test]
+    async fn parse_nameserver_policy_rule_set_arm_shadows_later_domain_key() {
+        use crate::raw::RawNspValue;
+        let providers =
+            inline_rule_providers(&[("rs", "domain", vec!["+.shadow.example".to_string()])]);
+        let map = nsp_map(&[
+            (
+                "rule-set:rs",
+                RawNspValue::One("rcode://success".to_string()),
+            ),
+            (
+                "+.shadow.example",
+                RawNspValue::Many(vec![
+                    "rcode://success".to_string(),
+                    "rcode://name_error".to_string(),
+                ]),
+            ),
+        ]);
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
+            .await
+            .unwrap();
+        let hit = pol.lookup("x.shadow.example").expect("must match");
+        assert_eq!(
+            hit.nameservers.len(),
+            1,
+            "the earlier rule-set arm must shadow the later domain key"
+        );
+
+        // Same keys, reversed document order: the domain arm now wins.
+        let reversed = nsp_map(&[
+            (
+                "+.shadow.example",
+                RawNspValue::Many(vec![
+                    "rcode://success".to_string(),
+                    "rcode://name_error".to_string(),
+                ]),
+            ),
+            (
+                "rule-set:rs",
+                RawNspValue::One("rcode://success".to_string()),
+            ),
+        ]);
+        let pol = build_nameserver_policy(&reversed, None, &[], &HashMap::new(), &providers, false)
+            .await
+            .unwrap();
+        let hit = pol.lookup("x.shadow.example").expect("must match");
+        assert_eq!(
+            hit.nameservers.len(),
+            2,
+            "the earlier domain arm must win once order flips"
+        );
+    }
+
+    // A comma-mixed key expands in place: `"+.a.example,rule-set:rs"`
+    // produces a domain pattern followed by a matcher — the matcher arm
+    // lands BEFORE the next key's domain arm and still shadows it.
+    #[tokio::test]
+    async fn parse_nameserver_policy_comma_mixed_key_expands_in_place() {
+        use crate::raw::RawNspValue;
+        let providers = inline_rule_providers(&[("rs", "domain", vec!["+.b.example".to_string()])]);
+        let map = nsp_map(&[
+            (
+                "+.a.example,rule-set:rs",
+                RawNspValue::One("rcode://success".to_string()),
+            ),
+            (
+                "+.b.example",
+                RawNspValue::Many(vec![
+                    "rcode://success".to_string(),
+                    "rcode://name_error".to_string(),
+                ]),
+            ),
+        ]);
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
+            .await
+            .unwrap();
+        // `q.a.example` hits the first key's domain arm.
+        assert_eq!(pol.lookup("q.a.example").unwrap().nameservers.len(), 1);
+        // `q.b.example`: the Domains arm holding `+.a.example` misses, the
+        // matcher arm from the SAME key hits → the later `+.b.example`
+        // domain key (two URLs) is shadowed.
+        assert_eq!(
+            pol.lookup("q.b.example").unwrap().nameservers.len(),
+            1,
+            "the mixed key's matcher arm must shadow the later domain key"
+        );
+    }
+
+    // IndexMap-layer pin: a duplicate key folds to its first position
+    // with the LAST value — mihomo `OrderedMap.Set` semantics. This goes
+    // through `from_str::<RawConfig>` on purpose: every production
+    // ingest path uses `parse_raw_yaml`, whose serde_norway `Value`
+    // layer rejects a literal duplicate key (`duplicate entry`) before
+    // the map exists — the fold below is only reachable from
+    // non-literal sources.
+    #[tokio::test]
+    async fn parse_nameserver_policy_duplicate_key_folds_last_value_wins() {
+        let raw: crate::raw::RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver-policy:\n    '+.dup.example': rcode://success\n    '+.dup.example':\n      - rcode://success\n      - rcode://name_error\n",
+        )
+        .expect("duplicate keys must parse");
+        let map = raw.dns.unwrap().nameserver_policy.unwrap();
+        assert_eq!(map.len(), 1, "the duplicate key must fold");
+        assert_eq!(
+            map.get("+.dup.example").unwrap().as_urls().len(),
+            2,
+            "the last value must win"
+        );
+        // The folded entry still builds a working policy.
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
+            .await
+            .unwrap();
+        assert_eq!(pol.lookup("x.dup.example").unwrap().nameservers.len(), 2);
+    }
+
+    // Save path: serializing a raw config writes the policy keys back in
+    // document order — the old `HashMap` wrote them in arbitrary order,
+    // permanently reshuffling the document on every save.
+    #[test]
+    fn nameserver_policy_key_order_survives_save_roundtrip() {
+        let raw: crate::raw::RawConfig = serde_yaml::from_str(
+            "dns:\n  nameserver-policy:\n    '+.first.example': 1.1.1.1\n    'second.example': 2.2.2.2\n    'rule-set:x': 3.3.3.3\n",
+        )
+        .unwrap();
+        let yaml = serde_yaml::to_string(&raw).unwrap();
+        let i_first = yaml.find("+.first.example").unwrap();
+        let i_second = yaml.find("second.example").unwrap();
+        let i_third = yaml.find("rule-set:x").unwrap();
+        assert!(
+            i_first < i_second && i_second < i_third,
+            "keys must serialize in document order:\n{yaml}"
+        );
+        // A reparse of the saved document keeps the same order.
+        let raw2: crate::raw::RawConfig = serde_yaml::from_str(&yaml).unwrap();
+        let map2 = raw2.dns.unwrap().nameserver_policy.unwrap();
+        let keys: Vec<&String> = map2.keys().collect();
+        assert_eq!(keys, ["+.first.example", "second.example", "rule-set:x"]);
     }
 
     // Fallback-filter defaults when no raw config provided.
@@ -2150,11 +2358,10 @@ mod tests {
     /// (issue #533 review).
     #[tokio::test]
     async fn strict_rejects_geosite_policy_without_db() {
-        let mut map = HashMap::new();
-        map.insert(
-            "geosite:gfw".to_string(),
+        let map = nsp_map(&[(
+            "geosite:gfw",
             crate::raw::RawNspValue::One("8.8.8.8".to_string()),
-        );
+        )]);
         // Lenient: warn + entry skipped.
         build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
             .await
@@ -2172,11 +2379,10 @@ mod tests {
     /// (issue #533 review).
     #[tokio::test]
     async fn strict_rejects_unsupported_policy_prefix() {
-        let mut map = HashMap::new();
-        map.insert(
-            "geoip:cn".to_string(),
+        let map = nsp_map(&[(
+            "geoip:cn",
             crate::raw::RawNspValue::One("8.8.8.8".to_string()),
-        );
+        )]);
         build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
             .await
             .expect("lenient skips unknown prefixes");
@@ -2186,6 +2392,50 @@ mod tests {
             panic!("strict must reject an unsupported policy prefix");
         };
         assert!(err.to_string().contains("geoip"), "unexpected: {err}");
+    }
+
+    /// With several defective keys strict reports the FIRST one in
+    /// document order — the `IndexMap` carrier makes the error
+    /// deterministic (the old HashMap carrier picked one at random).
+    /// Build the same two bad keys in both orders and assert the
+    /// reported key follows the document.
+    #[tokio::test]
+    async fn strict_policy_error_reports_first_defective_key_in_document_order() {
+        let v = || crate::raw::RawNspValue::One("8.8.8.8".to_string());
+
+        let Err(err) = build_nameserver_policy(
+            &nsp_map(&[("geoip:cn", v()), ("geosite:gfw", v())]),
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+        )
+        .await
+        else {
+            panic!("strict must reject the defective policy");
+        };
+        assert!(
+            err.to_string().contains("'geoip:cn'"),
+            "first documented defective key must error first: {err}"
+        );
+
+        let Err(err) = build_nameserver_policy(
+            &nsp_map(&[("geosite:gfw", v()), ("geoip:cn", v())]),
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+        )
+        .await
+        else {
+            panic!("strict must reject the defective policy");
+        };
+        assert!(
+            err.to_string().contains("'geosite:gfw'"),
+            "reversing the document must reverse the reported key: {err}"
+        );
     }
 
     /// `fallback-filter.ipcidr` with an unparseable CIDR and a `hosts:`

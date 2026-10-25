@@ -13,7 +13,9 @@
 //!
 //! Semantics (unchanged): `exact` beats `*.` (one extra label) beats `.`
 //! (any depth) at the deepest matching node; `+.x` is `*.x` and `.x`
-//! together; first insert wins per (node, kind).
+//! together; first insert wins per (node, kind) under [`DomainTrie::insert`]
+//! — [`DomainTrie::insert_overwrite`] makes the LAST insert win instead
+//! (mihomo `node.setData` parity, used by the nameserver-policy builder).
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -40,6 +42,18 @@ enum MatchKind {
     Exact,
     Star,
     Dot,
+}
+
+/// Slot-write policy distinguishing [`DomainTrie::insert`] from
+/// [`DomainTrie::insert_overwrite`].
+#[derive(Clone, Copy)]
+enum InsertMode {
+    /// `Option::get_or_insert`: the first insert into a (node, kind) slot
+    /// wins; later inserts into the same slot are dropped.
+    FirstWins,
+    /// Direct assignment: the last insert into a slot wins — mihomo's
+    /// `node.setData` overwrite semantics.
+    Overwrite,
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +461,41 @@ impl<T: Clone + 'static> DomainTrie<T> {
         }
     }
 
+    /// Insert `data` under `domain`; when a key lands on an
+    /// already-occupied (node, kind) slot the FIRST insert wins.
+    ///
+    /// Trailing dots are not stripped on the insert side (`search`
+    /// trims them from queries): a key like `x.` builds an empty-label
+    /// node no query can ever reach — normalize it away if trailing
+    /// dots can appear.
+    ///
+    /// Insert-side case folding is `str::to_lowercase` (full Unicode),
+    /// while `search`'s case-insensitive path folds ASCII only — a key
+    /// like `Ä.x` is stored as `ä.x`, so a query containing `Ä` misses
+    /// and already-lowercase `ä.x` hits (inherited asymmetry; real IDN
+    /// input arrives as punycode).
+    ///
+    /// On a sealed trie the call is a silent no-op that still returns
+    /// `true` and bumps the internal `len` counter — `is_empty` can
+    /// then report `false` for a trie whose writes were all dropped
+    /// (inherited accounting quirk: finish inserting before `seal`).
     pub fn insert(&mut self, domain: &str, data: T) -> bool {
+        self.insert_inner(domain, data, InsertMode::FirstWins)
+    }
+
+    /// Like [`Self::insert`] — same validation, same lowercasing, same `+.`
+    /// dual-slot write — except a collision on a (node, kind) slot is won
+    /// by the LAST insert (direct overwrite; mihomo `node.setData`
+    /// parity). The nameserver-policy builder uses this so that two keys
+    /// colliding on one slot resolve to the document-last key.
+    ///
+    /// Like [`Self::insert`], a call on a sealed trie is silently
+    /// ignored — it still returns `true` and bumps `len`, though.
+    pub fn insert_overwrite(&mut self, domain: &str, data: T) -> bool {
+        self.insert_inner(domain, data, InsertMode::Overwrite)
+    }
+
+    fn insert_inner(&mut self, domain: &str, data: T, mode: InsertMode) -> bool {
         let trimmed = domain.trim();
         let lowered: Cow<'_, str> = if trimmed
             .bytes()
@@ -470,8 +518,8 @@ impl<T: Clone + 'static> DomainTrie<T> {
             if rest.is_empty() {
                 return false;
             }
-            self.insert_into_tree(rest, data.clone(), MatchKind::Exact);
-            self.insert_into_tree(rest, data, MatchKind::Dot);
+            self.insert_into_tree(rest, data.clone(), MatchKind::Exact, mode);
+            self.insert_into_tree(rest, data, MatchKind::Dot, mode);
             self.len += 2;
             return true;
         }
@@ -480,7 +528,7 @@ impl<T: Clone + 'static> DomainTrie<T> {
             if rest.is_empty() {
                 return false;
             }
-            self.insert_into_tree(rest, data, MatchKind::Star);
+            self.insert_into_tree(rest, data, MatchKind::Star, mode);
             self.len += 1;
             return true;
         }
@@ -489,17 +537,17 @@ impl<T: Clone + 'static> DomainTrie<T> {
             if rest.is_empty() {
                 return false;
             }
-            self.insert_into_tree(rest, data, MatchKind::Dot);
+            self.insert_into_tree(rest, data, MatchKind::Dot, mode);
             self.len += 1;
             return true;
         }
 
-        self.insert_into_tree(domain, data, MatchKind::Exact);
+        self.insert_into_tree(domain, data, MatchKind::Exact, mode);
         self.len += 1;
         true
     }
 
-    fn insert_into_tree(&mut self, base_domain: &str, value: T, kind: MatchKind) {
+    fn insert_into_tree(&mut self, base_domain: &str, value: T, kind: MatchKind, mode: InsertMode) {
         let TrieState::Building(builder) = &mut self.state else {
             return;
         };
@@ -509,15 +557,17 @@ impl<T: Clone + 'static> DomainTrie<T> {
             node = builder.child_or_insert(node, label);
         }
         let slot = &mut builder.nodes[node as usize];
-        match kind {
-            MatchKind::Exact => {
-                slot.exact.get_or_insert(value);
+        let slot = match kind {
+            MatchKind::Exact => &mut slot.exact,
+            MatchKind::Star => &mut slot.star,
+            MatchKind::Dot => &mut slot.dot,
+        };
+        match mode {
+            InsertMode::FirstWins => {
+                slot.get_or_insert(value);
             }
-            MatchKind::Star => {
-                slot.star.get_or_insert(value);
-            }
-            MatchKind::Dot => {
-                slot.dot.get_or_insert(value);
+            InsertMode::Overwrite => {
+                *slot = Some(value);
             }
         }
     }
@@ -1034,6 +1084,74 @@ mod tests {
         assert_eq!(trie.search("example.com"), Some(&1));
         assert_eq!(trie.search("foo.example.com"), Some(&2));
         assert_eq!(trie.search("a.b.example.com"), Some(&3));
+        assert_eq!(trie.search("other.com"), None);
+    }
+
+    #[test]
+    fn insert_overwrite_last_writer_wins_same_slot() {
+        // `+.x` writes BOTH the Exact and the Dot slot of `x`, so `x` and
+        // `+.x` collide on the Exact slot — under overwrite mode the
+        // document-last key wins it.
+        let mut trie = DomainTrie::new();
+        trie.insert_overwrite("example.com", 1);
+        trie.insert_overwrite("+.example.com", 2);
+        assert_eq!(trie.search("example.com"), Some(&2));
+        assert_eq!(trie.search("a.example.com"), Some(&2));
+
+        let mut trie = DomainTrie::new();
+        trie.insert_overwrite("+.example.com", 2);
+        trie.insert_overwrite("example.com", 1);
+        assert_eq!(trie.search("example.com"), Some(&1));
+        assert_eq!(trie.search("a.example.com"), Some(&2));
+
+        // `.x` and `+.x` collide on the Dot slot.
+        let mut trie = DomainTrie::new();
+        trie.insert_overwrite(".example.com", 1);
+        trie.insert_overwrite("+.example.com", 2);
+        assert_eq!(trie.search("a.example.com"), Some(&2));
+        assert_eq!(trie.search("example.com"), Some(&2));
+    }
+
+    #[test]
+    fn insert_overwrite_does_not_change_insert_semantics() {
+        // Mixing modes: `insert` keeps first-wins even against a slot an
+        // `insert_overwrite` wrote; `insert_overwrite` overwrites a slot an
+        // `insert` wrote.
+        let mut trie = DomainTrie::new();
+        trie.insert_overwrite("example.com", 1);
+        trie.insert("example.com", 2);
+        assert_eq!(trie.search("example.com"), Some(&1));
+
+        let mut trie = DomainTrie::new();
+        trie.insert("example.com", 2);
+        trie.insert_overwrite("example.com", 1);
+        assert_eq!(trie.search("example.com"), Some(&1));
+    }
+
+    #[test]
+    fn insert_overwrite_validates_and_lowercases_like_insert() {
+        let mut trie = DomainTrie::new();
+        assert!(!trie.insert_overwrite("", 1));
+        assert!(!trie.insert_overwrite("+.", 1));
+        assert!(!trie.insert_overwrite("*.", 1));
+        assert!(!trie.insert_overwrite(".", 1));
+        assert!(trie.is_empty());
+
+        assert!(trie.insert_overwrite("Example.COM", 1));
+        assert_eq!(trie.search("example.com"), Some(&1));
+        assert_eq!(trie.search("EXAMPLE.COM"), Some(&1));
+    }
+
+    #[test]
+    fn insert_overwrite_ignored_after_seal() {
+        // Same convention as `insert`: a sealed trie silently ignores
+        // further inserts — the doc comment on `insert_overwrite` pins it.
+        let mut trie = DomainTrie::new();
+        trie.insert("example.com", 1);
+        trie.seal();
+        trie.insert_overwrite("example.com", 2);
+        trie.insert_overwrite("other.com", 3);
+        assert_eq!(trie.search("example.com"), Some(&1));
         assert_eq!(trie.search("other.com"), None);
     }
 }

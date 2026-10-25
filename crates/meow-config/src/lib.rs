@@ -780,6 +780,10 @@ pub(crate) fn unique_scratch_path(path: &Path) -> PathBuf {
 /// *order* is only guaranteed when callers serialize under the
 /// `CONFIG_MUTATION` lane (meow-api) — an unsynchronized pair can still
 /// land an older document's rename last (issue #543).
+///
+/// The output is a full `RawConfig` serialization: serde_yaml emits
+/// `key: null` for every unset `Option` field, so a saved file is
+/// noisier than the hand-edited original (pre-existing shape).
 pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_yaml::to_string(raw)?;
     // Scratch files orphaned by a crash between create and rename
@@ -899,6 +903,33 @@ mod save_scratch_tests {
             leftovers(dir.path()).is_empty(),
             "no scratch survives a successful save storm"
         );
+    }
+
+    /// `nameserver-policy` key order is the lookup priority — saving must
+    /// write it back in document order (the old `HashMap` wrote an
+    /// arbitrary order and permanently reshuffled the file each save).
+    #[test]
+    fn save_preserves_nameserver_policy_key_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            "mode: rule\ndns:\n  nameserver-policy:\n    '+.first.example': 1.1.1.1\n    'second.example': 2.2.2.2\n    'rule-set:x': 3.3.3.3\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        save_raw_config(path.to_str().unwrap(), &raw).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let i_first = saved.find("+.first.example").unwrap();
+        let i_second = saved.find("second.example").unwrap();
+        let i_third = saved.find("rule-set:x").unwrap();
+        assert!(
+            i_first < i_second && i_second < i_third,
+            "saved document must keep the policy key order:\n{saved}"
+        );
+        // And a reload of the saved file yields the same order.
+        let reloaded: raw::RawConfig = serde_yaml::from_str(&saved).unwrap();
+        let map = reloaded.dns.unwrap().nameserver_policy.unwrap();
+        let keys: Vec<&String> = map.keys().collect();
+        assert_eq!(keys, ["+.first.example", "second.example", "rule-set:x"]);
     }
 
     #[test]
