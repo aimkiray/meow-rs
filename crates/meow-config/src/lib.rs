@@ -5151,7 +5151,10 @@ mod dialer_proxy_tests {
     /// doesn't silently rebind a name.
     #[test]
     fn duplicate_leaf_name_warns() {
-        // Scoped WARN capture — `with_default` is thread-local.
+        // Scoped WARN capture — `with_default` is thread-local. The
+        // discard subscriber keeps a bare-thread `warn!` from caching
+        // `Interest::never` on this callsite under our scope.
+        crate::test_support::install_global_discard_subscriber();
         #[derive(Clone)]
         struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {

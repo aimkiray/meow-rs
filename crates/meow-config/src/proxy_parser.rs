@@ -4567,8 +4567,11 @@ tls: true
     const LB_UNKNOWN_PROVIDER_WARN: &str = "proxy-provider 'airport' not found";
 
     /// Scoped WARN capture — `with_default` is thread-local, so parallel tests
-    /// in this binary don't see each other's lines.
+    /// in this binary don't see each other's lines. The discard subscriber
+    /// keeps a bare-thread `warn!` from caching `Interest::never` on the
+    /// callsites under capture.
     fn capture_warns<R>(f: impl FnOnce() -> R) -> (R, String) {
+        crate::test_support::install_global_discard_subscriber();
         #[derive(Clone)]
         struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {

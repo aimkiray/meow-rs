@@ -83,6 +83,27 @@ pub(crate) async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     panic!("timed out waiting for: {what}");
 }
 
+/// `tracing` caches per-callsite `Interest` process-globally, and any
+/// `with_default` enter/exit rebuilds that cache. A `warn!` evaluated on
+/// a parallel test thread while no subscriber is active then caches
+/// `Interest::never` — and the event is dropped *even inside a later
+/// `with_default` scope*, which flakes the scoped warn-capture tests.
+/// Installing a discarding GLOBAL default once makes bare threads
+/// register `always`/`never` under it instead, so a `never` can only
+/// stick for callsites this level would filter anyway. `WARN` matches
+/// every capture site; raise it if a test ever captures below WARN.
+/// `set_global_default` is once-per-process — later calls fail and are
+/// ignored.
+pub(crate) fn install_global_discard_subscriber() {
+    let _ = tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish(),
+    );
+}
+
 /// The process-wide logbook, installed in a temporary directory for one
 /// test at a time and uninstalled on drop. Tests that do not take it record
 /// into it meanwhile, so a test reads its own subjects only.

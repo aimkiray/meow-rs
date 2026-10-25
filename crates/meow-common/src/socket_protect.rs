@@ -128,6 +128,38 @@ fn in_host_resolver() -> bool {
     IN_HOST_RESOLVER.try_with(|()| ()).is_ok()
 }
 
+tokio::task_local! {
+    /// Set for the duration of a `proxy.dial_tcp` call made by a
+    /// DNS-via-proxy exchange (`meow_dns::client::DnsClient`). See
+    /// [`in_dns_via_proxy_dial`] for why.
+    static IN_DNS_VIA_PROXY_DIAL: ();
+}
+
+/// True when the current task is inside a proxy dial issued by a
+/// DNS-via-proxy exchange.
+///
+/// `IN_HOST_RESOLVER` only covers the `resolve_addrs` hook path: a
+/// `#PROXY`-tagged nameserver whose adapter resolves its target through
+/// `Resolver::resolve_ips` directly (e.g. `DirectAdapter`'s injected
+/// resolver) is not inside a hook call, so the fence above cannot see the
+/// re-entry. The DNS exchange therefore marks the whole `proxy.dial_tcp`
+/// with this task-local; `Resolver::resolve_ips` checks it at entry and,
+/// instead of running the upstream pipeline — whose single-flight
+/// `inflight` entry the outer lookup may already hold — answers from
+/// `resolve_ips_local` (`hosts:` + cache) and falls back to the system
+/// resolver on a miss. `#DIRECT` + domain upstream stays a degraded
+/// configuration (the proxy resolves locally anyway); IP-literal
+/// upstreams are unaffected.
+pub fn in_dns_via_proxy_dial() -> bool {
+    IN_DNS_VIA_PROXY_DIAL.try_with(|()| ()).is_ok()
+}
+
+/// Run `fut` with the [`in_dns_via_proxy_dial`] task-local set — the DNS
+/// client's counterpart of `resolve_via_hook`'s `IN_HOST_RESOLVER` scope.
+pub async fn dns_via_proxy_dial_scope<F: std::future::Future>(fut: F) -> F::Output {
+    IN_DNS_VIA_PROXY_DIAL.scope((), fut).await
+}
+
 // ─── System-resolver result cache (Android / iOS only) ─────────────────────
 //
 // Backstop for the path that still hits libc `getaddrinfo` (no `HostResolver`

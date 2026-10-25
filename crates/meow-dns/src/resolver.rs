@@ -52,12 +52,6 @@ pub enum BootstrapError {
     },
     #[error("nameserver '{nameserver}' references proxy '{proxy}', which is not defined")]
     UnknownProxy { nameserver: String, proxy: String },
-    #[error(
-        "nameserver '{nameserver}' uses proxy '{proxy}' on a tls:///https:// entry; \
-        DoT/DoH routing through a proxy is not implemented yet — use plain udp:// or tcp:// \
-        (issue #67 phase 2 follow-up)"
-    )]
-    EncryptedProxyUnsupported { nameserver: String, proxy: String },
 }
 
 /// Broadcast channel used to share a singleflight lookup result.
@@ -360,15 +354,6 @@ fn clamp_ttl(raw: Duration) -> Duration {
     const MIN_TTL: Duration = Duration::from_secs(10);
     const MAX_TTL: Duration = Duration::from_secs(3600);
     raw.clamp(MIN_TTL, MAX_TTL)
-}
-
-fn host_or_ip_to_addr(addr: &HostOrIp, resolved: &HashMap<String, IpAddr>) -> IpAddr {
-    match addr {
-        HostOrIp::Ip(ip) => *ip,
-        HostOrIp::Host(h) => *resolved
-            .get(h)
-            .expect("bootstrap must resolve all hostnames"),
-    }
 }
 
 fn url_to_plain_socketaddr(url: &NameServerUrl) -> SocketAddr {
@@ -901,36 +886,43 @@ impl Resolver {
         skip_bootstrap: bool,
     ) -> Result<Self, BootstrapError> {
         // ── Validate proxy references up front so misconfig fails loud.
-        // `default_ns` entries are forbidden from carrying #PROXY — they
-        // are the bootstrap path that resolves the proxy server's own
+        // `default_ns` entries are forbidden from carrying a proxy tag —
+        // they are the bootstrap path that resolves the proxy server's own
         // hostname, so routing them through a proxy would create the
         // chicken-and-egg loop ADR-0012 warns about.
         for entry in &default_ns {
             if let Some(p) = entry.proxy.as_ref() {
                 return Err(BootstrapError::UnknownProxy {
                     nameserver: entry.url.to_string(),
-                    proxy: format!("{p} (default-nameserver may not use #PROXY)"),
+                    proxy: format!("{p} (default-nameserver may not use #PROXY or ?proxy=)"),
                 });
             }
         }
         for entry in main_urls.iter().chain(fallback_urls.iter()) {
-            let Some(p) = entry.proxy.as_ref() else {
+            if let Some(p) = entry.proxy.as_ref() {
+                if !proxy_registry.contains_key(p.as_str()) {
+                    return Err(BootstrapError::UnknownProxy {
+                        nameserver: entry.url.to_string(),
+                        proxy: p.clone(),
+                    });
+                }
                 continue;
-            };
-            if matches!(
-                entry.url,
-                NameServerUrl::Tls { .. } | NameServerUrl::Https { .. }
-            ) {
-                return Err(BootstrapError::EncryptedProxyUnsupported {
-                    nameserver: entry.url.to_string(),
-                    proxy: p.clone(),
-                });
             }
-            if !proxy_registry.contains_key(p.as_str()) {
-                return Err(BootstrapError::UnknownProxy {
-                    nameserver: entry.url.to_string(),
-                    proxy: p.clone(),
-                });
+            // Migration aid: `#name` on a tls:///https:// entry is SNI
+            // here, not a proxy name — a config migrated from mihomo that
+            // meant `#X` as a proxy tag silently loses its routing intent
+            // when `X` happens to be a real proxy name. Warn loudly so the
+            // user can switch to `?proxy=X`.
+            let sni = match &entry.url {
+                NameServerUrl::Tls { sni, .. } | NameServerUrl::Https { sni, .. } => sni.as_str(),
+                _ => continue,
+            };
+            if proxy_registry.contains_key(sni) {
+                tracing::warn!(
+                    "nameserver '{entry}' looks like it tags proxy '{sni}' with '#': \
+                     `#X` on encrypted entries is SNI — did you mean `?proxy=X`?",
+                    entry = entry.url
+                );
             }
         }
 
@@ -967,8 +959,20 @@ impl Resolver {
         // Policy resolvers are pre-built by the caller with IP literals.
         let mut hostnames_needing_bootstrap: BTreeSet<String> = BTreeSet::new();
         let mut first_encrypted_with_hostname: Option<String> = None;
-        for url in main_urls.iter().chain(fallback_urls.iter()) {
+        for (url, proxy) in main_urls
+            .iter()
+            .zip(main_proxies.iter())
+            .chain(fallback_urls.iter().zip(fallback_proxies.iter()))
+        {
             if let Some(host) = url.needs_bootstrap() {
+                // A proxied hostname upstream is resolved *remotely* by
+                // the proxy (mihomo `newDNSDialer` semantics) — the local
+                // bootstrap path never needs its IP, and trying to get one
+                // would defeat the point (the name may be unresolvable
+                // locally by design).
+                if proxy.is_some() {
+                    continue;
+                }
                 if first_encrypted_with_hostname.is_none()
                     && matches!(url, NameServerUrl::Tls { .. } | NameServerUrl::Https { .. })
                 {
@@ -1125,17 +1129,53 @@ impl Resolver {
     /// Like [`Resolver::build_single_resolver`] but also attaches an optional
     /// proxy adapter so queries route via `proxy.dial_tcp` (issue #67
     /// phase 2). Pass `None` to get the unrouted client.
+    ///
+    /// A proxied upstream whose configured address is a **hostname** keeps
+    /// the hostname in `DnsClient::proxy_target` (remote resolution by the
+    /// proxy) and gets an unroutable placeholder `SocketAddr` — nothing
+    /// ever dials it because every proxied exchange goes through
+    /// `proxy.dial_tcp` with `Metadata.host` = the domain.
     pub fn build_single_resolver_with_proxy(
         url: &NameServerUrl,
         resolved: &HashMap<String, IpAddr>,
         proxy: Option<Arc<dyn meow_common::Proxy>>,
     ) -> Arc<DnsClient> {
-        let socket_addr = match url {
+        let (socket_addr, proxy_target) = match url {
             NameServerUrl::Udp { addr, port }
             | NameServerUrl::Tcp { addr, port }
             | NameServerUrl::Tls { addr, port, .. }
             | NameServerUrl::Https { addr, port, .. } => {
-                SocketAddr::new(host_or_ip_to_addr(addr, resolved), *port)
+                let proxy_target = match (addr, proxy.is_some()) {
+                    (HostOrIp::Host(host), true) => Some((Arc::from(host.as_str()), *port)),
+                    _ => None,
+                };
+                let ip = match addr {
+                    HostOrIp::Ip(ip) => *ip,
+                    // A proxied hostname's dial target lives in
+                    // `proxy_target` — `proxy_dial` consults it first and
+                    // this socket addr is never dialed, so it always gets
+                    // the TEST-NET-1 placeholder even when `resolved`
+                    // happens to carry a real IP for the same name (a
+                    // non-proxied entry may share the hostname).
+                    HostOrIp::Host(_) if proxy_target.is_some() => {
+                        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))
+                    }
+                    HostOrIp::Host(host) => resolved.get(host).copied().unwrap_or_else(|| {
+                        // Reaching this arm is a bug — non-proxied
+                        // hostnames were either resolved in the bootstrap
+                        // map or rejected upstream, and proxied ones took
+                        // the placeholder arm above. RFC 5737 TEST-NET-1:
+                        // strictly unroutable, so a bug that reaches a
+                        // *direct* dial fails fast rather than silently
+                        // contacting 0.0.0.0/localhost.
+                        debug_assert!(
+                            proxy.is_some(),
+                            "non-proxied nameserver hostname '{host}' escaped bootstrap"
+                        );
+                        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))
+                    }),
+                };
+                (SocketAddr::new(ip, *port), proxy_target)
             }
             NameServerUrl::RCode { code, .. } => {
                 let client = DnsClient::rcode(*code);
@@ -1186,9 +1226,10 @@ impl Resolver {
             Some(label) => client.with_upstream_label(label),
             None => client,
         };
-        let client = match proxy {
-            Some(p) => client.with_proxy(p),
-            None => client,
+        let client = match (proxy, proxy_target) {
+            (Some(p), Some((host, port))) => client.with_proxy(p).with_proxy_target(host, port),
+            (Some(p), None) => client.with_proxy(p),
+            (None, _) => client,
         };
         Arc::new(client)
     }
@@ -1204,6 +1245,31 @@ impl Resolver {
     /// `is_local_resource_error` intact instead of decaying into a
     /// "host unresolvable" member-health failure (#682).
     pub async fn resolve_ips(&self, host: &str) -> io::Result<Option<Vec<IpAddr>>> {
+        // A DNS-via-proxy exchange dialing through a resolver-injected
+        // adapter (e.g. `#DIRECT` whose `DirectAdapter` resolves its dial
+        // target through this very resolver) re-enters here *inside* the
+        // outer lookup — which may already hold this name's single-flight
+        // `inflight` entry. Running the upstream pipeline would deadlock
+        // the query that issued the dial. Answer from what the resolver
+        // already knows (`hosts:` + cache) and otherwise fall back to the
+        // system resolver: a proxied nameserver's domain is resolved
+        // remotely anyway, so this path only serves adapter dial targets.
+        if meow_common::socket_protect::in_dns_via_proxy_dial() {
+            if let Some(ips) = self.resolve_ips_local(host) {
+                return Ok(Some(ips));
+            }
+            let mut ips: Vec<IpAddr> = tokio::net::lookup_host((host, 0u16))
+                .await?
+                .map(|addr| addr.ip())
+                .collect();
+            ips.sort();
+            ips.dedup();
+            // The same family gate as every other `resolve_ips` exit:
+            // under `ipv6: false` an AAAA answer from the system resolver
+            // must not leak into the adapter's dial set, and a fully
+            // filtered answer is `None`, not `Some(vec![])`.
+            return Ok(self.filter_enabled_ips(&ips));
+        }
         let lookup_host = if self.use_hosts {
             match self.lookup_hosts_entry(host) {
                 Some(HostsLookup::Addresses(ips)) => {
@@ -2318,6 +2384,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "encrypted")]
     #[test]
     fn build_single_resolver_preserves_configured_dot_label() {
         let url = NameServerUrl::parse("tls://dns.google:853").unwrap();
@@ -2332,6 +2399,7 @@ mod tests {
         assert_eq!(client.upstream_label(), "tls://dns.google");
     }
 
+    #[cfg(feature = "encrypted")]
     #[test]
     fn build_single_resolver_preserves_configured_dot_sni_label() {
         let url = NameServerUrl::parse("tls://8.8.8.8:853#dns.google").unwrap();
@@ -2342,6 +2410,7 @@ mod tests {
         assert_eq!(client.upstream_label(), "tls://8.8.8.8#dns.google");
     }
 
+    #[cfg(feature = "encrypted")]
     #[test]
     fn build_single_resolver_preserves_configured_doh_label() {
         let url = NameServerUrl::parse("https://1.1.1.1/dns-query#cloudflare-dns.com").unwrap();
@@ -3440,6 +3509,7 @@ mod tests {
 
     // B2: IP-literal upstreams → bootstrap never called, even with empty default_ns.
     // Upstream: Go mihomo still attempts bootstrap for IP-literal entries. NOT a call here.
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn bootstrap_ip_literal_shortcircuits() {
         let main = vec![
@@ -3466,6 +3536,7 @@ mod tests {
     }
 
     // B5: Tls hostname in default_ns → DefaultNameserverNotPlain (bootstrap loop).
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn bootstrap_rejects_encrypted_hostname_default_ns() {
         let default_ns = vec![NameServerUrl::parse("tls://dns.google:853").unwrap()];
@@ -3490,6 +3561,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn bootstrap_rejects_plain_hostname_default_ns() {
         let default_ns = vec![NameServerUrl::parse("dns.google").unwrap()];
@@ -3514,6 +3586,7 @@ mod tests {
     }
 
     // B5b: Tls IP-literal in default_ns → accepted (no bootstrap loop).
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn bootstrap_accepts_encrypted_ip_literal_default_ns() {
         let default_ns = vec![NameServerUrl::parse("tls://8.8.8.8:853#dns.google").unwrap()];
@@ -3537,6 +3610,7 @@ mod tests {
     }
 
     // B6: Https hostname in default_ns → same error.
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn bootstrap_rejects_https_hostname_in_default_ns() {
         let default_ns =
@@ -3563,6 +3637,7 @@ mod tests {
     }
 
     // B6b: Https IP-literal in default_ns → accepted.
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn bootstrap_accepts_https_ip_literal_default_ns() {
         let default_ns =
@@ -3587,6 +3662,7 @@ mod tests {
     }
 
     // B7: tcp:// in default_ns is accepted (useful behind middleboxes blocking UDP/53).
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn bootstrap_accepts_tcp_in_default_ns() {
         let default_ns = vec![NameServerUrl::parse("tcp://8.8.8.8:53").unwrap()];
@@ -3611,6 +3687,7 @@ mod tests {
     // system DNS (mihomo-compat, issue #201 item 3) instead of hard-erroring.
     // Outcome is network-dependent: Ok when the system resolvers answer, or
     // CannotResolve when offline. We must never see a DefaultNameserver* error.
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn bootstrap_falls_back_to_system_dns_when_encrypted_has_hostname() {
         let main = vec![NameServerUrl::parse("https://cloudflare-dns.com/dns-query").unwrap()];
@@ -3635,6 +3712,7 @@ mod tests {
     }
 
     // B9: encrypted IP-literal with empty default_ns → Ok.
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn bootstrap_ok_encrypted_ip_literal_empty_default_ns() {
         let main = vec![NameServerUrl::parse("tls://8.8.8.8:853#dns.google").unwrap()];
@@ -3656,6 +3734,7 @@ mod tests {
 
     // C8: a fallback (not just main) encrypted hostname with empty default_ns
     // also bootstraps via system DNS rather than erroring (issue #201 item 3).
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn bootstrap_falls_back_to_system_dns_when_fallback_encrypted_has_hostname() {
         let main = vec![NameServerUrl::parse("8.8.8.8").unwrap()];
@@ -4270,5 +4349,268 @@ mod tests {
             ),
         ];
         assert_eq!(resolver.resolve_ips("gone.example").await.unwrap(), None);
+    }
+
+    // ─── `?proxy=` DNS-via-proxy — issue #67 phase 2, ADR-0012 ────────
+
+    fn stub_proxy_registry() -> HashMap<SmolStr, Arc<dyn meow_common::Proxy>> {
+        let mut registry: HashMap<SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
+        registry.insert(
+            SmolStr::from("P"),
+            Arc::new(ErrnoProxy {
+                health: meow_common::ProxyHealth::new(),
+                gate: None,
+                dials: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        registry
+    }
+
+    /// A `?proxy=` encrypted *hostname* upstream skips bootstrap
+    /// entirely: `.invalid` is unresolvable by definition (RFC 2606), so
+    /// a successful build proves the name was left for remote resolution
+    /// by the proxy. The client itself must carry the adapter.
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn bootstrap_skips_proxied_encrypted_hostname() {
+        let registry = stub_proxy_registry();
+        let main = vec![
+            NameServerEntry::parse("tls://unresolvable.invalid?proxy=P").unwrap(),
+            NameServerEntry::parse("8.8.8.8").unwrap(),
+        ];
+        let resolver = Resolver::new_with_bootstrap_with_proxies(
+            main,
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            true,
+            false,
+            None,
+            None,
+            &registry,
+            false,
+        )
+        .await
+        .expect("proxied hostname upstream must not require bootstrap");
+        assert_eq!(resolver.main.len(), 2);
+        assert!(resolver.main[0].is_proxied());
+        assert!(!resolver.main[1].is_proxied());
+    }
+
+    /// `?proxy=` on an IP-literal encrypted upstream wires the adapter
+    /// the same way — only the bootstrap path differs (nothing to skip).
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn encrypted_ip_literal_with_query_proxy_is_proxied() {
+        let registry = stub_proxy_registry();
+        let main = vec![NameServerEntry::parse("tls://8.8.8.8?proxy=P").unwrap()];
+        let resolver = Resolver::new_with_bootstrap_with_proxies(
+            main,
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            true,
+            false,
+            None,
+            None,
+            &registry,
+            false,
+        )
+        .await
+        .expect("build must succeed");
+        assert!(resolver.main[0].is_proxied());
+    }
+
+    /// `default-nameserver` continues to reject *every* proxy spelling —
+    /// it is the bootstrap path for the proxy server's own hostname, so
+    /// routing it through a proxy would be chicken-and-egg (ADR-0012).
+    #[tokio::test]
+    async fn default_nameserver_rejects_proxy_tags() {
+        let registry = stub_proxy_registry();
+        // The `tls://` arm needs `encrypted` to parse at all; the plain
+        // `#P` arm exercises the same rejection under every feature set.
+        let cases: &[&str] = if cfg!(feature = "encrypted") {
+            &["1.1.1.1#P", "tls://1.1.1.1?proxy=P"]
+        } else {
+            &["1.1.1.1#P"]
+        };
+        for &entry_str in cases {
+            let default_ns = vec![NameServerEntry::parse(entry_str).unwrap()];
+            let err = Resolver::new_with_bootstrap_with_proxies(
+                vec![],
+                vec![],
+                default_ns,
+                DnsMode::Normal,
+                DomainTrie::new(),
+                true,
+                true,
+                None,
+                None,
+                &registry,
+                false,
+            )
+            .await
+            .err()
+            .expect("default-nameserver must reject a proxy tag");
+            assert!(
+                matches!(err, BootstrapError::UnknownProxy { .. }),
+                "{entry_str}: expected UnknownProxy, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("#PROXY or ?proxy="),
+                "{entry_str}: error must name both spellings: {err}"
+            );
+        }
+    }
+
+    /// An unknown `?proxy=` name is `UnknownProxy` exactly like an
+    /// unknown `#PROXY` name — all four DNS layers share that contract.
+    /// (Encrypted arm; the plain `#NoSuch` arm is exercised by the
+    /// default_nameserver and config-layer tests as well.)
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn unknown_query_proxy_is_hard_error() {
+        let registry = stub_proxy_registry();
+        let main = vec![NameServerEntry::parse("tls://8.8.8.8?proxy=NoSuchProxy").unwrap()];
+        let err = Resolver::new_with_bootstrap_with_proxies(
+            main,
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            true,
+            true,
+            None,
+            None,
+            &registry,
+            false,
+        )
+        .await
+        .err()
+        .expect("unknown ?proxy= name must fail");
+        assert!(matches!(err, BootstrapError::UnknownProxy { .. }));
+        assert!(err.to_string().contains("NoSuchProxy"));
+    }
+
+    /// Offline validation (`-t`) builds fine on a proxied hostname
+    /// upstream — nothing to bootstrap *or* defer.
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn offline_validation_accepts_proxied_hostname() {
+        let registry = stub_proxy_registry();
+        let main =
+            vec![NameServerEntry::parse("https://unresolvable.invalid/dns-query?proxy=P").unwrap()];
+        Resolver::new_with_bootstrap_with_proxies(
+            main,
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            true,
+            false,
+            None,
+            None,
+            &registry,
+            true,
+        )
+        .await
+        .expect("skip_bootstrap build must succeed for proxied hostname");
+    }
+
+    /// The DNS-via-proxy fence: inside `proxy.dial_tcp` a resolver
+    /// re-entry must never run the upstream pipeline — the `hosts:` +
+    /// cache path answers instead, and a miss falls back to the system
+    /// resolver (bounded, never deadlocked). The `dials` counter is the
+    /// teeth of the assertion: a disabled fence (`if false && …`) runs
+    /// the pipeline, the EMFILE-proxied main client dials, and the count
+    /// goes nonzero — timeout-pass alone never noticed.
+    #[tokio::test]
+    async fn resolve_ips_inside_dns_via_proxy_dial_answers_locally() {
+        let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+        let pinned = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        hosts.insert("node.test", vec![pinned].into());
+        let mut resolver = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, false);
+        let dials = Arc::new(AtomicUsize::new(0));
+        resolver.main = vec![Arc::new(
+            DnsClient::udp("203.0.113.53:53".parse().unwrap()).with_proxy(Arc::new(ErrnoProxy {
+                health: meow_common::ProxyHealth::new(),
+                gate: None,
+                dials: Arc::clone(&dials),
+            })),
+        )];
+
+        let scoped = meow_common::socket_protect::dns_via_proxy_dial_scope(async {
+            // A hosts hit answers without touching upstreams…
+            assert_eq!(
+                resolver.resolve_ips("node.test").await.unwrap(),
+                Some(vec![pinned])
+            );
+            // …and a miss goes to the system resolver, completing in
+            // bounded time — `.invalid` NXDOMAINs (an `Err`) or answers
+            // empty, but never fabricates an address list.
+            let miss = tokio::time::timeout(
+                Duration::from_secs(15),
+                resolver.resolve_ips("unresolvable.invalid"),
+            )
+            .await
+            .expect("fenced miss must complete, not deadlock");
+            assert!(
+                matches!(miss, Ok(None) | Err(_)),
+                "fenced miss must surface the system resolver's verdict \
+                 (empty answer or lookup failure), got {miss:?}"
+            );
+        });
+        tokio::time::timeout(Duration::from_secs(20), scoped)
+            .await
+            .expect("fenced resolve_ips must not stall");
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            0,
+            "fenced lookups must never reach proxy.dial_tcp — the \
+             pipeline ran (fence bypassed) if this is nonzero"
+        );
+    }
+
+    /// The fence's system-resolver fallback applies the same `ipv6`
+    /// family gate as every other `resolve_ips` exit: under
+    /// `ipv6: false` a system-supplied AAAA must not reach the adapter's
+    /// dial set. The expected set is calibrated against the host's own
+    /// `lookup_host` answer for `localhost`, so the assertion holds
+    /// whether the system maps it v4-only or dual-stack — any v6 the
+    /// system returns must be filtered out, byte for byte.
+    #[tokio::test]
+    async fn resolve_ips_inside_dns_via_proxy_dial_system_fallback_filters_ipv6() {
+        let resolver = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            true,
+            false, // ipv6 disabled — AAAA must be filtered out of the answer
+        );
+        let mut raw: Vec<IpAddr> = tokio::net::lookup_host(("localhost", 0u16))
+            .await
+            .expect("localhost must resolve via the system resolver")
+            .map(|addr| addr.ip())
+            .collect();
+        raw.sort();
+        raw.dedup();
+        let expected: Vec<IpAddr> = raw.into_iter().filter(IpAddr::is_ipv4).collect();
+
+        let scoped = meow_common::socket_protect::dns_via_proxy_dial_scope(
+            resolver.resolve_ips("localhost"),
+        );
+        let got = tokio::time::timeout(Duration::from_secs(15), scoped)
+            .await
+            .expect("fenced localhost lookup must not stall")
+            .expect("localhost lookup must not error");
+        assert_eq!(
+            got,
+            (!expected.is_empty()).then_some(expected),
+            "fenced fallback must return exactly the enabled-family subset \
+             of the system answer (v6 leaked if this differs)"
+        );
     }
 }

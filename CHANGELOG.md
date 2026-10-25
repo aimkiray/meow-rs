@@ -66,6 +66,21 @@ the canonical, in-repo source a release is cut from.
   upstream points it at `geoip.dat`, which meow has no consumer for —
   the GeoIP MMDB URL lives under `geox-url.mmdb` or
   `geodata.url.mmdb`.
+- **Encrypted DNS through a proxy** (`?proxy=NAME`, issue #67 phase 2,
+  ADR-0012): `tls://` and `https://` nameserver entries accept a
+  canonical `?proxy=NAME` parameter that routes the DoT/DoH exchange
+  itself through the named proxy adapter — `tls://dns.google?proxy=JP`,
+  `https://dns.google/dns-query?proxy=JP`, and `?proxy=` composes with
+  an SNI fragment (`tls://8.8.8.8#dns.google?proxy=JP`). A proxied
+  *hostname* upstream is resolved remotely by the proxy, so no local
+  bootstrap lookup is needed. The spelling works on `nameserver`,
+  `fallback`, `nameserver-policy`, and `proxy-server-nameserver`;
+  `default-nameserver` still rejects every proxy spelling. Unknown
+  proxy names stay hard errors, and a `#X` fragment that happens to
+  name a configured proxy warns that `#` on encrypted entries is SNI —
+  migrated mihomo-style `tls://8.8.8.8#PROXY` configs should switch to
+  `?proxy=PROXY`. Plain DNS keeps `#PROXY`; `?` sections on unencrypted
+  entries are rejected.
 
 ### Changed
 
@@ -76,6 +91,14 @@ the canonical, in-repo source a release is cut from.
   to a stripped x86_64 binary (14.80 MB to 15.01 MB), because `full`
   already links the `shadowsocks` crate for the `ss` outbound. The
   `minimal` bundle still leaves it out.
+- **Proxy-tagged nameservers resolve hostname upstreams remotely**:
+  a plain `udp://host#PROXY` / `tcp://host#PROXY` entry used to run a
+  local bootstrap lookup for `host` at load and dial the resulting IP;
+  it now hands the hostname to the proxy adapter for remote resolution
+  (mihomo `newDNSDialer` semantics — the new `?proxy=` spelling on
+  `tls://`/`https://` entries behaves the same). A locally unresolvable
+  or poisoned upstream name no longer fails the config load, and no
+  bootstrap IP is pinned into the client.
 - **The logbook links the system SQLite on iOS and tvOS**: with the
   `logbook` feature, meow-common compiled its own SQLite (about 1 MiB) into
   every build. iOS and tvOS ship libsqlite3, and there the engine runs in a

@@ -1685,7 +1685,10 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
     let Some(dns) = raw.dns.as_ref() else {
         return false;
     };
-    let tagged = |s: &String| s.contains('#');
+    // A proxy reference is a `#name` tag on plain entries or `?proxy=name`
+    // on tls:///https:// entries — both capture `Arc<dyn Proxy>` at build
+    // time (issue #67 phase 2), so either spelling must force the rebuild.
+    let tagged = |s: &String| s.contains('#') || s.contains("?proxy=");
     let urls_tagged =
         |urls: &Option<Vec<String>>| urls.as_deref().is_some_and(|us| us.iter().any(tagged));
     urls_tagged(&dns.nameserver)
@@ -1693,8 +1696,11 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
         || urls_tagged(&dns.default_nameserver)
         || urls_tagged(&dns.proxy_server_nameserver)
         || dns.nameserver_policy.as_ref().is_some_and(|m| {
-            m.iter()
-                .any(|(_k, v)| v.as_urls().iter().any(|u| u.contains('#')))
+            m.iter().any(|(_k, v)| {
+                v.as_urls()
+                    .iter()
+                    .any(|u| u.contains('#') || u.contains("?proxy="))
+            })
         })
 }
 
@@ -4503,6 +4509,29 @@ mod tests {
             && !dns_uses_runtime_refs(&raw_with_tag)
             && !dns_uses_runtime_refs(&raw_with_tag);
         assert!(!unchanged, "a `#name` nameserver must force a rebuild");
+
+        // `?proxy=` on an encrypted entry is the same runtime ref under a
+        // different spelling — missing it would let a hot reload retain
+        // stale proxy adapters (issue #67 phase 2 review).
+        for field in [
+            "nameserver:\n    - tls://1.1.1.1?proxy=P\n",
+            "nameserver:\n    - https://1.1.1.1/dns-query?proxy=P\n",
+            "fallback:\n    - tls://8.8.8.8?proxy=P\n  nameserver:\n    - 223.5.5.5\n",
+            "nameserver:\n    - 223.5.5.5\n  proxy-server-nameserver:\n    - tls://223.5.5.5?proxy=P\n",
+        ] {
+            let raw: RawConfig =
+                serde_yaml::from_str(&format!("dns:\n  enable: true\n  {field}")).unwrap();
+            assert!(
+                dns_uses_proxy_refs(&raw),
+                "{field} must register as a proxy runtime ref"
+            );
+        }
+        // Policy URLs check the same pair of spellings.
+        let raw_policy: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver:\n    - 223.5.5.5\n  nameserver-policy:\n    'geosite:cn':\n      - tls://1.1.1.1?proxy=P\n",
+        )
+        .unwrap();
+        assert!(dns_uses_proxy_refs(&raw_policy));
 
         // rule-set: policy refs also force a rebuild — the matcher holds
         // provider Arcs that must track the committed generation's set.

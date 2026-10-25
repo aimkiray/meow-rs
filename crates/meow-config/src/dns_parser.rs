@@ -106,11 +106,12 @@ pub async fn parse_dns(
     } else {
         for (nameserver, proxy) in circular_proxy_tags(&proxy_ns_urls, proxy_registry) {
             warn!(
-                "dns.proxy-server-nameserver '{nameserver}' is tagged #{proxy}, but '{proxy}' is \
-                 itself reached by hostname — resolving that hostname is what this nameserver \
-                 exists to do, so the lookup re-enters the resolver, is fenced to hosts: + cache, \
-                 and falls through to the system resolver on a miss. Pin the node's server in \
-                 hosts:, give it an IP-literal server:, or drop the #{proxy} tag."
+                "dns.proxy-server-nameserver '{nameserver}' references proxy '{proxy}', but \
+                 '{proxy}' is itself reached by hostname — resolving that hostname is what \
+                 this nameserver exists to do, so the lookup re-enters the resolver, is \
+                 fenced to hosts: + cache, and falls through to the system resolver on a \
+                 miss. Pin the node's server in hosts:, give it an IP-literal server:, or \
+                 drop the proxy tag."
             );
         }
         let mut proxy_hosts = build_hosts_trie(raw.hosts.as_ref(), strict)?;
@@ -322,8 +323,9 @@ fn same_store(existing: Option<&std::path::Path>, wanted: Option<&std::path::Pat
     }
 }
 
-/// `#PROXY`-tagged `dns.proxy-server-nameserver` entries whose proxy cannot be
-/// dialled without this very resolver, as `(nameserver, proxy name)` pairs.
+/// Proxy-tagged (`#PROXY` / `?proxy=`) `dns.proxy-server-nameserver` entries
+/// whose proxy cannot be dialled without this very resolver, as
+/// `(nameserver, proxy name)` pairs.
 ///
 /// A tag here is legitimate when the named node has an IP-literal `server:` —
 /// `meow_common::resolve_addrs` short-circuits literals, so the hook is never
@@ -712,17 +714,34 @@ async fn build_policy_resolvers(
     for url_str in &url_strs {
         match NameServerEntry::parse(url_str) {
             Ok(entry) => {
-                let Some(url) =
-                    resolve_policy_hostname_url(entry.url, key, url_str, bootstrap_clients).await
-                else {
-                    continue;
-                };
-                // `#PROXY` fragment: route this upstream's exchanges through
-                // the named adapter, matching the nameserver/fallback entry
-                // semantics (issue #67 phase 2, ADR-0012). An unknown name
-                // degrades to a direct dial like the main path does — under
-                // `strict` that silent downgrade is a hard error instead
-                // (issue #533 review).
+                // Migration aid identical to the main/fallback path in
+                // `Resolver::new_with_bootstrap_with_proxies`: `#X` on a
+                // tls:///https:// entry is SNI, so a migrated config that
+                // meant it as a proxy tag warns here instead of silently
+                // losing its routing intent.
+                if entry.proxy.is_none() {
+                    let sni = match &entry.url {
+                        NameServerUrl::Tls { sni, .. } | NameServerUrl::Https { sni, .. } => {
+                            sni.as_str()
+                        }
+                        _ => "",
+                    };
+                    if !sni.is_empty() && proxy_registry.contains_key(sni) {
+                        warn!(
+                            "nameserver-policy entry '{}': URL '{}' looks like it tags proxy \
+                             '{}' with '#': `#X` on encrypted entries is SNI — did you mean \
+                             `?proxy=X`?",
+                            key, url_str, sni
+                        );
+                    }
+                }
+                // `#PROXY` fragment / `?proxy=` parameter: resolve the
+                // tag to a registry handle *before* deciding whether to
+                // skip local bootstrap — only a tag that resolved keeps
+                // the remote-resolution semantics below (r15 review M3).
+                // An unknown name degrades to a direct dial like the main
+                // path does — under `strict` that silent downgrade is a
+                // hard error instead (issue #533 review).
                 let proxy = match entry.proxy.as_deref() {
                     Some(name) => match proxy_registry.get(name).cloned() {
                         Some(handle) => Some(handle),
@@ -735,13 +754,31 @@ async fn build_policy_resolvers(
                         None => {
                             warn!(
                                 "nameserver-policy entry '{}': URL '{}' references unknown \
-                                proxy '{}'; dialing direct",
+                                proxy '{}'; ignoring the tag — resolving locally and \
+                                dialing direct",
                                 key, url_str, name
                             );
                             None
                         }
                     },
                     None => None,
+                };
+                // A proxied hostname upstream is resolved *remotely* by
+                // the proxy (mihomo `newDNSDialer` semantics) — running
+                // policy bootstrap on it would defeat the remote-
+                // resolution intent and fail outright for names that are
+                // unresolvable locally. Skip it like the main/fallback
+                // path does (`Resolver` step 2) — but only when the tag
+                // actually resolved to a handle: an unknown name degrades
+                // to the untagged path above, so its hostname still goes
+                // through bootstrap exactly like an untagged entry.
+                let url = if proxy.is_some() {
+                    Some(entry.url)
+                } else {
+                    resolve_policy_hostname_url(entry.url, key, url_str, bootstrap_clients).await
+                };
+                let Some(url) = url else {
+                    continue;
                 };
                 let resolver =
                     Resolver::build_single_resolver_with_proxy(&url, &empty_resolved, proxy);
@@ -2658,6 +2695,336 @@ mod tests {
             .expect("tls entry with SNI fragment builds");
         assert_eq!(resolvers.len(), 1);
         assert!(!resolvers[0].is_proxied());
+    }
+
+    // ─── `?proxy=` on encrypted policy entries (issue #67 phase 2) ─────
+
+    #[tokio::test]
+    async fn policy_resolver_attaches_registry_proxy_for_query_param() {
+        let mut registry: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
+        registry.insert(
+            "Proxy".into(),
+            Arc::new(PolicyStubProxy {
+                health: meow_common::ProxyHealth::new(),
+                addr: String::new(),
+            }),
+        );
+        let value = crate::raw::RawNspValue::One("tls://8.8.4.4?proxy=Proxy".to_string());
+        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false)
+            .await
+            .expect("`?proxy=` policy entry builds");
+        assert_eq!(resolvers.len(), 1);
+        assert!(
+            resolvers[0].is_proxied(),
+            "`?proxy=` must wire the registry adapter like `#` does"
+        );
+    }
+
+    /// A `?proxy=` *hostname* entry skips policy bootstrap: the name goes
+    /// to the proxy for remote resolution, so an empty bootstrap-client
+    /// list must not drop it (it would have been skipped before — the
+    /// hostname resolution path could never produce an IP for it).
+    #[tokio::test]
+    async fn policy_resolver_query_proxy_hostname_skips_bootstrap() {
+        let mut registry: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
+        registry.insert(
+            "Proxy".into(),
+            Arc::new(PolicyStubProxy {
+                health: meow_common::ProxyHealth::new(),
+                addr: String::new(),
+            }),
+        );
+        let value =
+            crate::raw::RawNspValue::One("tls://policy-stub.invalid?proxy=Proxy".to_string());
+        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false)
+            .await
+            .expect("proxied hostname policy entry builds with no bootstrap clients");
+        assert_eq!(resolvers.len(), 1);
+        assert!(resolvers[0].is_proxied());
+    }
+
+    /// An unknown `?proxy=` name degrades to a direct dial under the
+    /// lenient path and is a hard error under strict — identical to the
+    /// `#PROXY` contract.
+    #[tokio::test]
+    async fn policy_resolver_unknown_query_proxy_lenient_and_strict() {
+        let registry: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
+        let value = crate::raw::RawNspValue::One("tls://8.8.4.4?proxy=NoSuchProxy".to_string());
+        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false)
+            .await
+            .expect("lenient keeps the entry as a direct client");
+        assert_eq!(resolvers.len(), 1);
+        assert!(!resolvers[0].is_proxied());
+
+        let Err(err) = build_policy_resolvers("geosite:gfw", &value, &[], &registry, true).await
+        else {
+            panic!("strict must reject an unknown ?proxy= reference");
+        };
+        assert!(err.to_string().contains("NoSuchProxy"), "unexpected: {err}");
+    }
+
+    /// r15 M3 regression: a nameserver-policy *hostname* entry tagged with
+    /// an **unknown** proxy must not trip the
+    /// `build_single_resolver_with_proxy` debug_assert (debug panic) nor
+    /// mint a dead `192.0.2.1` client (release zombie). The lenient path
+    /// resolves the hostname via bootstrap — exactly like an untagged
+    /// entry — and dials direct. `?proxy=` and `#PROXY` hit the same path:
+    /// `entry.proxy` is spelling-agnostic.
+    #[test]
+    fn policy_resolver_unknown_proxy_hostname_bootstraps_and_dials_direct() {
+        use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{Name, RData, Record, RecordType};
+        use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+
+        // A bare-thread `warn!` on this callsite must not be able to
+        // cache `Interest::never` under the sink's scope — see the helper.
+        crate::test_support::install_global_discard_subscriber();
+        // Warn sink — same pattern as
+        // `policy_resolver_sni_matching_proxy_name_warns`: `with_default`
+        // is thread-local, so the future must be *driven* inside it.
+        #[derive(Clone)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let sink = Sink(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        let registry: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        tracing::subscriber::with_default(subscriber, || {
+            rt.block_on(async {
+                // UDP bootstrap stub: `A` answers 203.0.113.9, `AAAA` gets
+                // an empty NOERROR (NODATA) — enough for `lookup_ip`.
+                let stub = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind dns stub");
+                let stub_addr = stub.local_addr().unwrap();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 2048];
+                    while let Ok((len, peer)) = stub.recv_from(&mut buf).await {
+                        let Ok(req) = Message::from_bytes(&buf[..len]) else {
+                            continue;
+                        };
+                        let mut resp = Message::new(req.id, MessageType::Response, OpCode::Query);
+                        resp.metadata.response_code = ResponseCode::NoError;
+                        resp.metadata.recursion_available = true;
+                        for q in &req.queries {
+                            resp.add_query(q.clone());
+                            if q.query_type == RecordType::A {
+                                let name: Name = "policy-host.test.".parse().unwrap();
+                                resp.add_answer(Record::from_rdata(
+                                    name,
+                                    60,
+                                    RData::A(A(Ipv4Addr::new(203, 0, 113, 9))),
+                                ));
+                            }
+                        }
+                        let _ = stub.send_to(&resp.to_bytes().unwrap(), peer).await;
+                    }
+                });
+                let bootstrap = vec![Arc::new(DnsClient::udp(stub_addr))];
+
+                for url in [
+                    "tls://policy-host.test?proxy=NoSuchProxy",
+                    "tcp://policy-host.test#NoSuchProxy",
+                ] {
+                    let value = crate::raw::RawNspValue::One(url.to_string());
+                    let clients =
+                        build_policy_resolvers("geosite:gfw", &value, &bootstrap, &registry, false)
+                            .await
+                            .unwrap_or_else(|e| {
+                                panic!("'{url}' must build under lenient policy: {e}")
+                            });
+                    assert_eq!(clients.len(), 1, "{url}");
+                    assert!(
+                        !clients[0].is_proxied(),
+                        "{url}: an unknown tag must degrade to a direct client"
+                    );
+                    assert!(
+                        clients[0].upstream_label().contains("203.0.113.9"),
+                        "{url}: the hostname must be bootstrap-resolved, got label '{}'",
+                        clients[0].upstream_label()
+                    );
+                }
+            });
+        });
+
+        let captured = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        assert!(
+            captured.contains("NoSuchProxy") && captured.contains("direct"),
+            "an unknown proxy must warn about the direct fallback; got: {captured}"
+        );
+    }
+
+    /// The migration aid: `#X` on an encrypted entry is SNI — when `X`
+    /// names a real proxy the config almost certainly meant `?proxy=X`.
+    /// Assert the warn fires (scoped capture, same pattern as
+    /// `duplicate_leaf_name_warns` in lib.rs). `with_default` is a
+    /// thread-local scope, so the future must be *driven* inside it —
+    /// `block_on` from a sync test, not `.await` on a tokio test.
+    #[test]
+    fn policy_resolver_sni_matching_proxy_name_warns() {
+        crate::test_support::install_global_discard_subscriber();
+        #[derive(Clone)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let sink = Sink(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        let mut registry: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
+        registry.insert(
+            "Proxy".into(),
+            Arc::new(PolicyStubProxy {
+                health: meow_common::ProxyHealth::new(),
+                addr: String::new(),
+            }),
+        );
+        let value = crate::raw::RawNspValue::One("tls://8.8.4.4#Proxy".to_string());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+        tracing::subscriber::with_default(subscriber, || {
+            rt.block_on(build_policy_resolvers(
+                "geosite:gfw",
+                &value,
+                &[],
+                &registry,
+                false,
+            ))
+            .expect("SNI-fragment entry builds (fragment is SNI, not a proxy tag)");
+        });
+
+        let captured = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        assert!(
+            captured.contains("did you mean `?proxy=X`"),
+            "SNI matching a proxy name must warn; got: {captured}"
+        );
+    }
+
+    /// The same migration aid on the main path: `nameserver`,
+    /// `fallback`, and `proxy-server-nameserver` all flow through
+    /// `Resolver::new_with_bootstrap_with_proxies` (`parse_dns` call
+    /// sites), whose `#X`-is-SNI check warns when `X` names a configured
+    /// proxy. Drive a full `parse_dns` so both call sites are covered,
+    /// and assert the warn fires once per offending entry — three in
+    /// total. Same scoped-capture pattern as
+    /// `policy_resolver_sni_matching_proxy_name_warns`.
+    #[test]
+    fn main_path_sni_matching_proxy_name_warns() {
+        crate::test_support::install_global_discard_subscriber();
+        #[derive(Clone)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let sink = Sink(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        let mut registry: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
+        registry.insert(
+            "Proxy".into(),
+            Arc::new(PolicyStubProxy {
+                health: meow_common::ProxyHealth::new(),
+                addr: String::new(),
+            }),
+        );
+        // One `#Proxy`-SNI encrypted entry per field — every one must
+        // warn exactly once (`fallback-filter.geoip: false` only keeps
+        // an unrelated missing-MMDB warn out of the capture).
+        let raw: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver:\n    - tls://8.8.4.4#Proxy\n  fallback:\n    - https://8.8.4.4/dns-query#Proxy\n  fallback-filter:\n    geoip: false\n  proxy-server-nameserver:\n    - tls://1.1.1.1#Proxy\n",
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+        tracing::subscriber::with_default(subscriber, || {
+            rt.block_on(parse_dns(
+                &raw,
+                None,
+                None,
+                &registry,
+                None,
+                &HashMap::new(),
+                None,
+            ))
+            .expect("`#X` SNI entries still build — the warn is advisory");
+        });
+
+        let captured = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        assert_eq!(
+            captured.matches("did you mean `?proxy=X`").count(),
+            3,
+            "nameserver + fallback + proxy-server-nameserver must each warn once; got: {captured}"
+        );
+    }
+
+    /// `?proxy=` on a `proxy-server-nameserver` entry flows through the
+    /// same circularity audit as `#PROXY`: tagging a hostname-node proxy
+    /// there is still circular and must warn.
+    #[test]
+    fn query_proxy_tag_on_hostname_node_is_circular() {
+        let entries = parse_nameserver_entries(&["tls://223.5.5.5?proxy=JP".to_string()]).unwrap();
+        let registry = stub_registry(&[("JP", "node.example:443")]);
+        assert_eq!(circular_proxy_tags(&entries, &registry).len(), 1);
     }
 
     // --- proxy-server-nameserver `#PROXY` circularity ---------------------
