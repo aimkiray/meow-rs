@@ -578,14 +578,19 @@ impl ProxyProvider {
     /// a failed refresh keeps the in-memory last-good set (upstream
     /// `Update` semantics) instead of rewinding the slot to whatever
     /// generation the disk happens to hold.
-    async fn fetch_content(&self) -> Result<(String, Source), String> {
+    ///
+    /// `record_failure` suppresses the logbook write for a candidate that
+    /// may still be rejected (see [`Self::initial_load_blocking`]) — the
+    /// rejection itself is already reported, and the provider might never
+    /// be committed under this name.
+    async fn fetch_content(&self, record_failure: bool) -> Result<(String, Source), String> {
         let e = match self.fetch_source().await {
             Ok((text, userinfo)) => return Ok((text, Source::Fetched(userinfo))),
             Err(e) => e,
         };
         // Before the first route map is published a `proxy:` name cannot
         // resolve yet; that fetch is retried, not failed.
-        if !self.deferred_initial.load(Ordering::Relaxed) {
+        if record_failure && !self.deferred_initial.load(Ordering::Relaxed) {
             self.logbook_failed(&e);
         }
         match &self.vehicle {
@@ -791,21 +796,49 @@ impl ProxyProvider {
         true
     }
 
+    /// `true` when this provider reads its payload from a local `file:` —
+    /// the only vehicle whose payload is operator-authored, and the only
+    /// one the synchronous materialize path can validate before commit.
+    pub(crate) fn is_file_vehicle(&self) -> bool {
+        matches!(self.vehicle, Vehicle::File(_))
+    }
+
     /// The startup fetch for a provider without a usable cache. `Err` only
-    /// for a strict-mode payload rejection, which fails the config load;
-    /// `Ok(false)` when nothing could be acquired (already logged).
+    /// for a strict-mode rejection of a *local* (`file:`) payload, which
+    /// fails the config load; `Ok(false)` when nothing could be acquired
+    /// (already logged).
     ///
-    /// Strict gates the *parse*, not the fetch: a transient download
-    /// failure is not a config defect, so a provider that can't be fetched
-    /// still starts empty until a background retry, a scheduled tick or a
-    /// manual refresh succeeds. Lenient keeps the payload's usable nodes and
-    /// binds the rest to unavailable placeholders, so only a defect that
-    /// stops the *whole* payload from parsing fails it. That feed is
-    /// third-party and refetched on a timer: rejecting it wholesale would
-    /// hand its operator a daemon-wide kill switch that re-fires every tick.
+    /// Strict gates the *parse*, and its consequence is gated by the
+    /// payload's origin: a `file:` payload is operator-authored local
+    /// content, so a strict parse defect stays fail-closed. Remote bytes —
+    /// an HTTP response or the on-disk cache it left behind — are a
+    /// third-party feed the operator cannot fix by editing the config, so
+    /// a strict parse defect there degrades to the acquisition shape
+    /// (`Ok(false)`: registered empty, retried in the background) instead
+    /// of handing the feed's operator a daemon-wide kill switch. The
+    /// verdict therefore no longer depends on whether the fetch landed
+    /// before or after the provider deadline.
+    ///
+    /// A transient download/read failure is likewise not a payload defect:
+    /// the provider starts empty until a background retry, a scheduled
+    /// tick or a manual refresh succeeds. Lenient keeps the payload's
+    /// usable nodes and binds the rest to unavailable placeholders, so
+    /// only a defect that stops the *whole* payload from parsing fails it.
     async fn initial_load(&self, strict: bool) -> anyhow::Result<bool> {
+        self.initial_load_impl(strict, true).await
+    }
+
+    /// [`initial_load`] minus the failure's logbook record — for a
+    /// candidate that may still be rejected (`PUT /configs`'s 400 already
+    /// lands in `CONFIG_RELOAD` via `reload_rejected`), where the verdict
+    /// must be carried by the return value alone.
+    async fn initial_load_unrecorded(&self, strict: bool) -> anyhow::Result<bool> {
+        self.initial_load_impl(strict, false).await
+    }
+
+    async fn initial_load_impl(&self, strict: bool, record: bool) -> anyhow::Result<bool> {
         let _generation = self.refresh_lock.lock().await;
-        let (content, source) = match self.fetch_content().await {
+        let (content, source) = match self.fetch_content(record).await {
             Ok(fetched) => fetched,
             Err(e) => {
                 warn_initial_load_failure(self, &e);
@@ -815,14 +848,51 @@ impl ProxyProvider {
         match self.ingest(content, source).await {
             Ok(_) => Ok(true),
             Err(e) => {
-                self.logbook_failed(&e.to_string());
-                if strict {
+                if record {
+                    self.logbook_failed(&e.to_string());
+                }
+                // `file:` payloads are operator-authored: strict stays
+                // fail-closed on them. Remote bytes degrade to the
+                // acquisition shape — the feed's owner cannot veto this
+                // daemon's config by serving malformed content.
+                if strict && self.is_file_vehicle() {
                     return Err(anyhow::anyhow!("proxy-provider '{}': {e}", self.name));
                 }
                 warn_initial_load_failure(self, &e.to_string());
                 Ok(false)
             }
         }
+    }
+
+    /// [`initial_load`] for a synchronous caller — the
+    /// candidate-materialize path, which runs inside
+    /// `rebuild_from_raw_impl` on a `spawn_blocking` worker (and on plain
+    /// threads in tests). Runs the load on a short-lived thread with a
+    /// `current_thread` runtime — the same shape as
+    /// [`crate::rule_provider::fetch_http_blocking`] — so it works whether
+    /// or not the caller already sits inside a Tokio runtime.
+    ///
+    /// Only ever called on [`Vehicle::File`] providers: remote payloads
+    /// keep their detached-fetch contract and never block the caller.
+    pub(crate) fn initial_load_blocking(&self, strict: bool) -> anyhow::Result<bool> {
+        let name = self.name.clone();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                use anyhow::Context as _;
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("building temporary tokio runtime for proxy-provider load")?;
+                rt.block_on(self.initial_load_unrecorded(strict))
+            })
+            .join()
+            .map_err(|payload| {
+                anyhow::anyhow!(
+                    "proxy-provider '{name}' load thread panicked: {}",
+                    crate::rule_provider::panic_message(payload.as_ref())
+                )
+            })?
+        })
     }
 
     /// One attempt of the background fetch — `refresh` semantics: no cache
@@ -1165,7 +1235,7 @@ impl ProxyProvider {
     /// `declared_dialers` from different payloads.
     pub async fn acquire_initial(&self) -> anyhow::Result<()> {
         let _generation = self.refresh_lock.lock().await;
-        let (content, source) = self.fetch_content().await.map_err(anyhow::Error::msg)?;
+        let (content, source) = self.fetch_content(true).await.map_err(anyhow::Error::msg)?;
         self.ingest(content, source)
             .await
             .map(|_| ())
@@ -1261,6 +1331,12 @@ pub(crate) fn validate_paths(
 /// later) and is flagged for a background retry. The caller runs
 /// [`spawn_deferred_initial_fetches`] after its first routing install to
 /// serve both flags. `file` providers load inline — they are local reads.
+///
+/// A remote payload that fails parsing degrades to the same
+/// registered-empty-and-retry shape as a fetch failure — even under
+/// `strict`, which reserves its fatal verdict for operator-authored
+/// content: the `file:` payloads, provider definitions and the config
+/// document itself.
 pub async fn load_proxy_providers(
     raw_map: &HashMap<String, RawProxyProvider>,
     cache_dir: Option<&Path>,
@@ -1315,14 +1391,20 @@ pub async fn load_proxy_providers_within(
                 continue;
             }
         };
-        if crate::is_offline_validate() {
+        if matches!(provider.vehicle, Vehicle::File(_)) {
+            // A `file:` payload is local, operator-authored content — it
+            // must read identically under `-t` and at boot, so it loads
+            // before the offline short-circuit below (mirroring the
+            // rule-provider `file:`/`inline:` loads, which already run
+            // offline). Its strict verdict therefore cannot differ
+            // between validation and a real start.
+            provider.initial_load(strict).await?;
+        } else if crate::is_offline_validate() {
             // Offline validation (`meow -t`): the provider parsed and its
             // path/filters are structurally valid — that is what a config
             // test checks. Skip the network fetch so a slow or unreachable
             // subscription can't hang validation (the provider registers
             // empty, exactly as a transient fetch failure would leave it).
-        } else if matches!(provider.vehicle, Vehicle::File(_)) {
-            provider.initial_load(strict).await?;
         } else if provider.load_from_cache().await {
             provider.background_pending.store(true, Ordering::Relaxed);
         } else {
@@ -1347,6 +1429,12 @@ pub async fn load_proxy_providers_within(
         match outcome {
             Some(Ok(Ok(true))) => {}
             Some(Ok(Ok(false))) => provider.background_pending.store(true, Ordering::Relaxed),
+            // Defensive arm: `fetches` only holds remote providers, whose
+            // payload defects `initial_load` degrades to `Ok(false)` —
+            // only the `file:` vehicle stays strict-fatal, and it runs
+            // synchronously above, so no remote byte can veto this load
+            // by landing before the deadline while the same bytes in
+            // flight could not.
             Some(Ok(Err(e))) => return Err(e),
             Some(Err(e)) => {
                 warn!(provider = %name, error = %e, "proxy-provider initial fetch task failed");
@@ -1354,9 +1442,10 @@ pub async fn load_proxy_providers_within(
             }
             None => {
                 // Left running: it populates the provider's groups if it
-                // lands, and the background retry queues behind it. Past
-                // the deadline a strict rejection can no longer fail the
-                // load, so it is logged instead.
+                // lands, and the background retry queues behind it. A
+                // remote payload defect degrades to `Ok(false)` on the
+                // same rules as a pre-deadline one, so the strict verdict
+                // never depends on the fetch's timing.
                 warn!(provider = %name,
                     "proxy-provider still fetching at the startup deadline; \
                      starting empty and finishing in the background");
@@ -3449,5 +3538,204 @@ header:
         let memory = ProxyProvider::new("m", &raw, None, false, false, Default::default()).unwrap();
         memory.refresh().await.unwrap();
         assert_eq!(memory.subscription_userinfo(), Some(usage(3, 4)));
+    }
+
+    const BAD_NODE: &str = "proxies:\n  - {name: bad, type: nosuchtype}\n";
+
+    /// Under `strict`, a remote payload defect used to abort the load —
+    /// the feed's operator could kill the daemon by serving one bad node.
+    /// It now degrades to the acquisition shape: `Ok(false)` → registered
+    /// empty + `background_pending` → the retry loop fetches until the
+    /// publisher fixes the payload (or the provider is dropped).
+    #[tokio::test]
+    async fn strict_remote_payload_degrades() {
+        let origin = Origin::spawn(Some(BAD_NODE), true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = HashMap::from([("p".to_string(), raw_http_provider(&origin.url, None))]);
+        let providers = load_proxy_providers_within(
+            &raw,
+            Some(dir.path()),
+            false,
+            true,
+            &Default::default(),
+            None,
+            &mut DroppedProviders::default(),
+        )
+        .await
+        .expect("a remote payload defect must degrade under strict, not fail");
+        let p = Arc::clone(&providers["p"]);
+        drop(providers);
+        assert!(
+            p.proxies().is_empty(),
+            "the rejected payload registers empty"
+        );
+        assert!(
+            p.take_deferred_initial(),
+            "the degraded load owes a background fetch"
+        );
+
+        // The retry keeps fetching — a parse failure gets the same
+        // acquisition-failure retry contract as a transport error.
+        let task = p.spawn_initial_fetch();
+        eventually("retried fetches", || origin.hits() >= 2).await;
+        drop(p);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the retry loop must end with its provider")
+            .unwrap();
+    }
+
+    /// A rejected remote payload never reaches the on-disk cache — the
+    /// cache write runs only after a successful ingest.
+    #[tokio::test]
+    async fn strict_rejected_remote_bytes_never_write_the_cache() {
+        let origin = Origin::spawn(Some(BAD_NODE), true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = HashMap::from([("p".to_string(), raw_http_provider(&origin.url, None))]);
+        let providers = load_proxy_providers_within(
+            &raw,
+            Some(dir.path()),
+            false,
+            true,
+            &Default::default(),
+            None,
+            &mut DroppedProviders::default(),
+        )
+        .await
+        .unwrap();
+        assert!(providers["p"].proxies().is_empty());
+        assert!(
+            !dir.path().join("provider_p.yaml").exists(),
+            "the rejected payload must not be persisted"
+        );
+    }
+
+    /// The `file:` vehicle is operator-authored local content — strict
+    /// stays fail-closed on its payload defects, identically under `-t`
+    /// and at boot (the load runs before the offline short-circuit).
+    #[tokio::test]
+    async fn strict_file_payload_stays_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nodes.yaml"), BAD_NODE).unwrap();
+        let raw = HashMap::from([("f".to_string(), raw_file_provider("nodes.yaml"))]);
+        let err = load_proxy_providers_within(
+            &raw,
+            Some(dir.path()),
+            false,
+            true,
+            &Default::default(),
+            None,
+            &mut DroppedProviders::default(),
+        )
+        .await
+        .err()
+        .expect("a strict file payload defect must still fail the load");
+        assert!(err.to_string().contains("nosuchtype"), "{err}");
+    }
+
+    /// A missing `file:` is an *acquisition* failure, not a payload
+    /// defect — it stays lenient under strict: registered empty, healed
+    /// by the interval/background retry.
+    #[tokio::test]
+    async fn strict_missing_file_stays_lenient() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = HashMap::from([("f".to_string(), raw_file_provider("gone.yaml"))]);
+        let providers = load_proxy_providers_within(
+            &raw,
+            Some(dir.path()),
+            false,
+            true,
+            &Default::default(),
+            None,
+            &mut DroppedProviders::default(),
+        )
+        .await
+        .expect("a read failure must not fail strict");
+        assert!(providers["f"].proxies().is_empty());
+    }
+
+    /// `initial_load_blocking` runs the same load on a throwaway thread —
+    /// callable from a plain (non-runtime) thread, which is what the
+    /// candidate-materialize path needs.
+    #[test]
+    fn initial_load_blocking_runs_off_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nodes.yaml"), ONE_NODE).unwrap();
+        let p = ProxyProvider::new(
+            "f",
+            &raw_file_provider("nodes.yaml"),
+            Some(dir.path()),
+            false,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(
+            p.initial_load_blocking(true).unwrap(),
+            "a valid file payload loads"
+        );
+        assert_eq!(p.proxies().len(), 1);
+
+        std::fs::write(dir.path().join("bad.yaml"), BAD_NODE).unwrap();
+        let p = ProxyProvider::new(
+            "b",
+            &raw_file_provider("bad.yaml"),
+            Some(dir.path()),
+            false,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(
+            p.initial_load_blocking(true).is_err(),
+            "a strict file payload defect fails the candidate"
+        );
+    }
+
+    /// Whether a bad remote payload lands before or after the fetch
+    /// deadline, the strict verdict is the same: registered empty +
+    /// background retry. Before the origin split, a pre-deadline defect
+    /// was boot-fatal while the same bytes in flight were only warned —
+    /// the verdict depended on timing, not on the defect.
+    #[tokio::test]
+    async fn strict_deadline_race_gone() {
+        let bad = Origin::spawn(Some(BAD_NODE), true).await;
+        let slow = Origin::spawn(Some(ONE_NODE), false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = HashMap::from([
+            ("fast-bad".to_string(), raw_http_provider(&bad.url, None)),
+            ("slow".to_string(), raw_http_provider(&slow.url, None)),
+        ]);
+        let providers = tokio::time::timeout(
+            Duration::from_secs(5),
+            load_proxy_providers_within(
+                &raw,
+                Some(dir.path()),
+                false,
+                true,
+                &Default::default(),
+                Some(Duration::from_millis(50)),
+                &mut DroppedProviders::default(),
+            ),
+        )
+        .await
+        .expect("the deadline must bound the wait")
+        .expect("remote payload defects must not fail strict");
+        for name in ["fast-bad", "slow"] {
+            let p = &providers[name];
+            assert!(
+                p.proxies().is_empty(),
+                "{name} registers empty regardless of timing"
+            );
+            assert!(
+                p.take_deferred_initial(),
+                "{name} owes the same background fetch"
+            );
+        }
+        slow.gate.send_replace(true);
+        eventually("the late fetch lands", || {
+            providers["slow"].proxies().len() == 1
+        })
+        .await;
     }
 }

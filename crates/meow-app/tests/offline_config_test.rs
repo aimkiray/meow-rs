@@ -38,9 +38,14 @@ async fn config_test_does_not_contact_remote_providers() {
     );
 }
 
+/// A remote-derived rule-provider cache is remote content at rest: under
+/// `strict` a corrupt cache degrades — `-t` warns and goes green, matching
+/// what the next boot does (register empty + refetch) — while a valid cache
+/// still validates. The asymmetry is pinned by the `file:` legs in
+/// [`config_test_file_provider_payload_parity`], which stay fatal.
 #[tokio::test]
 async fn config_test_validates_cached_rules_without_refreshing() {
-    for (payload, valid) in [("payload: [example.test]\n", true), ("payload: [", false)] {
+    for (payload, corrupt) in [("payload: [example.test]\n", false), ("payload: [", true)] {
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         server.set_nonblocking(true).unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -51,10 +56,76 @@ async fn config_test_validates_cached_rules_without_refreshing() {
             server.local_addr().unwrap()
         )).unwrap();
         let output = run_offline(directory.path(), &config).await;
-        assert_eq!(output.status.success(), valid, "{output:?}");
+        assert!(output.status.success(), "{output:?}");
+        if corrupt {
+            let logs = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                logs.contains("cached") && logs.contains("no longer parses"),
+                "the corrupt cache must surface a warning: {logs}"
+            );
+        }
         assert_eq!(
             server.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+/// `-t` must give the same verdict as boot for `file:` proxy-provider
+/// payloads: a strict content defect fails, a valid payload passes, and a
+/// missing file stays a warning (acquisition failures are never strict
+/// errors). The `http:` sibling proves no network I/O happens at all.
+#[tokio::test]
+async fn config_test_file_provider_payload_parity() {
+    for (payload, valid) in [
+        // Malformed local payload → strict fatal, exactly like boot.
+        (Some("proxies:\n  - {name: bad, type: nosuchtype}\n"), false),
+        // Valid payload → green.
+        (Some("proxies:\n  - {name: ok, type: direct}\n"), true),
+        // Missing file → warn + green (acquisition stays lenient).
+        (None, true),
+    ] {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        if let Some(payload) = payload {
+            std::fs::write(directory.path().join("nodes.yaml"), payload).unwrap();
+        }
+        let config = directory.path().join("config.yaml");
+        std::fs::write(&config, format!(
+            "strict: true\nproxy-providers:\n  local:\n    type: file\n    path: ./nodes.yaml\n  remote:\n    type: http\n    url: http://{}/proxies.yaml\n    path: ./remote.yaml\n    interval: 3600\nproxy-groups:\n  - name: G\n    type: select\n    use: [local, remote]\nrules: ['MATCH,G']\n",
+            server.local_addr().unwrap()
+        )).unwrap();
+        let output = run_offline(directory.path(), &config).await;
+        assert_eq!(
+            output.status.success(),
+            valid,
+            "payload {payload:?}: {output:?}"
+        );
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        match payload {
+            None => assert!(
+                logs.contains("initial provider load failed"),
+                "the missing file must surface the acquisition warning: {logs}"
+            ),
+            Some("proxies:\n  - {name: bad, type: nosuchtype}\n") => assert!(
+                logs.contains("nosuchtype"),
+                "the strict failure must name the defect: {logs}"
+            ),
+            _ => {}
+        }
+        assert_eq!(
+            server.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "offline validation must not contact the remote provider"
         );
     }
 }
@@ -538,6 +609,79 @@ async fn deferred_trusttunnel_provider_does_not_block_startup_or_listeners() {
             .await
             .is_ok(),
         "the listener must keep serving"
+    );
+    let _ = child.kill().await;
+    server.abort();
+}
+
+/// Option C e2e: `strict: true` + an http proxy-provider serving a payload
+/// the strict parser rejects wholesale (`type: nosuchtype` is not a
+/// placeholderable trusttunnel node — the whole ingest fails). The daemon
+/// must still come up, the listener must serve, the provider registers
+/// empty and the background retry keeps hitting the origin — remote bytes
+/// are a degradable feed, not a kill switch.
+#[tokio::test]
+async fn strict_remote_provider_payload_degrades_at_boot() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = origin.local_addr().unwrap();
+    let served = std::sync::Arc::new(AtomicUsize::new(0));
+    let count = std::sync::Arc::clone(&served);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut buffer = [0; 2048];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            count.fetch_add(1, Ordering::SeqCst);
+            let body = "proxies:\n  - {name: bad, type: nosuchtype}\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.yaml");
+    let port = free_port();
+    std::fs::write(&config, format!(
+        "strict: true\nmixed-port: {port}\nallow-lan: false\ndns: {{enable: false}}\nproxy-providers:\n  p:\n    type: http\n    url: http://{address}/proxies.yaml\n    path: ./provider_p.yaml\nproxy-groups: [{{name: G, type: select, use: [p]}}]\nrules: ['MATCH,G']\n"
+    )).unwrap();
+    let mut child = spawn_meow(
+        &["-f".into(), config.to_string_lossy().into_owned()],
+        directory.path(),
+    );
+    // Pre-fix this config aborted startup: the strict payload rejection
+    // propagated out of `load_proxy_providers` and `load_config` failed.
+    wait_api(port, &mut child).await;
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "a remote payload defect must not abort the daemon under strict"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok(),
+        "the listener must keep serving"
+    );
+    // The degraded provider owes a background retry — the origin sees the
+    // startup fetch plus retries.
+    let retried = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while served.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        retried.is_ok(),
+        "the degraded provider must keep retrying in the background"
+    );
+    // The rejected payload must not have been persisted as the cache.
+    assert!(
+        !directory.path().join("provider_p.yaml").exists(),
+        "rejected remote bytes must not be written to the provider cache"
     );
     let _ = child.kill().await;
     server.abort();

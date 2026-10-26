@@ -687,9 +687,10 @@ static PROVIDER_FETCH_DEADLINE_MS: std::sync::atomic::AtomicU64 =
 /// (which [`rule_provider_refresh::RefreshSupervisor::reconcile`] runs).
 /// Every embedder runs both after its first routing install anyway; they
 /// also revalidate the cache-loaded providers. Cached providers never wait
-/// on the network, whatever this is set to. Under `strict`, a payload
-/// rejection that lands after the deadline is logged rather than failing
-/// the load.
+/// on the network, whatever this is set to. Under `strict`, a remote
+/// payload defect degrades to the same registered-empty-and-retry shape
+/// whether it lands before or after the deadline — only local (`file:` /
+/// `inline:`) payloads and document content keep the fatal verdict.
 pub fn set_provider_fetch_deadline(deadline: Option<std::time::Duration>) {
     let ms = deadline.map_or(u64::MAX, |d| {
         u64::try_from(d.as_millis()).unwrap_or(u64::MAX - 1)
@@ -2092,10 +2093,17 @@ fn insert_parsed_leaves(
 ///   reusing the old object would keep fetching the old `url`/`path` with the
 ///   old filters forever while the committed config claims otherwise
 ///   (issue #533 review).
-/// - A newly declared def constructs an empty [`ProxyProvider`] (no fetch —
-///   this path is sync); the committing caller spawns the first acquisition
-///   detached, so a slow or blackholed provider URL cannot hold the config
-///   mutation lane.
+/// - A newly declared def constructs an empty [`ProxyProvider`]. A `file:`
+///   provider's payload is operator-authored local content, so it is read
+///   right here — a synchronous local read cannot hold the mutation lane —
+///   and a strict payload defect fails the candidate before commit, the
+///   same verdict boot gives it. `Ok(false)` — a read failure or a lenient
+///   whole-payload failure — still registers the provider empty; the
+///   committing caller then spawns a detached first acquisition that
+///   retries the read. Remote (`http:`) payloads keep the detached-fetch
+///   contract: no fetch runs on this path, so a slow or blackholed
+///   provider URL cannot hold the config mutation lane, and a malformed
+///   remote payload degrades (empty + retry) instead of rejecting.
 /// - A def that fails construction is warn-skipped leniently and a hard
 ///   error under `strict` — the same gate startup's
 ///   [`proxy_provider::load_proxy_providers`] applies, so a committed
@@ -2136,6 +2144,17 @@ fn materialize_proxy_providers(
             provider_dialer_registry.clone(),
         ) {
             Ok(provider) => {
+                // A new `file:` provider's payload is local content —
+                // validate it now so a strict candidate cannot commit a
+                // payload the next boot would refuse (PUT /configs → 400
+                // leaving live state untouched). `Ok(false)` — unreadable
+                // file, or a lenient whole-payload failure — registers
+                // the provider empty; the commit's detached acquisition
+                // retries the read. Reused providers above are never
+                // reloaded; remote providers never load on this path.
+                if provider.is_file_vehicle() {
+                    provider.initial_load_blocking(strict)?;
+                }
                 out.insert(name.clone(), Arc::new(provider));
             }
             Err(e) if strict => {
@@ -2727,10 +2746,18 @@ fn rebuild_from_raw_impl(
     // object per provider). `None` = parse `raw.rule_providers` fresh.
     shared_providers: Option<HashMap<String, Arc<rule_provider::RuleProvider>>>,
 ) -> Result<RebuildResult, anyhow::Error> {
-    // Top-level `strict: true` (issue #533): warn-skipped entries become
-    // hard errors — proxies, proxy-groups and rules are covered inside
-    // `build_proxy_layer`/`parse_rules_full`; proxy-provider definitions
-    // and provider payload nodes are gated by the caller (they are async).
+    // Top-level `strict: true` (issue #533): warn-skipped defects in
+    // *operator-authored* content become hard errors — proxies,
+    // proxy-groups and rules are covered inside
+    // `build_proxy_layer`/`parse_rules_full`; provider definitions, and
+    // `file:`/`inline:` provider payloads, are gated at their load sites
+    // (a `file:` proxy-provider's payload is validated in
+    // `materialize_proxy_providers`, the rule-provider loads are sync).
+    // Remote payload bytes — http provider/subscription GETs and their
+    // on-disk caches — are third-party content: under strict they degrade
+    // to registered-empty + background retry instead of failing the
+    // build, so a remote feed cannot veto the daemon (Option C origin
+    // split).
     let strict = raw.strict.unwrap_or(false);
 
     // Subscription names key the `applied-*` contribution tracking (issue
@@ -7352,6 +7379,52 @@ proxy-providers:
         let proxies = provider.proxies();
         assert_eq!(proxies.len(), 1);
         assert_eq!(proxies[0].name(), "ok");
+    }
+
+    /// Same payload as the `file:` case above, served over HTTP: remote
+    /// bytes are third-party content the operator cannot fix by editing the
+    /// config, so strict registers the provider empty and owes a background
+    /// retry instead of aborting the load (origin split — the `file:` twin
+    /// stays fatal).
+    #[tokio::test]
+    async fn strict_degrades_unparseable_remote_provider_node() {
+        crate::test_support::install_global_discard_subscriber();
+        let origin = crate::test_support::Origin::spawn(
+            Some(
+                "proxies:\n  - { name: ok, type: ss, server: 127.0.0.1, port: 8388, cipher: aes-128-gcm, password: x }\n  - { name: broken, type: nosuchtype }\n",
+            ),
+            true,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+proxy-providers:
+  remote:
+    type: http
+    url: '{}'
+"#,
+            origin.url
+        );
+        let raw = raw_config(&yaml);
+        let map = proxy_provider::load_proxy_providers(
+            raw.proxy_providers.as_ref().unwrap(),
+            Some(dir.path()),
+            false,
+            true,
+            &Default::default(),
+        )
+        .await
+        .expect("a remote payload defect must degrade under strict, not fail");
+        let provider = map.get("remote").expect("provider must be registered");
+        assert!(
+            provider.proxies().is_empty(),
+            "the rejected remote payload registers the provider empty"
+        );
+        assert!(
+            provider.take_deferred_initial(),
+            "the degraded load owes a background retry"
+        );
     }
 
     #[test]

@@ -105,7 +105,11 @@ pub async fn run_loop(
             info!("Auto-refreshing subscription '{}'", name);
             // `strict` is a property of the daemon's live config, not the
             // fetched subscription payload — it gates both payload shape
-            // errors in the parser and ECH pre-resolution below.
+            // errors in the parser and ECH pre-resolution below. A remote
+            // payload defect (`PayloadDefect`) degrades: the iteration
+            // stamps `last_updated`, retains the previously applied
+            // contribution, and retries at `interval` — never a
+            // daemon-wide kill switch over third-party bytes.
             let strict = raw_config.read().strict.unwrap_or(false);
             // `proxy:` resolves against the route map published into the
             // provider dialer registry — a name a rebuild removed stays

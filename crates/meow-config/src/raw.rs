@@ -214,16 +214,21 @@ pub struct RawConfig {
     /// section. Referenced from `rules:` via `SUB-RULE,<name>`.
     pub sub_rules: Option<HashMap<String, Vec<String>>>,
     pub subscriptions: Option<Vec<RawSubscription>>,
-    /// Opt-in strict parsing (issue #533): when `true`, an entry that fails
-    /// to parse — a `proxies:`/`proxy-groups:`/`rules:` item, a
-    /// `proxy-providers:`/`rule-providers:` definition, or a proxy node
-    /// inside a provider payload — is a hard config error instead of a
-    /// warn-and-skip. Group members/`use:` names that don't resolve,
-    /// entries shadowing built-in adapter names, and malformed
-    /// `dialer-proxy` values are also promoted. Transient fetch failures
-    /// (provider downloads, unreadable files) stay lenient. Off by default
-    /// because it rejects real-world mihomo subscriptions that mix in node
-    /// types meow-rs does not support.
+    /// Opt-in strict parsing (issue #533): when `true`, a defect in
+    /// *operator-authored* content — a `proxies:`/`proxy-groups:`/`rules:`
+    /// item, a `proxy-providers:`/`rule-providers:` definition, a
+    /// `file:`/`inline:` provider payload, a dangling `use:`/`RULE-SET`
+    /// reference — is a hard config error instead of a warn-and-skip.
+    /// Group members/`use:` names that don't resolve, entries shadowing
+    /// built-in adapter names, and malformed `dialer-proxy` values are
+    /// also promoted. Remote payload bytes are third-party content the
+    /// config's editor cannot repair: a defect there degrades to
+    /// registered-empty + background retry (transient fetch failures
+    /// already did) instead of failing the config — the feed's operator
+    /// must not hold a daemon-wide kill switch. `use:`/`RULE-SET` still
+    /// resolve an empty-registered provider. Off by default because it
+    /// rejects real-world mihomo subscriptions that mix in node types
+    /// meow-rs does not support.
     pub strict: Option<bool>,
     pub tproxy_port: Option<u16>,
     pub tproxy_sni: Option<bool>,

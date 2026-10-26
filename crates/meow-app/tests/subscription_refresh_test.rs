@@ -189,7 +189,7 @@ async fn fixture_at(sub_addr: std::net::SocketAddr) -> Fixture {
     }
 }
 
-fn spawn_loop(fx: &Fixture) {
+fn spawn_loop(fx: &Fixture) -> tokio::task::JoinHandle<()> {
     tokio::spawn(meow_app::subscription_refresh::run_loop(
         Arc::clone(&fx.raw_config),
         fx.tunnel.clone(),
@@ -200,7 +200,7 @@ fn spawn_loop(fx: &Fixture) {
         fx.provider_dialer_registry.clone(),
         Arc::new(RefreshSupervisor::default()),
         Arc::new(meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default()),
-    ));
+    ))
 }
 
 /// Poll the tunnel until group `name` is committed by the refresh loop.
@@ -829,5 +829,112 @@ async fn refreshed_trusttunnel_provider_commits_with_a_dead_placeholder() {
             .await
             .is_err(),
         "a placeholder must fail the dial instead of leaking it direct"
+    );
+}
+
+/// Same wire shape as [`spawn_origin`], but the response body is read from
+/// a shared cell on every request — the test can swap the payload between
+/// phases (good → defective → healed) without restarting the listener.
+async fn spawn_switchable_origin(
+    body: Arc<std::sync::Mutex<&'static str>>,
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let body = Arc::clone(&body);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let mut head = Vec::new();
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            head.extend_from_slice(&buf[..n]);
+                            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let body = *body.lock().unwrap();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// Option C / issue #533: under `strict`, a subscription *payload* defect is
+/// remote-origin content — the loop calls `subscription_failed` and stamps
+/// `last_updated` (so the same bad payload is not re-downloaded until
+/// `interval`) instead of failing anything. The previously applied
+/// contribution stays live, and when the origin heals the next eligible
+/// pass commits the new payload and replaces the tracked contribution.
+///
+/// The defect below — a non-mapping `proxies:` entry — is only fatal under
+/// strict (`subscription.rs` shape gate); lenient would warn-skip it and
+/// apply an empty contribution, deleting the old node. Strict keeps it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strict_subscription_payload_defect_stamps_and_heals() {
+    let body = Arc::new(std::sync::Mutex::new(
+        "proxies:\n  - {name: node-1, type: http, server: 127.0.0.1, port: 9}\n",
+    ));
+    let sub_addr = spawn_switchable_origin(Arc::clone(&body)).await;
+    let fx = fixture_at(sub_addr).await;
+    fx.raw_config.write().strict = Some(true);
+
+    // Pass 1 — the good payload commits `node-1` as the contribution.
+    let task = spawn_loop(&fx);
+    wait_group(&fx.tunnel, "node-1").await;
+    task.abort();
+
+    // Pass 2 — shape-defective payload: `subscription_failed` +
+    // `last_updated` stamp; `node-1` stays live. (`last_updated` is
+    // backdated to make the entry eligible in this fresh loop instance —
+    // each spawned loop runs its first pass immediately.)
+    *body.lock().unwrap() = "proxies: [42]\n";
+    fx.raw_config.write().subscriptions.as_mut().unwrap()[0].last_updated = Some(0);
+    let task = spawn_loop(&fx);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let stamped = fx.raw_config.read().subscriptions.as_ref().unwrap()[0].last_updated;
+            if stamped != Some(0) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the payload defect must stamp last_updated (interval-bounded retry)");
+    task.abort();
+    assert!(
+        fx.tunnel.proxy("node-1").is_some(),
+        "the previously applied contribution must be retained"
+    );
+
+    // Pass 3 — healed payload commits and replaces the contribution.
+    *body.lock().unwrap() =
+        "proxies:\n  - {name: node-2, type: http, server: 127.0.0.1, port: 9}\n";
+    fx.raw_config.write().subscriptions.as_mut().unwrap()[0].last_updated = Some(0);
+    let task = spawn_loop(&fx);
+    wait_group(&fx.tunnel, "node-2").await;
+    task.abort();
+    assert!(
+        fx.tunnel.proxy("node-1").is_none(),
+        "the healed payload replaces the previous contribution"
+    );
+    assert_eq!(
+        fx.raw_config.read().subscriptions.as_ref().unwrap()[0].applied_proxies,
+        vec!["node-2".to_string()]
     );
 }

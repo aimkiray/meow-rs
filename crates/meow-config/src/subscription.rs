@@ -267,11 +267,14 @@ pub fn reconcile_contribution_claims(raw: &mut RawConfig) {
 /// Fetch a Clash YAML subscription and extract proxies, groups, and rules.
 /// `strict` (issue #533) turns payload shape defects — a `proxy-groups`
 /// section that fails to deserialize, a `proxies` entry that isn't a
-/// mapping — into hard errors instead of warn-and-skip, so a garbled
-/// subscription cannot silently empty every group under `strict: true`.
-/// `download_proxy` routes the fetch through a resolved proxy/group — the
-/// subscription's `proxy:` field, resolved by the caller against the live
-/// route map (issue #625).
+/// mapping — into [`PayloadDefect`] errors instead of warn-and-skip, so a
+/// garbled subscription cannot silently empty every group under
+/// `strict: true`. Those defects are *remote-payload* class: the caller
+/// degrades — stamps `last_updated`, retains the previously applied
+/// contribution, retries at `interval` — rather than aborting boot or a
+/// config commit over third-party bytes. `download_proxy` routes the
+/// fetch through a resolved proxy/group — the subscription's `proxy:`
+/// field, resolved by the caller against the live route map (issue #625).
 pub async fn fetch_subscription(
     url: &str,
     strict: bool,
@@ -289,6 +292,10 @@ pub async fn fetch_subscription(
 /// mode) as opposed to a transport failure — re-fetching the same URL
 /// reproduces the same error, so periodic refreshers stamp `last_updated`
 /// and honor `interval` instead of retrying every pass (issue #533 review).
+/// The payload is remote-origin content: `strict` keeps it parseable-or-
+/// rejected inside this function, but the *consequence* belongs to the
+/// caller — degrade and retry at the configured cadence, never a
+/// daemon-wide kill switch on bytes the operator cannot edit.
 /// Reachable via `err.downcast_ref::<PayloadDefect>()` on the
 /// `anyhow::Error` [`fetch_subscription`] returns.
 #[derive(Debug)]
