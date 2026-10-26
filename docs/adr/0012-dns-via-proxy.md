@@ -149,7 +149,16 @@ and stays part of the URL path verbatim (`https://dns.google/
 dns-query{?name}`-style templates are unaffected); a `proxy=` key in any
 *earlier* `?` section is `InvalidParams`, not a warn — it would ride
 inside the request path and leak the proxy name to the upstream.
-Plain/UDP entries keep `#PROXY` and must not carry `?`.
+Key detection trims whitespace around the key and is ASCII
+case-insensitive, so `? proxy=`, `?proxy =`, `?\tproxy\t=` and `?Proxy=`
+also mark a parameter section — then fail validation as non-canonical
+spellings, each with its own `InvalidParams` hint; whitespace *inside* a
+key (`?p roxy=`), percent-spellings (`?%20proxy=`), and keys prefixed
+with non-White_Space invisible characters (ZWSP, BOM, soft hyphen,
+word joiner, ZWNJ/ZWJ — none are `char::is_whitespace`) stay path
+material — a recorded residual of the invisible-key class.
+Plain/UDP entries keep `#PROXY`
+and must not carry `?`.
 
 *Revised on review (r15/I1) from the initial spec wording — "a `?` tail
 that does not start with `proxy=` stays in the path" — to per-segment

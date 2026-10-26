@@ -83,19 +83,22 @@ impl fmt::Display for NameServerUrl {
 /// entries. Using the entry's *last* `?` as the boundary: when any
 /// `&`-separated segment of the tail is a `proxy=` key, that `?` section
 /// is a parameter section — an `&`-separated `k=v` list whose only
-/// currently-legal key is `proxy`. The `proxy` value is trimmed like the
-/// `#PROXY` slot and must then be non-empty and contain no `#`/`?`/`&`;
-/// any other key is a hard [`NameServerParseError::InvalidParams`], so
-/// `?a=b&proxy=P` errors rather than silently dropping the proxy tag.
-/// When no `&`-separated segment is a `proxy=` key, the `?` section is
-/// not a parameter section and stays in the URL (path) verbatim — and if
-/// any earlier `?` section still carries a `proxy=` key (the
-/// `?proxy=P?x=1` double-`?` typo), parse fails: a stranded `proxy=` key
-/// would travel inside the request path and leak the proxy name to the
-/// upstream. Detection of the `proxy=` key is ASCII case-insensitive;
-/// only exact lowercase `proxy` is legal — `?Proxy=`/`?PROXY=` are hard
-/// `InvalidParams`, never path parameters. A path that legitimately
-/// needs the key percent-spells it (`?%70roxy=`).**
+/// currently-legal key is `proxy`. Key detection trims whitespace around
+/// the key and is ASCII case-insensitive, so `? proxy=P`, `?proxy =P`
+/// and `?Proxy=P` also mark a parameter section — then fail validation
+/// as non-canonical spellings rather than riding inside the request
+/// path. The `proxy` value is trimmed like the `#PROXY` slot and must
+/// then be non-empty and contain no `#`/`?`/`&`; any other key is a hard
+/// [`NameServerParseError::InvalidParams`], so `?a=b&proxy=P` errors
+/// rather than silently dropping the proxy tag. When no `&`-separated
+/// segment is a `proxy=` key, the `?` section is not a parameter section
+/// and stays in the URL (path) verbatim — whitespace *inside* a key
+/// (`?p roxy=P`) and percent-spellings (`?%20proxy=`) stay path
+/// material — and if any earlier `?` section still carries a `proxy=`
+/// key (the `?proxy=P?x=1` double-`?` typo), parse fails: a stranded
+/// `proxy=` key would travel inside the request path and leak the proxy
+/// name to the upstream. A path that legitimately needs the key
+/// percent-spells it (`?%70roxy=`).**
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameServerEntry {
     pub url: NameServerUrl,
@@ -131,12 +134,11 @@ impl NameServerEntry {
                 // The tail is a parameter section when ANY `&`-separated
                 // segment is a `proxy=` key — `?a=b&proxy=P` must hard-
                 // error on the unknown `a` key below, not silently lose
-                // the proxy tag inside the path (r15 review I1).
-                // Detection is ASCII case-insensitive (`get(..6)` — never
-                // `kv[..6]`, which panics on a short/multibyte segment):
-                // a `?Proxy=` tail marks the section too and is then
-                // rejected by the exact-case key check below, closing the
-                // DoH path leak where `?Proxy=P` survived into `path`.
+                // the proxy tag inside the path (r15 review I1). The
+                // shared key predicate trims whitespace and is ASCII
+                // case-insensitive, so `? proxy=P` / `?Proxy=P` mark the
+                // section too — and then fail validation below as
+                // non-canonical spellings.
                 if tail.split('&').any(is_proxy_key_segment) {
                     // The tail is a parameter section: an `&`-separated
                     // `k=v` list. `proxy` is the only legal key.
@@ -154,6 +156,17 @@ impl NameServerEntry {
                             )));
                         }
                         if key != "proxy" {
+                            // Whitespace-padded `proxy` keys marked this a
+                            // parameter section above; give the key its own
+                            // hint — the generic arm would print `' proxy'`
+                            // with the defect invisible.
+                            if key.trim().eq_ignore_ascii_case("proxy") {
+                                return Err(NameServerParseError::InvalidParams(format!(
+                                    "whitespace is not allowed in the 'proxy' \
+                                     parameter name in '{s}' — spell it exactly \
+                                     'proxy'"
+                                )));
+                            }
                             return Err(NameServerParseError::InvalidParams(format!(
                                 "unknown nameserver parameter '{key}' in '{s}' \
                                  (only 'proxy' is supported)"
@@ -394,14 +407,24 @@ impl NameServerUrl {
     }
 }
 
-/// A `k=v` segment IS a `proxy=` key in any ASCII case — a stranded
-/// `?Proxy=` is the same typo/leak class as a last-section `?Proxy=`.
+/// A `k=v` segment IS a `proxy=` key when its key — the bytes before
+/// the first `=` — trims to `proxy` in any ASCII case. Whitespace
+/// *around* the key (`? proxy=`, `?proxy =`, `?\tproxy\t=`, NBSP) and
+/// case flips (`?Proxy=`) are the same typo/leak class as the canonical
+/// spelling — left in the path they would leak the proxy name upstream.
 /// The `=` is required by the key shape, so `proxy` *values*
-/// (`?x=proxy=P`), bare keys (`?Proxy`), and look-alikes (`?proxyx=`,
-/// `?aproxy=`) never match.
+/// (`?x=proxy=P`), bare keys (`?Proxy`, `? proxy `), and look-alikes
+/// (`?proxyx=`, `?aproxy=`) never match; whitespace *inside* a key
+/// (`?p roxy=`) is not collapsed, and percent-spellings (`?%20proxy=`,
+/// `?%70roxy=`) stay literal path material. `trim()` is
+/// `char::is_whitespace` — the full White_Space set — so keys prefixed
+/// with *non*-White_Space invisible characters (ZWSP U+200B, BOM
+/// U+FEFF, soft hyphen U+00AD, word joiner U+2060, ZWNJ/ZWJ, …) are NOT
+/// caught: a recorded residual of the invisible-key class (the
+/// upstream 400s on them anyway).
 fn is_proxy_key_segment(kv: &str) -> bool {
-    kv.get(..6)
-        .is_some_and(|p| p.eq_ignore_ascii_case("proxy="))
+    kv.split_once('=')
+        .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("proxy"))
 }
 
 fn parse_rcode(s: &str) -> Result<NameServerUrl, NameServerParseError> {
@@ -1214,6 +1237,8 @@ mod tests {
             // encrypted-forms-only concept.
             "udp://1.1.1.1?Proxy=P",
             "udp://1.1.1.1?proxy=P?x=1",
+            // A padded key is still a `?` on a plain entry — same arm.
+            "udp://1.1.1.1? proxy=P",
         ] {
             assert!(
                 matches!(
@@ -1379,6 +1404,46 @@ mod tests {
         ));
     }
 
+    /// Whitespace-padded `proxy=` keys are the same typo/leak class as
+    /// the canonical spelling: detection trims the key (the full
+    /// White_Space set — NBSP included) and is ASCII case-insensitive,
+    /// so a padded or miscased key marks the `?` section a parameter
+    /// section, then validation refuses the non-canonical spelling. A
+    /// padded key gets a `whitespace` hint — the generic unknown-key
+    /// message would print `' proxy'` with the defect invisible.
+    #[test]
+    #[cfg(feature = "encrypted")]
+    fn entry_query_proxy_whitespace_key_errors() {
+        for s in [
+            "tls://8.8.8.8? proxy=P", // was InvalidHost — padded key slipped detection
+            "tls://8.8.8.8?proxy =P", // trailing-ws key — the same typo class
+            "tls://8.8.8.8? proxy =P",
+            "tls://8.8.8.8?\tproxy\t=P",
+            "https://h/dns-query? proxy=P", // the leak row: key rode inside the path
+            "https://h/dns-query?proxy =P",
+            "https://h/dns-query?\u{a0}proxy=P", // NBSP is White_Space
+            "https://h/p?proxy=Q& proxy=P",      // ws arm on a later `&` segment
+            "tls://8.8.8.8?Proxy =P",            // case+ws: ws is the visible defect
+        ] {
+            match NameServerEntry::parse(s) {
+                Err(NameServerParseError::InvalidParams(msg)) => assert!(
+                    msg.contains("whitespace"),
+                    "{s} must fail with the whitespace hint, got: {msg}"
+                ),
+                other => panic!("{s} must be InvalidParams, got {other:?}"),
+            }
+        }
+        // Case pin: a case-flipped key also marks the section, then fails
+        // with the lowercase hint rather than the whitespace one.
+        match NameServerEntry::parse("tls://8.8.8.8?PROXY=P") {
+            Err(NameServerParseError::InvalidParams(msg)) => assert!(
+                msg.contains("lowercase 'proxy'"),
+                "?PROXY=P must fail with the lowercase hint, got: {msg}"
+            ),
+            other => panic!("?PROXY=P must be InvalidParams, got {other:?}"),
+        }
+    }
+
     /// A `proxy=` key stranded in a non-last `?` section — any ASCII
     /// case, at a `?`- or `&`-segment start — is a hard `InvalidParams`,
     /// not a warn: the segment would travel inside the request path and
@@ -1390,9 +1455,13 @@ mod tests {
         for s in [
             "https://h/dns-query?proxy=P?x=1", // the leak row
             "https://h/p?x=1&proxy=P?y=2",     // median &-segment
+            "https://h/p?a=b?proxy=P?c=d",     // proxy= in a 2nd+ `?` section
             "https://h/p?proxy=A?proxy=B",     // INFO-3 silent leak
             "https://h/p?Proxy=P?x=1",         // case-insensitive median
             "https://h/p?PROXY=P?x=1",
+            "https://h/p? proxy=P?x=1", // whitespace-padded median
+            "https://h/p?proxy =P?x=1",
+            "https://h/p?x=1&proxy =P?y=2",
             "tls://8.8.8.8?proxy=P?x=1",
             // the median arm fires before the fragment check
             "tls://8.8.8.8#dns.google?proxy=P?x=1",
@@ -1421,6 +1490,11 @@ mod tests {
             "https://h/p?aproxy=P?y=1",
             "https://h/p?a=b?c=d",
             "https://h/p?Proxy?x=1",
+            "https://h/p? proxy?x=1", // bare padded key, no `=` — no key shape
+            "https://h/p?p roxy=P?x=1", // internal ws is never collapsed
+            "https://h/p?%20proxy=P?x=1", // percent-spelling is literal
+            "https://h/p?x= proxy=P", // ws lives in the VALUE; the key is x
+            "https://h/p?proxyý?x=1", // non-ASCII look-alike key
             "https://h/p&proxy=P?x=1",
         ] {
             let e = NameServerEntry::parse(s)
@@ -1429,6 +1503,8 @@ mod tests {
         }
         for (s, want) in [
             ("https://h/p?a=b?c=d", "/p?a=b?c=d"),
+            ("https://h/p?x= proxy=P", "/p?x= proxy=P"),
+            ("https://h/p?proxyý?x=1", "/p?proxyý?x=1"),
             ("https://h/p&proxy=P?x=1", "/p&proxy=P?x=1"),
         ] {
             match NameServerEntry::parse(s).unwrap().url {

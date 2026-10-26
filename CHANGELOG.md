@@ -250,6 +250,14 @@ the canonical, in-repo source a release is cut from.
   name to the upstream on every query; config load now fails with
   `'proxy=' must be the last query parameter`. A path that legitimately
   needs the key percent-spells it (`?%70roxy=`).
+- **A whitespace-padded or miscased `?proxy=` key hard-errors**:
+  `? proxy=P` / `?proxy =P` / `?Proxy=P` used to slip the `proxy=` key
+  check (which anchored at the segment start), so the padded key — and
+  the proxy name — rode inside the DoH request path. Key detection now
+  trims whitespace around the key and is ASCII case-insensitive; a
+  non-canonical spelling still marks the parameter section, then fails
+  `InvalidParams` with a targeted hint. Whitespace *inside* a key
+  (`?p roxy=`) and percent-spellings (`?%20proxy=`) stay path material.
 
 ### Security
 
