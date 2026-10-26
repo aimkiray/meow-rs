@@ -91,7 +91,10 @@ impl fmt::Display for NameServerUrl {
 /// not a parameter section and stays in the URL (path) verbatim — and if
 /// an earlier `?` section still carries a `proxy=` segment (the
 /// `?proxy=P?x=1` double-`?` typo), a warn is logged because that segment
-/// travels inside the request path instead of tagging a proxy.**
+/// travels inside the request path instead of tagging a proxy. Detection
+/// of the `proxy=` key is ASCII case-insensitive; only exact lowercase
+/// `proxy` is legal — `?Proxy=`/`?PROXY=` are hard `InvalidParams`, never
+/// path parameters.**
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameServerEntry {
     pub url: NameServerUrl,
@@ -128,12 +131,30 @@ impl NameServerEntry {
                 // segment is a `proxy=` key — `?a=b&proxy=P` must hard-
                 // error on the unknown `a` key below, not silently lose
                 // the proxy tag inside the path (r15 review I1).
-                if tail.split('&').any(|kv| kv.starts_with("proxy=")) {
+                // Detection is ASCII case-insensitive (`get(..6)` — never
+                // `kv[..6]`, which panics on a short/multibyte segment):
+                // a `?Proxy=` tail marks the section too and is then
+                // rejected by the exact-case key check below, closing the
+                // DoH path leak where `?Proxy=P` survived into `path`.
+                if tail.split('&').any(|kv| {
+                    kv.get(..6)
+                        .is_some_and(|p| p.eq_ignore_ascii_case("proxy="))
+                }) {
                     // The tail is a parameter section: an `&`-separated
                     // `k=v` list. `proxy` is the only legal key.
                     let mut value: Option<&str> = None;
                     for kv in tail.split('&') {
                         let (key, val) = kv.split_once('=').unwrap_or((kv, ""));
+                        // Case-variant keys reached this section through
+                        // the case-insensitive detection above — name the
+                        // canonical spelling instead of reporting `Proxy`
+                        // as just another unknown key.
+                        if key.eq_ignore_ascii_case("proxy") && key != "proxy" {
+                            return Err(NameServerParseError::InvalidParams(format!(
+                                "nameserver parameter '{key}' must be spelled \
+                                 lowercase 'proxy' in '{s}'"
+                            )));
+                        }
                         if key != "proxy" {
                             return Err(NameServerParseError::InvalidParams(format!(
                                 "unknown nameserver parameter '{key}' in '{s}' \
@@ -1024,7 +1045,9 @@ mod tests {
     // be non-empty and must not contain `#`/`?`/`&`; any other key is a
     // hard `InvalidParams`. When no `&`-separated segment is a `proxy=`
     // key, the `?` section is not a parameter section and stays in the
-    // URL (path) verbatim.
+    // URL (path) verbatim. Detection of the `proxy=` key is ASCII
+    // case-insensitive; only exact lowercase `proxy` is legal —
+    // `?Proxy=`/`?PROXY=` are hard `InvalidParams`, never path params.
 
     #[test]
     #[cfg(feature = "encrypted")]
@@ -1174,7 +1197,15 @@ mod tests {
     fn entry_plain_with_query_params_errors() {
         // `?` on a plain entry used to be silently folded into the
         // hostname — now a hard `InvalidParams`.
-        for s in ["8.8.8.8?proxy=P", "8.8.8.8?x=1", "udp://1.1.1.1?proxy=P"] {
+        for s in [
+            "8.8.8.8?proxy=P",
+            "8.8.8.8?x=1",
+            "udp://1.1.1.1?proxy=P",
+            // Any `?` on a plain entry is a hard error regardless of
+            // case — the `proxy=`-key case distinction is an
+            // encrypted-forms-only concept.
+            "udp://1.1.1.1?Proxy=P",
+        ] {
             assert!(
                 matches!(
                     NameServerEntry::parse(s),
@@ -1227,6 +1258,71 @@ mod tests {
                 ),
                 "{s} must be InvalidParams"
             );
+        }
+    }
+
+    /// Case hardening on the `?proxy=` key: detection of a `proxy=` segment
+    /// is ASCII case-insensitive (closing the leak where `?Proxy=P` survived
+    /// into the stored DoH request path), while validation stays exact —
+    /// only the lowercase `proxy` spelling is legal, so a case-variant key
+    /// is a hard `InvalidParams` that names the canonical spelling.
+    #[test]
+    #[cfg(feature = "encrypted")]
+    fn entry_query_proxy_case_variant_hard_errors() {
+        // Variants that hit the canonical-spelling hint — the case-variant
+        // key is the first failure the validation loop sees.
+        for s in [
+            "tls://8.8.8.8?Proxy=P",
+            "tls://8.8.8.8?PROXY=P",
+            "tls://8.8.8.8?pRoXy=P",
+            "https://h/dns-query?Proxy=P", // was the silent path leak
+            "tls://8.8.8.8#dns.google?Proxy=P", // SNI + variant
+            "https://h?Proxy=P",           // pins the InvalidHost → InvalidParams flip
+        ] {
+            match NameServerEntry::parse(s) {
+                Err(NameServerParseError::InvalidParams(msg)) => assert!(
+                    msg.contains("lowercase 'proxy'"),
+                    "{s} must hint the canonical spelling; got: {msg}"
+                ),
+                other => panic!("{s} must be InvalidParams, got {other:?}"),
+            }
+        }
+        // A case-variant segment in a non-first `&` position still marks
+        // the section — it errors as InvalidParams (here on the unknown
+        // `x` key first; either way the proxy name never reaches a path).
+        let s = "https://h/dns-query?x=1&PROXY=P";
+        assert!(
+            matches!(
+                NameServerEntry::parse(s),
+                Err(NameServerParseError::InvalidParams(_))
+            ),
+            "{s} must be InvalidParams"
+        );
+        // Look-alikes stay unchanged: `?Proxy` bare (no `=`, so nothing
+        // leakable) keeps the whole `?` section in the path, as do the
+        // `proxi=` / `x=a=proxy=` near-misses covered above.
+        for s in [
+            "https://h/p?Proxy",
+            "https://h/p?proxi=P",
+            "https://h/p?x=a=proxy=P",
+        ] {
+            let e = NameServerEntry::parse(s).unwrap();
+            assert!(e.proxy.is_none(), "{s} must not tag a proxy");
+        }
+        let e = NameServerEntry::parse("https://h/p?Proxy").unwrap();
+        match e.url {
+            NameServerUrl::Https { path, .. } => assert_eq!(path, "/p?Proxy"),
+            _ => panic!("expected Https"),
+        }
+        // Batch-3 boundary: a case-variant segment stranded by a *later*
+        // `?` section keeps the old case-sensitive treatment — it stays
+        // in the path with no error (median widening is batch 3's scope;
+        // the warn is deliberately not asserted here).
+        let e = NameServerEntry::parse("https://h/p?Proxy=P?x=1").unwrap();
+        assert!(e.proxy.is_none());
+        match e.url {
+            NameServerUrl::Https { path, .. } => assert_eq!(path, "/p?Proxy=P?x=1"),
+            _ => panic!("expected Https"),
         }
     }
 

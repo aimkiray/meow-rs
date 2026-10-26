@@ -239,6 +239,13 @@ the canonical, in-repo source a release is cut from.
   fetching now happens inside the config build, gated on what the
   config references.
 
+### Fixed
+
+- **`?proxy=` detection is now ASCII case-insensitive** —
+  `?Proxy=`/`?PROXY=` on `tls://`/`https://` nameservers hard-error at
+  config load instead of silently leaking the proxy name into the DoH
+  request path.
+
 ### Security
 
 - **Distrust the compromised eMudhra intermediates by key**: every

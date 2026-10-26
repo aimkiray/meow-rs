@@ -154,6 +154,13 @@ that does not start with `proxy=` stays in the path" — to per-segment
 detection: a `proxy=` key in any `&` segment marks the section, so a
 tail like `?a=b&proxy=P` is a hard `InvalidParams`, not a path.*
 
+*Detection of the `proxy=` key is ASCII case-insensitive while
+validation stays exact — `?Proxy=`/`?PROXY=` in the last `?` section
+mark it a parameter section and then hard-error with `InvalidParams`
+(canonical-spelling hint) rather than leaking the proxy name into the
+request path; a case-variant segment stranded before a later `?` keeps
+the case-sensitive warn path unchanged.*
+
 Wire-wise the proxy dial happens first, then the ordinary encrypted
 stack runs over the returned stream: `proxy.dial_tcp()` →
 `TlsLayer::connect_typed` → RFC 7766 length-prefixed framing (DoT) or
