@@ -32,7 +32,7 @@ pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum number of *idle* pooled `tcp://` streams per [`DnsClient`].
 ///
 /// This bounds only the keep-alive pool: a stream is pushed on return
-/// only while the pool is below this size (see [`TcpPool::push`]).
+/// only while the pool is below this size (see [`Pool::push`]).
 /// Concurrent exchanges are **not** capped by this value — a `tcp://`
 /// nameserver can be a user's primary resolver (a common way to dodge
 /// UDP truncation/pollution), and capping concurrent exchanges at the
@@ -67,6 +67,35 @@ const TCP_POOL_CAPACITY: usize = 4;
 /// server timeouts; 30 s stays under the shortest of those while still
 /// covering the bursts pooling exists to serve.
 const TCP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum number of *idle* pooled DoT/DoH sessions per [`DnsClient`].
+/// Same doctrine as [`TCP_POOL_CAPACITY`]: bounds only the keep-alive
+/// pool; concurrent exchanges are never capped — a burst dials fresh
+/// conns and surplus validated sessions close at push.
+#[cfg(feature = "encrypted")]
+const TLS_POOL_CAPACITY: usize = 4;
+
+/// Idle window for pooled DoT/DoH sessions — the same 30 s rationale as
+/// [`TCP_POOL_IDLE_TIMEOUT`]: servers drop long-idle conns anyway, and
+/// RFC 7766 §6.2.3 asks clients to close well inside server timeouts.
+#[cfg(feature = "encrypted")]
+const TLS_POOL_IDLE_TIMEOUT: Duration = TCP_POOL_IDLE_TIMEOUT;
+
+/// Floor of a reused TLS conn's exchange deadline. The reuse attempt runs
+/// under `min(timeout/2, max(4×est_rtt, REUSED_TLS_MIN_BUDGET))` — see
+/// [`tls_reuse_budget`] for the full rule including the viability skip: a
+/// silently half-closed conn (NAT/upstream dropped the socket — write
+/// succeeds, peer never answers) must be discovered fast enough to leave
+/// a full fresh-dial budget, while proxied DoH RTTs that legitimately
+/// exceed a flat cap still get `4×` their proven exchange time.
+#[cfg(feature = "encrypted")]
+const REUSED_TLS_MIN_BUDGET: Duration = Duration::from_millis(250);
+
+/// Budget for the best-effort `close_notify` a pooled TLS conn gets when
+/// the pool discards it in an async context — pure politeness, so it is
+/// capped hard and failure is ignored.
+#[cfg(feature = "encrypted")]
+const POLITE_CLOSE_BUDGET: Duration = Duration::from_millis(100);
 
 /// Process-wide generation of pooled upstream connections (issue #695).
 ///
@@ -240,21 +269,63 @@ pub struct DnsClient {
     label: Option<Arc<str>>,
     /// Idle direct `tcp://` connections. Streams are checked out for the whole
     /// exchange and returned only after the DNS response is fully validated.
-    tcp_pool: TcpPool,
+    tcp_pool: Pool<TcpStream>,
+    /// Idle DoT/DoH TLS sessions, pooled exactly like `tcp_pool`: one
+    /// upstream-bound conn type (`TlsConn`) covers direct and `?proxy=`
+    /// dials, checked out for the whole exchange so response-ID matching
+    /// can never cross packets. A pooled `?proxy=` conn keeps the group
+    /// member selected at dial time — reuse bypasses Selector/URLTest
+    /// re-selection until the conn dies (self-healing trade-off).
+    #[cfg(feature = "encrypted")]
+    tls_pool: Pool<PooledTls>,
+    /// `with_tls_pool_disabled` escape hatch (debug/test builds only —
+    /// written nowhere else). The mutation control proving the reuse
+    /// assertions measure real pooling: when set, every query pays the
+    /// full dial + handshake.
+    #[cfg(feature = "encrypted")]
+    tls_pool_disabled: bool,
+    /// Pooled conns rejected by the pre-checkout liveness probe —
+    /// test/debug instrumentation separating "the probe caught the dead
+    /// conn" from "the exchange-time EOF did": identical at accept-count
+    /// granularity, distinguishable here (review M4).
+    #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
+    probe_dead: std::sync::atomic::AtomicUsize,
 }
 
-struct TcpPool {
-    /// Idle streams paired with the instant they were returned to the pool.
-    /// Pushed and popped at the end, so the freshest stream is reused first
+/// What the pool does to an element it discards while an async context
+/// exists (push-side overflow, take-side reaping): bare `Drop` is the
+/// baseline; [`PooledTls`] adds a best-effort `close_notify`. Sync discard
+/// paths (`close_idle`, `reset`) always drop bare — spawning shutdown
+/// tasks for politeness is rejected.
+trait PoolElement: Send + 'static {
+    /// Best-effort graceful close, internally bounded. Default is a no-op:
+    /// the element is dropped bare, exactly like today.
+    fn polite_close(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+}
+
+impl PoolElement for TcpStream {}
+
+/// A bounded keep-alive pool of upstream conns checked out for one whole
+/// exchange at a time — `tcp://` sockets and (under `encrypted`) DoT/DoH
+/// TLS sessions share this machinery. `E` is the bare element; the
+/// generation stamp and the idle timestamp are tracked by the pool.
+struct Pool<E: PoolElement> {
+    /// Idle elements paired with the instant they were returned to the pool.
+    /// Pushed and popped at the end, so the freshest conn is reused first
     /// and the staler ones age out instead of being handed to a query.
-    idle: AsyncMutex<Vec<(PooledTcp, Instant)>>,
+    idle: AsyncMutex<Vec<(PoolEntry<E>, Instant)>>,
+    /// Upper bound on *idle* entries — enforced at [`Pool::push`], never a
+    /// cap on concurrent exchanges (see [`TCP_POOL_CAPACITY`]).
+    capacity: usize,
     idle_timeout: Duration,
     /// This pool's own generation, bumped by [`DnsClient::reset_connections`]
     /// — the per-client counterpart of [`CONNECTION_GENERATION`].
     generation: AtomicU,
 }
 
-/// The pool generation a stream was created under: stale once either the
+/// The pool generation a conn was created under: stale once either the
 /// process-wide or the pool-local counter moves (issue #695).
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PoolGeneration {
@@ -262,18 +333,47 @@ struct PoolGeneration {
     local: Uint,
 }
 
-/// A pooled `tcp://` stream plus the [`PoolGeneration`] captured before its
-/// socket was created.
-struct PooledTcp {
-    stream: TcpStream,
+/// A pooled element plus the [`PoolGeneration`] captured before its conn
+/// was created.
+struct PoolEntry<E> {
+    element: E,
     generation: PoolGeneration,
 }
 
-impl TcpPool {
-    fn new() -> Self {
+/// A negotiated DoT/DoH session ready for an exchange. Direct dials are
+/// boxed `TcpStream`s via the `ProxyConn` blanket impl, proxied dials are
+/// the adapter's own `ProxyConn` — one boxed element type covers both, so
+/// pooled reuse skips the per-query `dial_tcp`/`protect(fd)` entirely.
+#[cfg(feature = "encrypted")]
+type TlsConn = Pin<Box<tokio_boring::SslStream<Box<dyn meow_common::ProxyConn>>>>;
+
+/// A pooled TLS conn plus the conn's own last successful exchange
+/// duration, recorded at push: it bounds the *next* reuse attempt's
+/// deadline — proxied DoH RTTs legitimately exceed a flat 250 ms cap, so
+/// the cap scales with the conn's proven RTT instead.
+#[cfg(feature = "encrypted")]
+struct PooledTls {
+    stream: TlsConn,
+    est_rtt: Duration,
+}
+
+#[cfg(feature = "encrypted")]
+impl PoolElement for PooledTls {
+    fn polite_close(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(async {
+            // Pure politeness: a bounded `close_notify` where an async
+            // context exists anyway; failure and timeout are ignored.
+            let _ = tokio::time::timeout(POLITE_CLOSE_BUDGET, self.stream.shutdown()).await;
+        })
+    }
+}
+
+impl<E: PoolElement> Pool<E> {
+    fn new(capacity: usize, idle_timeout: Duration) -> Self {
         Self {
-            idle: AsyncMutex::new(Vec::with_capacity(TCP_POOL_CAPACITY)),
-            idle_timeout: TCP_POOL_IDLE_TIMEOUT,
+            idle: AsyncMutex::new(Vec::with_capacity(capacity)),
+            capacity,
+            idle_timeout,
             generation: AtomicU::new(0),
         }
     }
@@ -285,41 +385,56 @@ impl TcpPool {
         }
     }
 
-    /// Retire every stream this pool handed out or holds — idle ones close
-    /// now, checked-out ones on return. Returns the idle streams closed.
+    /// Retire every conn this pool handed out or holds — idle ones close
+    /// now, checked-out ones on return. Returns the idle conns closed.
     fn reset(&self) -> usize {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.close_idle()
     }
 
-    /// Return a validated stream to the idle pool, closing it instead when
+    /// Return a validated conn to the idle pool, closing it instead when
     /// the pool is already at capacity or [`reset_pooled_connections`]
     /// retired its generation while it was checked out.
     ///
     /// The size bound is enforced *here*, on the push side — it is not an
     /// emergent property of the exchange path — so any future caller
-    /// (e.g. a background reaper returning streams) cannot silently grow
-    /// the pool beyond [`TCP_POOL_CAPACITY`].
-    async fn push(&self, pooled: PooledTcp) {
-        let mut idle = self.idle.lock().await;
-        if idle.len() < TCP_POOL_CAPACITY && pooled.generation == self.generation() {
-            idle.push((pooled, Instant::now()));
+    /// (e.g. a background reaper returning conns) cannot silently grow
+    /// the pool beyond `capacity`.
+    async fn push(&self, mut pooled: PoolEntry<E>) {
+        {
+            let mut idle = self.idle.lock().await;
+            if idle.len() < self.capacity && pooled.generation == self.generation() {
+                idle.push((pooled, Instant::now()));
+                return;
+            }
         }
-        // else: `pooled` drops here, closing the connection.
+        // Overflow/retired: close politely — an async context exists.
+        pooled.element.polite_close().await;
     }
 
-    /// Pop the freshest reusable stream, closing every idle-expired or
-    /// generation-retired one on the way.
-    async fn take(&self) -> Option<PooledTcp> {
+    /// Pop the freshest reusable conn, closing every idle-expired or
+    /// generation-retired one on the way. Reaped conns get their
+    /// [`PoolElement::polite_close`] after the lock is released.
+    async fn take(&self) -> Option<PoolEntry<E>> {
         let generation = self.generation();
-        let mut idle = self.idle.lock().await;
-        idle.retain(|(pooled, _)| pooled.generation == generation);
-        take_fresh(&mut idle, Instant::now(), self.idle_timeout)
+        let mut reaped = Vec::new();
+        let taken = {
+            let mut idle = self.idle.lock().await;
+            reaped.extend(
+                idle.extract_if(.., |(pooled, _)| pooled.generation != generation)
+                    .map(|(entry, _)| entry),
+            );
+            take_fresh(&mut idle, Instant::now(), self.idle_timeout, &mut reaped)
+        };
+        for mut entry in reaped {
+            entry.element.polite_close().await;
+        }
+        taken
     }
 
-    /// Close every idle stream now, without waiting for the lock: a
+    /// Close every idle conn now, without waiting for the lock: a
     /// contended pool is mid-checkout and [`Self::take`] / [`Self::push`]
-    /// drop retired streams on their own. Returns the number closed.
+    /// drop retired conns on their own. Returns the number closed.
     fn close_idle(&self) -> usize {
         self.idle.try_lock().map_or(0, |mut idle| {
             let closed = idle.len();
@@ -329,14 +444,47 @@ impl TcpPool {
     }
 }
 
-/// Close every stream idle past `idle_timeout` and hand back the freshest
-/// survivor, or `None` when the pool has nothing reusable.
+/// Close every conn idle past `idle_timeout` and hand back the freshest
+/// survivor, or `None` when the pool has nothing reusable. Expired
+/// elements are moved into `reaped` for the caller to close (a sync drop
+/// is all a plain socket needs; a TLS conn gets a `close_notify`).
 ///
 /// Split out from the exchange so the reaping rule is testable without a
-/// socket or a clock: dropping the expired entries closes those connections.
-fn take_fresh<T>(idle: &mut Vec<(T, Instant)>, now: Instant, idle_timeout: Duration) -> Option<T> {
-    idle.retain(|(_, returned_at)| now.duration_since(*returned_at) < idle_timeout);
-    idle.pop().map(|(stream, _)| stream)
+/// socket or a clock.
+fn take_fresh<T>(
+    idle: &mut Vec<(T, Instant)>,
+    now: Instant,
+    idle_timeout: Duration,
+    reaped: &mut Vec<T>,
+) -> Option<T> {
+    reaped.extend(
+        idle.extract_if(.., |(_, returned_at)| {
+            now.duration_since(*returned_at) >= idle_timeout
+        })
+        .map(|(element, _)| element),
+    );
+    idle.pop().map(|(element, _)| element)
+}
+
+/// The exchange deadline for a reused pooled TLS conn — `None` when the
+/// conn provably cannot answer inside the cap, sending the query
+/// straight to the fresh dial.
+///
+/// `min(timeout/2, max(4×est_rtt, REUSED_TLS_MIN_BUDGET))`: the `t/2`
+/// ceiling is what guarantees the fresh fallback its own `≥t/2` — a
+/// failed reuse attempt can never burn more than half the query budget.
+/// But a conn whose proven RTT already meets or exceeds that ceiling is
+/// a *certain* miss that still spends the whole `t/2`, leaving
+/// dial+handshake+exchange `≤t/2` — the systematic timeout a cold dial
+/// would not have hit (review M2). The attempt is skipped instead, so
+/// both branches stay reachable: a healthy conn answers inside its
+/// budget, an answerable fresh path keeps the full `timeout`.
+#[cfg(feature = "encrypted")]
+fn tls_reuse_budget(timeout: Duration, est_rtt: Duration) -> Option<Duration> {
+    let budget = (timeout / 2).min(est_rtt.saturating_mul(4).max(REUSED_TLS_MIN_BUDGET));
+    // The attempt needs ~est_rtt inside `budget`; `est_rtt >= budget`
+    // cannot win — the deadline fires first — so don't spend it.
+    (est_rtt < budget).then_some(budget)
 }
 
 pub(crate) struct IpLookupResult {
@@ -438,7 +586,13 @@ impl DnsClient {
             #[cfg(feature = "encrypted")]
             tls_extra_roots: Vec::new(),
             label: None,
-            tcp_pool: TcpPool::new(),
+            tcp_pool: Pool::new(TCP_POOL_CAPACITY, TCP_POOL_IDLE_TIMEOUT),
+            #[cfg(feature = "encrypted")]
+            tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
+            #[cfg(feature = "encrypted")]
+            tls_pool_disabled: false,
+            #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
+            probe_dead: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -452,7 +606,13 @@ impl DnsClient {
             #[cfg(feature = "encrypted")]
             tls_extra_roots: Vec::new(),
             label: None,
-            tcp_pool: TcpPool::new(),
+            tcp_pool: Pool::new(TCP_POOL_CAPACITY, TCP_POOL_IDLE_TIMEOUT),
+            #[cfg(feature = "encrypted")]
+            tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
+            #[cfg(feature = "encrypted")]
+            tls_pool_disabled: false,
+            #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
+            probe_dead: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -466,7 +626,13 @@ impl DnsClient {
             #[cfg(feature = "encrypted")]
             tls_extra_roots: Vec::new(),
             label: None,
-            tcp_pool: TcpPool::new(),
+            tcp_pool: Pool::new(TCP_POOL_CAPACITY, TCP_POOL_IDLE_TIMEOUT),
+            #[cfg(feature = "encrypted")]
+            tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
+            #[cfg(feature = "encrypted")]
+            tls_pool_disabled: false,
+            #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
+            probe_dead: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -484,7 +650,13 @@ impl DnsClient {
             #[cfg(feature = "encrypted")]
             tls_extra_roots: Vec::new(),
             label: None,
-            tcp_pool: TcpPool::new(),
+            tcp_pool: Pool::new(TCP_POOL_CAPACITY, TCP_POOL_IDLE_TIMEOUT),
+            #[cfg(feature = "encrypted")]
+            tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
+            #[cfg(feature = "encrypted")]
+            tls_pool_disabled: false,
+            #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
+            probe_dead: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -503,7 +675,13 @@ impl DnsClient {
             #[cfg(feature = "encrypted")]
             tls_extra_roots: Vec::new(),
             label: None,
-            tcp_pool: TcpPool::new(),
+            tcp_pool: Pool::new(TCP_POOL_CAPACITY, TCP_POOL_IDLE_TIMEOUT),
+            #[cfg(feature = "encrypted")]
+            tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
+            #[cfg(feature = "encrypted")]
+            tls_pool_disabled: false,
+            #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
+            probe_dead: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -555,6 +733,31 @@ impl DnsClient {
         self
     }
 
+    /// Disable the DoT/DoH session pool — every query pays a full dial +
+    /// TLS handshake. Mutation control for the pooling tests: the
+    /// accept/dial counters of a pool-disabled client prove the reuse
+    /// assertions measure real reuse and not a silent no-op. Compiled
+    /// only into test and debug builds, like
+    /// [`Self::with_tls_additional_roots`].
+    #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
+    #[doc(hidden)]
+    pub fn with_tls_pool_disabled(mut self) -> Self {
+        self.tls_pool_disabled = true;
+        self
+    }
+
+    /// Pooled TLS conns rejected by the pre-checkout liveness probe —
+    /// instrumentation separating "the probe caught the dead conn" from
+    /// "the exchange-time EOF did": identical at accept-count
+    /// granularity, so this counter is what makes probe removal a
+    /// testable mutation (review M4). Compiled only into test and debug
+    /// builds, like [`Self::with_tls_pool_disabled`].
+    #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
+    #[doc(hidden)]
+    pub fn tls_probe_rejections(&self) -> usize {
+        self.probe_dead.load(Ordering::Relaxed)
+    }
+
     /// Override the API/UI label used to report this upstream in DNS results.
     pub fn with_upstream_label(mut self, label: impl Into<String>) -> Self {
         self.label = Some(Arc::from(label.into()));
@@ -575,15 +778,23 @@ impl DnsClient {
         self.proxy.as_ref()
     }
 
-    /// Drop this client's pooled `tcp://` connections so the next query
-    /// dials a fresh socket (issue #695). Idle streams close now unless the
-    /// pool is mid-checkout, in which case they close on the next checkout;
-    /// a stream an in-flight query holds finishes that query (bounded by the
-    /// per-query timeout) and is then closed instead of pooled. Non-blocking.
-    /// Returns the idle streams closed now. UDP, DoT and DoH open a socket
-    /// per query and pool nothing.
+    /// Drop this client's pooled upstream connections — `tcp://` sockets
+    /// and, under `encrypted`, DoT/DoH TLS sessions — so the next query
+    /// dials fresh (issue #695). Idle conns close now unless the pool is
+    /// mid-checkout, in which case they close on the next checkout; a conn
+    /// an in-flight query holds finishes that query (bounded by the
+    /// per-query timeout) and is then closed instead of pooled.
+    /// Non-blocking. Returns the idle conns closed now. UDP opens a socket
+    /// per query and pools nothing.
     pub fn reset_connections(&self) -> usize {
-        self.tcp_pool.reset()
+        #[cfg(feature = "encrypted")]
+        {
+            self.tcp_pool.reset() + self.tls_pool.reset()
+        }
+        #[cfg(not(feature = "encrypted"))]
+        {
+            self.tcp_pool.reset()
+        }
     }
 
     /// Human-readable upstream identifier for API/UI surfaces.
@@ -872,7 +1083,7 @@ impl DnsClient {
     /// Concurrency is **not** capped: each in-flight exchange either reuses a
     /// pooled stream or opens its own connection, and validated streams are
     /// returned to the pool only while it is below
-    /// [`TCP_POOL_CAPACITY`] (see [`TcpPool::push`]); surplus streams are
+    /// [`TCP_POOL_CAPACITY`] (see [`Pool::push`]); surplus streams are
     /// closed. The async mutex only guards the idle-slot pop/push.
     ///
     /// The pooled (reused) attempt runs under a *short* read deadline — at
@@ -886,9 +1097,10 @@ impl DnsClient {
     /// [`TCP_POOL_IDLE_TIMEOUT`] closes a stream before it has been idle
     /// long enough to be silently dropped, so the common path after a quiet
     /// period is a plain connect rather than a reuse attempt that has to
-    /// time out first. Pooling is intentionally scoped to plain
-    /// `tcp://`; DoT/DoH keep a full TLS handshake per query and are out of
-    /// scope.
+    /// time out first. DoT/DoH use the encrypted counterpart,
+    /// [`Self::tls_exchange_pooled`], which adds a pre-checkout liveness
+    /// probe and an RTT-scaled deadline (proxied DoH legitimately exceeds
+    /// a flat 250 ms).
     /// Test hook: shorten the pooled-stream idle window so reaping can be
     /// exercised without sleeping for the production timeout.
     #[cfg(test)]
@@ -912,7 +1124,7 @@ impl DnsClient {
         let pooled_budget = pooled_budget.min(Duration::from_millis(250));
 
         if let Some(mut pooled) = pooled {
-            let attempt = tcp_message_exchange(&mut pooled.stream, wire, expected);
+            let attempt = tcp_message_exchange(&mut pooled.element, wire, expected);
             if let Ok(Ok(response)) = tokio::time::timeout(pooled_budget, attempt).await {
                 self.tcp_pool.push(pooled).await;
                 return Ok(response);
@@ -927,7 +1139,12 @@ impl DnsClient {
         let generation = self.tcp_pool.generation();
         let mut stream = factory().connect_tcp(addr).await?;
         let response = tcp_message_exchange(&mut stream, wire, expected).await?;
-        self.tcp_pool.push(PooledTcp { stream, generation }).await;
+        self.tcp_pool
+            .push(PoolEntry {
+                element: stream,
+                generation,
+            })
+            .await;
         Ok(response)
     }
 
@@ -1015,40 +1232,182 @@ impl DnsClient {
             .map_err(tls_connect_error::<S>)
     }
 
-    /// DoT exchange over an already-dialed stream (direct TCP or proxy
-    /// conn) — RFC 7858: TLS, then RFC 7766 length-prefixed framing.
+    /// Open the raw conn a DoT/DoH session is built over: the adapter's
+    /// `ProxyConn` under `?proxy=` (the dial keeps its `internal:true`
+    /// housekeeping metadata), a boxed `TcpStream` otherwise — one
+    /// `Box<dyn ProxyConn>` either way, so the pool stores a single type.
     #[cfg(feature = "encrypted")]
-    async fn dot_exchange_on<S>(
-        &self,
-        inner: S,
-        sni: &str,
-        wire: &[u8],
-    ) -> Result<Vec<u8>, ClientError>
-    where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-    {
-        let tls = tls_layer(sni, "dot", &self.tls_extra_roots)?;
-        let mut stream = self.tls_connect_pinned(&tls, inner).await?;
-        write_lp(&mut stream, wire).await?;
-        read_lp(&mut stream).await
+    async fn dial_tls_inner(&self) -> Result<Box<dyn meow_common::ProxyConn>, ClientError> {
+        if let Some(proxy) = self.proxy.as_ref() {
+            self.proxy_dial(proxy).await
+        } else {
+            let tcp = factory().connect_tcp(self.transport.dial_addr()).await?;
+            Ok(Box::new(tcp))
+        }
     }
 
-    /// DoH exchange over an already-dialed stream — RFC 8484 HTTP/1.1
-    /// POST `application/dns-message`.
+    /// Dial and TLS-handshake a fresh DoT/DoH conn — the cold path every
+    /// query took before pooling.
     #[cfg(feature = "encrypted")]
-    async fn doh_exchange_on<S>(
+    async fn tls_dial_handshake(&self) -> Result<TlsConn, ClientError> {
+        let (sni, alpn) = match &self.transport {
+            Transport::Dot { sni, .. } => (sni.as_ref(), "dot"),
+            Transport::Doh { sni, .. } => (sni.as_ref(), "http/1.1"),
+            _ => unreachable!("tls_dial_handshake on a non-TLS transport"),
+        };
+        let conn = self.dial_tls_inner().await?;
+        let tls = tls_layer(sni, alpn, &self.tls_extra_roots)?;
+        self.tls_connect_pinned(&tls, conn).await
+    }
+
+    /// One DNS exchange over an established TLS conn, returning the
+    /// validated response and whether the conn may return to the pool.
+    /// DoT is always reusable after a clean exchange; DoH defers to the
+    /// response's own framing verdict — a `Connection: close` or
+    /// close-delimited answer is still a correct answer, just not a
+    /// reusable conn.
+    #[cfg(feature = "encrypted")]
+    async fn tls_message_exchange(
         &self,
-        inner: S,
-        sni: &str,
-        path: &str,
+        stream: &mut TlsConn,
         wire: &[u8],
-    ) -> Result<Vec<u8>, ClientError>
-    where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-    {
-        let tls = tls_layer(sni, "http/1.1", &self.tls_extra_roots)?;
-        let mut stream = self.tls_connect_pinned(&tls, inner).await?;
-        doh_http_exchange(&mut stream, sni, path, wire).await
+        expected: &ExpectedResponse,
+    ) -> Result<(Message, bool), ClientError> {
+        match &self.transport {
+            Transport::Dot { .. } => {
+                write_lp(stream, wire).await?;
+                let body = read_lp(stream).await?;
+                Ok((decode_validated_response(&body, expected)?, true))
+            }
+            Transport::Doh { sni, path, .. } => {
+                let (body, reusable) = doh_http_exchange(stream, sni, path, wire).await?;
+                Ok((decode_validated_response(&body, expected)?, reusable))
+            }
+            _ => unreachable!("tls_message_exchange on a non-TLS transport"),
+        }
+    }
+
+    /// A DoT/DoH query through a bounded keep-alive pool of TLS sessions —
+    /// the encrypted counterpart of [`Self::tcp_exchange_pooled`], sharing
+    /// its doctrine: exclusive checkout (no pipelining — a checked-out
+    /// conn runs exactly one exchange, so response-ID matching cannot
+    /// cross packets), concurrency never capped by the pool size, surplus
+    /// conns closed at push.
+    ///
+    /// On top of the TCP flow it adds two TLS-specific defences:
+    ///
+    /// - a free pre-checkout liveness probe ([`tls_conn_alive`]) — a
+    ///   half-open conn is discarded and redialed at zero query cost;
+    /// - an RTT-scaled reuse deadline, `min(timeout/2, max(4×est_rtt,
+    ///   250ms))` ([`tls_reuse_budget`]): a flat 250 ms cap would make
+    ///   every proxied-DoH reuse self-defeating (deadline burns, redial
+    ///   anyway), while silent-drop discovery only needs to outlive the
+    ///   conn's own proven RTT. The `t/2` ceiling reserves the fresh
+    ///   path its `≥t/2` floor — and a conn whose proven RTT already
+    ///   exceeds it is never attempted at all (review M2).
+    ///
+    /// The retry whitelist is `{Io error, reuse deadline elapsed}` only —
+    /// a `Protocol`/`Tls`/validation failure on a pooled conn cannot be
+    /// staleness (only fully validated conns are ever pushed) and is
+    /// returned verbatim, never retried, never pooled. A fresh attempt's
+    /// error is authoritative and returned as-is.
+    #[cfg(feature = "encrypted")]
+    async fn tls_exchange_pooled(
+        &self,
+        wire: &[u8],
+        expected: &ExpectedResponse,
+    ) -> Result<Message, ClientError> {
+        if !self.tls_pool_disabled {
+            if let Some(mut pooled) = self.tls_pool.take().await {
+                // `Some(budget)` only for a conn that is both alive at
+                // the probe and able to answer inside its capped reuse
+                // deadline — anything else falls straight through to
+                // the fresh dial below with the full timeout in hand.
+                let viable = if tls_conn_alive(&mut pooled.element.stream).await {
+                    match tls_reuse_budget(self.timeout, pooled.element.est_rtt) {
+                        Some(budget) => {
+                            tracing::debug!(
+                                upstream = %self.upstream_label(),
+                                "dns tls pool: reusing pooled conn"
+                            );
+                            Some(budget)
+                        }
+                        None => {
+                            tracing::debug!(
+                                upstream = %self.upstream_label(),
+                                est_rtt = ?pooled.element.est_rtt,
+                                "dns tls pool: proven RTT cannot meet the reuse cap; dialing fresh"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    #[cfg(any(test, debug_assertions))]
+                    self.probe_dead.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        upstream = %self.upstream_label(),
+                        "dns tls pool: pooled conn dead at liveness probe; dialing fresh"
+                    );
+                    None
+                };
+                if let Some(budget) = viable {
+                    let started = Instant::now();
+                    let attempt =
+                        self.tls_message_exchange(&mut pooled.element.stream, wire, expected);
+                    match tokio::time::timeout(budget, attempt).await {
+                        Ok(Ok((response, reusable))) => {
+                            pooled.element.est_rtt = started.elapsed();
+                            if reusable {
+                                self.tls_pool.push(pooled).await;
+                            }
+                            return Ok(response);
+                        }
+                        Ok(Err(ClientError::Io(err))) => {
+                            tracing::debug!(
+                                upstream = %self.upstream_label(),
+                                error = %err,
+                                "dns tls pool: pooled conn failed mid-exchange; retrying fresh"
+                            );
+                        }
+                        // `Protocol`/`Tls`/validation errors cannot be
+                        // staleness — propagate verbatim, no retry.
+                        Ok(Err(err)) => return Err(err),
+                        Err(_elapsed) => {
+                            tracing::debug!(
+                                upstream = %self.upstream_label(),
+                                budget = ?budget,
+                                "dns tls pool: pooled conn missed its reuse deadline; retrying fresh"
+                            );
+                        }
+                    }
+                }
+                // Dead/failed pooled conn drops here — never re-pooled.
+            } else {
+                tracing::debug!(
+                    upstream = %self.upstream_label(),
+                    "dns tls pool: miss; dialing fresh"
+                );
+            }
+        }
+
+        // Fresh dial. The generation is captured before the conn exists:
+        // a reset racing the dial must retire this conn too (issue #695).
+        let generation = self.tls_pool.generation();
+        let mut stream = self.tls_dial_handshake().await?;
+        let started = Instant::now();
+        let (response, reusable) = self
+            .tls_message_exchange(&mut stream, wire, expected)
+            .await?;
+        let est_rtt = started.elapsed();
+        if reusable && !self.tls_pool_disabled {
+            self.tls_pool
+                .push(PoolEntry {
+                    element: PooledTls { stream, est_rtt },
+                    generation,
+                })
+                .await;
+        }
+        Ok(response)
     }
 
     async fn exchange(
@@ -1057,9 +1416,10 @@ impl DnsClient {
         expected: &ExpectedResponse,
     ) -> Result<Message, ClientError> {
         if let Some(proxy) = self.proxy.as_ref() {
-            let response = match &self.transport {
+            match &self.transport {
                 Transport::Udp { .. } | Transport::Tcp { .. } => {
-                    self.proxy_tcp_exchange(proxy, wire).await?
+                    let response = self.proxy_tcp_exchange(proxy, wire).await?;
+                    return decode_validated_response(&response, expected);
                 }
                 Transport::RCode { .. } => {
                     return Err(ClientError::Protocol(
@@ -1067,17 +1427,10 @@ impl DnsClient {
                     ));
                 }
                 #[cfg(feature = "encrypted")]
-                Transport::Dot { sni, .. } => {
-                    let conn = self.proxy_dial(proxy).await?;
-                    self.dot_exchange_on(conn, sni, wire).await?
+                Transport::Dot { .. } | Transport::Doh { .. } => {
+                    return self.tls_exchange_pooled(wire, expected).await;
                 }
-                #[cfg(feature = "encrypted")]
-                Transport::Doh { sni, path, .. } => {
-                    let conn = self.proxy_dial(proxy).await?;
-                    self.doh_exchange_on(conn, sni, path, wire).await?
-                }
-            };
-            return decode_validated_response(&response, expected);
+            }
         }
         match &self.transport {
             Transport::Udp { addr } => udp_exchange(*addr, wire, expected).await,
@@ -1086,16 +1439,8 @@ impl DnsClient {
                 "rcode transport should not perform network exchange",
             )),
             #[cfg(feature = "encrypted")]
-            Transport::Dot { addr, sni } => {
-                let tcp = factory().connect_tcp(*addr).await?;
-                let response = self.dot_exchange_on(tcp, sni, wire).await?;
-                decode_validated_response(&response, expected)
-            }
-            #[cfg(feature = "encrypted")]
-            Transport::Doh { addr, sni, path } => {
-                let tcp = factory().connect_tcp(*addr).await?;
-                let response = self.doh_exchange_on(tcp, sni, path, wire).await?;
-                decode_validated_response(&response, expected)
+            Transport::Dot { .. } | Transport::Doh { .. } => {
+                self.tls_exchange_pooled(wire, expected).await
             }
         }
     }
@@ -1456,19 +1801,17 @@ async fn read_lp<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>, ClientEr
 /// The HTTP/1.1 half of a DoH exchange — shared by the direct and
 /// proxied paths, which differ only in how `stream` was dialed.
 ///
-/// Sends a minimal `POST path` with `application/dns-message` and
-/// `Connection: close`, then reads the response to EOF (bounded by
-/// [`MAX_DOH_RESPONSE_BYTES`]) and returns the DNS body.
+/// Sends a minimal `POST path` with `application/dns-message` (no
+/// `Connection: close` — the session is poolable), then reads the
+/// response with full RFC 7230 §3.3 framing via [`read_http_response`]
+/// and returns the DNS body plus the pool-eligibility verdict.
 #[cfg(feature = "encrypted")]
-async fn doh_http_exchange<S>(
-    stream: &mut Pin<Box<tokio_boring::SslStream<S>>>,
+async fn doh_http_exchange(
+    stream: &mut TlsConn,
     sni: &str,
     path: &str,
     wire: &[u8],
-) -> Result<Vec<u8>, ClientError>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-{
+) -> Result<(Vec<u8>, bool), ClientError> {
     let head = format!(
         "POST {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
@@ -1476,7 +1819,6 @@ where
          Accept: application/dns-message\r\n\
          Content-Type: application/dns-message\r\n\
          Content-Length: {len}\r\n\
-         Connection: close\r\n\
          \r\n",
         host = sni,
         len = wire.len(),
@@ -1485,25 +1827,331 @@ where
     stream.write_all(wire).await?;
     stream.flush().await?;
 
-    let all = read_bounded_http_response(stream).await?;
-    let split = find_subseq(&all, b"\r\n\r\n")
-        .ok_or(ClientError::Protocol("doh: missing header terminator"))?;
-    let head_bytes = &all[..split];
-    let body = &all[split + 4..];
-    let head_str =
-        std::str::from_utf8(head_bytes).map_err(|_| ClientError::Protocol("doh: bad headers"))?;
-    let status_line = head_str
-        .lines()
-        .next()
-        .ok_or(ClientError::Protocol("doh: empty response"))?;
-    // "HTTP/1.1 200 OK" — extract the status code.
-    let mut parts = status_line.split_whitespace();
-    let _version = parts.next();
-    let status = parts.next().unwrap_or("");
-    if status != "200" {
-        return Err(ClientError::Protocol("doh: non-200 status"));
+    read_http_response(stream).await
+}
+
+/// Incremental reader for one HTTP/1.1 DoH response. Reads run just ahead
+/// of the parser and stop at message boundaries, so a keep-alive peer is
+/// never asked for bytes it will never send; every byte read counts
+/// toward [`MAX_DOH_RESPONSE_BYTES`].
+#[cfg(feature = "encrypted")]
+struct HttpReader<'a, R> {
+    stream: &'a mut R,
+    buf: Vec<u8>,
+    /// Parse cursor: `buf[..pos]` is consumed.
+    pos: usize,
+}
+
+/// The fields of a final (non-`1xx`) DoH response head that decide body
+/// framing and pool eligibility.
+#[cfg(feature = "encrypted")]
+struct DohHead {
+    /// `HTTP/1.1` status line — keep-alive is the 1.1 default; anything
+    /// older is treated as close-delimited regardless of headers.
+    http11: bool,
+    /// A `Connection:` header carrying the `close` token.
+    connection_close: bool,
+    /// `Some(final_coding_is_chunked)` when a `Transfer-Encoding` header
+    /// is present — per RFC 7230 §3.3.1 a non-chunked final coding makes
+    /// the body close-delimited.
+    transfer_encoding: Option<bool>,
+    content_length: Option<usize>,
+}
+
+/// The classification boundary for DoH exchange failures (review M3):
+/// an EOF *anywhere* inside an in-flight response is `Io`
+/// (`UnexpectedEof`), never `Protocol` — on a pooled conn a mid-read EOF
+/// is indistinguishable from a dead socket, so the `{Io, deadline}`
+/// retry whitelist must see it for the transparent redial to fire.
+/// `Protocol` is reserved for malformed *content*: bytes that actually
+/// arrived and violate RFC 7230.
+#[cfg(feature = "encrypted")]
+fn doh_eof(context: &'static str) -> ClientError {
+    ClientError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, context))
+}
+
+#[cfg(feature = "encrypted")]
+impl<R> HttpReader<'_, R>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
+    fn new(stream: &mut R) -> HttpReader<'_, R> {
+        HttpReader {
+            stream,
+            buf: Vec::with_capacity(1024),
+            pos: 0,
+        }
     }
-    Ok(body.to_vec())
+
+    fn unconsumed(&self) -> &[u8] {
+        &self.buf[self.pos..]
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.pos += n;
+    }
+
+    /// Append one more read to the buffer. `Ok(false)` on EOF.
+    async fn fill(&mut self) -> Result<bool, ClientError> {
+        let mut chunk = [0u8; 4096];
+        let n = self.stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(false);
+        }
+        self.buf.extend_from_slice(&chunk[..n]);
+        if self.buf.len() > MAX_DOH_RESPONSE_BYTES {
+            return Err(ClientError::Protocol("doh: response exceeds maximum size"));
+        }
+        Ok(true)
+    }
+
+    /// Buffer until `needle` appears in the unconsumed bytes and return
+    /// its offset from the cursor. `Err(Io(UnexpectedEof))` on EOF first
+    /// — [`doh_eof`] keeps truncation retryable on pooled conns.
+    async fn fill_until(
+        &mut self,
+        needle: &[u8],
+        eof_err: &'static str,
+    ) -> Result<usize, ClientError> {
+        // `unconsumed()` only grows inside this loop (`pos` is untouched
+        // until the caller consumes), so a start offset already scanned
+        // stays ruled out: resume just `needle.len() - 1` bytes back —
+        // a match may straddle the previous fill's tail. Rescanning the
+        // whole buffer after every fill would let a byte-dribbling peer
+        // turn the parse into O(buf²) CPU burn inside the query
+        // deadline (review I2).
+        let mut scanned = 0usize;
+        loop {
+            let hay = self.unconsumed();
+            if let Some(at) = find_subseq(hay.get(scanned..).unwrap_or_default(), needle) {
+                return Ok(scanned + at);
+            }
+            scanned = hay.len().saturating_sub(needle.len().saturating_sub(1));
+            if !self.fill().await? {
+                return Err(doh_eof(eof_err));
+            }
+        }
+    }
+
+    /// Take exactly `len` body bytes, buffered remainder first. An EOF
+    /// inside a `Content-Length` body is a truncated exchange — an `Io`
+    /// failure so a pooled conn hit by it is retryable once.
+    async fn read_len(&mut self, len: usize) -> Result<Vec<u8>, ClientError> {
+        while self.unconsumed().len() < len {
+            if !self.fill().await? {
+                return Err(doh_eof("doh: EOF inside content-length body"));
+            }
+        }
+        let body = self.unconsumed()[..len].to_vec();
+        self.consume(len);
+        Ok(body)
+    }
+
+    /// Read a close-delimited body: buffered remainder plus the rest of
+    /// the stream via [`read_bounded_http_response`] (the historical EOF
+    /// arm), the total bounded by [`MAX_DOH_RESPONSE_BYTES`].
+    async fn read_to_eof(&mut self) -> Result<Vec<u8>, ClientError> {
+        let mut body = self.unconsumed().to_vec();
+        let rest = read_bounded_http_response(self.stream).await?;
+        if body.len() + rest.len() > MAX_DOH_RESPONSE_BYTES {
+            return Err(ClientError::Protocol("doh: response exceeds maximum size"));
+        }
+        body.extend_from_slice(&rest);
+        Ok(body)
+    }
+
+    /// Read a `Transfer-Encoding: chunked` body (RFC 7230 §4.1): hex-size
+    /// lines (extensions ignored), data + trailing CRLF, a zero chunk,
+    /// then trailer fields to the terminating empty line.
+    async fn read_chunked(&mut self) -> Result<Vec<u8>, ClientError> {
+        let mut body = Vec::new();
+        loop {
+            let line_len = self
+                .fill_until(b"\r\n", "doh: EOF inside chunked body")
+                .await?;
+            let line = std::str::from_utf8(&self.unconsumed()[..line_len])
+                .map_err(|_| ClientError::Protocol("doh: bad chunk size"))?;
+            // Chunk extensions (`;name=val`) are ignored per §4.1.1.
+            let size_token = line.split(';').next().unwrap_or_default().trim();
+            let size = usize::from_str_radix(size_token, 16)
+                .map_err(|_| ClientError::Protocol("doh: bad chunk size"))?;
+            // Bound the declaration before any arithmetic: a
+            // `usize::MAX`-scale chunk size must be a plain `Protocol`
+            // rejection — otherwise `body.len() + size` and `size + 2`
+            // below wrap into a slice-index panic (review M1).
+            if size > MAX_DOH_RESPONSE_BYTES {
+                return Err(ClientError::Protocol("doh: response exceeds maximum size"));
+            }
+            self.consume(line_len + 2);
+            if size == 0 {
+                // Trailer section: header fields to the empty line.
+                loop {
+                    let tlen = self
+                        .fill_until(b"\r\n", "doh: EOF inside chunked trailer")
+                        .await?;
+                    self.consume(tlen + 2);
+                    if tlen == 0 {
+                        return Ok(body);
+                    }
+                }
+            }
+            if body.len() + size > MAX_DOH_RESPONSE_BYTES {
+                return Err(ClientError::Protocol("doh: response exceeds maximum size"));
+            }
+            while self.unconsumed().len() < size + 2 {
+                if !self.fill().await? {
+                    return Err(doh_eof("doh: EOF inside chunked body"));
+                }
+            }
+            if &self.unconsumed()[size..size + 2] != b"\r\n" {
+                return Err(ClientError::Protocol("doh: bad chunk terminator"));
+            }
+            body.extend_from_slice(&self.unconsumed()[..size]);
+            self.consume(size + 2);
+        }
+    }
+}
+
+/// Read one HTTP/1.1 response off a DoH stream with full RFC 7230 §3.3
+/// framing: interim `1xx` blocks are skipped, status must be `200`, and
+/// the body is framed by `Transfer-Encoding: chunked`, `Content-Length`,
+/// or connection close — in that precedence.
+///
+/// Returns the body plus the pool-eligibility verdict: `false` for a
+/// `Connection: close` header, a non-`HTTP/1.1` status line, a
+/// non-chunked final transfer coding, or a close-delimited body — those
+/// responses are still correct answers, their conns are just not
+/// reusable. Non-200 statuses and framing errors (unparseable chunk
+/// sizes, missing terminators, the size cap) are [`ClientError::Protocol`]
+/// and never reach the pool — while an EOF at any parser stage is `Io`
+/// per [`doh_eof`], because on a pooled conn it is indistinguishable
+/// from a dead socket and must reach the `{Io, deadline}` retry
+/// whitelist (review M3).
+#[cfg(feature = "encrypted")]
+async fn read_http_response<R>(stream: &mut R) -> Result<(Vec<u8>, bool), ClientError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
+    let mut reader = HttpReader::new(stream);
+    let head = loop {
+        let head_len = reader
+            .fill_until(b"\r\n\r\n", "doh: EOF inside response headers")
+            .await?;
+        let head_str = std::str::from_utf8(&reader.unconsumed()[..head_len])
+            .map_err(|_| ClientError::Protocol("doh: bad headers"))?;
+        let mut lines = head_str.lines();
+        let status_line = lines
+            .next()
+            .ok_or(ClientError::Protocol("doh: empty response"))?;
+        // "HTTP/1.1 200 OK" — version token, status code, reason phrase.
+        let mut parts = status_line.split_whitespace();
+        let version = parts.next().unwrap_or_default();
+        let status: u16 = parts
+            .next()
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_default();
+        if (100..200).contains(&status) && status != 101 {
+            // Interim response (e.g. `100 Continue`) — consume this block
+            // and read the final head that follows.
+            reader.consume(head_len + 4);
+            continue;
+        }
+        if status != 200 {
+            return Err(ClientError::Protocol("doh: non-200 status"));
+        }
+        let mut head = DohHead {
+            http11: version.eq_ignore_ascii_case("HTTP/1.1"),
+            connection_close: false,
+            transfer_encoding: None,
+            content_length: None,
+        };
+        for line in lines {
+            // Colon-less lines — including obs-fold continuations — are
+            // skipped, so a `close` token folded onto a second line of
+            // `Connection:` can be missed and the conn pooled anyway.
+            // Tolerated deliberately: the desync stays bounded by the
+            // checkout liveness probe + the next exchange's validation
+            // (review I3).
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            if name.trim().eq_ignore_ascii_case("connection") {
+                head.connection_close = head.connection_close
+                    || value
+                        .split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case("close"));
+            } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+                // The final coding of the (possibly multi-header) list
+                // decides framing — earlier codings were already undone.
+                head.transfer_encoding = Some(
+                    value
+                        .rsplit(',')
+                        .next()
+                        .is_some_and(|coding| coding.trim().eq_ignore_ascii_case("chunked")),
+                );
+            } else if name.trim().eq_ignore_ascii_case("content-length") {
+                // Duplicate CLs take the last value. RFC 7230 §3.3.3 #4
+                // wants mismatched duplicates rejected — tolerated
+                // deliberately, on the same bounded-desync reasoning as
+                // the obs-fold skip above (review I3).
+                head.content_length = Some(
+                    value
+                        .parse()
+                        .map_err(|_| ClientError::Protocol("doh: bad content-length"))?,
+                );
+            }
+        }
+        reader.consume(head_len + 4);
+        break head;
+    };
+
+    let reusable = head.http11 && !head.connection_close;
+    match (head.transfer_encoding, head.content_length) {
+        // Chunked is self-delimiting — the conn stays reusable.
+        (Some(true), _) => Ok((reader.read_chunked().await?, reusable)),
+        // A non-chunked final coding or no length at all: the body ends
+        // at connection close — correct answer, unpoolable conn.
+        (Some(false), _) | (None, None) => Ok((reader.read_to_eof().await?, false)),
+        (None, Some(len)) => {
+            if len > MAX_DOH_RESPONSE_BYTES {
+                return Err(ClientError::Protocol("doh: response exceeds maximum size"));
+            }
+            Ok((reader.read_len(len).await?, reusable))
+        }
+    }
+}
+
+/// Free liveness probe before a pooled TLS conn is reused — costs no
+/// wire bytes and consumes nothing on the healthy path:
+///
+/// - `SSL_pending > 0`: decrypted bytes sit buffered, but a drained
+///   exchange leaves none — these are desync remnants. Dead.
+/// - `poll_read` `Ready` with bytes: stray data, same desync. Dead (the
+///   byte is consumed, but the conn is being discarded anyway).
+/// - `poll_read` `Ready` with no bytes: close_notify/FIN or an error.
+///   Dead.
+/// - `poll_read` `Pending`: nothing arrived — TLS 1.3 session tickets
+///   are consumed inside `SSL_read` and never surface as app data, so a
+///   pending probe means a clean conn. Alive.
+#[cfg(feature = "encrypted")]
+async fn tls_conn_alive(stream: &mut TlsConn) -> bool {
+    use std::task::Poll;
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    if stream.ssl().pending() > 0 {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    std::future::poll_fn(|cx| {
+        let mut rb = ReadBuf::new(&mut byte);
+        // Ready(Ok) with bytes = stray desync data; with none =
+        // close_notify/FIN; Ready(Err) = RST — all dead. (A byte may be
+        // consumed, but the conn is being discarded regardless.) Only a
+        // `Pending` poll means a clean, reusable conn.
+        Poll::Ready(stream.as_mut().poll_read(cx, &mut rb).is_pending())
+    })
+    .await
 }
 
 /// Maximum DoH response size (HTTP/1.1 headers + DNS body), in bytes.
@@ -1511,19 +2159,21 @@ where
 /// DNS wire messages are inherently capped at 65535 bytes — the 2-octet
 /// length prefix used by DNS-over-TCP and DNS-over-TLS (`read_lp`) enforces
 /// it structurally. DoH, however, frames the DNS message inside an HTTP
-/// response and this client reads the whole response with `Connection:
-/// close` (no `Transfer-Encoding` parsing). An unbounded `read_to_end` there
-/// let a misbehaving or hostile upstream stream an arbitrarily large body and
-/// drive unbounded heap growth (low-risk review item). Cap the total response
-/// at the DNS message maximum plus generous room for HTTP/1.1 headers; a
-/// well-formed DoH answer always fits while an oversized response is rejected.
+/// response, and every framing arm of [`read_http_response`] —
+/// `Content-Length`, chunked, and close-delimited — applies this cap so a
+/// misbehaving or hostile upstream cannot stream an arbitrarily large body
+/// and drive unbounded heap growth (low-risk review item). Cap the total
+/// response at the DNS message maximum plus generous room for HTTP/1.1
+/// headers; a well-formed DoH answer always fits while an oversized response
+/// is rejected.
 #[cfg(feature = "encrypted")]
 const MAX_DOH_RESPONSE_BYTES: usize = 65535 + 16 * 1024;
 
-/// Read an HTTP/1.1 response to EOF (the server uses `Connection: close`),
-/// rejecting responses whose total size exceeds [`MAX_DOH_RESPONSE_BYTES`].
-/// Extracted from [`doh_exchange`] so the bounded-read behaviour is unit
-/// testable without standing up a TLS DoH server.
+/// Read a stream to EOF, rejecting responses whose total size exceeds
+/// [`MAX_DOH_RESPONSE_BYTES`]. This is the close-delimited body arm of
+/// [`read_http_response`] (via [`HttpReader::read_to_eof`]) — split out so
+/// the bounded read stays unit testable without standing up a TLS DoH
+/// server.
 #[cfg(feature = "encrypted")]
 async fn read_bounded_http_response<R>(stream: &mut R) -> Result<Vec<u8>, ClientError>
 where
@@ -1639,6 +2289,389 @@ mod tests {
                 ClientError::Protocol("doh: response exceeds maximum size")
             ),
             "expected oversized-rejection, got {err:?}"
+        );
+    }
+
+    /// Reader that yields at most `step` bytes per `poll_read` — proves
+    /// the incremental parser never blocks on bytes past the message it
+    /// is framing (a keep-alive peer owes it none) and copes with
+    /// boundaries falling anywhere.
+    #[cfg(feature = "encrypted")]
+    struct Dribble<'a> {
+        data: &'a [u8],
+        step: usize,
+    }
+
+    #[cfg(feature = "encrypted")]
+    impl tokio::io::AsyncRead for Dribble<'_> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let n = self.step.min(self.data.len()).min(buf.remaining());
+            buf.put_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Drive `read_http_response` over a canned wire response, byte by
+    /// byte — the dribble forces every parser boundary to split.
+    #[cfg(feature = "encrypted")]
+    async fn doh_response(raw: &[u8]) -> Result<(Vec<u8>, bool), ClientError> {
+        let mut reader = Dribble { data: raw, step: 3 };
+        read_http_response(&mut reader).await
+    }
+
+    /// The DoH framing matrix (RFC 7230 §3.3): `Content-Length` and
+    /// chunked bodies are poolable; `Connection: close`, HTTP/1.0, a
+    /// non-chunked final coding and close-delimited bodies answer
+    /// correctly but must not be pooled.
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_response_framing_matrix() {
+        // Content-Length + keep-alive → reusable.
+        let (body, reusable) = doh_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: application/dns-message\r\n\r\nABCD",
+        )
+        .await
+        .unwrap();
+        assert_eq!(&body, b"ABCD");
+        assert!(reusable, "a CL response on a 1.1 conn must be poolable");
+
+        // Chunked + keep-alive → reusable. Chunks split mid-data on
+        // purpose; a trailer field rides the last chunk.
+        let (body, reusable) = doh_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+              2\r\nAB\r\n2;x=y\r\nCD\r\n0\r\nX-T: 1\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(&body, b"ABCD");
+        assert!(
+            reusable,
+            "a chunked response on a 1.1 conn must be poolable"
+        );
+
+        // Content-Length + `Connection: close` → answer but unpoolable.
+        let (body, reusable) =
+            doh_response(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nABCD")
+                .await
+                .unwrap();
+        assert_eq!(&body, b"ABCD");
+        assert!(!reusable);
+
+        // HTTP/1.0 + Content-Length → answer but unpoolable.
+        let (body, reusable) = doh_response(b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nABCD")
+            .await
+            .unwrap();
+        assert_eq!(&body, b"ABCD");
+        assert!(!reusable);
+
+        // No CL, no TE: close-delimited body — the whole tail is the
+        // answer, the conn is spent.
+        let (body, reusable) =
+            doh_response(b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n\r\nABCD")
+                .await
+                .unwrap();
+        assert_eq!(&body, b"ABCD");
+        assert!(!reusable);
+
+        // A non-chunked final transfer coding is close-delimited too
+        // (RFC 7230 §3.3.3 #7).
+        let (body, reusable) =
+            doh_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nABCD")
+                .await
+                .unwrap();
+        assert_eq!(&body, b"ABCD");
+        assert!(!reusable);
+    }
+
+    /// Header-list semantics the framing depends on (review F5). All
+    /// behaviours pinned here are the parser's *actual* contract:
+    ///
+    /// - a multi-coding `Transfer-Encoding` is decided by its **final**
+    ///   coding (RFC 7230 §3.3.1) — `rsplit(',')`, so `gzip, chunked`
+    ///   frames chunked while `chunked, gzip` is close-delimited;
+    /// - a second `Transfer-Encoding` header continues the same list —
+    ///   the later header's final coding decides;
+    /// - contradictory duplicate `Content-Length` values take the
+    ///   **last** value — a deliberate tolerance: RFC 7230 §3.3.3 #4
+    ///   wants mismatched duplicates rejected, but a smuggling-shaped
+    ///   desync here stays bounded by the checkout liveness probe +
+    ///   the next exchange's response validation (see the parse loop);
+    /// - obs-fold continuations are colon-less lines and skipped — a
+    ///   `close` token folded onto `Connection:` is *missed* and the
+    ///   conn pooled anyway, same bounded-desync tolerance;
+    /// - `+N` is accepted by `usize::from_str` for `Content-Length`.
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_response_header_list_semantics() {
+        // `TE: gzip, chunked` — the final coding is chunked, so the
+        // body is chunk-framed and the conn stays poolable. (A
+        // first-coding mutation reads this close-delimited instead.)
+        let (body, reusable) = doh_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n\
+              4\r\nABCD\r\n0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(&body, b"ABCD");
+        assert!(reusable, "a chunked final coding must be poolable");
+
+        // `TE: chunked, gzip` — final coding is NOT chunked: the body
+        // is close-delimited (RFC 7230 §3.3.3 #7) and the conn dies.
+        let (body, reusable) =
+            doh_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\nABCD")
+                .await
+                .unwrap();
+        assert_eq!(&body, b"ABCD");
+        assert!(!reusable, "a non-chunked final coding must not pool");
+
+        // The same list split across two headers — `TE` fields combine
+        // in order, so the later header's coding is the final one.
+        let (body, reusable) = doh_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n\
+              4\r\nABCD\r\n0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(&body, b"ABCD");
+        assert!(reusable);
+        let (body, reusable) = doh_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\nABCD",
+        )
+        .await
+        .unwrap();
+        assert_eq!(&body, b"ABCD");
+        assert!(!reusable);
+
+        // Contradictory duplicate `Content-Length`: last wins — pinned
+        // in both orders (the documented §3.3.3 #4 tolerance).
+        let (body, reusable) = doh_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nABCDEF",
+        )
+        .await
+        .unwrap();
+        assert_eq!(&body, b"ABCDEF", "the last Content-Length decides");
+        assert!(reusable);
+        let (body, reusable) =
+            doh_response(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nContent-Length: 5\r\n\r\nABCDE")
+                .await
+                .unwrap();
+        assert_eq!(&body, b"ABCDE", "the last Content-Length decides");
+        assert!(reusable);
+
+        // A malformed `Content-Length` is still a `Protocol` rejection —
+        // both a junk value and the RFC's own merged-list smuggling
+        // shape (`2, 2` — the same duplicate, one line).
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 5abc\r\n\r\nABCDE"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 2, 2\r\n\r\nAB"[..],
+        ] {
+            assert!(
+                matches!(
+                    doh_response(raw).await,
+                    Err(ClientError::Protocol("doh: bad content-length"))
+                ),
+                "malformed Content-Length must reject: {raw:?}"
+            );
+        }
+
+        // obs-fold: a continuation line carries no colon, so it is
+        // skipped wholesale — a `close` token folded onto `Connection:`
+        // is missed and the conn is pooled regardless. Pinned as the
+        // deliberate tolerance it is: the desync is bounded by the
+        // liveness probe catching the closed conn on next checkout.
+        let (body, reusable) = doh_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n close\r\n\r\nOK",
+        )
+        .await
+        .unwrap();
+        assert_eq!(&body, b"OK");
+        assert!(
+            reusable,
+            "a folded `close` token is missed by design (probe-bounded)"
+        );
+
+        // Same skip for a folded second `Content-Length` — it cannot
+        // smuggle a value past the first header.
+        let (body, reusable) =
+            doh_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n 4\r\n\r\nAB")
+                .await
+                .unwrap();
+        assert_eq!(&body, b"AB");
+        assert!(reusable);
+
+        // `+N` parses: `usize::from_str` accepts a leading `+`.
+        let (body, reusable) = doh_response(b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nOK")
+            .await
+            .unwrap();
+        assert_eq!(&body, b"OK");
+        assert!(reusable);
+
+        // A `close`-suffixed token is not `close` — only exact tokens
+        // count in the `Connection:` list.
+        let (body, reusable) =
+            doh_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: x-close\r\n\r\nOK")
+                .await
+                .unwrap();
+        assert_eq!(&body, b"OK");
+        assert!(reusable);
+    }
+
+    /// Interim `1xx` blocks precede the final head; a `Connection:
+    /// keep-alive, close` list still counts as close; non-200, framing
+    /// errors and truncation surface as `Protocol`/`Io` — never pooled.
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_response_head_and_error_paths() {
+        // `100 Continue` then the final 200 head.
+        let (body, reusable) = doh_response(
+            b"HTTP/1.1 100 Continue\r\n\r\n\
+              HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK",
+        )
+        .await
+        .unwrap();
+        assert_eq!(&body, b"OK");
+        assert!(reusable);
+
+        // Token list containing `close` → unpoolable.
+        let (_, reusable) = doh_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive, close\r\n\r\nOK",
+        )
+        .await
+        .unwrap();
+        assert!(!reusable);
+
+        // Non-200 → Protocol error.
+        assert!(matches!(
+            doh_response(b"HTTP/1.1 500 Nope\r\nContent-Length: 0\r\n\r\n").await,
+            Err(ClientError::Protocol("doh: non-200 status"))
+        ));
+
+        // Bad chunk size → Protocol error.
+        assert!(matches!(
+            doh_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n").await,
+            Err(ClientError::Protocol("doh: bad chunk size"))
+        ));
+
+        // EOF inside the header block → Io, like every truncation
+        // (a pooled conn dying mid-read is indistinguishable from
+        // staleness — retryable once; review M3).
+        assert!(matches!(
+            doh_response(b"HTTP/1.1 200 OK\r\nContent-Length: 4").await,
+            Err(ClientError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        // EOF inside a Content-Length body → Io (retryable once on a
+        // pooled conn, per the retry whitelist).
+        assert!(matches!(
+            doh_response(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nAB").await,
+            Err(ClientError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        // A declared CL beyond the cap → Protocol error, no read needed.
+        let declared_over = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_DOH_RESPONSE_BYTES + 1
+        );
+        assert!(matches!(
+            doh_response(declared_over.as_bytes()).await,
+            Err(ClientError::Protocol("doh: response exceeds maximum size"))
+        ));
+    }
+
+    /// The EOF classification boundary (review M3): *every* truncation —
+    /// an EOF at any parser stage — is `Io(UnexpectedEof)`, so a dead
+    /// pooled conn rides the `{Io, deadline}` retry whitelist.
+    /// `Protocol` is reserved for bytes that actually arrived and
+    /// violate RFC 7230.
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_response_eof_anywhere_is_io_not_protocol() {
+        for (stage, raw) in [
+            ("mid-head", &b"HTTP/1.1 200 OK\r\nContent-Len"[..]),
+            ("mid-1xx", &b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200"[..]),
+            (
+                "mid-cl-body",
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nAB"[..],
+            ),
+            (
+                "mid-chunk-size",
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2"[..],
+            ),
+            (
+                "mid-chunk-data",
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nAB"[..],
+            ),
+            (
+                "mid-chunk-trailer",
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nA\r\n0\r\nX-T: 1"[..],
+            ),
+        ] {
+            match doh_response(raw).await {
+                Err(ClientError::Io(e)) => assert_eq!(
+                    e.kind(),
+                    io::ErrorKind::UnexpectedEof,
+                    "{stage}: EOF must classify as Io(UnexpectedEof)"
+                ),
+                other => panic!("{stage}: expected Io(UnexpectedEof), got {other:?}"),
+            }
+        }
+    }
+
+    /// A `usize::MAX`-scale chunk-size declaration is a plain `Protocol`
+    /// rejection — never an arithmetic panic. Regression for the
+    /// `body.len() + size` / `size + 2` wrap that turned the declaration
+    /// into an out-of-bounds slice index (review M1).
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_response_chunk_size_overflow_is_rejected() {
+        for raw in [
+            // First chunk declares usize::MAX.
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nB"[..],
+            // A prior chunk makes `body.len() + size` the wrap site.
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nA\r\nffffffffffffffff\r\nB"[..],
+            // usize::MAX - 1 keeps `size + 2` on the wrap boundary too.
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nA\r\nfffffffffffffffe\r\nB"[..],
+        ] {
+            match doh_response(raw).await {
+                Err(ClientError::Protocol("doh: response exceeds maximum size")) => {}
+                other => panic!("expected oversized-chunk rejection, got {other:?}"),
+            }
+        }
+    }
+
+    /// The reuse-deadline rule (review M2): a conn whose proven RTT is
+    /// at or beyond its own capped budget can never win the attempt —
+    /// `None` sends the query straight to the fresh dial so the fresh
+    /// side keeps its `≥timeout/2` floor.
+    #[cfg(feature = "encrypted")]
+    #[test]
+    fn tls_reuse_budget_skips_attempts_that_cannot_fit() {
+        let t = Duration::from_secs(5);
+        // Fast conn: the RTT-scaled term loses to the 250 ms floor.
+        assert_eq!(
+            tls_reuse_budget(t, Duration::ZERO),
+            Some(REUSED_TLS_MIN_BUDGET)
+        );
+        // Proven RTT inside `t/2`: the `4×` scale loses to the `t/2` cap.
+        assert_eq!(tls_reuse_budget(t, Duration::from_secs(2)), Some(t / 2));
+        // RTT at or beyond `t/2`: the attempt can never make its own
+        // deadline — skip it so the fresh path keeps the full timeout.
+        assert_eq!(tls_reuse_budget(t, t / 2), None);
+        assert_eq!(tls_reuse_budget(t, Duration::from_secs(3)), None);
+        // Tiny timeout, fast conn: capped at `t/2`, not the 250 ms floor.
+        assert_eq!(
+            tls_reuse_budget(Duration::from_millis(400), Duration::from_millis(10)),
+            Some(Duration::from_millis(200))
+        );
+        // `est_rtt == budget` is still a certain miss → skip.
+        assert_eq!(
+            tls_reuse_budget(Duration::from_millis(500), Duration::from_millis(250)),
+            None
         );
     }
 
@@ -2340,15 +3373,18 @@ mod tests {
             (2u32, now - Duration::from_secs(45)),
             (3u32, now - Duration::from_secs(5)),
         ];
+        let mut reaped = Vec::new();
         assert_eq!(
-            take_fresh(&mut idle, now, timeout),
+            take_fresh(&mut idle, now, timeout, &mut reaped),
             Some(3),
             "the most recently returned stream must be reused first"
         );
-        assert!(
-            idle.is_empty(),
-            "both streams idle past the timeout must have been closed, not left pooled"
+        assert_eq!(
+            reaped,
+            vec![1, 2],
+            "both streams idle past the timeout must have been reaped, not left pooled"
         );
+        assert!(idle.is_empty());
     }
 
     #[test]
@@ -2359,11 +3395,13 @@ mod tests {
             (1u32, now - Duration::from_secs(31)),
             (2u32, now - Duration::from_secs(60)),
         ];
+        let mut reaped = Vec::new();
         assert_eq!(
-            take_fresh(&mut idle, now, timeout),
+            take_fresh(&mut idle, now, timeout, &mut reaped),
             None,
             "an all-stale pool must force a fresh connect"
         );
+        assert_eq!(reaped, vec![1, 2]);
         assert!(idle.is_empty());
     }
 
@@ -2375,7 +3413,9 @@ mod tests {
             (1u32, now - Duration::from_secs(29)),
             (2u32, now - Duration::from_secs(1)),
         ];
-        assert_eq!(take_fresh(&mut idle, now, timeout), Some(2));
+        let mut reaped = Vec::new();
+        assert_eq!(take_fresh(&mut idle, now, timeout, &mut reaped), Some(2));
+        assert!(reaped.is_empty());
         assert_eq!(
             idle.len(),
             1,
