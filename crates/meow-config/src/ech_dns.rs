@@ -47,6 +47,13 @@ const DOH_FALLBACK_IPS: &[IpAddr] = &[
     IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 1)),
 ];
 
+/// Test-only counter of [`fetch_ech_from_dns`] calls — the tripwire that
+/// proves the config-mutation lane's candidate load performs no DNS I/O
+/// (asserted in `proxy_provider`'s tests).
+#[cfg(test)]
+pub(crate) static ECH_LOOKUPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Parse a resolv.conf-style nameserver token into a `SocketAddr` on port 53,
 /// honouring an optional IPv6 zone identifier (`fe80::1%en0`). Rust's
 /// `IpAddr::FromStr` rejects the `%zone` suffix outright, so we strip it and
@@ -126,6 +133,8 @@ async fn system_nameservers() -> Vec<SocketAddr> {
 }
 
 pub(crate) async fn fetch_ech_from_dns(name: &str) -> Result<Vec<u8>, String> {
+    #[cfg(test)]
+    ECH_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nameservers = system_nameservers().await;
     let mut clients: Vec<Arc<DnsClient>> = nameservers
         .iter()
@@ -276,6 +285,40 @@ pub async fn preresolve_ech(
     Ok(())
 }
 
+/// `Some(has_query_source)` when a proxy map declares `ech-opts.enable:
+/// true` without an inline `config:` — the shape [`preresolve_ech`] looks
+/// up in DNS, and the shape [`check_ech_defects`] defects on when nothing
+/// names a query target. `has_query_source` is `true` when
+/// `query-server-name:` or `server:` supplies one. `None` for every other
+/// map (`ech-opts:` absent, not a mapping, disabled, or already inline).
+fn ech_dns_status(proxy: &HashMap<String, Value>) -> Option<bool> {
+    let ech_map = proxy.get("ech-opts")?.as_object()?;
+    let enabled = ech_map
+        .get("enable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let has_config = ech_map.get("config").and_then(Value::as_str).is_some();
+    if !enabled || has_config {
+        return None;
+    }
+    Some(
+        ech_map
+            .get("query-server-name")
+            .and_then(Value::as_str)
+            .is_some()
+            || proxy.get("server").and_then(Value::as_str).is_some(),
+    )
+}
+
+/// `true` when any proxy map would make [`preresolve_ech`] issue a DNS
+/// lookup — `ech-opts.enable: true`, no inline `config:`, and a query
+/// source to ask. Lets a parse that ran only [`check_ech_defects`] (the
+/// config-mutation lane's no-network load) tell whether the deferred
+/// preresolve still has work to do.
+pub(crate) fn needs_ech_dns(proxies: &[HashMap<String, Value>]) -> bool {
+    proxies.iter().any(|p| ech_dns_status(p) == Some(true))
+}
+
 /// The pure-defect half of [`preresolve_ech`], with no network I/O:
 /// `ech-opts.enable: true` without `config:` and without any name to query
 /// (`query-server-name:` or `server:`) is a config defect that can never
@@ -285,43 +328,25 @@ pub async fn preresolve_ech(
 /// review); writers are expected to have preresolved before storing.
 pub fn check_ech_defects(proxies: &[HashMap<String, Value>], strict: bool) -> Result<(), String> {
     for proxy in proxies {
+        let Some(has_query_source) = ech_dns_status(proxy) else {
+            continue;
+        };
+        if has_query_source {
+            continue;
+        }
         let proxy_name = proxy
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("<unnamed>")
             .to_string();
-        let server = proxy.get("server").and_then(|v| v.as_str());
-        let has_query_source = server.is_some()
-            || proxy
-                .get("ech-opts")
-                .and_then(|v| v.as_object())
-                .is_some_and(|m| {
-                    m.get("query-server-name")
-                        .and_then(|v| v.as_str())
-                        .is_some()
-                });
-        let enabled_without_config = proxy
-            .get("ech-opts")
-            .and_then(|v| v.as_object())
-            .is_some_and(|m| {
-                m.get("enable")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-                    && m.get("config").and_then(|v| v.as_str()).is_none()
-            });
-        if !enabled_without_config {
-            continue;
+        let msg = format!(
+            "proxy '{proxy_name}': ech-opts.enable=true with no `config:`, no \
+             `query-server-name:`, and no `server:` to fall back on"
+        );
+        if strict {
+            return Err(msg);
         }
-        if !has_query_source {
-            let msg = format!(
-                "proxy '{proxy_name}': ech-opts.enable=true with no `config:`, no \
-                 `query-server-name:`, and no `server:` to fall back on"
-            );
-            if strict {
-                return Err(msg);
-            }
-            tracing::warn!(proxy = %proxy_name, "{msg}; skipping ECH");
-        }
+        tracing::warn!(proxy = %proxy_name, "{msg}; skipping ECH");
     }
     Ok(())
 }

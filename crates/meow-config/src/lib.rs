@@ -920,8 +920,9 @@ pub(crate) fn unique_scratch_path(path: &Path) -> PathBuf {
 /// land an older document's rename last (issue #543).
 ///
 /// The output is a full `RawConfig` serialization: serde-saphyr emits
-/// `key: null` for every unset `Option` field, so a saved file is
-/// noisier than the hand-edited original (pre-existing shape).
+/// `key: null` for every unset `Option` field that has no
+/// `skip_serializing_if`, so a saved file is noisier than the
+/// hand-edited original (pre-existing shape).
 pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_saphyr::to_string_with_options(raw, yaml_ser_options())?;
     // Scratch files orphaned by a crash between create and rename
@@ -2095,15 +2096,21 @@ fn insert_parsed_leaves(
 ///   (issue #533 review).
 /// - A newly declared def constructs an empty [`ProxyProvider`]. A `file:`
 ///   provider's payload is operator-authored local content, so it is read
-///   right here — a synchronous local read cannot hold the mutation lane —
-///   and a strict payload defect fails the candidate before commit, the
-///   same verdict boot gives it. `Ok(false)` — a read failure or a lenient
+///   and parsed right here — local I/O only, and the ECH DNS preresolve
+///   runs in `Defer` mode so no lookup can serialize the lane (the same
+///   discipline `apply_raw_to_tunnel` keeps, issue #533 review); a strict
+///   payload defect fails the candidate before commit, the same verdict
+///   boot gives it. `Ok(false)` — a read failure or a lenient
 ///   whole-payload failure — still registers the provider empty; the
 ///   committing caller then spawns a detached first acquisition that
-///   retries the read. Remote (`http:`) payloads keep the detached-fetch
-///   contract: no fetch runs on this path, so a slow or blackholed
-///   provider URL cannot hold the config mutation lane, and a malformed
-///   remote payload degrades (empty + retry) instead of rejecting.
+///   retries the read — a stronger retry than boot, which leaves a failed
+///   first read to the interval/manual refresh, deliberately: the commit
+///   knows the provider is new — and finishes the deferred preresolve
+///   off-lane so the nodes a `file:` provider serves match a boot load.
+///   Remote (`http:`) payloads keep the detached-fetch contract: no fetch
+///   runs on this path, so a slow or blackholed provider URL cannot hold
+///   the config mutation lane, and a malformed remote payload degrades
+///   (empty + retry) instead of rejecting.
 /// - A def that fails construction is warn-skipped leniently and a hard
 ///   error under `strict` — the same gate startup's
 ///   [`proxy_provider::load_proxy_providers`] applies, so a committed
@@ -2147,11 +2154,14 @@ fn materialize_proxy_providers(
                 // A new `file:` provider's payload is local content —
                 // validate it now so a strict candidate cannot commit a
                 // payload the next boot would refuse (PUT /configs → 400
-                // leaving live state untouched). `Ok(false)` — unreadable
-                // file, or a lenient whole-payload failure — registers
-                // the provider empty; the commit's detached acquisition
-                // retries the read. Reused providers above are never
-                // reloaded; remote providers never load on this path.
+                // leaving live state untouched). The load stays
+                // network-free on this lane — the ECH preresolve is
+                // deferred to the committed provider's detached first
+                // fetch. `Ok(false)` — unreadable file, or a lenient
+                // whole-payload failure — registers the provider empty;
+                // the commit's detached acquisition retries the read.
+                // Reused providers above are never reloaded; remote
+                // providers never load on this path.
                 if provider.is_file_vehicle() {
                     provider.initial_load_blocking(strict)?;
                 }

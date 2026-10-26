@@ -64,7 +64,7 @@ async fn config_test_validates_cached_rules_without_refreshing() {
                 String::from_utf8_lossy(&output.stderr)
             );
             assert!(
-                logs.contains("cached") && logs.contains("no longer parses"),
+                logs.contains("payload unavailable") && logs.contains("no longer parses"),
                 "the corrupt cache must surface a warning: {logs}"
             );
         }

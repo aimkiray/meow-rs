@@ -1993,7 +1993,7 @@ mod tests {
     async fn proxy_server_nameserver_hosts_trie_matches_main() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         let raw: RawConfig = serde_saphyr::from_str(
-            "dns:\n  enable: true\n  use-system-hosts: false\n  nameserver:\n    - 1.1.1.1\n  proxy-server-nameserver:\n    - 8.8.8.8\nhosts:\n  '+.parity.test': 10.0.0.1\n  parity.test: 10.0.0.2\n",
+            "dns:\n  enable: true\n  use-system-hosts: false\n  nameserver:\n    - 1.1.1.1\n  proxy-server-nameserver:\n    - 8.8.8.8\nhosts:\n  '+.parity.test': 10.0.0.1\n  parity.test: 10.0.0.2\n  parity2.test: 10.0.0.3\n  '+.parity2.test': 10.0.0.4\n",
         )
         .unwrap();
         let cfg = parse_dns(
@@ -2011,14 +2011,21 @@ mod tests {
             .proxy_resolver
             .as_ref()
             .expect("proxy resolver must build");
-        for q in ["parity.test", "deep.parity.test"] {
+        for q in [
+            "parity.test",
+            "deep.parity.test",
+            "parity2.test",
+            "deep.parity2.test",
+        ] {
             assert_eq!(
                 cfg.resolver.lookup_hosts_all(q),
                 proxy.lookup_hosts_all(q),
                 "main and proxy resolvers must agree on '{q}'"
             );
         }
-        // And the collision itself resolved document-last on both.
+        // And the collision itself resolved document-last on both —
+        // `+.` written first keeps its Dot slot while the bare key takes
+        // Exact…
         assert_eq!(
             cfg.resolver.lookup_hosts_all("parity.test"),
             Some(&vec![ip("10.0.0.2")])
@@ -2026,6 +2033,15 @@ mod tests {
         assert_eq!(
             cfg.resolver.lookup_hosts_all("deep.parity.test"),
             Some(&vec![ip("10.0.0.1")])
+        );
+        // …and `+.` written *last* wins both slots (reversed direction).
+        assert_eq!(
+            cfg.resolver.lookup_hosts_all("parity2.test"),
+            Some(&vec![ip("10.0.0.4")])
+        );
+        assert_eq!(
+            cfg.resolver.lookup_hosts_all("deep.parity2.test"),
+            Some(&vec![ip("10.0.0.4")])
         );
     }
 

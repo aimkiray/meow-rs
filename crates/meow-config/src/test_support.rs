@@ -140,3 +140,12 @@ impl Drop for TestLogbook {
         logbook::uninstall();
     }
 }
+
+/// Serializes tests that observe [`crate::ech_dns::ECH_LOOKUPS`] — a
+/// process-global counter a parallel test doing a real lookup could
+/// otherwise interleave. Tokio-aware so it may be held across `.await`
+/// (plain `#[test]` callers use `blocking_lock()`).
+pub(crate) fn ech_dns_serial() -> &'static tokio::sync::Mutex<()> {
+    static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+}

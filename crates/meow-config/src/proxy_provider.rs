@@ -98,6 +98,12 @@ pub struct ProxyProvider {
     /// at least once — lets a queued background attempt skip the fetch a
     /// straggling startup fetch just completed.
     fetched_remote: AtomicBool,
+    /// The committed payload was parsed without its ECH DNS preresolve —
+    /// the config-mutation lane's check-only load must not look anything
+    /// up, so the detached post-commit fetch owes the slot one off-lane
+    /// re-parse under the full preresolve before `fetched_remote` can
+    /// settle (issue #533 review).
+    ech_pending: AtomicBool,
     /// `dialer-proxy` names declared by the currently loaded nodes —
     /// repopulated on every [`refresh`](Self::refresh) so a config build can
     /// warn about references the registry will never resolve.
@@ -429,6 +435,7 @@ impl ProxyProvider {
             deferred_initial: AtomicBool::new(false),
             background_pending: AtomicBool::new(false),
             fetched_remote: AtomicBool::new(false),
+            ech_pending: AtomicBool::new(false),
             declared_dialers: RwLock::new(Vec::new()),
             provider_dialer,
             override_dialer,
@@ -671,22 +678,47 @@ impl ProxyProvider {
     /// content changes). `source` distinguishes a live fetch from an
     /// on-disk cache read — cache content is never written back. A fetch
     /// the provider accepts, changed or not, also sets the plan usage.
-    async fn ingest(&self, content: String, source: Source) -> Result<bool, anyhow::Error> {
+    ///
+    /// `ech` selects the parse's ECH treatment; a commit made under
+    /// [`EchResolution::Defer`] left the DNS preresolve unrun, so
+    /// identical bytes do not dedup until the off-lane pass re-parses
+    /// them (`ech_pending` below). `record` gates the logbook success
+    /// entry the same way it gates [`Self::logbook_failed`] on the
+    /// callers' failure paths: a not-yet-committed candidate load
+    /// ([`Self::initial_load_unrecorded`]) must not write an "Updated"
+    /// entry — the verdict belongs to the rebuild's return value.
+    async fn ingest(
+        &self,
+        content: String,
+        source: Source,
+        ech: EchResolution,
+        record: bool,
+    ) -> Result<bool, anyhow::Error> {
         let strict = self.strict.load(Ordering::Relaxed);
         let hash = content_hash(&content);
         let from_remote = matches!(source, Source::Fetched(_));
-        if *self.content_hash.lock() == Some((hash, strict)) {
+        // `ech_pending` is read, not consumed: a still-owed resolve bypasses
+        // the dedup so the bytes re-parse under `Resolve`, and the flag is
+        // only cleared by a *successful* re-parse below. Clearing it on the
+        // way in would abandon the deferral whenever that re-parse fails —
+        // every later identical fetch would then dedup and the deferred
+        // lookup would never land.
+        if *self.content_hash.lock() == Some((hash, strict))
+            && !self.ech_pending.load(Ordering::Relaxed)
+        {
             if let Source::Fetched(userinfo) = source {
                 self.fetched_remote.store(true, Ordering::Relaxed);
                 // The usage moves on most fetches, the payload on few.
                 if self.set_userinfo(userinfo) {
                     self.persist_userinfo(userinfo).await;
                 }
-                self.logbook_updated(Payload::Unchanged);
+                if record {
+                    self.logbook_updated(Payload::Unchanged);
+                }
             }
             return Ok(false);
         }
-        let proxies = self.parse_proxies(&content).await?;
+        let (proxies, ech_resolved) = self.parse_proxies(&content, ech).await?;
         match source {
             Source::Fetched(userinfo) => {
                 self.write_cache(&content).await;
@@ -704,9 +736,17 @@ impl ProxyProvider {
         };
         self.commit(proxies);
         *self.content_hash.lock() = Some((hash, strict));
+        self.ech_pending.store(!ech_resolved, Ordering::Relaxed);
         if from_remote {
-            self.fetched_remote.store(true, Ordering::Relaxed);
-            self.logbook_updated(payload);
+            // Not "fetched" while the preresolve is still owed — the
+            // detached post-commit fetch runs it before the initial
+            // retry loop may retire.
+            if ech_resolved {
+                self.fetched_remote.store(true, Ordering::Relaxed);
+            }
+            if record {
+                self.logbook_updated(payload);
+            }
         }
         Ok(true)
     }
@@ -778,7 +818,10 @@ impl ProxyProvider {
                 return false;
             }
         };
-        if let Err(e) = self.ingest(content, Source::Cache).await {
+        if let Err(e) = self
+            .ingest(content, Source::Cache, EchResolution::Resolve, true)
+            .await
+        {
             warn!(provider = %self.name, path = ?path, error = %e, "ignoring unparseable provider cache");
             return false;
         }
@@ -825,18 +868,31 @@ impl ProxyProvider {
     /// usable nodes and binds the rest to unavailable placeholders, so
     /// only a defect that stops the *whole* payload from parsing fails it.
     async fn initial_load(&self, strict: bool) -> anyhow::Result<bool> {
-        self.initial_load_impl(strict, true).await
+        self.initial_load_impl(strict, true, EchResolution::Resolve)
+            .await
     }
 
-    /// [`initial_load`] minus the failure's logbook record — for a
-    /// candidate that may still be rejected (`PUT /configs`'s 400 already
-    /// lands in `CONFIG_RELOAD` via `reload_rejected`), where the verdict
-    /// must be carried by the return value alone.
+    /// [`initial_load`] minus the logbook record — for a candidate that
+    /// may still be rejected (`PUT /configs`'s 400 already lands in
+    /// `CONFIG_RELOAD` via `reload_rejected`), where the verdict must be
+    /// carried by the return value alone: no failure entry, and no
+    /// "Updated" success entry for a provider that was never committed.
+    /// Minus the ECH DNS preresolve too: the caller holds the
+    /// config-mutation lane, so the parse runs [`EchResolution::Defer`] —
+    /// the same strict verdict, no network I/O — and a committed
+    /// provider's detached first fetch owes the deferred pass (see
+    /// [`ProxyProvider::ech_pending`]).
     async fn initial_load_unrecorded(&self, strict: bool) -> anyhow::Result<bool> {
-        self.initial_load_impl(strict, false).await
+        self.initial_load_impl(strict, false, EchResolution::Defer)
+            .await
     }
 
-    async fn initial_load_impl(&self, strict: bool, record: bool) -> anyhow::Result<bool> {
+    async fn initial_load_impl(
+        &self,
+        strict: bool,
+        record: bool,
+        ech: EchResolution,
+    ) -> anyhow::Result<bool> {
         let _generation = self.refresh_lock.lock().await;
         let (content, source) = match self.fetch_content(record).await {
             Ok(fetched) => fetched,
@@ -845,7 +901,7 @@ impl ProxyProvider {
                 return Ok(false);
             }
         };
-        match self.ingest(content, source).await {
+        match self.ingest(content, source, ech, record).await {
             Ok(_) => Ok(true),
             Err(e) => {
                 if record {
@@ -873,8 +929,29 @@ impl ProxyProvider {
     /// or not the caller already sits inside a Tokio runtime.
     ///
     /// Only ever called on [`Vehicle::File`] providers: remote payloads
-    /// keep their detached-fetch contract and never block the caller.
+    /// keep their detached-fetch contract and never block the caller —
+    /// asserted below so a future caller on an `http:` vehicle cannot
+    /// reintroduce a lane-blocking `fetch_response` by mistake. The
+    /// load stays network-free — `fetch_source` reads only the file and
+    /// the parse runs [`EchResolution::Defer`], so no ECH DNS lookup can
+    /// serialize the mutation lane; a committed provider's detached
+    /// `spawn_initial_fetch` re-parses under the full preresolve, leaving
+    /// the nodes it serves identical to a boot load.
+    ///
+    /// Two failure-shape notes: the file read is deliberately unbounded —
+    /// boot reads the same path inline, so a size cap here would only
+    /// fork the verdicts (operator-controlled local content, same
+    /// exposure class as the config file itself). And a panic inside the
+    /// load surfaces as `Err` via the join below, rejecting the candidate
+    /// — where the same panic in a detached fetch task used to end only
+    /// that task, here it fails the PUT loudly, which is the safer
+    /// direction for a parse bug.
     pub(crate) fn initial_load_blocking(&self, strict: bool) -> anyhow::Result<bool> {
+        debug_assert!(
+            self.is_file_vehicle(),
+            "initial_load_blocking is the file-vehicle gate; on a remote vehicle it \
+             would run a real network fetch on the caller's lane"
+        );
         let name = self.name.clone();
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -907,7 +984,12 @@ impl ProxyProvider {
         }
         let result = match self.fetch_source().await {
             Ok((content, userinfo)) => self
-                .ingest(content, Source::Fetched(userinfo))
+                .ingest(
+                    content,
+                    Source::Fetched(userinfo),
+                    EchResolution::Resolve,
+                    true,
+                )
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string()),
@@ -948,7 +1030,15 @@ impl ProxyProvider {
     /// `declared_dialers` is rewritten only on the success path that will
     /// be committed: an `Err` keeps the last-good slot running, so it must
     /// keep that generation's declarations too (issue #489 review).
-    async fn parse_proxies(&self, content: &str) -> Result<Vec<Arc<dyn Proxy>>, anyhow::Error> {
+    ///
+    /// Returns the parsed nodes plus `true` when their ECH configs are
+    /// fully resolved — `false` under [`EchResolution::Defer`] when the
+    /// payload still owes the DNS lookup the caller may not run.
+    async fn parse_proxies(
+        &self,
+        content: &str,
+        ech: EchResolution,
+    ) -> Result<(Vec<Arc<dyn Proxy>>, bool), anyhow::Error> {
         let strict = self.strict.load(Ordering::Relaxed);
         if !crate::yaml_within_depth(content) {
             return Err(anyhow::anyhow!(
@@ -983,9 +1073,28 @@ impl ProxyProvider {
         // Pre-resolve any DNS-sourced ECH configs into inline base64 — keeps
         // `parse_proxy` itself sync. An `ech-opts.enable: true` node with no
         // query source at all is a defect — strict turns it into an error.
-        crate::ech_dns::preresolve_ech(&mut proxy_maps, strict)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e} (strict mode)"))?;
+        // `Defer` runs the same defect gate but no lookup: the caller holds
+        // the config-mutation lane, where a DNS answer can only serialize
+        // other commits (issue #533 review). `ech_pending` then owes the
+        // deferred pass to the detached post-commit fetch.
+        let ech_resolved = match ech {
+            EchResolution::Resolve => {
+                crate::ech_dns::preresolve_ech(&mut proxy_maps, strict)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e} (strict mode)"))?;
+                // `-t` skips the lookups entirely (`preresolve_ech`
+                // short-circuits under `is_offline_validate`): report the
+                // resolve as still owed rather than claiming one that
+                // never ran — harmless under `-t` itself, which exits, and
+                // truthful for any provider kept past validation.
+                !crate::is_offline_validate() || !crate::ech_dns::needs_ech_dns(&proxy_maps)
+            }
+            EchResolution::Defer => {
+                crate::ech_dns::check_ech_defects(&proxy_maps, strict)
+                    .map_err(|e| anyhow::anyhow!("{e} (strict mode)"))?;
+                !crate::ech_dns::needs_ech_dns(&proxy_maps)
+            }
+        };
 
         let mut declared = Vec::new();
         let mut result = Vec::new();
@@ -1047,7 +1156,7 @@ impl ProxyProvider {
         }
         *self.declared_dialers.write() = declared;
 
-        Ok(result)
+        Ok((result, ech_resolved))
     }
 
     /// Publish a freshly parsed node set — shared by `refresh` and the
@@ -1209,7 +1318,15 @@ impl ProxyProvider {
         let _generation = self.refresh_lock.lock().await;
         match self.fetch_source().await {
             Ok((content, userinfo)) => {
-                match self.ingest(content, Source::Fetched(userinfo)).await {
+                match self
+                    .ingest(
+                        content,
+                        Source::Fetched(userinfo),
+                        EchResolution::Resolve,
+                        true,
+                    )
+                    .await
+                {
                     Ok(_) => Ok(()),
                     Err(e) => {
                         // A torn payload keeps the last-good set instead of
@@ -1236,7 +1353,7 @@ impl ProxyProvider {
     pub async fn acquire_initial(&self) -> anyhow::Result<()> {
         let _generation = self.refresh_lock.lock().await;
         let (content, source) = self.fetch_content(true).await.map_err(anyhow::Error::msg)?;
-        self.ingest(content, source)
+        self.ingest(content, source, EchResolution::Resolve, true)
             .await
             .map(|_| ())
             .inspect_err(|e| self.logbook_failed(&e.to_string()))
@@ -1245,8 +1362,10 @@ impl ProxyProvider {
     /// Consumes the deferred-initial-fetch flags: `true` once per provider
     /// whose startup load still owes a remote fetch — its `proxy:` name
     /// could not resolve before the route map was published (issue #625),
-    /// it started from its on-disk cache, or its fetch failed or outlived
-    /// [`crate::set_provider_fetch_deadline`]. The caller fetches it now
+    /// it started from its on-disk cache, its fetch failed or outlived
+    /// [`crate::set_provider_fetch_deadline`], or the payload it fetched
+    /// was rejected by the parse (a remote-payload defect degrades to the
+    /// same deferred shape in either mode). The caller fetches it now
     /// that the route map is published; [`spawn_deferred_initial_fetches`]
     /// does exactly that, with retries. `meow-app` runs it once after the
     /// first `update_routing`; embedders that drive `load_config` plus a
@@ -1492,6 +1611,26 @@ pub(crate) fn record_failure(name: &str, error: &str) {
     .record();
 }
 
+/// How [`ProxyProvider::ingest`] treats DNS-sourced ECH configs while
+/// parsing a payload.
+#[derive(Clone, Copy)]
+enum EchResolution {
+    /// [`preresolve_ech`](crate::ech_dns::preresolve_ech): run the
+    /// HTTPS-record lookups and inline the results — every off-lane load
+    /// (boot, background fetch, refresh, cache read).
+    Resolve,
+    /// [`check_ech_defects`](crate::ech_dns::check_ech_defects) only —
+    /// the same strict verdict with no network I/O, for the
+    /// config-mutation lane's pre-commit load, where a lookup would
+    /// serialize every other commit behind one name's DNS answer (the
+    /// same reason `apply_raw_to_tunnel` checks instead of preresolving,
+    /// issue #533 review). A commit that still owes lookups sets
+    /// [`ProxyProvider::ech_pending`], and the detached post-commit fetch
+    /// re-parses under [`Resolve`](Self::Resolve) so the committed nodes
+    /// match a boot load.
+    Defer,
+}
+
 /// Where a payload handed to [`ProxyProvider::ingest`] came from.
 #[derive(Clone, Copy)]
 enum Source {
@@ -1560,6 +1699,13 @@ fn warn_initial_load_failure(provider: &ProxyProvider, error: &str) {
         warn!(provider = %provider.name, error = %error,
             "initial provider load failed (proxy not resolvable yet); \
              starting empty — will retry once the route map is published");
+    } else if provider.is_file_vehicle() {
+        // A `file:` read failure owes no startup background fetch —
+        // `background_pending` is only set for remote vehicles — so it
+        // heals on an `interval:` tick, a manual refresh, or the detached
+        // first fetch a config commit spawns for a new provider.
+        warn!(provider = %provider.name, error = %error,
+            "initial provider load failed; starting empty until a refresh succeeds");
     } else {
         warn!(provider = %provider.name, error = %error,
             "initial provider load failed; starting empty until a background fetch succeeds");
@@ -1663,7 +1809,7 @@ fn build_health_check_config(raw: Option<&RawHealthCheck>) -> Option<HealthCheck
 mod tests {
     use super::*;
     use crate::raw::RawProxyProvider;
-    use crate::test_support::{eventually, Origin};
+    use crate::test_support::{eventually, Origin, TestLogbook};
 
     fn raw_file_provider(path: &str) -> RawProxyProvider {
         RawProxyProvider {
@@ -3689,6 +3835,217 @@ header:
         assert!(
             p.initial_load_blocking(true).is_err(),
             "a strict file payload defect fails the candidate"
+        );
+    }
+
+    /// A parseable node that still owes an ECH DNS lookup — `ech-opts.
+    /// enable: true`, no inline `config:`, a `server:` to query. `type:
+    /// direct` keeps it feature-independent; the defect/lookup gates
+    /// read the raw map, not the adapter.
+    const ECH_NODE: &str =
+        "proxies:\n  - {name: n1, type: direct, server: ech.invalid, ech-opts: {enable: true}}\n";
+
+    /// The candidate-materialize load performs no DNS I/O: the strict
+    /// ECH gate still fires (`check_ech_defects` — same verdict as
+    /// `preresolve_ech`), but the lookup is deferred so it cannot
+    /// serialize the mutation lane (`ech_pending` owes it).
+    #[test]
+    fn initial_load_blocking_defers_ech_dns() {
+        let _serial = crate::test_support::ech_dns_serial().blocking_lock();
+        crate::ech_dns::ECH_LOOKUPS.store(0, Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ech.yaml"), ECH_NODE).unwrap();
+        let p = ProxyProvider::new(
+            "e",
+            &raw_file_provider("ech.yaml"),
+            Some(dir.path()),
+            false,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(
+            p.initial_load_blocking(true).unwrap(),
+            "a valid file payload loads"
+        );
+        assert_eq!(p.proxies().len(), 1, "the committed nodes are served");
+        assert_eq!(
+            crate::ech_dns::ECH_LOOKUPS.load(Ordering::Relaxed),
+            0,
+            "the mutation lane must not run the ECH DNS lookup"
+        );
+        assert!(
+            p.ech_pending.load(Ordering::Relaxed),
+            "the deferred preresolve stays owed"
+        );
+    }
+
+    /// The deferred preresolve completes off-lane: a byte-identical
+    /// refetch still re-parses (dedup knows the resolve half is owed),
+    /// the lookup runs on the detached path the commit kicks off, and
+    /// ordinary dedup resumes once the slot is fully resolved.
+    #[tokio::test]
+    async fn deferred_ech_resolve_completes_off_lane() {
+        let _serial = crate::test_support::ech_dns_serial().lock().await;
+        crate::ech_dns::ECH_LOOKUPS.store(0, Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ech.yaml"), ECH_NODE).unwrap();
+        let p = ProxyProvider::new(
+            "e",
+            &raw_file_provider("ech.yaml"),
+            Some(dir.path()),
+            false,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(p.initial_load_blocking(true).unwrap());
+        assert!(p.ech_pending.load(Ordering::Relaxed));
+
+        // `refresh` runs the same `Resolve` ingest as the detached
+        // post-commit fetch — identical bytes must still re-parse, and
+        // the lookup the lane skipped lands here. A bounded wait: the
+        // DNS miss itself can stretch to the per-nameserver timeouts.
+        tokio::time::timeout(Duration::from_secs(60), p.refresh())
+            .await
+            .expect("the deferred pass must not hang")
+            .expect("the deferred pass succeeds");
+        assert_eq!(
+            crate::ech_dns::ECH_LOOKUPS.load(Ordering::Relaxed),
+            1,
+            "the deferred pass ran the lookup the lane skipped"
+        );
+        assert!(!p.ech_pending.load(Ordering::Relaxed));
+        assert!(
+            p.fetched_remote.load(Ordering::Relaxed),
+            "only a fully resolved payload counts as fetched"
+        );
+        assert_eq!(p.proxies().len(), 1);
+
+        // Resolved now — a second identical refetch dedups like always.
+        p.refresh().await.expect("the resolved payload dedups");
+        assert_eq!(crate::ech_dns::ECH_LOOKUPS.load(Ordering::Relaxed), 1);
+    }
+
+    /// The deferred resolve's production path is not `refresh` but the
+    /// detached task `commit_proxy_providers` spawns for a new provider:
+    /// `spawn_initial_fetch` → `background_attempt`. While `ech_pending`
+    /// is owed, `fetched_remote` must not be treated as settled —
+    /// otherwise the attempt's early-return would retire the loop having
+    /// served only unresolved nodes, and a provider without `interval:`
+    /// would stay that way permanently.
+    #[tokio::test]
+    async fn spawn_initial_fetch_completes_the_deferred_ech_resolve() {
+        let _serial = crate::test_support::ech_dns_serial().lock().await;
+        crate::ech_dns::ECH_LOOKUPS.store(0, Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ech.yaml"), ECH_NODE).unwrap();
+        let p = Arc::new(
+            ProxyProvider::new(
+                "e",
+                &raw_file_provider("ech.yaml"),
+                Some(dir.path()),
+                false,
+                true,
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        assert!(p.initial_load_blocking(true).unwrap());
+        assert!(p.ech_pending.load(Ordering::Relaxed));
+        assert!(
+            !p.fetched_remote.load(Ordering::Relaxed),
+            "a payload still owing its ECH lookup is not fetched"
+        );
+
+        // The detached loop must run the owed re-parse (identical bytes
+        // under `Resolve`, so the lookup fires) and only then retire.
+        tokio::time::timeout(Duration::from_secs(60), p.spawn_initial_fetch())
+            .await
+            .expect("the detached fetch retires once the resolve lands")
+            .unwrap();
+        assert_eq!(
+            crate::ech_dns::ECH_LOOKUPS.load(Ordering::Relaxed),
+            1,
+            "the detached fetch ran the lookup the lane skipped"
+        );
+        assert!(!p.ech_pending.load(Ordering::Relaxed));
+        assert!(p.fetched_remote.load(Ordering::Relaxed));
+    }
+
+    /// A candidate load may still be rejected by the rebuild, so it must
+    /// write no logbook entry at all — including the "Updated" success
+    /// entry an ordinary load records when a prior same-name failure
+    /// stands: a rejected PUT would otherwise falsely clear the failing
+    /// state for a provider that was never committed.
+    #[tokio::test]
+    async fn unrecorded_candidate_load_writes_no_logbook_entry() {
+        let book = TestLogbook::install();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nodes.yaml"), ONE_NODE).unwrap();
+        record_failure("unrecorded-load", "seeded failure");
+        let p = ProxyProvider::new(
+            "unrecorded-load",
+            &raw_file_provider("nodes.yaml"),
+            Some(dir.path()),
+            false,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(p.initial_load_blocking(true).unwrap());
+        let entries = book.entries("unrecorded-load");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the seeded failure may stand — the uncommitted load records nothing: {entries:?}"
+        );
+        assert_eq!(entries[0].level, Level::Error, "{entries:?}");
+    }
+
+    /// A remote payload defect degrades AND records the failure — spec
+    /// §9.7: every remote degrade must warn and write a logbook entry
+    /// (`initial_load`'s record path, not the candidate-only
+    /// `initial_load_unrecorded`).
+    #[tokio::test]
+    async fn strict_remote_payload_degrade_records_logbook() {
+        let book = TestLogbook::install();
+        let origin = Origin::spawn(Some(BAD_NODE), true).await;
+        let dir = tempfile::tempdir().unwrap();
+        // The subject must be unique in this binary: `TestLogbook` is
+        // process-global and parallel tests keep recording into it — the
+        // generic "p" is shared with rule-provider tests, whose entries
+        // would pollute this assertion.
+        let raw = HashMap::from([(
+            "strict-degrade-pp".to_string(),
+            raw_http_provider(&origin.url, None),
+        )]);
+        let providers = load_proxy_providers_within(
+            &raw,
+            Some(dir.path()),
+            false,
+            true,
+            &Default::default(),
+            None,
+            &mut DroppedProviders::default(),
+        )
+        .await
+        .expect("a remote payload defect must degrade under strict");
+        assert!(providers["strict-degrade-pp"].proxies().is_empty());
+        let entries = book.entries("strict-degrade-pp");
+        let entries: Vec<(Level, &str)> = entries
+            .iter()
+            .filter(|e| e.kind.as_str() == logbook::kind::PROXY_PROVIDER_UPDATE)
+            .map(|e| (e.level, e.message.as_str()))
+            .collect();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].0, Level::Error, "{entries:?}");
+        assert!(
+            entries[0]
+                .1
+                .starts_with("Updating proxy provider 'strict-degrade-pp' failed: "),
+            "unexpected: {}",
+            entries[0].1
         );
     }
 

@@ -1630,9 +1630,11 @@ pub fn commit_proxy_providers(
         // where an awaited download would serialize every other commit
         // behind one slow or blackholed provider URL — the same reason ECH
         // preresolution is kept out of `apply_raw_to_tunnel` (issue #533
-        // review). A node this build cannot parse can no longer reject the
-        // payload (it binds an unavailable placeholder instead), so there
-        // is nothing here for a pre-commit await to gate.
+        // review). The one verdict a commit can still owe — a strict
+        // `file:` payload defect — was already settled inside
+        // `materialize_proxy_providers`, and a remote parse defect degrades
+        // to registered-empty + this fetch's retry rather than rejecting,
+        // so there is nothing left here for a pre-commit await to gate.
         let reused = registry
             .insert(name.clone(), Arc::clone(provider))
             .is_some_and(|previous| Arc::ptr_eq(&previous, provider));

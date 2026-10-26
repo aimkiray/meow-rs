@@ -976,9 +976,10 @@ fn cache_needs_revalidation(modified: Option<SystemTime>, interval: u64) -> bool
 ///
 /// Returns a map from provider name to `Arc<RuleProvider>`.  Providers that
 /// fail to load are skipped with a `warn!` (best-effort keep-running);
-/// under `strict` definition/payload defects return `Err` instead, while
-/// pure acquisition failures still register the provider empty (issue
-/// #533).
+/// under `strict`, definition defects and *local* (`file:`/`inline:`)
+/// payload defects return `Err` instead, while remote payload defects
+/// degrade like pure acquisition failures: the provider registers empty
+/// in either mode and retries in the background (issue #533).
 pub fn load_providers(
     raw_providers: &HashMap<String, RawRuleProvider>,
     cache_dir: Option<&Path>,
@@ -1075,6 +1076,16 @@ pub fn load_providers_prefetched(
                 // failing strict validation as "unknown provider") and a
                 // later `PUT /providers/rules/{name}` refresh can heal it.
                 // Matches mihomo, which registers failed providers.
+                //
+                // Remote *payload* parse defects funnel here too — a feed's
+                // malformed bytes are third-party content the operator
+                // cannot fix by editing the config, so they take the same
+                // registered-empty + background-retry shape. That is a
+                // deliberate lenient-side change: such a defect used to
+                // drop the provider outright until the next config reload;
+                // the spec (§4.2 "registered empty in both modes") and
+                // upstream's failed-provider registration both prefer the
+                // retryable shape.
                 warn!("rule-provider '{name}': payload unavailable, starting empty: {e:#}");
                 // A download still running at the deadline is not a
                 // failure; the adopted download records its own outcome.
@@ -3400,10 +3411,35 @@ header:
 
     /// A corrupt remote-derived cache degrades too — remote content at
     /// rest, not operator-authored bytes. The `is_offline_validate` fatal
-    /// special case is gone, so the same arm serves `-t` and boot alike
-    /// (the subprocess `-t` wiring is covered in `offline_config_test.rs`).
+    /// special case is gone, so the same arm serves `-t` and boot alike.
+    /// The `-t` arm pins itself in a child process: `set_offline_validate`
+    /// is a one-way process-global flag a parallel sibling test's prefetch
+    /// could observe inside even the narrowest window.
     #[test]
     fn strict_corrupt_cache_degrades() {
+        if std::env::var_os("MEOW_OFFLINE_VALIDATE_CHILD").is_some() {
+            crate::set_offline_validate(true);
+            corrupt_cache_degrades();
+            return;
+        }
+        corrupt_cache_degrades();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "rule_provider::tests::strict_corrupt_cache_degrades",
+                "--exact",
+            ])
+            .env("MEOW_OFFLINE_VALIDATE_CHILD", "1")
+            .status()
+            .expect("spawn the -t arm child");
+        assert!(
+            status.success(),
+            "the corrupt cache must degrade under -t too"
+        );
+    }
+
+    /// One `strict_corrupt_cache_degrades` pass — identical verdict under
+    /// boot and under `set_offline_validate(true)` (the `-t` arm).
+    fn corrupt_cache_degrades() {
         let dir = tempfile::tempdir().unwrap();
         let raw = HashMap::from([(
             "p".to_string(),
