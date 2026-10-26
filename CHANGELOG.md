@@ -155,7 +155,14 @@ the canonical, in-repo source a release is cut from.
   What was genuinely arbitrary — wildcard keys colliding on one slot
   (`+.x` versus `.x`) and the order among `geosite:`/`rule-set:`
   matchers — fell to hash-map iteration order, a per-startup coin
-  toss the document order now fixes as well. A YAML-literal duplicate
+  toss the document order now fixes as well. Because the flip can
+  silently reroute an existing config, loading one now logs a warning
+  for each bare or `+.` key written after a `geosite:`/`rule-set:` key
+  that already matches it with different nameservers (move the domain
+  key above the matcher to keep its old priority). A matcher key
+  skipped in lenient mode (no geosite DB, an empty name, an unsupported
+  prefix) still closes the open domain arm, so the domain keys around
+  it keep the precedence they get once it loads. A YAML-literal duplicate
   key is a hard parse error (`duplicate entry with key "…"`) — every
   ingest path goes through `parse_raw_yaml`, which rejects it at the
   serde_norway `Value` layer before the map is built; the

@@ -140,6 +140,9 @@ pub struct NameserverPolicy {
     /// be iterated, and [`Resolver::reset_connections`] must reach each
     /// policy upstream's connection pool (issue #695).
     clients: Vec<Arc<DnsClient>>,
+    /// Whether the next domain key may join a trailing `Domains` arm;
+    /// [`Self::close_domain_arm`] clears it so the next one opens a new arm.
+    domain_arm_open: bool,
 }
 
 impl Default for NameserverPolicy {
@@ -153,7 +156,17 @@ impl NameserverPolicy {
         Self {
             arms: Vec::new(),
             clients: Vec::new(),
+            domain_arm_open: false,
         }
+    }
+
+    /// End the open domain arm without adding a matcher: the next domain
+    /// key starts a new arm. The config builder calls this for a
+    /// matcher-shaped key it skips (no geosite DB loaded, an unsupported
+    /// prefix), so the domain keys on either side keep the precedence they
+    /// have when that key's matcher arm sits between them.
+    pub fn close_domain_arm(&mut self) {
+        self.domain_arm_open = false;
     }
 
     /// Compatibility shim kept from the pre-arm-list API: despite the
@@ -201,12 +214,14 @@ impl NameserverPolicy {
         self.open_domain_arm().insert_overwrite(pattern, entry);
     }
 
-    /// The open domain arm: the last arm when it is a `Domains` block,
-    /// else a freshly pushed one — mihomo `makePolicy` flushes the pending
-    /// trie into an arm when a matcher policy arrives.
+    /// The open domain arm: the last arm when it is a `Domains` block not
+    /// ended by [`Self::close_domain_arm`], else a freshly pushed one —
+    /// mihomo `makePolicy` flushes the pending trie into an arm when a
+    /// matcher policy arrives.
     fn open_domain_arm(&mut self) -> &mut DomainTrie<PolicyEntry> {
-        if !matches!(self.arms.last(), Some(PolicyArm::Domains(_))) {
+        if !self.domain_arm_open || !matches!(self.arms.last(), Some(PolicyArm::Domains(_))) {
             self.arms.push(PolicyArm::Domains(DomainTrie::new()));
+            self.domain_arm_open = true;
         }
         let Some(PolicyArm::Domains(trie)) = self.arms.last_mut() else {
             unreachable!("a Domains arm was just pushed");

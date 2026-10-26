@@ -107,7 +107,14 @@ Field reference — `nameserver-policy`:
 (`bare`, `+.`, `*.`, `.`) merges into one domain-trie arm; each
 `geosite:`/`rule-set:` key appends a matcher arm and closes the open domain
 block. A query walks the arms top-down and the first match wins — so a
-`rule-set:` or `geosite:` key written before a domain key shadows it. Within
+`rule-set:` or `geosite:` key written before a domain key shadows it. Such a
+shadow is reported at load: a bare or `+.` key written after a matcher arm
+that already matches the domain it names, with different nameservers, logs
+a warning naming both keys (move the domain key above the matcher to
+override it; `*.`/`.` keys are not checked). A matcher key skipped in
+lenient mode (no geosite DB, an empty name, an unsupported prefix) adds no
+arm but still closes the open domain block, so the domain keys around it
+keep the precedence they get once it loads. Within
 one domain-trie arm the usual specificity rules decide (exact > `*.` > `.`
 at the deepest node); two keys landing on the SAME trie slot — e.g. `x` and
 `+.x`, which both write `x`'s exact slot — resolve to the document-last
@@ -123,10 +130,11 @@ END of the map no matter where the `<<:` line is written, and an
 explicit key overrides a merged same-name key — merged entries are
 therefore always the lowest-priority arms, so a merged
 `rule-set:`/`geosite:` key can never shadow an explicit domain key.
-Caveat: `apply_merge` removes the `<<:` key with `swap_remove`, so a
-`<<:` line written before the last explicit line permutes the order of
-the remaining explicit keys — keep `<<:` first in the map or order
-matters beyond "merged keys rank last". Bare-key lookups are
+Caveat: `apply_merge` removes the `<<:` key with `swap_remove`, which
+moves the map's last explicit key into the slot `<<:` held — a `<<:`
+line written above other keys makes the last one jump ahead of every key
+between them. Write `<<:` as the map's last line to keep the written
+order. Bare-key lookups are
 case-insensitive: the query is folded before the match.
 
 Nameserver URL format: identical to M1.E-1 (`udp://`, `tcp://`, `https://`, `tls://`).
