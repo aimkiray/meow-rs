@@ -89,12 +89,13 @@ impl fmt::Display for NameServerUrl {
 /// `?a=b&proxy=P` errors rather than silently dropping the proxy tag.
 /// When no `&`-separated segment is a `proxy=` key, the `?` section is
 /// not a parameter section and stays in the URL (path) verbatim — and if
-/// an earlier `?` section still carries a `proxy=` segment (the
-/// `?proxy=P?x=1` double-`?` typo), a warn is logged because that segment
-/// travels inside the request path instead of tagging a proxy. Detection
-/// of the `proxy=` key is ASCII case-insensitive; only exact lowercase
-/// `proxy` is legal — `?Proxy=`/`?PROXY=` are hard `InvalidParams`, never
-/// path parameters.**
+/// any earlier `?` section still carries a `proxy=` key (the
+/// `?proxy=P?x=1` double-`?` typo), parse fails: a stranded `proxy=` key
+/// would travel inside the request path and leak the proxy name to the
+/// upstream. Detection of the `proxy=` key is ASCII case-insensitive;
+/// only exact lowercase `proxy` is legal — `?Proxy=`/`?PROXY=` are hard
+/// `InvalidParams`, never path parameters. A path that legitimately
+/// needs the key percent-spells it (`?%70roxy=`).**
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameServerEntry {
     pub url: NameServerUrl,
@@ -136,10 +137,7 @@ impl NameServerEntry {
                 // a `?Proxy=` tail marks the section too and is then
                 // rejected by the exact-case key check below, closing the
                 // DoH path leak where `?Proxy=P` survived into `path`.
-                if tail.split('&').any(|kv| {
-                    kv.get(..6)
-                        .is_some_and(|p| p.eq_ignore_ascii_case("proxy="))
-                }) {
+                if tail.split('&').any(is_proxy_key_segment) {
                     // The tail is a parameter section: an `&`-separated
                     // `k=v` list. `proxy` is the only legal key.
                     let mut value: Option<&str> = None;
@@ -178,25 +176,25 @@ impl NameServerEntry {
                     }
                     query_proxy = value.map(str::to_string);
                     head = &s[..qidx];
-                } else {
-                    // No `&`-separated segment is a `proxy=` key — the
-                    // `?` section is part of the URL (DoH path) and
-                    // stays. But if an *earlier* `?` section still
-                    // carries a `proxy=` segment — the `?proxy=P?x=1`
-                    // double-`?` typo — that segment is silently sent to
-                    // the server inside the request path instead of
-                    // tagging a proxy. Warn rather than hard-error: a
-                    // legitimate path can contain the substring.
-                    if head.contains("?proxy=") || head.contains("&proxy=") {
-                        tracing::warn!(
-                            "nameserver '{s}' keeps a 'proxy=' segment inside the \
-                             URL — the ?proxy=NAME parameter section must be the \
-                             entry's LAST '?' section; as written it travels \
-                             inside the request path. Did you mean to move \
-                             '?proxy=NAME' last?"
-                        );
-                    }
                 }
+            }
+            // Every `?` section still standing (post-strip on either
+            // branch — `head` is final here) must be proxy-key-free: a
+            // `proxy=` key stranded in an earlier `?` section — the
+            // `?proxy=P?x=1` double-`?` typo, or `?proxy=A?proxy=B`
+            // where the last `?` still tagged — would travel inside the
+            // request path and leak the proxy name to the upstream.
+            // Key-level per `?`-section, `skip(1)` so `&` inside the
+            // path (`/p&proxy=P?x=1`) stays path material.
+            if head
+                .split('?')
+                .skip(1)
+                .flat_map(|sec| sec.split('&'))
+                .any(is_proxy_key_segment)
+            {
+                return Err(NameServerParseError::InvalidParams(format!(
+                    "'proxy=' must be the last query parameter in '{s}'"
+                )));
             }
             // The fragment that survives `?`-section stripping must be
             // clean SNI material: leftover `&`/`?` is the classic mihomo
@@ -394,6 +392,16 @@ impl NameServerUrl {
     fn parse_https(_rest: &str, _fragment: Option<&str>) -> Result<Self, NameServerParseError> {
         Err(NameServerParseError::EncryptedFeatureDisabled)
     }
+}
+
+/// A `k=v` segment IS a `proxy=` key in any ASCII case — a stranded
+/// `?Proxy=` is the same typo/leak class as a last-section `?Proxy=`.
+/// The `=` is required by the key shape, so `proxy` *values*
+/// (`?x=proxy=P`), bare keys (`?Proxy`), and look-alikes (`?proxyx=`,
+/// `?aproxy=`) never match.
+fn is_proxy_key_segment(kv: &str) -> bool {
+    kv.get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case("proxy="))
 }
 
 fn parse_rcode(s: &str) -> Result<NameServerUrl, NameServerParseError> {
@@ -1205,6 +1213,7 @@ mod tests {
             // case — the `proxy=`-key case distinction is an
             // encrypted-forms-only concept.
             "udp://1.1.1.1?Proxy=P",
+            "udp://1.1.1.1?proxy=P?x=1",
         ] {
             assert!(
                 matches!(
@@ -1314,16 +1323,13 @@ mod tests {
             NameServerUrl::Https { path, .. } => assert_eq!(path, "/p?Proxy"),
             _ => panic!("expected Https"),
         }
-        // Batch-3 boundary: a case-variant segment stranded by a *later*
-        // `?` section keeps the old case-sensitive treatment — it stays
-        // in the path with no error (median widening is batch 3's scope;
-        // the warn is deliberately not asserted here).
-        let e = NameServerEntry::parse("https://h/p?Proxy=P?x=1").unwrap();
-        assert!(e.proxy.is_none());
-        match e.url {
-            NameServerUrl::Https { path, .. } => assert_eq!(path, "/p?Proxy=P?x=1"),
-            _ => panic!("expected Https"),
-        }
+        // A case-variant segment stranded by a *later* `?` section is
+        // caught by the post-strip `?`-section scan too — the stranded
+        // `proxy=` key hard-errors regardless of position or spelling.
+        assert!(matches!(
+            NameServerEntry::parse("https://h/p?Proxy=P?x=1"),
+            Err(NameServerParseError::InvalidParams(_))
+        ));
     }
 
     #[test]
@@ -1373,96 +1379,62 @@ mod tests {
         ));
     }
 
-    /// `?proxy=P?x=1` — a `proxy=` segment stranded by a *later* `?`
-    /// section is silently folded into the request path. That is not a
-    /// hard error (a legitimate path can carry the substring), but it
-    /// must warn so the likely-typo is visible. Scoped-subscriber
-    /// capture, same pattern as meow-config's `capture_warns`.
+    /// A `proxy=` key stranded in a non-last `?` section — any ASCII
+    /// case, at a `?`- or `&`-segment start — is a hard `InvalidParams`,
+    /// not a warn: the segment would travel inside the request path and
+    /// leak the proxy name to the DoH upstream on every query (audit §2
+    /// residual #1; `?proxy=A?proxy=B` covers r-b2's INFO-3 silent leak).
     #[test]
     #[cfg(feature = "encrypted")]
-    fn entry_path_retained_proxy_segment_warns() {
-        let ((), logs) = capture_warns(|| {
-            // The double-`?` typo: last `?` tail `x=1` is not a
-            // parameter section, so `?proxy=P` stays inside the path…
-            let e = NameServerEntry::parse("https://h/dns-query?proxy=P?x=1").unwrap();
-            assert!(e.proxy.is_none());
-            match e.url {
-                NameServerUrl::Https { path, .. } => {
-                    assert_eq!(path, "/dns-query?proxy=P?x=1");
-                }
+    fn entry_stranded_proxy_segment_errors() {
+        for s in [
+            "https://h/dns-query?proxy=P?x=1", // the leak row
+            "https://h/p?x=1&proxy=P?y=2",     // median &-segment
+            "https://h/p?proxy=A?proxy=B",     // INFO-3 silent leak
+            "https://h/p?Proxy=P?x=1",         // case-insensitive median
+            "https://h/p?PROXY=P?x=1",
+            "tls://8.8.8.8?proxy=P?x=1",
+            // the median arm fires before the fragment check
+            "tls://8.8.8.8#dns.google?proxy=P?x=1",
+        ] {
+            match NameServerEntry::parse(s) {
+                Err(NameServerParseError::InvalidParams(msg)) => assert!(
+                    msg.contains("last query parameter"),
+                    "{s} error must name the fix; got: {msg}"
+                ),
+                other => panic!("{s} must be InvalidParams, got {other:?}"),
+            }
+        }
+    }
+
+    /// The negative side of the scan: a `proxy=` *value*, a look-alike
+    /// key, a bare `Proxy` segment with no `=`, a `&` before the first
+    /// `?`, or a proxy-free double-`?` all stay in the path verbatim
+    /// and tag no proxy — `skip(1)` plus the key-level predicate never
+    /// reaches them.
+    #[test]
+    #[cfg(feature = "encrypted")]
+    fn entry_stranded_scan_leaves_non_key_segments() {
+        for s in [
+            "https://h/p?x=proxy=P?y=1", // `proxy=` is a VALUE; the key is x
+            "https://h/p?proxyx=P?y=1",
+            "https://h/p?aproxy=P?y=1",
+            "https://h/p?a=b?c=d",
+            "https://h/p?Proxy?x=1",
+            "https://h/p&proxy=P?x=1",
+        ] {
+            let e = NameServerEntry::parse(s)
+                .unwrap_or_else(|err| panic!("{s} must stay in the path, got {err}"));
+            assert!(e.proxy.is_none(), "{s} must not tag a proxy");
+        }
+        for (s, want) in [
+            ("https://h/p?a=b?c=d", "/p?a=b?c=d"),
+            ("https://h/p&proxy=P?x=1", "/p&proxy=P?x=1"),
+        ] {
+            match NameServerEntry::parse(s).unwrap().url {
+                NameServerUrl::Https { path, .. } => assert_eq!(path, want, "{s}"),
                 _ => panic!("expected Https"),
             }
-            // …and an `&`-stranded segment warns the same way…
-            let e = NameServerEntry::parse("https://h/p?x=1&proxy=P?y=2").unwrap();
-            assert!(e.proxy.is_none());
-            // …while these stay silent: a clean `?` tail, and a
-            // `proxy=` substring that is not a `?`/`&` segment start.
-            let e = NameServerEntry::parse("https://h/p?x=1").unwrap();
-            assert!(e.proxy.is_none());
-            let e = NameServerEntry::parse("https://h/p?a=proxy=1?x=1").unwrap();
-            assert!(e.proxy.is_none());
-        });
-        assert_eq!(
-            logs.matches("keeps a 'proxy=' segment").count(),
-            2,
-            "exactly the two stranded-proxy-segment entries must warn; got: {logs}"
-        );
-        assert!(
-            logs.contains("Did you mean to move '?proxy=NAME' last?"),
-            "the warn must name the likely fix; got: {logs}"
-        );
-    }
-
-    /// `tracing` caches per-callsite `Interest` process-globally, and any
-    /// `with_default` enter/exit rebuilds that cache. A `warn!` evaluated
-    /// on a parallel test thread while no subscriber is active then
-    /// caches `Interest::never` — and the event is dropped *even inside a
-    /// later `with_default` scope*, which flakes the scoped warn-capture
-    /// test. Installing a discarding GLOBAL default once makes bare
-    /// threads register `always`/`never` under it instead. Mirrors
-    /// meow-config `test_support::install_global_discard_subscriber`.
-    #[cfg(feature = "encrypted")]
-    fn install_global_discard_subscriber() {
-        let _ = tracing::subscriber::set_global_default(
-            tracing_subscriber::fmt()
-                .with_writer(std::io::sink)
-                .with_ansi(false)
-                .with_max_level(tracing::Level::WARN)
-                .finish(),
-        );
-    }
-
-    /// Scoped WARN capture — `with_default` is thread-local, so parallel
-    /// tests in this binary don't see each other's lines. Mirrors
-    /// meow-config `proxy_parser`'s `capture_warns`.
-    #[cfg(feature = "encrypted")]
-    fn capture_warns<R>(f: impl FnOnce() -> R) -> (R, String) {
-        install_global_discard_subscriber();
-        #[derive(Clone)]
-        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
         }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
-            type Writer = Sink;
-            fn make_writer(&'a self) -> Sink {
-                self.clone()
-            }
-        }
-        let sink = Sink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(sink.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let out = tracing::subscriber::with_default(subscriber, f);
-        let captured = sink.0.lock().unwrap();
-        (out, String::from_utf8_lossy(&captured).into_owned())
     }
 }

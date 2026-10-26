@@ -146,8 +146,10 @@ with `InvalidParams`, so `?a=b&proxy=P` errors on the unknown `a`
 rather than silently dropping the proxy tag). When no `&`-separated
 segment is a `proxy=` key, the `?` section is not a parameter section
 and stays part of the URL path verbatim (`https://dns.google/
-dns-query{?name}`-style templates are unaffected). Plain/UDP entries
-keep `#PROXY` and must not carry `?`.
+dns-query{?name}`-style templates are unaffected); a `proxy=` key in any
+*earlier* `?` section is `InvalidParams`, not a warn — it would ride
+inside the request path and leak the proxy name to the upstream.
+Plain/UDP entries keep `#PROXY` and must not carry `?`.
 
 *Revised on review (r15/I1) from the initial spec wording — "a `?` tail
 that does not start with `proxy=` stays in the path" — to per-segment

@@ -245,6 +245,11 @@ the canonical, in-repo source a release is cut from.
   `?Proxy=`/`?PROXY=` on `tls://`/`https://` nameservers hard-error at
   config load instead of silently leaking the proxy name into the DoH
   request path.
+- **A `proxy=` key stranded in a non-last `?` section hard-errors**:
+  previously it rode inside the DoH request path and leaked the proxy
+  name to the upstream on every query; config load now fails with
+  `'proxy=' must be the last query parameter`. A path that legitimately
+  needs the key percent-spells it (`?%70roxy=`).
 
 ### Security
 
