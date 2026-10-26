@@ -1069,6 +1069,36 @@ mod save_scratch_tests {
         assert_eq!(keys, ["+.first.example", "second.example", "rule-set:x"]);
     }
 
+    /// `hosts:` key order is written back verbatim too — it decides
+    /// same-slot collision winners, and the old `HashMap` reshuffled the
+    /// section on every save.
+    #[test]
+    fn save_preserves_hosts_key_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let raw: raw::RawConfig = serde_saphyr::from_str(
+            "mode: rule\nhosts:\n  '+.first.example': 1.1.1.1\n  'second.example': 2.2.2.2\n  '*.third.example': 3.3.3.3\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        save_raw_config(path.to_str().unwrap(), &raw).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let i_first = saved.find("+.first.example").unwrap();
+        let i_second = saved.find("second.example").unwrap();
+        let i_third = saved.find("*.third.example").unwrap();
+        assert!(
+            i_first < i_second && i_second < i_third,
+            "saved document must keep the hosts key order:\n{saved}"
+        );
+        // And a reload of the saved file yields the same order.
+        let reloaded: raw::RawConfig = serde_saphyr::from_str(&saved).unwrap();
+        let map = reloaded.hosts.unwrap();
+        let keys: Vec<&String> = map.keys().collect();
+        assert_eq!(
+            keys,
+            ["+.first.example", "second.example", "*.third.example"]
+        );
+    }
+
     #[test]
     fn failed_save_leaves_no_scratch() {
         let dir = tempfile::tempdir().unwrap();

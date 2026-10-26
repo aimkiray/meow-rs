@@ -322,6 +322,11 @@ the canonical, in-repo source a release is cut from.
   non-canonical spelling still marks the parameter section, then fails
   `InvalidParams` with a targeted hint. Whitespace *inside* a key
   (`?p roxy=`) and percent-spellings (`?%20proxy=`) stay path material.
+- **`hosts:` YAML document order is now preserved**: same-slot collisions
+  (`x` vs `+.x`, `.x` vs `+.x`, case/whitespace variants that normalize
+  together) resolve to the document-last writer — mihomo `setData`
+  parity, previously a per-startup coin flip — and saved configs no
+  longer reshuffle `hosts:` keys.
 
 ### Security
 

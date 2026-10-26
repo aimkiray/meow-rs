@@ -131,6 +131,19 @@ single-label `*.` pattern (there is no `*` → `+.` rewrite; configure `+.`
 directly for apex-inclusive coverage) and resolves via the trie's existing
 wildcard lookup. No new trie logic needed.
 
+### Same-slot collisions
+
+`hosts:` is carried in YAML document order (`RawHosts`, an `IndexMap` —
+the same contract `nameserver-policy` has). Two keys can land on the same
+(node, kind) trie slot: `x` vs `+.x` both write node `x`'s Exact slot,
+`.x` vs `+.x` both write its Dot slot, and `X.com`/` x.com ` normalize to
+`x.com`'s Exact slot (insert-side trim + lowercase). The document-last
+writer wins each slot (`insert_overwrite`, mihomo `node.setData` parity)
+— collisions resolve per-slot, so `x` written after `+.x` wins only the
+Exact slot and `sub.x` still resolves through `+.x`'s Dot slot. The save
+path emits the same document order, and `PUT /configs` order comes from
+the submitted text.
+
 ## Acceptance criteria
 
 1. `use-hosts: false` → hosts trie lookup skipped; `dns.hosts` entries have

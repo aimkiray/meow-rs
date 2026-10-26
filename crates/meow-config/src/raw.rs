@@ -247,8 +247,10 @@ pub struct RawConfig {
     /// by default.
     pub logbook: Option<RawLogbook>,
     /// Static host mappings, preferred over upstream DNS lookups. Values may
-    /// be a single IP, a list of IPs, or one domain-name alias.
-    pub hosts: Option<HashMap<String, HostsValue>>,
+    /// be a single IP, a list of IPs, or one domain-name alias. **Document
+    /// order decides same-slot collision winners** and round-trips through
+    /// the save path — see [`RawHosts`].
+    pub hosts: Option<RawHosts>,
     pub sniffer: Option<RawSniffer>,
     /// Named listener array. Each entry defines an explicitly-named proxy
     /// listener instance. Merged with the shorthand port fields at parse time.
@@ -302,6 +304,25 @@ impl HostsValue {
         }
     }
 }
+
+/// The raw `hosts:` map, kept in YAML document order: that order decides
+/// same-slot collision winners (document-last wins — see `build_hosts_trie`)
+/// and is written back verbatim by the save path.
+///
+/// A YAML-literal duplicate key is a hard parse error, not a fold:
+/// every production ingest path (`-f`/`-t`, `--config-string`,
+/// `PUT /configs`) funnels through [`crate::parse_raw_yaml`], whose
+/// serde-saphyr parser rejects the document with
+/// `duplicate mapping key: …` before this map is built. The
+/// `IndexMap::insert` fold — first position kept, last value wins, the
+/// same collapse mihomo's `orderedmap.Set` produces — only decides
+/// duplicates from non-literal sources: a programmatically built map.
+///
+/// Warning: `IndexMap`'s `PartialEq` is order-INSENSITIVE — `==` cannot
+/// tell a pure key reorder apart from identity. Any comparison where
+/// order matters (e.g. `dns_inputs_equal` in meow-api) must compare
+/// `iter()` pairwise instead.
+pub type RawHosts = IndexMap<String, HostsValue>;
 
 /// `tun:` YAML section (issue #326) — mihomo-compatible TUN inbound.
 ///

@@ -1,4 +1,4 @@
-use crate::raw::{HostsValue, RawConfig};
+use crate::raw::{RawConfig, RawHosts};
 use crate::rule_provider::RuleProvider;
 use crate::DnsConfig;
 use meow_common::DnsMode;
@@ -1002,8 +1002,16 @@ fn build_fallback_filter(
 /// Build the hosts trie from top-level mihomo-compatible `hosts:` entries.
 /// A single value may be an IP or domain alias; lists must contain only IPs.
 /// Malformed values and alias cycles are hard errors (Class A per ADR-0002).
+///
+/// Keys iterate in YAML document order. Two keys colliding on one (node, kind)
+/// slot — `x` vs `+.x` (Exact), `.x` vs `+.x` (Dot), or spelling variants that
+/// normalize together (insert-side trim + lowercase, e.g. `X.com` vs `x.com`,
+/// ` x.com ` vs `x.com`) — resolve to the document-last writer
+/// (`insert_overwrite`, mihomo `node.setData` parity). Collisions are per-slot:
+/// `+.x` writes Exact AND Dot, so `x` written *after* `+.x` wins only the Exact
+/// slot — `sub.x` still resolves through `+.x`'s Dot slot.
 fn build_hosts_trie(
-    hosts: Option<&HashMap<String, HostsValue>>,
+    hosts: Option<&RawHosts>,
     strict: bool,
 ) -> Result<DomainTrie<HostEntry>, anyhow::Error> {
     let mut trie: DomainTrie<HostEntry> = DomainTrie::new();
@@ -1049,7 +1057,7 @@ fn build_hosts_trie(
         };
         // Keys go in as written: `*.foo` is a single-label wildcard, `+.foo`
         // covers the apex plus any-depth subdomains, a bare key is exact.
-        if !trie.insert(host.trim(), host_entry) {
+        if !trie.insert_overwrite(host.trim(), host_entry) {
             if strict {
                 return Err(anyhow::anyhow!(
                     "hosts: '{}' is not a valid domain pattern (strict mode)",
@@ -1165,6 +1173,7 @@ async fn parse_system_hosts() -> Vec<(String, Vec<IpAddr>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raw::HostsValue;
     use std::net::Ipv4Addr;
 
     fn one(s: &str) -> HostsValue {
@@ -1678,7 +1687,7 @@ mod tests {
 
     #[test]
     fn build_hosts_trie_single_ip() {
-        let mut map = HashMap::new();
+        let mut map = RawHosts::new();
         map.insert("example.com".to_string(), one("1.2.3.4"));
         let trie = build_hosts_trie(Some(&map), false).unwrap();
         let v = trie.search("example.com").expect("must hit");
@@ -1687,7 +1696,7 @@ mod tests {
 
     #[test]
     fn build_hosts_trie_many_ips() {
-        let mut map = HashMap::new();
+        let mut map = RawHosts::new();
         map.insert("dual.test".to_string(), many(&["1.1.1.1", "::1"]));
         let trie = build_hosts_trie(Some(&map), false).unwrap();
         let v = trie.search("dual.test").expect("must hit");
@@ -1696,7 +1705,7 @@ mod tests {
 
     #[test]
     fn build_hosts_trie_domain_alias() {
-        let mut map = HashMap::new();
+        let mut map = RawHosts::new();
         map.insert("node.example".to_string(), one("origin.example"));
         let trie = build_hosts_trie(Some(&map), false).unwrap();
         assert_eq!(
@@ -1707,7 +1716,7 @@ mod tests {
 
     #[test]
     fn build_hosts_trie_rejects_alias_cycle() {
-        let mut map = HashMap::new();
+        let mut map = RawHosts::new();
         map.insert("a.example".to_string(), one("b.example"));
         map.insert("b.example".to_string(), one("a.example"));
         let err = build_hosts_trie(Some(&map), false)
@@ -1718,7 +1727,7 @@ mod tests {
 
     #[test]
     fn build_hosts_trie_rejects_domain_in_multi_value_list() {
-        let mut map = HashMap::new();
+        let mut map = RawHosts::new();
         map.insert(
             "bad.example".to_string(),
             many(&["192.0.2.1", "origin.example"]),
@@ -1733,7 +1742,7 @@ mod tests {
     // Upstream: silently skips malformed IPs. NOT silent skip — Class A per ADR-0002.
     #[test]
     fn build_hosts_trie_malformed_ip_hard_error() {
-        let mut map = HashMap::new();
+        let mut map = RawHosts::new();
         map.insert("bad.test".to_string(), one("not-an-ip"));
         let result = build_hosts_trie(Some(&map), false);
         let err = result
@@ -1748,7 +1757,7 @@ mod tests {
 
     #[test]
     fn build_hosts_trie_wildcard_and_bare() {
-        let mut map = HashMap::new();
+        let mut map = RawHosts::new();
         map.insert("+.corp.example".to_string(), one("10.0.0.1"));
         let trie = build_hosts_trie(Some(&map), false).unwrap();
         assert!(trie.search("host.corp.example").is_some());
@@ -1760,7 +1769,7 @@ mod tests {
     // subdomains.
     #[test]
     fn build_hosts_trie_star_wildcard_single_label() {
-        let mut map = HashMap::new();
+        let mut map = RawHosts::new();
         map.insert("*.corp.internal".to_string(), one("10.0.0.50"));
         let trie = build_hosts_trie(Some(&map), false).unwrap();
         assert!(
@@ -1783,7 +1792,7 @@ mod tests {
     fn build_hosts_trie_exact_overrides_wildcard() {
         let exact_ip = "10.0.0.53";
         let wild_ip = "10.0.0.50";
-        let mut map = HashMap::new();
+        let mut map = RawHosts::new();
         map.insert("*.corp.internal".to_string(), one(wild_ip));
         map.insert("dns.corp.internal".to_string(), one(exact_ip));
         let trie = build_hosts_trie(Some(&map), false).unwrap();
@@ -1793,6 +1802,230 @@ mod tests {
             addresses(exact).first().copied(),
             Some(exact_addr),
             "exact entry must override wildcard"
+        );
+    }
+
+    // ─── `hosts:` same-slot collisions: document-last wins ─────────────
+    //
+    // `x` and `+.x` share node `x`'s Exact slot; `.x` and `+.x` share its
+    // Dot slot; case/whitespace variants normalize onto the same slot at
+    // insert. The ordered carrier (`RawHosts`) makes the document-last
+    // writer the deterministic winner per slot (`insert_overwrite`,
+    // mihomo `node.setData` parity) — collisions are per-slot, NOT
+    // per-key.
+
+    /// `x` written after `+.x` wins only the Exact slot — `sub.x` still
+    /// resolves through `+.x`'s Dot slot. Reversed, `+.x` overwrites both.
+    #[test]
+    fn hosts_collision_bare_vs_plus_last_wins() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+
+        let mut map = RawHosts::new();
+        map.insert("+.slot.test".to_string(), one("10.0.0.1"));
+        map.insert("slot.test".to_string(), one("10.0.0.2"));
+        let trie = build_hosts_trie(Some(&map), false).unwrap();
+        assert_eq!(
+            addresses(trie.search("slot.test").expect("must hit")),
+            &[ip("10.0.0.2")],
+            "bare key written last must win the Exact slot"
+        );
+        assert_eq!(
+            addresses(trie.search("deep.slot.test").expect("must hit")),
+            &[ip("10.0.0.1")],
+            "the Dot slot keeps `+.`'s entry — collisions are per-slot"
+        );
+
+        let mut reversed = RawHosts::new();
+        reversed.insert("slot.test".to_string(), one("10.0.0.2"));
+        reversed.insert("+.slot.test".to_string(), one("10.0.0.1"));
+        let trie = build_hosts_trie(Some(&reversed), false).unwrap();
+        assert_eq!(
+            addresses(trie.search("slot.test").expect("must hit")),
+            &[ip("10.0.0.1")]
+        );
+        assert_eq!(
+            addresses(trie.search("deep.slot.test").expect("must hit")),
+            &[ip("10.0.0.1")]
+        );
+    }
+
+    /// `.x` and `+.x` share the Dot slot only — `.x` written last leaves
+    /// `+.`'s Exact slot alone; reversed, `+.x` overwrites both slots.
+    #[test]
+    fn hosts_collision_dot_vs_plus_last_wins() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+
+        let mut map = RawHosts::new();
+        map.insert("+.t.test".to_string(), one("10.0.0.1"));
+        map.insert(".t.test".to_string(), one("10.0.0.3"));
+        let trie = build_hosts_trie(Some(&map), false).unwrap();
+        assert_eq!(
+            addresses(trie.search("x.t.test").expect("must hit")),
+            &[ip("10.0.0.3")],
+            "`.t.test` written last must win the Dot slot"
+        );
+        assert_eq!(
+            addresses(trie.search("t.test").expect("must hit")),
+            &[ip("10.0.0.1")],
+            "`.t.test` writes no Exact slot — `+.`'s apex entry survives"
+        );
+
+        let mut reversed = RawHosts::new();
+        reversed.insert(".t.test".to_string(), one("10.0.0.3"));
+        reversed.insert("+.t.test".to_string(), one("10.0.0.1"));
+        let trie = build_hosts_trie(Some(&reversed), false).unwrap();
+        assert_eq!(
+            addresses(trie.search("x.t.test").expect("must hit")),
+            &[ip("10.0.0.1")]
+        );
+        assert_eq!(
+            addresses(trie.search("t.test").expect("must hit")),
+            &[ip("10.0.0.1")]
+        );
+    }
+
+    /// Case-folded spellings normalize onto one slot — the document-last
+    /// writer wins while the map keeps both distinct YAML keys.
+    #[test]
+    fn hosts_collision_casefold_last_wins() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+
+        let mut map = RawHosts::new();
+        map.insert("Case.test".to_string(), one("10.0.0.1"));
+        map.insert("case.test".to_string(), one("10.0.0.2"));
+        assert_eq!(map.len(), 2, "distinct YAML keys both live in the map");
+        let trie = build_hosts_trie(Some(&map), false).unwrap();
+        assert_eq!(
+            addresses(trie.search("CASE.test").expect("must hit")),
+            &[ip("10.0.0.2")]
+        );
+    }
+
+    /// Insert-side trim normalizes padded keys onto the same slot —
+    /// document-last wins. (Keys whose *interior* whitespace fails trie
+    /// validation keep the existing warn/strict path; not asserted here.)
+    #[test]
+    fn hosts_collision_whitespace_last_wins() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+
+        let mut map = RawHosts::new();
+        map.insert(" pad.test".to_string(), one("10.0.0.1"));
+        map.insert("pad.test".to_string(), one("10.0.0.2"));
+        let trie = build_hosts_trie(Some(&map), false).unwrap();
+        assert_eq!(
+            addresses(trie.search("pad.test").expect("must hit")),
+            &[ip("10.0.0.2")]
+        );
+    }
+
+    /// Reparsing the same document must yield the same collision winners
+    /// every iteration — the ordered carrier makes iteration order
+    /// deterministic, where the old `HashMap` shuffled it per process.
+    #[test]
+    fn hosts_document_order_is_deterministic_across_reparses() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let doc = "hosts:\n  '+.rep.test': 10.0.0.1\n  rep.test: 10.0.0.2\n  '.rep2.test': 10.0.0.3\n  '+.rep2.test': 10.0.0.4\n  '*.wild.test': 10.0.0.5\n";
+        for i in 0..64 {
+            let raw: RawConfig = serde_saphyr::from_str(doc).unwrap();
+            let trie = build_hosts_trie(raw.hosts.as_ref(), false).unwrap();
+            assert_eq!(
+                addresses(trie.search("rep.test").expect("must hit")),
+                &[ip("10.0.0.2")],
+                "iteration {i}: bare key written after `+.` must win Exact"
+            );
+            assert_eq!(
+                addresses(trie.search("deep.rep.test").expect("must hit")),
+                &[ip("10.0.0.1")],
+                "iteration {i}: `+.`'s Dot slot must survive"
+            );
+            assert_eq!(
+                addresses(trie.search("rep2.test").expect("must hit")),
+                &[ip("10.0.0.4")],
+                "iteration {i}: `+.` written last must win Exact"
+            );
+            assert_eq!(
+                addresses(trie.search("deep.rep2.test").expect("must hit")),
+                &[ip("10.0.0.4")],
+                "iteration {i}: `+.` written last must win Dot"
+            );
+            assert_eq!(
+                addresses(trie.search("x.wild.test").expect("must hit")),
+                &[ip("10.0.0.5")],
+                "iteration {i}: non-colliding `*.` entry unaffected"
+            );
+        }
+    }
+
+    /// `insert_overwrite` keeps `insert`'s validation — `+.`/`.`/empty
+    /// keys return `false` identically, so lenient mode warn-skips and
+    /// strict mode hard-errors.
+    #[test]
+    fn hosts_invalid_pattern_still_warns_lenient_errors_strict() {
+        for bad_key in ["+.", ".", "   "] {
+            let mut map = RawHosts::new();
+            map.insert(bad_key.to_string(), one("10.0.0.1"));
+
+            let cap = WarnCapture::start();
+            let trie = build_hosts_trie(Some(&map), false)
+                .expect("lenient must warn-skip an invalid pattern");
+            let logs = cap.take();
+            assert!(
+                logs.contains("failed to insert"),
+                "lenient path must warn for '{bad_key}', got: {logs}"
+            );
+            drop(cap);
+            assert!(trie.search(bad_key).is_none());
+
+            let err = build_hosts_trie(Some(&map), true)
+                .err()
+                .expect("strict must reject an invalid pattern");
+            assert!(
+                err.to_string().contains("not a valid domain pattern"),
+                "strict error for '{bad_key}' must cite the pattern check: {err}"
+            );
+        }
+    }
+
+    /// `proxy-server-nameserver` rebuilds its hosts trie through the same
+    /// `build_hosts_trie` (`DomainTrie` is not `Clone`), so it must carry
+    /// identical collision semantics — document-last wins on both copies.
+    #[tokio::test]
+    async fn proxy_server_nameserver_hosts_trie_matches_main() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let raw: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  use-system-hosts: false\n  nameserver:\n    - 1.1.1.1\n  proxy-server-nameserver:\n    - 8.8.8.8\nhosts:\n  '+.parity.test': 10.0.0.1\n  parity.test: 10.0.0.2\n",
+        )
+        .unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let proxy = cfg
+            .proxy_resolver
+            .as_ref()
+            .expect("proxy resolver must build");
+        for q in ["parity.test", "deep.parity.test"] {
+            assert_eq!(
+                cfg.resolver.lookup_hosts_all(q),
+                proxy.lookup_hosts_all(q),
+                "main and proxy resolvers must agree on '{q}'"
+            );
+        }
+        // And the collision itself resolved document-last on both.
+        assert_eq!(
+            cfg.resolver.lookup_hosts_all("parity.test"),
+            Some(&vec![ip("10.0.0.2")])
+        );
+        assert_eq!(
+            cfg.resolver.lookup_hosts_all("deep.parity.test"),
+            Some(&vec![ip("10.0.0.1")])
         );
     }
 
@@ -2681,7 +2914,7 @@ mod tests {
             "strict must reject an invalid fallback-filter CIDR"
         );
 
-        let mut hosts = HashMap::new();
+        let mut hosts = RawHosts::new();
         hosts.insert("empty.test".to_string(), HostsValue::Many(vec![]));
         build_hosts_trie(Some(&hosts), false).expect("lenient skips empty hosts entries");
         assert!(

@@ -536,7 +536,10 @@ hosts:
 
 Both syntaxes work in config and are stored verbatim: `*.` matches exactly
 one subdomain label, `+.` covers the apex plus subdomains at any depth, and
-`.` covers any-depth subdomains excluding the apex.
+`.` covers any-depth subdomains excluding the apex. When two keys land on
+the same trie slot (`x` vs `+.x`, `.x` vs `+.x`, or spellings that
+normalize together), the document-last writer wins — mihomo's `setData`
+parity — and the document order round-trips through config saves.
 
 ---
 

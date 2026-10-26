@@ -1711,9 +1711,11 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
 /// resolver build. Compared structurally (the `Raw*` types derive
 /// `PartialEq`; map sections are order-insensitive, list sections keep
 /// list order — same semantics the JSON comparison had, without building
-/// a DOM per commit) — with one exception: `nameserver-policy` key order
-/// IS semantic (document order = lookup priority), but `IndexMap`'s `==`
-/// cannot see it, so that map gets a pairwise order-sensitive pass below.
+/// a DOM per commit) — with two exceptions: `nameserver-policy` key
+/// order IS semantic (document order = lookup priority) and `hosts` key
+/// order decides same-slot collision winners (the document-last writer
+/// wins, so a pure reorder must rebuild), but `IndexMap`'s `==` cannot
+/// see either, so those maps get a pairwise order-sensitive pass below.
 /// When a `dns:` section references
 /// proxies/rule-providers (`#name` nameserver tags, `rule-set:` policy
 /// keys), those sections join the comparison — the resolver snapshots
@@ -1739,11 +1741,27 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
             _ => false,
         }
     };
+    // A pure key reorder of `hosts` must read as a change — document order
+    // decides same-slot collision winners, and `IndexMap`'s `==` is
+    // order-insensitive.
+    let hosts_equal = {
+        match (&a.hosts, &b.hosts) {
+            (None, None) => true,
+            (Some(ma), Some(mb)) => {
+                ma.len() == mb.len()
+                    && ma
+                        .iter()
+                        .zip(mb.iter())
+                        .all(|((ka, va), (kb, vb))| ka == kb && va == vb)
+            }
+            _ => false,
+        }
+    };
     // `geox-url` is the top-level alias for `geodata.url.*` — it feeds the
     // same `parse_geodata` result, so it joins the DNS-input comparison.
-    let base = nsp_equal
+    let base = hosts_equal
+        && nsp_equal
         && a.dns == b.dns
-        && a.hosts == b.hosts
         && a.ipv6 == b.ipv6
         && a.geodata == b.geodata
         && a.geox_url == b.geox_url;
@@ -4624,6 +4642,45 @@ mod tests {
         )
         .unwrap();
         assert!(!dns_inputs_equal(&raw_a, &raw_d));
+    }
+
+    /// `hosts` key order is semantic too — document order decides
+    /// same-slot collision winners (the document-last writer wins) — but
+    /// `IndexMap`'s `==` is order-insensitive, so `dns_inputs_equal`
+    /// compares that map pairwise like `nameserver-policy`. A `PUT
+    /// /configs` that only reorders the hosts keys must still rebuild
+    /// the resolver.
+    #[test]
+    fn dns_inputs_equal_sees_hosts_key_order() {
+        let raw_a: RawConfig =
+            serde_saphyr::from_str("hosts:\n  '+.a.example': 1.1.1.1\n  '+.b.example': 2.2.2.2\n")
+                .unwrap();
+        let raw_b: RawConfig =
+            serde_saphyr::from_str("hosts:\n  '+.b.example': 2.2.2.2\n  '+.a.example': 1.1.1.1\n")
+                .unwrap();
+        // Same keys, same values, different document order → not equal.
+        assert!(!dns_inputs_equal(&raw_a, &raw_b));
+        assert!(!dns_inputs_equal(&raw_b, &raw_a));
+        // Same order, same content → equal.
+        let raw_c: RawConfig =
+            serde_saphyr::from_str("hosts:\n  '+.a.example': 1.1.1.1\n  '+.b.example': 2.2.2.2\n")
+                .unwrap();
+        assert!(dns_inputs_equal(&raw_a, &raw_c));
+        // Same order, different value → not equal.
+        let raw_d: RawConfig =
+            serde_saphyr::from_str("hosts:\n  '+.a.example': 1.1.1.1\n  '+.b.example': 9.9.9.9\n")
+                .unwrap();
+        assert!(!dns_inputs_equal(&raw_a, &raw_d));
+        // `None` vs `Some(empty)` reads as a change — the Option-diff
+        // semantics the `_ => false` arm pins.
+        let raw_none: RawConfig = serde_saphyr::from_str("mode: rule\n").unwrap();
+        let raw_empty: RawConfig = serde_saphyr::from_str("hosts: {}\n").unwrap();
+        assert!(
+            raw_empty.hosts.as_ref().unwrap().is_empty(),
+            "`hosts: {{}}` must parse as `Some(empty)`"
+        );
+        assert!(!dns_inputs_equal(&raw_none, &raw_empty));
+        assert!(!dns_inputs_equal(&raw_empty, &raw_none));
     }
 
     /// Issue #533 review: `swap_config_and_reconcile_tun` compares the TUN
