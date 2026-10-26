@@ -34,7 +34,7 @@ still used internally so rules and proxies can resolve names.
 | `fake-ip-filter-mode` | string | `blacklist` | `blacklist` or `whitelist` |
 | `store-fake-ip` | bool | `false` | Persist the fake-IP map across restarts |
 | `use-hosts` | bool | `true` | Honor the top-level `hosts:` map |
-| `use-system-hosts` | bool | `true` | Merge the OS hosts file (no-op on Windows) |
+| `use-system-hosts` | bool | `true` | Merge the OS hosts file (`/etc/hosts`, or `%SystemRoot%\System32\drivers\etc\hosts` on Windows) |
 
 ## Upstream formats
 

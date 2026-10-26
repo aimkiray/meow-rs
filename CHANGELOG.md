@@ -235,7 +235,7 @@ the canonical, in-repo source a release is cut from.
   skipped in lenient mode (no geosite DB, an empty name, an unsupported
   prefix) still closes the open domain arm, so the domain keys around
   it keep the precedence they get once it loads. A YAML-literal duplicate
-  key is a hard parse error (`duplicate entry with key "…"`) — every
+  key is a hard parse error (`duplicate mapping key: …`) — every
   ingest path goes through `parse_raw_yaml`, which rejects it at the
   parser layer before the map is built; the
   first-position/last-value fold (mihomo `orderedmap.Set` parity) only
@@ -326,7 +326,11 @@ the canonical, in-repo source a release is cut from.
   (`x` vs `+.x`, `.x` vs `+.x`, case/whitespace variants that normalize
   together) resolve to the document-last writer — mihomo `setData`
   parity, previously a per-startup coin flip — and saved configs no
-  longer reshuffle `hosts:` keys.
+  longer reshuffle `hosts:` keys. For embedders: `RawConfig::hosts` is
+  now `Option<RawHosts>` (`IndexMap<String, HostsValue>`) instead of
+  `Option<HashMap<..>>`, and note that `IndexMap`'s `==` is
+  order-insensitive — the DNS-rebuild comparison in meow-api compares
+  it pairwise.
 
 ### Security
 

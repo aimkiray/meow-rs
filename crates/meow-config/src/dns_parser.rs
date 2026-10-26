@@ -1010,6 +1010,18 @@ fn build_fallback_filter(
 /// (`insert_overwrite`, mihomo `node.setData` parity). Collisions are per-slot:
 /// `+.x` writes Exact AND Dot, so `x` written *after* `+.x` wins only the Exact
 /// slot — `sub.x` still resolves through `+.x`'s Dot slot.
+///
+/// Known pre-existing validation divergences from mihomo, kept as-is: a key
+/// with a trailing dot (`x.com.`) or an empty mid-label (`a..b`) is accepted
+/// into a trie slot no query can reach (silently dead, even under `strict:`),
+/// where mihomo's `ValidAndSplitDomain` would reject it; whitespace-padded
+/// keys are trimmed and accepted where mihomo rejects; a mid-path `*`
+/// segment (`sub.*.x`) is stored as a literal label where mihomo treats it
+/// as a wildcard; an alias value trims only trailing dots where mihomo
+/// trims both ends (`.foo.com` differs); and mihomo seeds an implicit
+/// `localhost → 127.0.0.1` and accepts the `lan` magic value
+/// (interface addresses), neither of which exists here — `hosts: {x: lan}`
+/// is a hard error.
 fn build_hosts_trie(
     hosts: Option<&RawHosts>,
     strict: bool,
@@ -1085,6 +1097,18 @@ fn parse_host_alias(value: &str, host: &str) -> Result<String, anyhow::Error> {
     Ok(alias)
 }
 
+/// Reject domain-alias cycles. `aliases` are the edges recorded at WRITE
+/// time, one per alias key — NOT per final trie slot: a later same-slot key
+/// can overwrite the alias with a non-alias entry, leaving a dead edge that
+/// still seeds `seen`. The walk can then report a cycle the final trie does
+/// not contain (e.g. `{dead: loop, loop: dead, +.dead: 10.0.0.1}` — `+.dead`
+/// reclaims `dead`'s Exact slot, so `loop → dead` resolves cleanly at
+/// runtime, yet the recorded `dead → loop` edge still closes the loop).
+/// That is a conservative over-rejection kept deliberately: a document that
+/// trips it always contains a cycle among the *written* alias edges, and
+/// mihomo rejects the same class — its unordered hosts map can keep the
+/// cycle live — so the user-visible outcome matches. No false negatives
+/// either: a live cycle is revisited no matter which edge seeds `seen`.
 fn reject_host_alias_cycles(
     trie: &DomainTrie<HostEntry>,
     aliases: &[(String, String)],

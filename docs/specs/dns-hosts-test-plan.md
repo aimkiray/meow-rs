@@ -18,13 +18,13 @@ spec can be updated.
 - `*.foo` wildcard entries stored verbatim — single-label subdomain
   coverage only (root NOT included; `+.foo` covers root + any depth).
 - Exact host entry takes priority over wildcard for the same parent domain.
-- `use-system-hosts: bool` toggle; `/etc/hosts` parse on Unix; no-op+warn on Windows.
-- `dns.hosts` config entries override `/etc/hosts` entries for the same domain.
+- `use-system-hosts: bool` toggle; OS hosts file parse (`/etc/hosts` on Unix,
+  `%SystemRoot%\System32\drivers\etc\hosts` on Windows).
+- `hosts:` config entries override OS hosts file entries for the same domain.
 - Multi-IP hosts entries returning only the queried address family (NOERROR+zero
   answers when the queried family is absent).
 - Hosts lookup fires before `nameserver-policy` dispatch.
 - Malformed IP → hard parse error (Class A).
-- `use-system-hosts: true` on Windows → warn-once, no-op (Class B).
 
 **Out of scope:**
 
@@ -126,11 +126,11 @@ The `system_hosts_path: None` path skips `/etc/hosts` loading entirely
 |---|------|---------|
 | D1 | `system_hosts_entry_resolves_when_enabled` | Temp `/etc/hosts` with `192.168.1.1 myhost.local`; `use-system-hosts: true`; query A `myhost.local` → `192.168.1.1`. <br/> Upstream: `component/hosts/hosts.go`. NOT NXDOMAIN. |
 | D2 | `system_hosts_disabled_does_not_load` | `use-system-hosts: false`; temp `/etc/hosts` with `192.168.1.1 myhost.local`; mock upstream returns `5.5.5.5`; query A `myhost.local` → `5.5.5.5`. NOT `192.168.1.1`. |
-| D3 | `config_hosts_overrides_system_hosts` | Temp `/etc/hosts` with `192.168.1.1 example.com`; `dns.hosts` config with `example.com: 9.9.9.9`; query A `example.com` → `9.9.9.9`. <br/> NOT `192.168.1.1`. Config has higher priority. |
+| D3 | `config_hosts_overrides_system_hosts` | Temp `/etc/hosts` with `192.168.1.1 example.com`; `hosts:` config with `example.com: 9.9.9.9`; query A `example.com` → `9.9.9.9`. <br/> NOT `192.168.1.1`. Config has higher priority. |
 | D4 | `system_hosts_aliases_all_loaded` | Temp `/etc/hosts` with `192.168.1.2 primary alias1 alias2`; assert all three names resolve to `192.168.1.2`. NOT only `primary` loaded. |
 | D5 | `system_hosts_comment_lines_skipped` | Temp `/etc/hosts` with `# 10.0.0.1 commented.host`; assert `commented.host` does NOT resolve from hosts. NOT comment parsed as entry. |
 | D6 | `system_hosts_unreadable_warns_not_errors` | Path to a non-existent or permission-denied hosts file; assert `warn!` logged; resolver starts normally. NOT startup error. NOT panic. |
-| D7 | `use_system_hosts_on_windows_warns_and_no_ops` | Compile-time gate: `#[cfg(windows)]` only. `use-system-hosts: true` on Windows → `warn!` logged once at startup; no `/etc/hosts` loaded. <br/> ADR-0002 Class B — `warn!` not error. If CI has no Windows runner, mark `#[ignore = "windows-only"]`. |
+| D7 | `use_system_hosts_on_windows_reads_windows_hosts` | Compile-time gate: `#[cfg(windows)]` only. `use-system-hosts: true` on Windows reads `%SystemRoot%\System32\drivers\etc\hosts` (via `SystemRoot` env, `C:\Windows` fallback) — same merge priority as Unix. An unreadable file logs `warn!` and merges nothing. <br/> If CI has no Windows runner, mark `#[ignore = "windows-only"]`. |
 
 ---
 
@@ -162,7 +162,7 @@ The `system_hosts_path: None` path skips `/etc/hosts` loading entirely
 
 | # | Case | Asserts |
 |---|------|---------|
-| G1 | `hosts_entry_bypasses_nameserver_policy` | `nameserver-policy` routes `corp.internal` to a mock upstream that returns `8.8.8.8`; `dns.hosts` has `server.corp.internal: 10.0.0.1`; query A `server.corp.internal` → `10.0.0.1`. <br/> NOT `8.8.8.8`. Hosts lookup fires before policy dispatch. |
+| G1 | `hosts_entry_bypasses_nameserver_policy` | `nameserver-policy` routes `corp.internal` to a mock upstream that returns `8.8.8.8`; `hosts:` has `server.corp.internal: 10.0.0.1`; query A `server.corp.internal` → `10.0.0.1`. <br/> NOT `8.8.8.8`. Hosts lookup fires before policy dispatch. |
 | G2 | `non_hosts_domain_still_routes_through_nameserver_policy` | Same config; query A `other.corp.internal` (no hosts entry) → `8.8.8.8` (policy routes to mock). Guards that G1 does not accidentally bypass policy for all `.corp.internal`. |
 
 ---
@@ -171,7 +171,7 @@ The `system_hosts_path: None` path skips `/etc/hosts` loading entirely
 
 | # | Case | Asserts |
 |---|------|---------|
-| H1 | `malformed_ip_in_dns_hosts_hard_errors` | Config with `"example.com": "not-an-ip"`; assert `load_config()` or `Resolver::new()` returns `Err(...)`. <br/> Upstream: `component/hosts/hosts.go` silently skips. <br/> ADR-0002 Class A — malformed IPs in hosts are almost certainly typos; silent skip masks misconfiguration. NOT silent skip. NOT warn. |
+| H1 | `malformed_ip_in_hosts_hard_errors` | Config with `"example.com": "not-an-ip"`; assert `load_config()` or `Resolver::new()` returns `Err(...)`. <br/> Upstream: `component/hosts/hosts.go` silently skips. <br/> ADR-0002 Class A — malformed IPs in hosts are almost certainly typos; silent skip masks misconfiguration. NOT silent skip. NOT warn. |
 | H2 | `malformed_ip_in_multi_ip_list_hard_errors` | Config with `"example.com": ["1.2.3.4", "bad-ip"]`; assert hard error. NOT partial load (first IP accepted, second skipped). |
 | H3 | `ipv4_mapped_ipv6_in_hosts_parses` | Entry `"example.com": "::ffff:1.2.3.4"` (valid IPv6); assert parses without error. NOT false positive on valid IPv6 notation. |
 
@@ -183,6 +183,6 @@ All spec divergence rows have test coverage:
 
 | Spec row | Class | Test cases |
 |----------|:-----:|------------|
-| 1 — `use-system-hosts: true` on Windows → no-op, warn | B | D7 |
-| 2 — Malformed IP in `dns.hosts` → hard parse error (upstream silently skips) | A | H1, H2 |
+| 1 — `use-system-hosts: true` on Windows → reads `%SystemRoot%\System32\drivers\etc\hosts` | — | D7 |
+| 2 — Malformed IP in `hosts:` → hard parse error (upstream silently skips) | A | H1, H2 |
 | 3 — Multiple IPs as list → we match upstream | — | F1, F2, F5 |

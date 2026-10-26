@@ -319,9 +319,13 @@ impl HostsValue {
 /// `PUT /configs`) funnels through [`crate::parse_raw_yaml`], whose
 /// serde-saphyr parser rejects the document with
 /// `duplicate mapping key: …` before this map is built. The
-/// `IndexMap::insert` fold — first position kept, last value wins, the
-/// same collapse mihomo's `orderedmap.Set` produces — only decides
-/// duplicates from non-literal sources: a programmatically built map.
+/// `IndexMap::insert` fold — first position kept, last value wins — only
+/// decides duplicates from non-literal sources: a programmatically built
+/// map. (mihomo parses `hosts:` into a plain `map[string]any` — unordered,
+/// so its collision winner is nondeterministic per parse; the document
+/// order kept here is a deliberate strengthening, and the fold itself is
+/// the same collapse mihomo's `orderedmap.Set` applies to
+/// `nameserver-policy`.)
 ///
 /// Warning: `IndexMap`'s `PartialEq` is order-INSENSITIVE — `==` cannot
 /// tell a pure key reorder apart from identity. Any comparison where
@@ -477,8 +481,10 @@ pub struct RawDns {
     pub fake_ip_filter: Option<Vec<String>>,
     /// If false, the hosts trie lookup is skipped entirely at query time.
     pub use_hosts: Option<bool>,
-    /// If true, `/etc/hosts` is read at startup and merged (lower priority than
-    /// top-level `hosts` config entries). No-op + warn on Windows.
+    /// If true, the OS hosts file is read at startup and merged (lower
+    /// priority than top-level `hosts` config entries): `/etc/hosts` on
+    /// Unix, `%SystemRoot%\System32\drivers\etc\hosts` on Windows. An
+    /// unreadable file logs a `warn!` and merges nothing.
     pub use_system_hosts: Option<bool>,
     /// Per-domain nameserver routing: each key is an exact domain, a `+.` /
     /// `*.` / `.` wildcard prefix, or a `geosite:`/`rule-set:` matcher;

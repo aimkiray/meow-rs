@@ -118,7 +118,9 @@ keep the precedence they get once it loads. Within
 one domain-trie arm the usual specificity rules decide (exact > `*.` > `.`
 at the deepest node); two keys landing on the SAME trie slot — e.g. `x` and
 `+.x`, which both write `x`'s exact slot — resolve to the document-last
-writer (mihomo `setData` overwrite). A YAML-literal duplicate key is a
+writer (mihomo `setData` overwrite). A YAML-literal duplicate key (other
+than `<<`, a merge directive the parser consumes before duplicate
+detection — two `<<:` lines in one map expand both anchors) is a
 hard parse error (`duplicate mapping key: …`): every ingest path
 (`-f`/`-t`, `--config-string`, `PUT /configs`) funnels through
 `parse_raw_yaml`, whose serde-saphyr parser rejects the document before

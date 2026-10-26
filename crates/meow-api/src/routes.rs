@@ -4646,6 +4646,28 @@ mod tests {
         assert!(!dns_inputs_equal(&raw_a, &raw_d));
     }
 
+    /// A `nameserver-policy` length mismatch must read as a change too:
+    /// `zip` truncates to the shorter side, so `{a, b}` vs `{a}` is a case
+    /// the pairwise pass only sees through its explicit `len` guard (the
+    /// derived `RawDns` `==` — `IndexMap`'s `==` being length-sensitive —
+    /// catches it today as a second net). Pin the observable contract
+    /// with a prefix-identical pair where length is the ONLY difference.
+    #[test]
+    fn dns_inputs_equal_sees_nameserver_policy_len_mismatch() {
+        let raw_ab: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  nameserver-policy:\n    '+.a.example': 1.1.1.1\n    '+.b.example': 2.2.2.2\n",
+        )
+        .unwrap();
+        let raw_a: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  nameserver-policy:\n    '+.a.example': 1.1.1.1\n",
+        )
+        .unwrap();
+        // The shared prefix `+.a.example` is identical in both maps — only
+        // `len` differs.
+        assert!(!dns_inputs_equal(&raw_ab, &raw_a));
+        assert!(!dns_inputs_equal(&raw_a, &raw_ab));
+    }
+
     /// `hosts` key order is semantic too — document order decides
     /// same-slot collision winners (the document-last writer wins) — but
     /// `IndexMap`'s `==` is order-insensitive, so `dns_inputs_equal`
@@ -4683,6 +4705,25 @@ mod tests {
         );
         assert!(!dns_inputs_equal(&raw_none, &raw_empty));
         assert!(!dns_inputs_equal(&raw_empty, &raw_none));
+    }
+
+    /// The `hosts` pairwise pass has the same `zip`-truncation trap:
+    /// `{a, b}` vs `{a}` would compare equal without the explicit `len`
+    /// guard, so a `PUT /configs` that only deletes a trailing hosts
+    /// entry would skip the rebuild and keep serving the deleted name.
+    /// Pin it with a prefix-identical pair where length is the ONLY
+    /// difference.
+    #[test]
+    fn dns_inputs_equal_sees_hosts_len_mismatch() {
+        let raw_ab: RawConfig =
+            serde_saphyr::from_str("hosts:\n  '+.a.example': 1.1.1.1\n  '+.b.example': 2.2.2.2\n")
+                .unwrap();
+        let raw_a: RawConfig =
+            serde_saphyr::from_str("hosts:\n  '+.a.example': 1.1.1.1\n").unwrap();
+        // The shared prefix `+.a.example` is identical in both maps — only
+        // `len` differs, so this is the `ma.len() == mb.len()` guard's pin.
+        assert!(!dns_inputs_equal(&raw_ab, &raw_a));
+        assert!(!dns_inputs_equal(&raw_a, &raw_ab));
     }
 
     /// Issue #533 review: `swap_config_and_reconcile_tun` compares the TUN

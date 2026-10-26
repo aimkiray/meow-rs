@@ -83,7 +83,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — `default-nameserver` | ✓ | Bootstrap resolver for encrypted upstream hostnames. |
 | `dns:` — `nameserver-policy` | ✓ | Exact, `+.`/`*.`/`.` wildcard, `geosite:`/`rule-set:` policy keys. Key order is the lookup priority (document order = first match wins); a matcher key shadows domain keys written after it, and same-slot collisions resolve to the document-last key. |
 | `dns:` — `fallback-filter` | ✓ | GeoIP/IP-CIDR/domain gates. |
-| `dns:` — `hosts` + `use-system-hosts` | ✓ | M1.E-5, wildcards supported. |
+| `hosts:` (top level) + `dns:` `use-system-hosts` | ✓ | M1.E-5, wildcards supported. |
 | `dns:` — `fake-ip` mode | ✓ | v4/v6 pools, `fake-ip-filter`, `fake-ip-filter-mode`, `store-fake-ip` JSON persistence. See §fake-ip mode. |
 | `tproxy-port` | ✓ | Linux nftables / macOS pf. |
 | `proxy-providers:` | ✓ | http/file sources, provider filters, health checks, and group `use:`. |
@@ -139,7 +139,7 @@ security gaps and typo-likely mistakes become hard errors (Class A).
 | `authentication` entry with no `:` | Silently stored with empty password | Hard parse error |
 | `authentication` entry with empty username (`:pass`) | Silently accepted | Hard parse error |
 | `skip-auth-prefixes` with invalid CIDR | Silently dropped | Hard parse error |
-| Malformed IP in `dns.hosts` | Silently skips | Hard parse error |
+| Malformed IP in `hosts:` | Silently skips | Hard parse error |
 | `.dat` geosite file in discovery path | Loads (protobuf) | Hard error + conversion hint (`convert-geo`) |
 | `sub-rules:` cycle | May panic or loop | Hard parse error |
 | `sub-rules:` reference to undefined block | Runtime no-match | Hard parse error |
