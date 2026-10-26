@@ -54,9 +54,6 @@ async-trait = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 sysinfo = "0.32"
 hickory-proto = { workspace = true }
-# Scoped-subscriber `warn!` capture for the `?`-section migration-warn
-# tests in upstream.rs (same pattern as meow-config's dns_parser tests).
-tracing-subscriber = { workspace = true }
 # In-process TLS upstreams for the DoT/DoH-over-proxy e2e tests:
 # `boring`/`tokio-boring` serve the handshake, `rcgen` mints the
 # self-signed chain the client's `with_tls_additional_roots` hook trusts.

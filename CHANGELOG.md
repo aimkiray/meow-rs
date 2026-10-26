@@ -172,6 +172,14 @@ the canonical, in-repo source a release is cut from.
   fetching now happens inside the config build, gated on what the
   config references.
 
+### Fixed
+
+- **A `proxy=` key stranded in a non-last `?` section hard-errors**:
+  previously it rode inside the DoH request path and leaked the proxy
+  name to the upstream on every query; config load now fails with
+  `'proxy=' must be the last query parameter`. A path that legitimately
+  needs the key percent-spells it (`?%70roxy=`).
+
 ### Security
 
 - **Distrust the compromised eMudhra intermediates by key**: every
