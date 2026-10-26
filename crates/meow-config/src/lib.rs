@@ -918,7 +918,7 @@ pub(crate) fn unique_scratch_path(path: &Path) -> PathBuf {
 /// `CONFIG_MUTATION` lane (meow-api) — an unsynchronized pair can still
 /// land an older document's rename last (issue #543).
 ///
-/// The output is a full `RawConfig` serialization: serde_yaml emits
+/// The output is a full `RawConfig` serialization: serde-saphyr emits
 /// `key: null` for every unset `Option` field, so a saved file is
 /// noisier than the hand-edited original (pre-existing shape).
 pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {

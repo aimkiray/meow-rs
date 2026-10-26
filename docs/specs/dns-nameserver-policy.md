@@ -119,23 +119,20 @@ one domain-trie arm the usual specificity rules decide (exact > `*.` > `.`
 at the deepest node); two keys landing on the SAME trie slot — e.g. `x` and
 `+.x`, which both write `x`'s exact slot — resolve to the document-last
 writer (mihomo `setData` overwrite). A YAML-literal duplicate key is a
-hard parse error (`duplicate entry with key "…"`): every ingest path
+hard parse error (`duplicate mapping key: …`): every ingest path
 (`-f`/`-t`, `--config-string`, `PUT /configs`) funnels through
-`parse_raw_yaml`, whose serde_norway `Value` layer rejects the document
-before the policy map is built. The first-position/last-value fold
+`parse_raw_yaml`, whose serde-saphyr parser rejects the document before
+the policy map is built. The first-position/last-value fold
 (mihomo `orderedmap.Set`) only decides duplicates from non-literal
 sources — a programmatically built map, or the expanded segments of one
-comma-mixed key. A `<<:` merge key appends the anchor's entries at the
-END of the map no matter where the `<<:` line is written, and an
-explicit key overrides a merged same-name key — merged entries are
+comma-mixed key. serde-saphyr expands a `<<:` merge key in the event
+stream: the anchor's entries append at the END of the map no matter
+where the `<<:` line is written, and an explicit key keeps its written
+position and wins over a merged same-name key — merged entries are
 therefore always the lowest-priority arms, so a merged
-`rule-set:`/`geosite:` key can never shadow an explicit domain key.
-Caveat: `apply_merge` removes the `<<:` key with `swap_remove`, which
-moves the map's last explicit key into the slot `<<:` held — a `<<:`
-line written above other keys makes the last one jump ahead of every key
-between them. Write `<<:` as the map's last line to keep the written
-order. Bare-key lookups are
-case-insensitive: the query is folded before the match.
+`rule-set:`/`geosite:` key can never shadow an explicit domain key. The
+`<<:` line's own position carries no ordering weight. Bare-key lookups
+are case-insensitive: the query is folded before the match.
 
 Nameserver URL format: identical to M1.E-1 (`udp://`, `tcp://`, `https://`, `tls://`).
 

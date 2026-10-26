@@ -289,6 +289,47 @@ fn merge_key_null_merges_to_empty_map() {
     );
 }
 
+/// Order pin on the repo's one order-sensitive map: `nameserver-policy`
+/// is an `IndexMap` whose key order IS the lookup priority, so the
+/// merge-key contract above must hold positionally, not just by value.
+/// serde-saphyr expands `<<:` in the event stream — merged entries append
+/// at the map tail wherever the `<<:` line sits, and an explicit key
+/// keeps its written position and wins over a merged same-name key.
+/// Asserted on `keys()` order through the production ingest (#802
+/// semantics; mirrored in `docs/specs/dns-nameserver-policy.md`).
+#[test]
+fn nameserver_policy_mid_map_merge_key_appends_merged_at_tail() {
+    let doc = r#"
+x-nsp-defaults: &defaults
+  "+.merged-a.example": 8.8.8.8
+  "+.shared.example": 5.5.5.5
+  "+.merged-b.example": 9.9.9.9
+dns:
+  nameserver-policy:
+    "+.first.example": 1.1.1.1
+    <<: *defaults
+    "+.shared.example": 2.2.2.2
+    "+.last.example": 3.3.3.3
+"#;
+    let raw = meow_config::parse_raw_yaml(doc).unwrap();
+    let policy = raw.dns.unwrap().nameserver_policy.unwrap();
+    let keys: Vec<&String> = policy.keys().collect();
+    assert_eq!(
+        keys,
+        [
+            "+.first.example",
+            "+.shared.example",
+            "+.last.example",
+            "+.merged-a.example",
+            "+.merged-b.example",
+        ],
+        "explicit keys keep written order; a mid-map `<<:` still lands its \
+         merged entries at the tail"
+    );
+    // Explicit wins over the merged same-name key in its own slot.
+    assert_eq!(policy["+.shared.example"].as_urls(), ["2.2.2.2"]);
+}
+
 /// Regression for the production stack overflow (serde-saphyr migration
 /// review, F1): the shipped `meow`/`meow-cli` binaries parse on a 1 MiB
 /// main thread already ~350-400 KiB deep in async-poll frames, where the
