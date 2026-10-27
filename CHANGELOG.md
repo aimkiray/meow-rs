@@ -378,6 +378,15 @@ the canonical, in-repo source a release is cut from.
   `Option<HashMap<..>>`, and note that `IndexMap`'s `==` is
   order-insensitive — the DNS-rebuild comparison in meow-api compares
   it pairwise.
+- **meow-cli reads a plain-scalar `secret` as its source spelling**:
+  the controller file's `secret:`/`external-controller:` are now
+  deserialized as `Option<String>`, so a plain numeric or boolean
+  spelling (`secret: 012345`, `secret: 0x1F`, `secret: 000000`) reaches
+  the CLI exactly as written — the same text the daemon's
+  `parse_raw_yaml` delivers into `RawApi::secret`. Previously the CLI
+  read them through `serde_json::Value` and re-serialized the resolved
+  number (`012345` → `12345.0`), sending a `Bearer` secret the daemon
+  did not write and 401-ing every call.
 
 ### Security
 
