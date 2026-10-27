@@ -927,7 +927,7 @@ pub fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
     meow_common::yaml::run_on_parse_stack(content, |doc| {
         let root: yaml_tree::SpannedNode =
             serde_saphyr::from_str_with_options(doc, yaml_options())?;
-        yaml_tree::deserialize_config(&root).map_err(Into::into)
+        yaml_tree::deserialize_config(&root, doc).map_err(Into::into)
     })
     .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))?
 }

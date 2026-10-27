@@ -79,16 +79,11 @@ impl YamlNode<'_> {
     /// bools as `true`/`false` (a case-folded `TrUe` arrives as `true`),
     /// non-finite floats as `.nan`/`.inf`/`-.inf`, other floats via
     /// `f64`'s shortest `Display` (`0123`, resolved to `123.0`, reports as
-    /// `123`). The raw spelling is unrecoverable once resolved — the one
-    /// place that shows is a non-string scalar landing in a `String`
-    /// field or a string-typed map key, which sees the canonical text
-    /// instead of the spelling (`+7`/`0x1F` arrive as `7`/`31`). That is
-    /// a genuine divergence from the *direct* saphyr path — its
-    /// `deserialize_string` delivered the raw spelling — but matches the
-    /// `serde_json::Value` intermediate this tree replaced (a `Number`/
-    /// `Bool` value re-stringifies the same way) and the serde_norway
-    /// `Value` path before that. It is also what `NodeMapAcc`
-    /// deduplicates map keys on.
+    /// `123`). String targets do not read this form for an untagged
+    /// resolved scalar: they get its source spelling (see
+    /// [`string_text`]), as the direct saphyr path and mihomo deliver it —
+    /// `password: 000000` stays `000000`. The canonical form is only the
+    /// fallback when the node's position yields no plausible spelling.
     ///
     /// `Null` reports `"null"` for the numeric/bool paths (failing their
     /// parses exactly like a literal `~`/`null` did) but is special-cased
@@ -284,6 +279,55 @@ impl Loc {
     const UNKNOWN: Self = Self { line: 0, column: 0 };
 }
 
+/// The parsed document and its line starts. String targets slice an
+/// untagged resolved scalar's source spelling out of it, at the node's
+/// `defined` position (see [`string_text`]) — line and column, which the
+/// tree already reads, so no saphyr span type is driven.
+pub(crate) struct Source<'de> {
+    doc: &'de str,
+    /// Byte offset of each line's first byte. A line ends at `\n`, `\r\n`
+    /// or a lone `\r` — YAML's three line breaks — so the index agrees
+    /// with saphyr's line numbers; a leading BOM is not part of the first
+    /// line, as saphyr's columns don't count it.
+    line_starts: Vec<usize>,
+}
+
+impl<'de> Source<'de> {
+    pub(crate) fn new(doc: &'de str) -> Self {
+        let bytes = doc.as_bytes();
+        let mut line_starts = vec![if doc.starts_with('\u{feff}') { 3 } else { 0 }];
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'\n' || (b == b'\r' && bytes.get(i + 1) != Some(&b'\n')) {
+                line_starts.push(i + 1);
+            }
+        }
+        Self { doc, line_starts }
+    }
+
+    /// The plain scalar starting at `loc` (1-indexed line, column counted
+    /// in chars): it runs to the first blank, flow indicator, `#` or `:`,
+    /// none of which a scalar resolved to a number or bool contains, and
+    /// never past its line.
+    fn plain_scalar_at(&self, loc: Loc) -> Option<&'de str> {
+        let line = usize::try_from(loc.line).ok()?.checked_sub(1)?;
+        let column = usize::try_from(loc.column).ok()?.checked_sub(1)?;
+        let start = *self.line_starts.get(line)?;
+        let end = self
+            .line_starts
+            .get(line + 1)
+            .copied()
+            .unwrap_or(self.doc.len());
+        let rest = &self.doc[start..end];
+        let rest = &rest[rest.char_indices().nth(column)?.0..];
+        let end = rest
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, ',' | '[' | ']' | '{' | '}' | '#' | ':')
+            })
+            .unwrap_or(rest.len());
+        Some(&rest[..end]).filter(|s| !s.is_empty())
+    }
+}
+
 /// The explicit tag a node carried, bucketed to saphyr's reachable
 /// `SfTag` set. Saphyr resolves a scalar's tag into the node type itself
 /// (`!!int 42` lands as `Int(42)`), which hid the direct path's tag
@@ -401,11 +445,11 @@ impl NodeTag {
 pub(crate) struct SpannedNode<'de> {
     pub node: YamlNode<'de>,
     /// Use-site (`referenced`) location — for an alias/merge-expanded
-    /// node the `*`/`<<:` position. saphyr's `defined` field is left
-    /// unread (the synthesized map is abandoned mid-drive): it only ever
-    /// served as the fallback for a missing `referenced`, which saphyr
-    /// always sets to the event's own location for a real node.
+    /// node the `*`/`<<:` position. Diagnostics point here.
     pub loc: Loc,
+    /// Definition-site (`defined`) location — for an alias the anchored
+    /// node's, where its source spelling is (see [`string_text`]).
+    pub defined: Loc,
     /// The node's explicit tag, [`None`] when untagged (nearly all).
     /// See [`NodeTag`] for why it is kept.
     pub tag: Option<NodeTag>,
@@ -499,6 +543,7 @@ impl<'de> serde::Deserialize<'de> for Loc {
 struct SpannedCore<'de> {
     node: YamlNode<'de>,
     loc: Loc,
+    defined: Loc,
 }
 
 impl<'de> serde::Deserialize<'de> for SpannedCore<'de> {
@@ -547,9 +592,9 @@ impl<'de> serde::Deserialize<'de> for SpannedCore<'de> {
                 let node = map.next_value::<YamlNode<'de>>()?;
                 check_key::<A>(&mut map, "referenced")?;
                 let loc = map.next_value::<Loc>()?;
-                // `defined` deliberately unread — returning early leaves
-                // the synthesized map access mid-drive, which it allows.
-                Ok(SpannedCore { node, loc })
+                check_key::<A>(&mut map, "defined")?;
+                let defined = map.next_value::<Loc>()?;
+                Ok(SpannedCore { node, loc, defined })
             }
         }
 
@@ -597,6 +642,7 @@ impl<'de> serde::Deserialize<'de> for SpannedNode<'de> {
                 Ok(SpannedNode {
                     node: core.node,
                     loc: core.loc,
+                    defined: core.defined,
                     tag,
                 })
             }
@@ -613,6 +659,7 @@ impl<'de> serde::Deserialize<'de> for SpannedNode<'de> {
                 Ok(SpannedNode {
                     node: core.node,
                     loc: core.loc,
+                    defined: core.defined,
                     tag: None,
                 })
             }
@@ -862,12 +909,67 @@ fn node_loc(node: &SpannedNode<'_>) -> Loc {
     node.loc
 }
 
-/// The field-path segment a map key renders as.
-fn key_segment(key: &YamlNode<'_>) -> String {
-    match key.scalar_text() {
-        Some(text) => text.into_owned(),
-        None => node_kind(key).to_string(),
+/// The text a `str`/`String` target (a field or a map key) receives for a
+/// non-null scalar. An untagged resolved scalar delivers its source
+/// spelling — `0123`, `000000`, `0x1F`, `+7`, `TrUe`, `1e999` arrive
+/// verbatim, as on the direct saphyr path and in mihomo, instead of the
+/// canonical `123`/`0`/`31`/`7`/`true`/`.inf` that would silently rewrite
+/// a password, secret or filter regex. Strings are already verbatim, and
+/// a tagged scalar (`!!int 42`) keeps its tag verdicts, so both use
+/// [`YamlNode::scalar_text`], as does a node whose position yields no
+/// plausible spelling.
+fn string_text<'de>(node: &'de SpannedNode<'de>, source: &Source<'de>) -> Option<Cow<'de, str>> {
+    if node.tag.is_none() {
+        // A first char the resolved kind can't start with means the
+        // position is off; keep the canonical text rather than a wrong
+        // slice.
+        let plausible: fn(char) -> bool = match node.node {
+            YamlNode::Int(_) | YamlNode::Float(_) => {
+                |c| c.is_ascii_digit() || matches!(c, '+' | '-' | '.')
+            }
+            YamlNode::Bool(_) => |c| matches!(c, 't' | 'T' | 'f' | 'F'),
+            _ => return node.node.scalar_text(),
+        };
+        if let Some(raw) = source
+            .plain_scalar_at(node.defined)
+            .filter(|raw| raw.starts_with(plausible))
+        {
+            return Some(Cow::Borrowed(raw));
+        }
     }
+    node.node.scalar_text()
+}
+
+/// The field-path segment a map key renders as — the key's
+/// [`string_text`], as the map received it.
+fn key_segment<'de>(key: &'de SpannedNode<'de>, source: &Source<'de>) -> String {
+    match string_text(key, source) {
+        Some(text) => text.into_owned(),
+        None => node_kind(&key.node).to_string(),
+    }
+}
+
+/// A sequence element's escaping error. A visitor-raised error (an
+/// untagged enum, a custom `Deserialize`) has no location yet: it belongs
+/// to this element, not to whatever enclosing node would attach its own
+/// on the way out. Out of line so the per-type accessor instantiations
+/// stay small.
+#[cold]
+#[inline(never)]
+fn element_error(e: TreeError, node: &SpannedNode<'_>, idx: usize) -> TreeError {
+    e.at(node_loc(node)).prepend(format!("[{idx}]"))
+}
+
+/// A map value's escaping error — see [`element_error`].
+#[cold]
+#[inline(never)]
+fn entry_error<'de>(
+    e: TreeError,
+    key: &'de SpannedNode<'de>,
+    value: &SpannedNode<'_>,
+    source: &Source<'de>,
+) -> TreeError {
+    e.at(node_loc(value)).prepend(key_segment(key, source))
 }
 
 /// The node's kind word for "expected string scalar"-style fallbacks.
@@ -889,8 +991,9 @@ fn node_kind(node: &YamlNode<'_>) -> &'static str {
 ///
 /// Semantics mirror the direct serde-saphyr path point by point:
 ///
-/// - scalar→string coerces via the canonical scalar text (`secret: 123456`
-///   → `"123456"`), and quoted strings parse into numeric/bool targets
+/// - scalar→string delivers the scalar's source spelling (`secret: 123456`
+///   → `"123456"`, `password: 000000` → `"000000"`, see [`string_text`]),
+///   and quoted strings parse into numeric/bool targets
 ///   (`port: "7890"` → `7890`, `ipv6: "true"` → `true`) — both exactly as
 ///   saphyr's text-driven typed methods behaved;
 /// - `Null` is `None` for `Option`, an empty map for map/struct targets,
@@ -933,14 +1036,21 @@ fn node_kind(node: &YamlNode<'_>) -> &'static str {
 ///   `u16`).
 #[derive(Clone, Copy)]
 struct NodeDe<'de> {
-    node: &'de YamlNode<'de>,
-    loc: Loc,
-    tag: Option<NodeTag>,
+    sn: &'de SpannedNode<'de>,
+    source: &'de Source<'de>,
 }
 
 impl<'de> NodeDe<'de> {
+    fn node(&self) -> &'de YamlNode<'de> {
+        &self.sn.node
+    }
+
+    fn tag(&self) -> Option<NodeTag> {
+        self.sn.tag
+    }
+
     fn loc(&self) -> Loc {
-        self.loc
+        node_loc(self.sn)
     }
 
     fn err(&self, msg: impl Into<String>) -> TreeError {
@@ -948,7 +1058,7 @@ impl<'de> NodeDe<'de> {
     }
 
     fn scalar_text(&self) -> Option<Cow<'de, str>> {
-        self.node.scalar_text()
+        self.node().scalar_text()
     }
 
     /// `invalid {ty}` — saphyr's `InvalidScalar` message — at this node.
@@ -968,7 +1078,7 @@ impl<'de> NodeDe<'de> {
     /// direct path). Non-core tags (`!!binary`, `!!timestamp`, `!`) skip
     /// the check there, so they skip it here.
     fn check_core_tag(&self, expected: NodeTag, ty: &'static str) -> Result<(), TreeError> {
-        match self.tag {
+        match self.tag() {
             Some(t) if t.is_core() && t != expected => Err(self.invalid_scalar(ty)),
             _ => Ok(()),
         }
@@ -982,7 +1092,7 @@ impl<'de> NodeDe<'de> {
     /// by `ignore_binary_tag_for_string`, and `Null`-tagged scalars
     /// already resolve to `YamlNode::Null`, which has its own verdict.
     fn check_stringable(&self) -> Result<(), TreeError> {
-        match self.tag {
+        match self.tag() {
             Some(t) if t.barred_from_string() => {
                 Err(self.err("cannot deserialize tagged scalar into string"))
             }
@@ -998,11 +1108,11 @@ impl<'de> NodeDe<'de> {
     /// `Null` texts fail the parse the same way they did on the direct
     /// path.
     fn uint<T: TryFrom<u128>>(&self, ty: &'static str) -> Result<T, TreeError> {
-        match &self.node {
+        match self.node() {
             YamlNode::Seq(_) | YamlNode::Map(_) => Err(self.expect_scalar()),
             _ => {
                 self.check_core_tag(NodeTag::Int, ty)?;
-                match &self.node {
+                match self.node() {
                     YamlNode::Int(v) => u128::try_from(*v)
                         .ok()
                         .and_then(|m| T::try_from(m).ok())
@@ -1017,11 +1127,11 @@ impl<'de> NodeDe<'de> {
 
     /// Signed-integer field value; same rules as [`NodeDe::uint`].
     fn sint<T: TryFrom<i128>>(&self, ty: &'static str) -> Result<T, TreeError> {
-        match &self.node {
+        match self.node() {
             YamlNode::Seq(_) | YamlNode::Map(_) => Err(self.expect_scalar()),
             _ => {
                 self.check_core_tag(NodeTag::Int, ty)?;
-                match &self.node {
+                match self.node() {
                     YamlNode::Int(v) => T::try_from(*v).map_err(|_| self.invalid_scalar(ty)),
                     YamlNode::Float(_) => Err(self.invalid_scalar(ty)),
                     _ => parse_int_signed::<T>(&self.scalar_text().unwrap_or_default())
@@ -1042,7 +1152,7 @@ impl<'de> NodeDe<'de> {
     /// normal `deserialize_seq` verdicts (`expected sequence start`, or
     /// the empty-sequence treatment for `Null`).
     fn check_tuple_len(&self, len: usize, what: &'static str) -> Result<(), TreeError> {
-        if let YamlNode::Seq(items) = &self.node {
+        if let YamlNode::Seq(items) = self.node() {
             if items.len() != len {
                 return Err(self.err(format!(
                     "invalid length {}, expected a {what} of length {len}",
@@ -1072,31 +1182,24 @@ macro_rules! deser_sint {
     };
 }
 
-/// Shared scalar→string delivery: verbatim for `Str`, canonical text for
-/// the resolved scalars (see [`YamlNode::scalar_text`] — a deliberate
-/// divergence from the direct path's raw-spelling delivery, matching the
-/// `serde_json::Value` intermediate).
+/// Shared scalar→string delivery: verbatim for `Str`, the source spelling
+/// for the resolved scalars (see [`string_text`]).
 fn visit_strlike<'de, V: Visitor<'de>>(
     de: &NodeDe<'de>,
     visitor: V,
 ) -> Result<V::Value, TreeError> {
-    match &de.node {
+    match de.node() {
         YamlNode::Null => Err(de.err("cannot deserialize null into string; use Option<String>")),
         YamlNode::Seq(_) | YamlNode::Map(_) => Err(de.expect_scalar()),
-        scalar => {
+        _ => {
             de.check_stringable()?;
-            match scalar {
-                YamlNode::Str(s) => visitor
-                    .visit_borrowed_str(s.as_ref())
-                    .map_err(|e: TreeError| e.at(de.loc())),
-                _ => visitor
-                    .visit_string(
-                        de.scalar_text()
-                            .expect("numeric/bool nodes have scalar text")
-                            .into_owned(),
-                    )
-                    .map_err(|e: TreeError| e.at(de.loc())),
+            // Borrowed for `Str` and for a sliced source spelling; owned
+            // only for the canonical fallback.
+            match string_text(de.sn, de.source).expect("scalars have scalar text") {
+                Cow::Borrowed(s) => visitor.visit_borrowed_str(s),
+                Cow::Owned(s) => visitor.visit_string(s),
             }
+            .map_err(|e: TreeError| e.at(de.loc()))
         }
     }
 }
@@ -1106,7 +1209,7 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         let loc = self.loc();
-        match &self.node {
+        match self.node() {
             YamlNode::Null => visitor.visit_unit(),
             YamlNode::Bool(b) => visitor.visit_bool(*b),
             YamlNode::Int(v) => {
@@ -1131,7 +1234,7 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
     }
 
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match &self.node {
+        match self.node() {
             YamlNode::Seq(_) | YamlNode::Map(_) => Err(self.expect_scalar()),
             _ => {
                 self.check_core_tag(NodeTag::Bool, "boolean")?;
@@ -1161,11 +1264,11 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
     }
 
     fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match &self.node {
+        match self.node() {
             YamlNode::Seq(_) | YamlNode::Map(_) => Err(self.expect_scalar()),
             _ => {
                 self.check_core_tag(NodeTag::Float, "floating point")?;
-                match &self.node {
+                match self.node() {
                     YamlNode::Float(v) => visitor
                         .visit_f64(*v)
                         .map_err(|e: TreeError| e.at(self.loc())),
@@ -1186,7 +1289,7 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
     }
 
     fn deserialize_char<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match &self.node {
+        match self.node() {
             YamlNode::Null => {
                 Err(self.err("invalid char: cannot deserialize null; use Option<char>"))
             }
@@ -1213,14 +1316,14 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
     }
 
     fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match &self.node {
+        match self.node() {
             // A u8-element sequence, as saphyr accepted for byte targets.
             YamlNode::Seq(_) => self.deserialize_seq(visitor),
             YamlNode::Map(_) => Err(self.err("expected scalar (!!binary) or sequence of 0..=255")),
             // No `Raw*` field is byte-typed, so the walk does not carry a
             // base64 decoder for the `!!binary` scalars the direct path
             // decoded (a narrowing only reachable by a future field).
-            YamlNode::Str(_) if self.tag == Some(NodeTag::Binary) => {
+            YamlNode::Str(_) if self.tag() == Some(NodeTag::Binary) => {
                 Err(self.err("bytes not supported (!!binary decode not implemented)"))
             }
             _ => Err(self.err("bytes not supported (missing !!binary tag)")),
@@ -1232,7 +1335,7 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match &self.node {
+        match self.node() {
             YamlNode::Null => visitor.visit_none(),
             _ => visitor.visit_some(self),
         }
@@ -1240,7 +1343,7 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
     }
 
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match &self.node {
+        match self.node() {
             YamlNode::Null => visitor
                 .visit_unit()
                 .map_err(|e: TreeError| e.at(self.loc())),
@@ -1253,7 +1356,7 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
         _name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        match &self.node {
+        match self.node() {
             YamlNode::Null => visitor
                 .visit_unit()
                 .map_err(|e: TreeError| e.at(self.loc())),
@@ -1276,11 +1379,12 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
 
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         let loc = self.loc();
-        match &self.node {
+        match self.node() {
             YamlNode::Seq(items) => visitor
                 .visit_seq(NodeSeqAcc {
                     iter: items.iter(),
                     idx: 0,
+                    source: self.source,
                 })
                 .map_err(|e: TreeError| e.at(loc)),
             // saphyr treated a null-like scalar as an empty sequence.
@@ -1288,6 +1392,7 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
                 .visit_seq(NodeSeqAcc {
                     iter: [].iter(),
                     idx: 0,
+                    source: self.source,
                 })
                 .map_err(|e: TreeError| e.at(loc)),
             _ => Err(self.err("expected sequence start")),
@@ -1315,12 +1420,13 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
 
     fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         let loc = self.loc();
-        match &self.node {
+        match self.node() {
             YamlNode::Map(entries) => visitor
                 .visit_map(NodeMapAcc {
                     iter: entries.iter(),
                     pending: None,
                     seen: HashSet::new(),
+                    source: self.source,
                 })
                 .map_err(|e: TreeError| e.at(loc)),
             // saphyr treated a null-like scalar as an empty mapping — this
@@ -1331,6 +1437,7 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
                     iter: [].iter(),
                     pending: None,
                     seen: HashSet::new(),
+                    source: self.source,
                 })
                 .map_err(|e: TreeError| e.at(loc)),
             _ => Err(self.err("expected mapping start")),
@@ -1352,15 +1459,14 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
         _variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        match &self.node {
+        match self.node() {
             YamlNode::Seq(_) => Err(self.err("externally tagged enum expected scalar or mapping")),
             YamlNode::Map(entries) => match entries.as_slice() {
                 [(key, value)] => visitor
                     .visit_enum(TreeEnumAccess {
                         variant: KeyDe {
-                            node: &key.node,
-                            loc: node_loc(key),
-                            tag: key.tag,
+                            sn: key,
+                            source: self.source,
                         },
                         value: Some(value),
                     })
@@ -1374,9 +1480,8 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
             _ => visitor
                 .visit_enum(TreeEnumAccess {
                     variant: KeyDe {
-                        node: self.node,
-                        loc: self.loc,
-                        tag: self.tag,
+                        sn: self.sn,
+                        source: self.source,
                     },
                     value: None,
                 })
@@ -1406,6 +1511,7 @@ impl<'de> de::Deserializer<'de> for NodeDe<'de> {
 struct NodeSeqAcc<'de> {
     iter: std::slice::Iter<'de, SpannedNode<'de>>,
     idx: usize,
+    source: &'de Source<'de>,
 }
 
 impl<'de> SeqAccess<'de> for NodeSeqAcc<'de> {
@@ -1420,13 +1526,15 @@ impl<'de> SeqAccess<'de> for NodeSeqAcc<'de> {
         };
         let idx = self.idx;
         self.idx += 1;
+        // A visitor-raised error (an untagged enum, a custom `Deserialize`)
+        // has no location yet: it belongs to this element, not to
+        // whatever enclosing node would attach its own on the way out.
         seed.deserialize(NodeDe {
-            node: &node.node,
-            loc: node_loc(node),
-            tag: node.tag,
+            sn: node,
+            source: self.source,
         })
         .map(Some)
-        .map_err(|e| e.prepend(format!("[{idx}]")))
+        .map_err(|e| element_error(e, node, idx))
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -1438,28 +1546,28 @@ impl<'de> SeqAccess<'de> for NodeSeqAcc<'de> {
 /// text becomes the path segment prepended to a value's escaping error —
 /// rendered lazily so the no-error path allocates nothing per key.
 ///
-/// `seen` tracks the canonical text of every key already yielded:
-/// saphyr's key-fingerprint dedup ran on *resolved* scalars, so it let
-/// `{TrUe: a, "true": b}` or `{1.0: a, "1": b}` through as two distinct
-/// keys — and on the direct path they *stayed* distinct, because typed
-/// `String` keys were delivered with their raw spellings (`"TrUe"`,
-/// `"1.0"`). The tree canonicalizes resolved scalars before they reach
-/// the `IndexMap<String, _>`/`BTreeMap`/`String`-keyed maps every
-/// `RawConfig` map type becomes, so those pairs collapse to one key
-/// (`"true"`, `"1"`) and a silent `insert` would drop the first entry.
-/// Rejecting the document instead is a deliberate narrowing relative to
-/// the direct path — a config whose maps genuinely contain canonical
-/// twin keys is a config bug, and erroring preserves the map-shape
-/// invariant every downstream consumer assumes.
+/// `seen` tracks the text every key already yielded was delivered as (its
+/// [`string_text`]): saphyr's key-fingerprint dedup runs on *resolved*
+/// scalars, so it lets `{1: a, "1": b}` or `{0x1F: a, "0x1F": b}` through
+/// as two distinct keys (an int beside a string), yet both read as the
+/// one key `"1"`/`"0x1F"` in the `IndexMap<String, _>`/`BTreeMap`/
+/// `String`-keyed maps every `RawConfig` map type becomes, where a silent
+/// `insert` would drop the first entry. The document is rejected instead
+/// — a config whose maps genuinely contain such twin keys is a config bug,
+/// and erroring preserves the map-shape invariant every downstream
+/// consumer assumes. Distinct spellings of one value (`{TrUe: a, "true":
+/// b}`, `{1.0: a, "1": b}`) are distinct strings and stay two keys, as on
+/// the direct path.
 struct NodeMapAcc<'de> {
     iter: std::slice::Iter<'de, (SpannedNode<'de>, SpannedNode<'de>)>,
     /// `(value node, key node)` of the in-flight entry.
     pending: Option<(&'de SpannedNode<'de>, &'de SpannedNode<'de>)>,
-    /// Canonical texts of keys already yielded — see the type docs. Only
+    /// Delivered texts of keys already yielded — see the type docs. Only
     /// scalar keys are tracked (container keys fail `expected string
     /// scalar` at `KeyDe`); `HashSet::new` allocates nothing until the
     /// first insert.
     seen: HashSet<Cow<'de, str>>,
+    source: &'de Source<'de>,
 }
 
 impl<'de> MapAccess<'de> for NodeMapAcc<'de> {
@@ -1472,21 +1580,20 @@ impl<'de> MapAccess<'de> for NodeMapAcc<'de> {
         let Some((key, value)) = self.iter.next() else {
             return Ok(None);
         };
-        if let Some(text) = key.node.scalar_text() {
+        if let Some(text) = string_text(key, self.source) {
             if !self.seen.insert(text.clone()) {
                 return Err(TreeError::new(
                     node_loc(key),
                     format!(
-                        "duplicate mapping key `{text}` — distinct YAML scalars canonicalize identically"
+                        "duplicate mapping key `{text}` — distinct YAML scalars read as the same string"
                     ),
                 ));
             }
         }
         self.pending = Some((value, key));
         seed.deserialize(KeyDe {
-            node: &key.node,
-            loc: node_loc(key),
-            tag: key.tag,
+            sn: key,
+            source: self.source,
         })
         .map(Some)
     }
@@ -1502,12 +1609,12 @@ impl<'de> MapAccess<'de> for NodeMapAcc<'de> {
             // panic.
             return Err(de::Error::custom("value requested before key"));
         };
+        // As in `NodeSeqAcc`: a location-less error is this value's.
         seed.deserialize(NodeDe {
-            node: &value.node,
-            loc: node_loc(value),
-            tag: value.tag,
+            sn: value,
+            source: self.source,
         })
-        .map_err(|e| e.prepend(key_segment(&key.node)))
+        .map_err(|e| entry_error(e, key, value, self.source))
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -1516,48 +1623,57 @@ impl<'de> MapAccess<'de> for NodeMapAcc<'de> {
 }
 
 /// A map *key* deserializer. Keys are scalars: a resolved scalar reports
-/// its canonical text (`123`, `true`, `1.5`, `.inf` keys all work) —
-/// where the direct path delivered the *raw* spelling into `String` keys,
-/// the tree reports the same canonical form [`YamlNode::scalar_text`]
-/// defines (a documented divergence). A `~`/empty key fails the
+/// its source spelling (`123`, `0x1F`, `TrUe`, `1.50`, `.inf` keys all
+/// work and arrive verbatim), as the direct path delivered it into
+/// `String` keys — see [`string_text`]. A `~`/empty key fails the
 /// string-shaped requests, an explicit non-string tag (`{!!int 42: x}`)
 /// fails the same `can_parse_into_string` check the direct path ran on
 /// keys, and a container key is `expected string scalar`.
 #[derive(Clone, Copy)]
 struct KeyDe<'de> {
-    node: &'de YamlNode<'de>,
-    /// The key's own location (`__yaml_spanned` delivers one for keys
-    /// just like values).
-    loc: Loc,
-    /// The key's explicit tag — same checks as [`NodeDe::tag`]: a
-    /// `!!int`-tagged scalar key never fed a `String` map on the direct
-    /// path.
-    tag: Option<NodeTag>,
+    /// The key node — its own location (`__yaml_spanned` delivers one for
+    /// keys just like values) and its explicit tag, which gets the same
+    /// checks as a value's: a `!!int`-tagged scalar key never fed a
+    /// `String` map on the direct path.
+    sn: &'de SpannedNode<'de>,
+    source: &'de Source<'de>,
 }
 
 impl<'de> KeyDe<'de> {
     fn loc(&self) -> Loc {
-        self.loc
+        node_loc(self.sn)
+    }
+
+    fn node(&self) -> &'de YamlNode<'de> {
+        &self.sn.node
+    }
+
+    fn tag(&self) -> Option<NodeTag> {
+        self.sn.tag
     }
 
     fn err(&self, msg: impl Into<String>) -> TreeError {
         TreeError::new(self.loc(), msg)
     }
 
+    /// The key's text for string-shaped requests — its [`string_text`].
     fn text(&self) -> Result<Cow<'de, str>, TreeError> {
-        match self.node {
+        self.check_stringable()?;
+        string_text(self.sn, self.source).ok_or_else(|| self.err("expected string scalar"))
+    }
+
+    /// Null and container keys, and keys tagged with a non-string type,
+    /// fail the string-shaped requests.
+    fn check_stringable(&self) -> Result<(), TreeError> {
+        match self.node() {
             YamlNode::Null => {
                 Err(self.err("cannot deserialize null into string; use Option<String>"))
             }
             YamlNode::Seq(_) | YamlNode::Map(_) => Err(self.err("expected string scalar")),
-            _ => {
-                if self.tag.is_some_and(NodeTag::barred_from_string) {
-                    return Err(self.err("cannot deserialize tagged scalar into string"));
-                }
-                self.node
-                    .scalar_text()
-                    .ok_or_else(|| self.err("expected string scalar"))
+            _ if self.tag().is_some_and(NodeTag::barred_from_string) => {
+                Err(self.err("cannot deserialize tagged scalar into string"))
             }
+            _ => Ok(()),
         }
     }
 }
@@ -1571,9 +1687,8 @@ impl<'de> de::Deserializer<'de> for KeyDe<'de> {
         // `deserialize_any` infers `123`→int even in key position — so
         // dispatch by node kind exactly like `NodeDe::deserialize_any`.
         NodeDe {
-            node: self.node,
-            loc: self.loc,
-            tag: self.tag,
+            sn: self.sn,
+            source: self.source,
         }
         .deserialize_any(visitor)
     }
@@ -1603,7 +1718,7 @@ impl<'de> de::Deserializer<'de> for KeyDe<'de> {
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match &self.node {
+        match self.node() {
             YamlNode::Null => visitor.visit_none(),
             _ => visitor.visit_some(self),
         }
@@ -1611,7 +1726,7 @@ impl<'de> de::Deserializer<'de> for KeyDe<'de> {
     }
 
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match &self.node {
+        match self.node() {
             YamlNode::Null => visitor
                 .visit_unit()
                 .map_err(|e: TreeError| e.at(self.loc())),
@@ -1621,14 +1736,16 @@ impl<'de> de::Deserializer<'de> for KeyDe<'de> {
 
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         let loc = self.loc();
-        if let Some(t) = self.tag {
+        if let Some(t) = self.tag() {
             if t.is_core() && t != NodeTag::Bool {
                 // `validate_core_scalar_tag` parity for bool-key targets —
                 // `!!str true` as a key rejected `invalid boolean`.
                 return Err(self.err("invalid boolean"));
             }
         }
-        let text = self.text()?;
+        // The resolved form, as before: a `TrUe` key spells `true`.
+        self.check_stringable()?;
+        let text = self.node().scalar_text().unwrap_or_default();
         let b = parse_strict_bool(&text)
             .ok_or_else(|| self.err("invalid boolean (strict mode expects true/false)"))?;
         visitor.visit_bool(b).map_err(|e: TreeError| e.at(loc))
@@ -1667,23 +1784,23 @@ impl<'de> EnumAccess<'de> for TreeEnumAccess<'de> {
         self,
         seed: V,
     ) -> Result<(V::Value, Self::Variant), Self::Error> {
-        let value = self.value;
+        let (value, source) = (self.value, self.variant.source);
         seed.deserialize(self.variant)
-            .map(|variant| (variant, TreeVariantAccess { value }))
+            .map(|variant| (variant, TreeVariantAccess { value, source }))
     }
 }
 
 struct TreeVariantAccess<'de> {
     value: Option<&'de SpannedNode<'de>>,
+    source: &'de Source<'de>,
 }
 
 impl<'de> TreeVariantAccess<'de> {
     fn require_value(&self) -> Result<NodeDe<'de>, TreeError> {
         match self.value {
             Some(node) => Ok(NodeDe {
-                node: &node.node,
-                loc: node_loc(node),
-                tag: node.tag,
+                sn: node,
+                source: self.source,
             }),
             None => Err(de::Error::custom("expected a variant value")),
         }
@@ -1736,13 +1853,17 @@ impl<'de> VariantAccess<'de> for TreeVariantAccess<'de> {
 /// applies there, before any node reaches this walk. Kept signature-clean
 /// of backend paths so the `yaml_backend_test` public-API guard holds:
 /// the body names `serde_saphyr` types, declarations only `SpannedNode`.
+///
+/// `doc` must be the text `root` was parsed from: string targets slice
+/// their source spellings out of it.
 pub(crate) fn deserialize_config<'de>(
     root: &'de SpannedNode<'de>,
+    doc: &'de str,
 ) -> Result<crate::raw::RawConfig, TreeError> {
+    let source = Source::new(doc);
     <crate::raw::RawConfig as serde::Deserialize>::deserialize(NodeDe {
-        node: &root.node,
-        loc: node_loc(root),
-        tag: root.tag,
+        sn: root,
+        source: &source,
     })
 }
 
@@ -1828,34 +1949,108 @@ mod tests {
             panic!("expected a map, got {:?}", root.node);
         };
         let (_key, value) = &entries[0];
+        let source = Source::new(doc);
         T::deserialize(NodeDe {
-            node: &value.node,
-            loc: node_loc(value),
-            tag: value.tag,
+            sn: value,
+            source: &source,
         })
     }
 
-    /// `{TrUe: a, "true": b}` / `{1.0: a, "1": b}` survived saphyr's
+    /// Deserialize a whole document as a `String`-keyed map.
+    fn parse_map<T: serde::de::DeserializeOwned>(
+        doc: &str,
+    ) -> Result<indexmap::IndexMap<String, T>, TreeError> {
+        let root: SpannedNode<'_> =
+            serde_saphyr::from_str_with_options(doc, crate::yaml_options()).unwrap();
+        let source = Source::new(doc);
+        serde::Deserialize::deserialize(NodeDe {
+            sn: &root,
+            source: &source,
+        })
+    }
+
+    /// An untagged resolved scalar reaches a `String` target as its
+    /// source spelling, not its canonical text: a password `000000` must
+    /// not become `0`, nor a regex `01` become `1`.
+    #[test]
+    fn string_targets_get_source_spelling() {
+        for spelling in [
+            "000000",
+            "0123",
+            "0x1F",
+            "+7",
+            "TrUe",
+            "1.50",
+            "1e999",
+            "123e4567",
+            ".inf",
+            "99999999999999999999",
+            "123456789012345678901234567890",
+        ] {
+            assert_eq!(
+                parse_field::<String>(&format!("secret: {spelling}  # comment\n")).unwrap(),
+                spelling
+            );
+        }
+        // Flow sequences, aliases (the anchor's text, not `*x`), merge
+        // keys, multi-byte text before the scalar, a BOM and CRLF line ends.
+        assert_eq!(
+            parse_field::<Vec<String>>("x: [01, 0x1F ,+7]").unwrap(),
+            ["01", "0x1F", "+7"]
+        );
+        let map = parse_map::<String>("a: &x 000\nb: *x\n").unwrap();
+        assert_eq!((map["a"].as_str(), map["b"].as_str()), ("000", "000"));
+        let map =
+            parse_map::<indexmap::IndexMap<String, String>>("base: &b {k: 0123}\nm:\n  <<: *b\n")
+                .unwrap();
+        assert_eq!(map["m"]["k"], "0123");
+        let map = parse_map::<String>("\u{5bc6}\u{7801}: 00042\n").unwrap();
+        assert_eq!(map["\u{5bc6}\u{7801}"], "00042");
+        let map = parse_map::<String>("\u{feff}secret: 0123\n").unwrap();
+        assert_eq!(map["secret"], "0123");
+        let map = parse_map::<String>("a: x\r\nsecret: 0123\r\nb:\t007\r\n").unwrap();
+        assert_eq!((map["secret"].as_str(), map["b"].as_str()), ("0123", "007"));
+        // Columns count chars, astral ones included; a lone `\r` ends a line.
+        let map = parse_map::<Vec<String>>("k: [\u{20000}, 0x0A]\n").unwrap();
+        assert_eq!(map["k"], ["\u{20000}", "0x0A"]);
+        let map = parse_map::<String>("a: x\rsecret: 0123\rb: 007\r").unwrap();
+        assert_eq!((map["secret"].as_str(), map["b"].as_str()), ("0123", "007"));
+        // Keys too, and the typed paths still read the resolved value.
+        let map = parse_map::<u16>("{0x1F: 0x1F, TrUe: 10, 1.50: +7}").unwrap();
+        let entries: Vec<(&str, u16)> = map.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        assert_eq!(entries, [("0x1F", 31), ("TrUe", 10), ("1.50", 7)]);
+        // A tagged scalar keeps its verdict instead of its spelling.
+        assert!(parse_field::<String>("secret: !!float 1.50").is_err());
+        assert_eq!(parse_field::<String>("secret: !!str 0123").unwrap(), "0123");
+    }
+
+    /// A visitor-raised error (here: no `HostsValue`-style untagged
+    /// variant matches) carries the failing value's position, not the
+    /// enclosing key's or element's.
+    #[test]
+    fn visitor_errors_use_the_value_location() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(untagged)]
+        #[allow(dead_code)]
+        enum One {
+            Text(String),
+            Number(u16),
+        }
+        let err = parse_map::<One>("a.example: [1, 2]\n").unwrap_err();
+        assert!(err.to_string().starts_with("line 1 column 12"), "{err}");
+        let err = parse_field::<Vec<One>>("x:\n  - ok\n  - {k: v}\n").unwrap_err();
+        assert!(err.to_string().starts_with("line 3 column 5"), "{err}");
+    }
+
+    /// `{1: a, "1": b}` / `{0x1F: a, "0x1F": b}` survive saphyr's
     /// resolved-scalar fingerprint dedup as distinct keys, but the
     /// `IndexMap<String, _>` a `hosts:`/`nameserver-policy:` map becomes
-    /// would silently drop the first entry — the canonical-text dedup in
+    /// would silently drop the first entry — the delivered-text dedup in
     /// `NodeMapAcc` must reject the document instead.
     #[test]
-    fn canonical_key_collision_rejected() {
-        for doc in [
-            "{TrUe: a, \"true\": b}",
-            "{1.0: a, \"1\": b}",
-            "{1: a, \"1\": b}",
-        ] {
-            let root: SpannedNode<'_> =
-                serde_saphyr::from_str_with_options(doc, crate::yaml_options()).unwrap();
-            let err =
-                <indexmap::IndexMap<String, String> as serde::Deserialize>::deserialize(NodeDe {
-                    node: &root.node,
-                    loc: node_loc(&root),
-                    tag: root.tag,
-                })
-                .expect_err(&format!("{doc} should fail"));
+    fn same_string_key_collision_rejected() {
+        for doc in ["{1: a, \"1\": b}", "{0x1F: a, \"0x1F\": b}"] {
+            let err = parse_map::<String>(doc).expect_err(&format!("{doc} should fail"));
             assert!(
                 err.to_string().contains("duplicate mapping key"),
                 "{doc} -> {err}"
@@ -1863,22 +2058,19 @@ mod tests {
         }
     }
 
-    /// Distinct canonical keys still coexist: `{1: a, 1.5: b}` are two
-    /// canonical texts (`"1"`, `"1.5"`) — no collision. (Note `1.0`
-    /// canonicalizes to `"1"` — it would collide; that is covered by
-    /// `canonical_key_collision_rejected`.)
+    /// Distinct spellings are distinct strings, even when they resolve to
+    /// one value: `{TrUe: a, "true": b}` keeps both keys, as the direct
+    /// path did.
     #[test]
-    fn distinct_canonical_keys_pass() {
-        let doc = "{1: a, 1.5: b}";
-        let root: SpannedNode<'_> =
-            serde_saphyr::from_str_with_options(doc, crate::yaml_options()).unwrap();
-        let map = <indexmap::IndexMap<String, String> as serde::Deserialize>::deserialize(NodeDe {
-            node: &root.node,
-            loc: node_loc(&root),
-            tag: root.tag,
-        })
-        .unwrap();
-        assert_eq!(map.len(), 2);
+    fn distinct_spellings_stay_distinct_keys() {
+        for (doc, keys) in [
+            ("{TrUe: a, \"true\": b}", ["TrUe", "true"]),
+            ("{1.0: a, \"1\": b}", ["1.0", "1"]),
+            ("{1: a, 1.5: b}", ["1", "1.5"]),
+        ] {
+            let map = parse_map::<String>(doc).unwrap();
+            assert_eq!(map.keys().map(String::as_str).collect::<Vec<_>>(), keys);
+        }
     }
 
     /// Explicit-tag coercion parity with the direct path: a scalar
@@ -1916,15 +2108,7 @@ mod tests {
     /// path's `can_parse_into_string` check — same here.
     #[test]
     fn tagged_key_rejected() {
-        let doc = "{!!int 42: a}";
-        let root: SpannedNode<'_> =
-            serde_saphyr::from_str_with_options(doc, crate::yaml_options()).unwrap();
-        let err = <indexmap::IndexMap<String, String> as serde::Deserialize>::deserialize(NodeDe {
-            node: &root.node,
-            loc: node_loc(&root),
-            tag: root.tag,
-        })
-        .expect_err("!!int key should fail");
+        let err = parse_map::<String>("{!!int 42: a}").expect_err("!!int key should fail");
         assert!(err.to_string().contains("cannot deserialize tagged scalar"));
     }
 
@@ -1949,15 +2133,7 @@ mod tests {
     /// the *key's* position now that keys carry their own span.
     #[test]
     fn key_error_uses_key_location() {
-        let doc = "a: 1\n~: 2\n";
-        let root: SpannedNode<'_> =
-            serde_saphyr::from_str_with_options(doc, crate::yaml_options()).unwrap();
-        let err = <indexmap::IndexMap<String, String> as serde::Deserialize>::deserialize(NodeDe {
-            node: &root.node,
-            loc: node_loc(&root),
-            tag: root.tag,
-        })
-        .expect_err("null key should fail");
+        let err = parse_map::<String>("a: 1\n~: 2\n").expect_err("null key should fail");
         assert!(err.to_string().starts_with("line 2 column 1"), "{err}");
     }
 }

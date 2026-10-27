@@ -314,7 +314,9 @@ the canonical, in-repo source a release is cut from.
   parse. That restores the direct-path behavior the intermediate had
   lost: `hosts:` and `dns.nameserver-policy:` keep YAML document order
   (the overlay could only re-read them for a narrow field list), scalar
-  coercions like `port: "7890"` and `secret: 123456` apply again, typed
+  coercions like `port: "7890"` and `secret: 123456` apply again, an
+  unquoted number-like value reaches a string field as written
+  (`password: 000000` stays `000000`, `filter: 01` stays `01`), typed
   errors carry `line N column M` plus a `dns.fallback-filter.geoip`-style
   field path, non-finite floats reach typed `f64` fields instead of
   collapsing to `null`, and a top-level sequence can no longer fill
@@ -328,25 +330,16 @@ the canonical, in-repo source a release is cut from.
   `serde_json::Value` ingest (`parse_yaml_value`), whose `BTreeMap` key
   order is unchanged.
 
-  The tree carries each scalar's *resolved* form, which shifts a few
-  pathological edges relative to the direct saphyr path — all
-  intentional, none reachable through a real `RawConfig` field today:
+  The tree carries each scalar's *resolved* form (string targets slice
+  the source spelling back out of the document), which shifts a few
+  pathological edges relative to the direct saphyr path, all
+  intentional:
 
-  - A resolved non-string scalar landing in a `String` field or a
-    string-typed map key reads as its canonical text, not its source
-    spelling: `0123`/`+7`/`0x1F`/`TrUe`/`.inf`/`1.50` arrive as
-    `123`/`7`/`31`/`true`/`.inf`/`1.5` — the same strings the
-    `serde_json::Value` intermediate produced, but raw spellings the
-    direct path had delivered. Integers wider than `u64` resolve
-    through `f64` (saphyr's own overflow fallback), so a string target
-    sees the lossy float text — e.g. `123456789012345678901234567890`
-    reads as `1.2345678901234568e29`.
-  - By the same canonicalization, distinct map keys that spell one
-    resolved scalar now collide and are *rejected*
-    (`{TrUe: a, "true": b}`, `{1.0: a, "1": b}` errors
-    `duplicate mapping key`), where the direct path kept them as two
-    distinct string keys — the alternative was a silent `insert`
-    overwrite dropping the first entry.
+  - Map keys that saphyr's resolved-value dedup tells apart but that
+    read as the same string (`{1: a, "1": b}`) are *rejected* with
+    `duplicate mapping key` instead of the second silently overwriting
+    the first in the `String`-keyed map. Distinct spellings
+    (`{TrUe: a, "true": b}`) stay two keys, as before.
   - A negative-zero literal (`port: -0`) resolves to integer `0` before
     the tree sees it, so an unsigned field accepts it where the direct
     path's text parse rejected the `-` prefix.

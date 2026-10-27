@@ -679,8 +679,8 @@ fn scalar_coercions_match_the_direct_path() {
 /// them to `null` (that visitor's own semantics).
 ///
 /// (`Option<String>` legitimately *accepts* the literal — the direct path
-/// delivered `.inf` as the string `".inf"`; the tree yields the canonical
-/// float text. No `f64` field exists in `RawConfig`, so the typed-`f64`
+/// delivered `.inf` as the string `".inf"`, and the tree delivers the same
+/// source spelling. No `f64` field exists in `RawConfig`, so the typed-`f64`
 /// acceptance leg is covered by `non_finite_floats_pass_through` above.)
 #[test]
 fn non_finite_floats_error_on_typed_option_fields() {
@@ -698,9 +698,10 @@ fn non_finite_floats_error_on_typed_option_fields() {
         }
         // The direct-path behaviour for string targets, kept.
         let raw = meow_config::parse_raw_yaml(&format!("secret: {literal}\n")).unwrap();
-        assert!(
-            raw.secret.is_some(),
-            "`secret: {literal}` delivers its scalar text, as the direct path did"
+        assert_eq!(
+            raw.secret.as_deref(),
+            Some(literal),
+            "`secret: {literal}` delivers its source spelling, as the direct path did"
         );
         // And the `serde_json::Value` capture fields still flatten.
         let raw = meow_config::parse_raw_yaml(&format!("firewall: {literal}\n")).unwrap();
@@ -841,14 +842,11 @@ fn top_level_scalar_error_reports_value_column() {
     );
 }
 
-/// Non-string scalar keys into a `String`-keyed map: the direct path fed
-/// serde the key's raw scalar text; the tree feeds the *canonical* resolved
-/// text — identical for every spelling a plain int/str key realistically
-/// uses (`123` → `"123"`), differing only on pathological spellings a
-/// hostname never carries (`+7`/`0x1F` → `7`/`31`). A null key errors on
-/// both paths.
+/// Non-string scalar keys into a `String`-keyed map get the key's source
+/// spelling, as on the direct path (`0x1F` stays `"0x1F"`, not `"31"`). A
+/// null key errors on both paths.
 #[test]
-fn scalar_map_keys_report_canonical_text() {
+fn scalar_map_keys_keep_source_text() {
     let doc = "hosts:\n  123: 1.1.1.1\n  ~: 2.2.2.2\n";
     let err = meow_config::parse_raw_yaml(doc).unwrap_err().to_string();
     assert!(
@@ -856,30 +854,115 @@ fn scalar_map_keys_report_canonical_text() {
         "a `~` key must fail like the direct path's NullIntoString, got: {err}"
     );
 
-    let raw =
-        meow_config::parse_raw_yaml("hosts:\n  123: 1.1.1.1\n  plain.example: 2.2.2.2\n").unwrap();
+    let raw = meow_config::parse_raw_yaml(
+        "hosts:\n  123: 1.1.1.1\n  plain.example: 2.2.2.2\n  0x1F: 3.3.3.3\n  +7: 4.4.4.4\n",
+    )
+    .unwrap();
     let hosts = raw.hosts.unwrap();
     let keys: Vec<&str> = hosts.keys().map(String::as_str).collect();
-    assert_eq!(keys, ["123", "plain.example"]);
+    assert_eq!(keys, ["123", "plain.example", "0x1F", "+7"]);
 }
 
-/// Canonicalization can also *collide* two keys: `TrUe` resolves to bool
-/// `true` whose canonical text is `"true"` — the same key `"true"` (and
-/// `1.0`/`"1"`, `+7`/`"7"`, `0x1F`/`"31"`) produces. The direct path kept
-/// them as two distinct string keys; the tree's `IndexMap<String, _>`
-/// target would let the second silently overwrite the first, so the
-/// document is rejected instead — an intentional narrowing a real config
-/// never trips (a `hosts:` hostname is never `TrUe`-spelled).
+/// Two keys saphyr's resolved-value dedup tells apart can still read as
+/// the same string — `1` (an int) and `"1"`. The tree's
+/// `IndexMap<String, _>` target would let the second silently overwrite
+/// the first, so the document is rejected instead — an intentional
+/// narrowing. Distinct spellings of one value (`TrUe`/`"true"`,
+/// `1.0`/`"1"`) are distinct strings and stay two keys, as on the direct
+/// path.
 #[test]
-fn canonicalized_key_collision_is_an_error() {
+fn same_string_key_collision_is_an_error() {
     for doc in [
-        "hosts:\n  TrUe: 1.1.1.1\n  \"true\": 2.2.2.2\n",
-        "dns:\n  nameserver-policy:\n    1.0: 1.1.1.1\n    \"1\": 2.2.2.2\n",
+        "hosts:\n  1: 1.1.1.1\n  \"1\": 2.2.2.2\n",
+        "dns:\n  nameserver-policy:\n    0x1F: 1.1.1.1\n    \"0x1F\": 2.2.2.2\n",
     ] {
         let err = meow_config::parse_raw_yaml(doc).unwrap_err().to_string();
         assert!(
             err.contains("duplicate mapping key"),
-            "{doc:?} must fail as a canonicalized duplicate, got: {err}"
+            "{doc:?} must fail as a same-string duplicate, got: {err}"
         );
     }
+
+    let raw =
+        meow_config::parse_raw_yaml("hosts:\n  TrUe: 1.1.1.1\n  \"true\": 2.2.2.2\n").unwrap();
+    let hosts = raw.hosts.unwrap();
+    assert_eq!(
+        hosts.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["TrUe", "true"]
+    );
+    let raw = meow_config::parse_raw_yaml(
+        "dns:\n  nameserver-policy:\n    1.0: 1.1.1.1\n    \"1\": 2.2.2.2\n",
+    )
+    .unwrap();
+    let policy = raw.dns.unwrap().nameserver_policy.unwrap();
+    assert_eq!(
+        policy.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["1.0", "1"]
+    );
+}
+
+/// PR #827 review: an unquoted value that YAML resolves to a number or
+/// bool reaches a `String` field as it was written. A rewritten listener
+/// password or API secret would lock clients out, and `filter: 01` is not
+/// the regex `1`.
+#[test]
+fn number_like_strings_keep_source_text() {
+    let doc = "\
+secret: 012345
+listeners:
+  - name: ss-in
+    type: shadowsocks
+    port: 8388
+    listen: 127.0.0.1
+    cipher: aes-128-gcm
+    password: 000000
+  - name: ss-in2
+    type: shadowsocks
+    port: 8389
+    listen: 127.0.0.1
+    cipher: aes-128-gcm
+    password: 123e4567
+  - name: &n 0123
+    type: shadowsocks
+    port: 8390
+    listen: 127.0.0.1
+    cipher: aes-128-gcm
+    password: *n
+proxy-groups:
+  - name: g
+    type: select
+    proxies: [DIRECT]
+    filter: 01
+    exclude-filter: 0x1F
+";
+    let raw = meow_config::parse_raw_yaml(doc).unwrap();
+    assert_eq!(raw.secret.as_deref(), Some("012345"));
+    let passwords: Vec<Option<&str>> = raw
+        .listeners
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|l| l.password.as_deref())
+        .collect();
+    assert_eq!(
+        passwords,
+        [Some("000000"), Some("123e4567"), Some("0123")],
+        "an alias delivers its anchor's spelling"
+    );
+    let group = &raw.proxy_groups.as_deref().unwrap()[0];
+    assert_eq!(group.filter.as_deref(), Some("01"));
+    assert_eq!(group.exclude_filter.as_deref(), Some("0x1F"));
+}
+
+/// PR #827 review: an error raised by serde's own visitor (no
+/// `HostsValue` variant matches) points at the value, not at its key.
+#[test]
+fn visitor_error_points_at_the_value() {
+    let err = meow_config::parse_raw_yaml("mode: rule\nhosts:\n  a.example: [1, 2]\n")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("line 3 column 14") && err.contains("hosts.a.example"),
+        "expected `line 3 column 14: hosts.a.example: …`, got: {err}"
+    );
 }
