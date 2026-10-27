@@ -862,3 +862,24 @@ fn scalar_map_keys_report_canonical_text() {
     let keys: Vec<&str> = hosts.keys().map(String::as_str).collect();
     assert_eq!(keys, ["123", "plain.example"]);
 }
+
+/// Canonicalization can also *collide* two keys: `TrUe` resolves to bool
+/// `true` whose canonical text is `"true"` — the same key `"true"` (and
+/// `1.0`/`"1"`, `+7`/`"7"`, `0x1F`/`"31"`) produces. The direct path kept
+/// them as two distinct string keys; the tree's `IndexMap<String, _>`
+/// target would let the second silently overwrite the first, so the
+/// document is rejected instead — an intentional narrowing a real config
+/// never trips (a `hosts:` hostname is never `TrUe`-spelled).
+#[test]
+fn canonicalized_key_collision_is_an_error() {
+    for doc in [
+        "hosts:\n  TrUe: 1.1.1.1\n  \"true\": 2.2.2.2\n",
+        "dns:\n  nameserver-policy:\n    1.0: 1.1.1.1\n    \"1\": 2.2.2.2\n",
+    ] {
+        let err = meow_config::parse_raw_yaml(doc).unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate mapping key"),
+            "{doc:?} must fail as a canonicalized duplicate, got: {err}"
+        );
+    }
+}

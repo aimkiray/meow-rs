@@ -754,9 +754,11 @@ pub async fn load_config_from_str(content: &str) -> Result<Config, anyhow::Error
 }
 
 /// Upper bound on YAML document nesting for remote-controlled documents.
-/// `serde_saphyr` deserializes `serde_json::Value` recursively — a document
-/// of `[[[[…` or of ever-deepening indentation recurses one stack frame per
-/// level and can overflow a blocking-thread stack well inside the
+/// `serde_saphyr` deserializes its targets recursively — both the
+/// `serde_json::Value` ingest (`parse_yaml_value`) and the
+/// `yaml_tree::SpannedNode` build (`parse_raw_yaml`) recurse one stack
+/// frame per level, so a document of `[[[[…` or of ever-deepening
+/// indentation can overflow a blocking-thread stack well inside the
 /// fetch-size caps (issue #533 review). Two cheap over-approximations bound
 /// the depth up front:
 ///
@@ -815,11 +817,12 @@ pub(crate) fn yaml_within_depth(doc: &str) -> bool {
 ///   the span tree keeps them as `YamlNode::Float`, so `Option<u16>: .inf`
 ///   is the same `invalid u16` the direct path reported rather than a
 ///   silent `None` (PR #827 review).
-/// - `budget.max_depth`: saphyr's `serde_json::Value` deserializer
-///   recurses one stack frame per nesting level, so the depth bound must
-///   trip inside the parser before the descend overflows — the value is
-///   `meow_common::yaml::MAX_DEPTH` (32), the single definition meow-cli's
-///   config parse shares so every front-end enforces the same contract.
+/// - `budget.max_depth`: both saphyr targets (`serde_json::Value` and the
+///   `yaml_tree` node tree) deserialize recursively, one stack frame per
+///   nesting level, so the depth bound must trip inside the parser before
+///   the descend overflows — the value is `meow_common::yaml::MAX_DEPTH`
+///   (32), the single definition meow-cli's config parse shares so every
+///   front-end enforces the same contract.
 ///   The budget is only a real guard because every parse below runs on a
 ///   dedicated `meow_common::yaml::PARSE_STACK_SIZE` thread: on the 1 MiB
 ///   main thread the fatal depth measured ≈25 — *below* 32 — so an inline
@@ -834,6 +837,14 @@ pub(crate) fn yaml_within_depth(doc: &str) -> bool {
 /// Stays crate-private: backend types must never sit in a `pub` signature
 /// (`serde_json::Value` is the public value namespace), so sibling modules
 /// ingest through [`parse_yaml_value`] below.
+///
+/// Production ingest really does funnel through `parse_raw_yaml` and
+/// `parse_yaml_value` only: the ~90 `serde_saphyr::from_str` call sites
+/// left in this crate's `src/*.rs` all sit inside `#[cfg(test)]` modules
+/// and deliberately pin *direct-path* semantics — the contract reference
+/// the `yaml_tree` deserializer is held to. The single direct use outside
+/// this crate is meow-cli's two-field `ConfigDoc` reader, which mirrors
+/// this option profile by hand.
 fn yaml_options() -> serde_saphyr::Options {
     serde_saphyr::options! {
         strict_booleans: true,
@@ -892,7 +903,7 @@ fn yaml_ser_options() -> serde_saphyr::SerializerOptions {
 /// `yaml_tree::SpannedNode` wrappers — scalar type, document order and
 /// every node's `line:column` retained — and `yaml_tree`'s compact
 /// `serde::Deserializer` walks the tree into [`raw::RawConfig`]. Routing the
-/// 17-struct/2-enum `RawConfig` tree through that small handwritten
+/// 17-struct/4-untagged-enum `RawConfig` tree through that small handwritten
 /// deserializer, instead of `serde_saphyr`'s streaming
 /// `deserialize_map`/`deserialize_struct` state machines monomorphized
 /// across every `Raw*` type, keeps the `minimal` binary within the

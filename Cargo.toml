@@ -85,10 +85,12 @@ serde_json = "1"
 # `serde_norway`/`unsafe-libyaml-norway` (themselves a fork arrangement for
 # RUSTSEC-2024-0449, the archived `unsafe-libyaml` c2rust backend), so no
 # libyaml-descended crate remains in the tree at all.
-# `~2.0.0` floors the researched release and admits 2.0.x patches while
-# requiring a deliberate bump for a 2.1 that could alter scalar/tag
-# semantics (mirrors the `~0.9.42` precedent).
-serde-saphyr = { version = "~2.0.0", default-features = false, features = ["serialize", "deserialize"] }
+# Pinned exactly: `meow-config`'s `yaml_tree` composes saphyr's internal
+# `__yaml_tagged`/`__yaml_spanned` newtype protocols and synthesized
+# field orders to capture per-node tags and source locations. Those
+# internals are not a stability surface — even a 2.0.x patch could move
+# them — so the bump is always deliberate.
+serde-saphyr = { version = "=2.0.0", default-features = false, features = ["serialize", "deserialize"] }
 # Order-preserving map for `dns.nameserver-policy` — the YAML document
 # order IS the lookup priority (mihomo `parseNameServerPolicy` parity), so
 # a plain `HashMap` cannot carry it. `serde` deserializes in document order.
