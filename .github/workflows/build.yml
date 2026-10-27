@@ -146,10 +146,14 @@ jobs:
           rustup toolchain install "$tc" --profile minimal --no-self-update
           rustup target add --toolchain "$tc" "${{ matrix.target }}"
 
+      # The key carries the cargo-zigbuild pin below: boring-sys's CMake
+      # cache records the zigbuild wrapper paths, which are versioned, so a
+      # cache built by another zigbuild points CMAKE_ASM_COMPILER at a
+      # wrapper that no longer exists. Bump both together.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          key: release-${{ matrix.target }}
+          key: release-${{ matrix.target }}-zigbuild-0.23.2
 
       - name: Install cargo-zigbuild and zig
         if: runner.os == 'Linux'
@@ -157,7 +161,13 @@ jobs:
         with:
           version: 0.13.0
 
-      - run: cargo install --locked cargo-zigbuild
+      # Pinned: from 0.23.3 on, every 32-bit ARM link also compiles an
+      # `aeabi_unaligned.c` shim (unaligned-access helpers that only
+      # strict-align targets such as armv6 need, not our armv7). Parallel
+      # first compiles of it race in zig's cache (`FileNotFound`), which
+      # intermittently fails boring-sys's CMake compiler check on armv7.
+      # Lift the pin once upstream builds the shim race-free.
+      - run: cargo install --locked cargo-zigbuild --version 0.23.2
         if: runner.os == 'Linux'
 
       - name: Build release binary
