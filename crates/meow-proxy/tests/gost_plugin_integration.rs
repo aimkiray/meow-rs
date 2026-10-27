@@ -1,4 +1,4 @@
-#![cfg(all(feature = "ss", feature = "mux"))]
+#![cfg(all(feature = "gost-plugin", feature = "mux"))]
 //! Real-server integration test for the built-in `gost-plugin` transport.
 //!
 //!   meow-rs ShadowsocksAdapter  --ws+smux-->  gost `ss+mws` listener  -->  TCP echo

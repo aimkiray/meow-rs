@@ -1684,6 +1684,7 @@ async fn test_proxy_parsing_ss_with_builtin_obfs_table() {
     );
 }
 
+#[cfg(feature = "gost-plugin")]
 #[tokio::test]
 async fn test_proxy_parsing_ss_with_gost_plugin() {
     // `gost-plugin` is an in-process built-in (issue #533): a ws transport

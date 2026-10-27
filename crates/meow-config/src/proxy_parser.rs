@@ -151,7 +151,10 @@ pub fn node_selects_external_plugin(config: &HashMap<String, serde_json::Value>)
 /// binary (issue #513). Built-in/in-process plugins (`obfs`,
 /// `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`,
 /// `kcptun`, `ech-tls-tunnel`) stay allowed — mihomo
-/// implements those in-process too, so gating them would diverge.
+/// implements those in-process too, so gating them would diverge.  A built-in
+/// name whose cargo feature is compiled out still counts as built-in here
+/// (reserved name): the adapter then fails construction with a clean
+/// "not compiled into this build" error instead of spawning an executable.
 ///
 /// `dialer` is the pluggable TCP dialer the node's adapter dials its server
 /// through — [`meow_proxy::dialer::DirectDialer`] for an unchained node, or a
@@ -3725,7 +3728,7 @@ tls: true
     /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
     /// the in-process shadow-tls parser → adapter construction, incl.
     /// the `alpn` sequence and node-level `client-fingerprint` plumbing.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "shadow-tls")]
     #[test]
     fn test_shadow_tls_node_parse_e2e() {
         let cfg = proxy_config(
@@ -3756,7 +3759,7 @@ tls: true
 
     /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
     /// the in-process restls parser → adapter construction.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "restls")]
     #[test]
     fn test_restls_node_parse_e2e() {
         let cfg = proxy_config(
@@ -3788,7 +3791,7 @@ tls: true
 
     /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
     /// the in-process jls parser → adapter construction.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "jls")]
     #[test]
     fn test_jls_node_parse_e2e() {
         let cfg = proxy_config(
@@ -5498,7 +5501,7 @@ tls: true
     /// reject it on provider nodes, and `is_external_sip003_plugin` must
     /// agree (a misclassification would silently drop subscription nodes).
     /// `mux: false` keeps the fixture valid under a `ss`-without-`mux` build.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "gost-plugin")]
     #[test]
     fn provider_node_allows_gost_plugin() {
         assert!(!is_external_sip003_plugin(Some("gost-plugin")));
@@ -5518,7 +5521,7 @@ tls: true
 
     /// shadow-tls is a built-in in-process plugin too — the provider gate
     /// must route it through without `allow-external-plugin`.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "shadow-tls")]
     #[test]
     fn provider_node_allows_shadow_tls_plugin() {
         assert!(!is_external_sip003_plugin(Some("shadow-tls")));
@@ -5566,5 +5569,122 @@ tls: true
             .filter_map(|p| p.get("name").and_then(|v| v.as_str()))
             .collect();
         assert_eq!(names, ["ok", "plain"], "dropped: {names:?}");
+    }
+
+    // ─── feature-gated built-in plugins: disabled names fail cleanly ─────────
+    //
+    // Every name `is_builtin_sip003_plugin` lists is reserved: when its
+    // feature is compiled out the adapter must return a clean Config error
+    // ("not compiled into this build"), never fall through to the external
+    // SIP003 `Plugin::start` spawn path. `is_external_sip003_plugin` must
+    // agree — a misclassified reserved name would be treated as external
+    // (spawned, or rejected/dropped by the provider gates).
+
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[test]
+    fn gost_plugin_disabled_errors_cleanly() {
+        assert!(
+            !is_external_sip003_plugin(Some("gost-plugin")),
+            "gost-plugin stays a reserved built-in name when its feature is off"
+        );
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: gost-plugin\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("disabled gost-plugin must fail at construction");
+        };
+        assert!(err.contains("not compiled into this build"), "msg: {err}");
+        assert!(err.contains("gost-plugin"), "msg: {err}");
+    }
+
+    #[cfg(all(feature = "ss", not(feature = "shadow-tls")))]
+    #[test]
+    fn shadow_tls_plugin_disabled_errors_cleanly() {
+        assert!(
+            !is_external_sip003_plugin(Some("shadow-tls")),
+            "shadow-tls stays a reserved built-in name when its feature is off"
+        );
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: shadow-tls\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("disabled shadow-tls must fail at construction");
+        };
+        assert!(err.contains("not compiled into this build"), "msg: {err}");
+        assert!(err.contains("shadow-tls"), "msg: {err}");
+    }
+
+    #[cfg(all(feature = "ss", not(feature = "restls")))]
+    #[test]
+    fn restls_plugin_disabled_errors_cleanly() {
+        assert!(
+            !is_external_sip003_plugin(Some("restls")),
+            "restls stays a reserved built-in name when its feature is off"
+        );
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: restls\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("disabled restls must fail at construction");
+        };
+        assert!(err.contains("not compiled into this build"), "msg: {err}");
+        assert!(err.contains("restls"), "msg: {err}");
+    }
+
+    #[cfg(all(feature = "ss", not(feature = "jls")))]
+    #[test]
+    fn jls_plugin_disabled_errors_cleanly() {
+        assert!(
+            !is_external_sip003_plugin(Some("jls")),
+            "jls stays a reserved built-in name when its feature is off"
+        );
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: jls\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("disabled jls must fail at construction");
+        };
+        assert!(err.contains("not compiled into this build"), "msg: {err}");
+        assert!(err.contains("jls"), "msg: {err}");
+    }
+
+    #[cfg(all(feature = "ss", not(feature = "kcptun")))]
+    #[test]
+    fn kcptun_plugin_disabled_errors_cleanly() {
+        assert!(
+            !is_external_sip003_plugin(Some("kcptun")),
+            "kcptun stays a reserved built-in name when its feature is off"
+        );
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: kcptun\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("disabled kcptun must fail at construction");
+        };
+        assert!(err.contains("not compiled into this build"), "msg: {err}");
+        assert!(err.contains("kcptun"), "msg: {err}");
+    }
+
+    #[cfg(all(feature = "ss", not(feature = "ech-tls-tunnel")))]
+    #[test]
+    fn ech_tls_tunnel_plugin_disabled_errors_cleanly() {
+        assert!(
+            !is_external_sip003_plugin(Some("ech-tls-tunnel")),
+            "ech-tls-tunnel stays a reserved built-in name when its feature is off"
+        );
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: ech-tls-tunnel\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("disabled ech-tls-tunnel must fail at construction");
+        };
+        assert!(err.contains("not compiled into this build"), "msg: {err}");
+        assert!(err.contains("ech-tls-tunnel"), "msg: {err}");
     }
 }

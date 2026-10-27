@@ -26,17 +26,17 @@ pub mod unavailable;
 
 #[cfg(feature = "ech-tls-tunnel")]
 pub mod ech_tls_tunnel;
-#[cfg(feature = "ss")]
+#[cfg(feature = "gost-plugin")]
 pub mod gost_plugin;
-#[cfg(feature = "ss")]
+#[cfg(feature = "jls")]
 pub mod jls_plugin;
 #[cfg(feature = "kcptun")]
 pub mod kcptun_plugin;
 #[cfg(feature = "ss")]
 mod plugin_util;
-#[cfg(feature = "ss")]
+#[cfg(feature = "restls")]
 pub mod restls_plugin;
-#[cfg(feature = "ss")]
+#[cfg(feature = "shadow-tls")]
 pub mod shadow_tls_plugin;
 #[cfg(feature = "ss")]
 pub mod shadowsocks_adapter;

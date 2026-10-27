@@ -2,6 +2,15 @@
 //! `v2ray_plugin`, `gost_plugin`, `shadow_tls_plugin`, `restls_plugin`,
 //! `jls_plugin`, `kcptun_plugin`, `ech_tls_tunnel`.
 
+// `MeowError`/`Result` are only needed by the helpers whose consumers sit
+// behind the per-plugin features — under an `ss`-only build (v2ray-plugin +
+// simple-obfs) nothing here returns `Result`.
+#[cfg(any(
+    feature = "gost-plugin",
+    feature = "shadow-tls",
+    feature = "restls",
+    feature = "kcptun"
+))]
 use meow_common::error::{MeowError, Result};
 use tracing::warn;
 
@@ -39,6 +48,12 @@ pub(crate) fn parse_bool(s: &str, plugin: &str, key: &str) -> bool {
 /// Strict bool for security-relevant knobs: an unrecognized value is a
 /// config error — silently coercing `tls=bogus` to `false` would produce
 /// a plaintext transport the operator believes is TLS.
+#[cfg(any(
+    feature = "gost-plugin",
+    feature = "shadow-tls",
+    feature = "restls",
+    feature = "kcptun"
+))]
 pub(crate) fn parse_bool_strict(s: &str, plugin: &str, key: &str) -> Result<bool> {
     match s.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -53,6 +68,7 @@ pub(crate) fn parse_bool_strict(s: &str, plugin: &str, key: &str) -> Result<bool
 /// SHA-256 of the pinned certificate (upstream
 /// `ca.NewFingerprintVerifier`).  uTLS profile names are rejected,
 /// mirroring upstream's explicit check.
+#[cfg(any(feature = "gost-plugin", feature = "shadow-tls", feature = "restls"))]
 pub(crate) fn parse_cert_pin(s: &str, plugin: &str) -> Result<[u8; 32]> {
     // Upstream guards against the easy confusion between this pin and a
     // uTLS ClientHello profile name.
@@ -106,6 +122,7 @@ pub(crate) fn parse_cert_pin(s: &str, plugin: &str) -> Result<[u8; 32]> {
 /// Relative paths resolve against the meow home dir (upstream `C.Path`),
 /// not the process CWD — `resolved_home_dir` carries the `-d` override or
 /// the shared XDG config-dir default when no home is set.
+#[cfg(any(feature = "gost-plugin", feature = "shadow-tls"))]
 pub(crate) fn load_pem_or_path(value: &str, opt: &str, plugin: &str) -> Result<Vec<u8>> {
     match pem_source(value) {
         PemSource::Inline => Ok(value.as_bytes().to_vec()),
@@ -134,6 +151,7 @@ pub(crate) fn load_pem_or_path(value: &str, opt: &str, plugin: &str) -> Result<V
 /// (issue #648), and a PEM bundle is a few KiB in practice. 1 MiB leaves
 /// generous headroom for stacked chains while capping a swapped-in huge
 /// regular file.
+#[cfg(any(feature = "gost-plugin", feature = "shadow-tls"))]
 const MAX_PEM_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Read a cert/key file that an `is_file` check already proved regular.
@@ -141,6 +159,7 @@ const MAX_PEM_FILE_BYTES: u64 = 1024 * 1024;
 /// between the stat and this read can't wedge the caller (a nonblocking
 /// FIFO read errors instead of blocking; regular files ignore the flag).
 /// Reads are capped at [`MAX_PEM_FILE_BYTES`].
+#[cfg(any(feature = "gost-plugin", feature = "shadow-tls"))]
 pub(crate) fn read_cert_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -167,6 +186,7 @@ pub(crate) fn read_cert_file(path: &std::path::Path) -> std::io::Result<Vec<u8>>
 /// Consumers that support hot reload (gost-plugin; upstream
 /// `NewTLSKeyPairLoader` + fswatch) keep the [`PemSource::File`] path so
 /// they can re-stat and re-read it per dial.
+#[cfg(any(feature = "gost-plugin", feature = "shadow-tls"))]
 pub(crate) enum PemSource {
     /// PEM content inline in the opt value — immutable.
     Inline,
@@ -174,8 +194,11 @@ pub(crate) enum PemSource {
     File(std::path::PathBuf),
 }
 
+#[cfg(any(feature = "gost-plugin", feature = "shadow-tls"))]
 impl PemSource {
     /// The resolved path when the value named a file, else `None`.
+    /// Only gost-plugin keeps the path (for its per-dial re-stat reload).
+    #[cfg(feature = "gost-plugin")]
     pub(crate) fn into_path(self) -> Option<std::path::PathBuf> {
         match self {
             PemSource::File(p) => Some(p),
@@ -185,6 +208,7 @@ impl PemSource {
 }
 
 /// Classify a PEM opt value without reading it (see [`PemSource`]).
+#[cfg(any(feature = "gost-plugin", feature = "shadow-tls"))]
 pub(crate) fn pem_source(value: &str) -> PemSource {
     if value.contains("-----BEGIN") {
         PemSource::Inline
@@ -221,6 +245,12 @@ mod tests {
         assert_eq!(sip003_opts("  ;; ").next(), None);
     }
 
+    #[cfg(any(
+        feature = "gost-plugin",
+        feature = "shadow-tls",
+        feature = "restls",
+        feature = "kcptun"
+    ))]
     #[test]
     fn parse_bool_lenient_vs_strict() {
         assert!(parse_bool("YES", "p", "k"));
@@ -231,6 +261,7 @@ mod tests {
         assert!(parse_bool_strict("", "p", "k").is_err());
     }
 
+    #[cfg(any(feature = "gost-plugin", feature = "shadow-tls"))]
     #[test]
     fn read_cert_file_caps_oversized_files() {
         // A provider-controlled `certificate`/`private-key` path reaches this
@@ -251,6 +282,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(any(feature = "gost-plugin", feature = "shadow-tls", feature = "restls"))]
     #[test]
     fn cert_pin_rejects_utls_names_and_bad_hex() {
         assert!(parse_cert_pin("chrome", "p").is_err());

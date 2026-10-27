@@ -203,3 +203,51 @@ contributor than mux). None of those were measured against `default` at
 the time they landed either; this section only closes the mux-specific gap
 that issue #426 asked for. A follow-up audit to re-baseline `default` size
 against the full feature history is out of scope here.
+
+## SS built-in plugin transports split (perf/ss-plugin-features, U4)
+
+Measured 2026-10-28 on macOS/Apple Silicon (`uname -m` = arm64, `rustc 1.98.1
+aarch64-apple-darwin`). A/B against the unit base commit `4201881b` (built in a
+scratch checkout with the identical recipe). Release profile unchanged:
+`lto=fat, strip=true, codegen-units=1, panic=abort, opt-level="z"`.
+
+The change splits the four heavier built-in SIP003 transports
+(`gost-plugin`, `shadow-tls`, `restls`, `jls`) out of `ss` into their own
+opt-in features. `minimal`'s `ss` contract narrows to simple-obfs +
+v2ray-plugin; `default`/`full` still bundle all four, so release binaries
+are expected ~unchanged. `kcptun`/`ech-tls-tunnel` were already separate
+features and only gained explicit disabled-name error arms.
+
+Build commands:
+
+```bash
+# minimal A/B
+cargo zigbuild --release --no-default-features --features minimal \
+  --target x86_64-unknown-linux-musl --bin meow      # musl
+cargo build --release --no-default-features --features minimal --bin meow   # host
+# default A/B
+cargo zigbuild --release --target x86_64-unknown-linux-musl --bin meow      # musl
+cargo build --release --bin meow                                           # host
+```
+
+| Target | Profile | Before (`4201881b`) | After (U4) | Delta |
+|--------|---------|--------------------:|-----------:|------:|
+| `x86_64-unknown-linux-musl` | minimal | 10,263,808 B (~9.79 MiB) | 10,003,680 B (~9.54 MiB) | **−260,128 B (~−254 KiB, −2.5%)** |
+| `x86_64-unknown-linux-musl` | default | 15,153,992 B (~14.45 MiB) | 15,153,928 B (~14.45 MiB) | −64 B (≈0, as expected) |
+| `aarch64-apple-darwin` (host) | minimal | 7,038,432 B (~6.71 MiB) | 6,871,744 B (~6.55 MiB) | **−166,688 B (~−163 KiB, −2.4%)** |
+| `aarch64-apple-darwin` (host) | default | 9,967,584 B (~9.51 MiB) | 9,967,616 B (~9.51 MiB) | +32 B (≈0, as expected) |
+| `aarch64-unknown-linux-musl` | minimal | not measured (only the x86_64 leg was built) | | — |
+
+Dep-tree evidence (`cargo tree -p meow-proxy -e normal
+--no-default-features --features ss`, base vs branch): `ss`-only drops
+`curve25519-dalek` and `x25519-dalek` (the x25519 key-exchange chain used
+by the shadow-tls/restls/jls transports); identical at the `meow-app`
+level. `Cargo.lock` is unchanged — every plugin dep was already declared
+optional, so feature rewiring moves no packages.
+
+Behavior: a `plugin: gost-plugin` ss node under an `ss`-without-`gost-plugin`
+build reports `plugin 'gost-plugin' is not compiled into this build;
+rebuild with \`--features gost-plugin\`` (verified via `meow -f <yml> -t`
+in both directions); all built-in names stay reserved in
+`is_builtin_sip003_plugin` so they can never fall through to the external
+SIP003 subprocess path.

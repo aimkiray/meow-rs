@@ -50,7 +50,7 @@ Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vme
 | `password` | string | ✓ | — | |
 | `cipher` | string | ✓ | — | e.g. `aes-256-gcm`, `chacha20-ietf-poly1305` |
 | `udp` | bool | | `false` | Enable UDP relay |
-| `plugin` | string | | — | `obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`, `kcptun`, `ech-tls-tunnel` (built-in, no external binary) |
+| `plugin` | string | | — | `obfs`/`simple-obfs`, `v2ray-plugin` (bundled with `ss`); `gost-plugin`, `shadow-tls`, `restls`, `jls`, `kcptun`, `ech-tls-tunnel` (built-in, no external binary — each behind its same-named Cargo feature; all ship in `full`/default builds, none in `minimal`) |
 | `plugin-opts` | string \| map | | — | Plugin options |
 
 ```yaml
@@ -69,7 +69,10 @@ Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vme
 
 `gost-plugin` runs in-process too — a WebSocket transport with optional
 TLS and smux. Upstream defaults apply: `host` defaults to `bing.com` and
-`mux` to `true` (a fresh smux session per connection).
+`mux` to `true` (a fresh smux session per connection). It needs the
+`gost-plugin` Cargo feature: shipped in `full`/default builds, not in
+`minimal` (enable it with `--features gost-plugin`; without it the node
+fails to load with "not compiled into this build").
 
 ```yaml
 - name: ss-gost
@@ -106,6 +109,8 @@ upstream.
 `shadow-tls` runs in-process too — a cover-TLS record transport with all
 three upstream protocol versions. `host` (cover SNI) and `version`
 (1/2/3) are required; `strict-mode: true` refuses non-TLS-1.3 covers.
+It needs the `shadow-tls` Cargo feature: shipped in `full`/default
+builds, not in `minimal` (enable it with `--features shadow-tls`).
 
 ```yaml
 - name: ss-stls
@@ -126,7 +131,9 @@ three upstream protocol versions. `host` (cover SNI) and `version`
 ```
 
 `restls` authenticates the relay inside the TLS `session_id` — the cover
-handshake itself is real TLS (tls12 or tls13):
+handshake itself is real TLS (tls12 or tls13). It needs the `restls`
+Cargo feature: shipped in `full`/default builds, not in `minimal`
+(enable it with `--features restls`):
 
 ```yaml
 - name: ss-restls
@@ -150,7 +157,9 @@ handshake itself is real TLS (tls12 or tls13):
 `jls` authenticates inside a real TLS 1.3 handshake — `ClientHello`/
 `ServerHello` `random` carry an AES-256-GCM-sealed credential, so the auth
 blob is part of the handshake transcript and no generic TLS stack can
-speak it. Post-handshake is a plain TLS record stream (TLS 1.3 only):
+speak it. Post-handshake is a plain TLS record stream (TLS 1.3 only).
+It needs the `jls` Cargo feature: shipped in `full`/default builds, not
+in `minimal` (enable it with `--features jls`):
 
 ```yaml
 - name: ss-jls
@@ -176,7 +185,9 @@ full PKI and then rejects the connection.
 envelope + optional Reed-Solomon FEC + snappy + smux v1, wire-compatible
 with `xtaci/kcp-go` (which mihomo's plugin tracks). UDP is relayed via
 legacy UDP-over-TCP (`uot`) on a multiplexed session, matching upstream's
-forced `UDPOverTCP`:
+forced `UDPOverTCP`. It needs the `kcptun` Cargo feature: shipped in
+`full`/default builds, not in `minimal` (enable it with
+`--features kcptun`):
 
 ```yaml
 - name: ss-kcptun

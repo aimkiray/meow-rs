@@ -166,6 +166,15 @@ UDP relay via UDP-over-TCP). External SIP003 plugin binaries are
 supported via `plugin:` on `ss` nodes and `allow-external-plugin` on
 providers.
 
+Feature prerequisites: `obfs`/`simple-obfs` and `v2ray-plugin` are
+bundled with `ss` itself (so they are in `minimal`); `gost-plugin`,
+`shadow-tls`, `restls` and `jls` each sit behind a same-named Cargo
+feature, all re-bundled into `default`/`full` but absent from `minimal`
+— a `plugin:` line naming a compiled-out built-in fails at load with a
+"not compiled into this build" error (it is never handed to the
+external-plugin spawn path). `kcptun` and `ech-tls-tunnel` were already
+separate features and behave the same way.
+
 ### Trojan
 
 Fully supported. TLS via BoringSSL. WebSocket transport via the
@@ -410,7 +419,8 @@ preceding hop's stream (mihomo `DialContextWithDialer` semantics).
 `anytls`, and `ss` (built-in obfs/v2ray-plugin/ech-tls-tunnel included) all
 terminate a relay chain. Two carve-outs fail loudly instead of silently
 misbehaving: `hysteria2` (QUIC/UDP cannot ride a TCP stream — first-hop
-only) and `ss` with `gost-plugin`/`shadow-tls`/`restls`/`jls` or an
+only) and `ss` with `gost-plugin`/`shadow-tls`/`restls`/`jls` (when those
+per-plugin cargo features are compiled in) or an
 external SIP003 plugin (the plugin owns its outbound leg — a record-level
 transport cannot be replayed over an already-proxied stream). Mux pooling
 (`smux`/`yamux`/`h2mux`/`muxcool`) is bypassed on relay hops: a
