@@ -203,3 +203,35 @@ contributor than mux). None of those were measured against `default` at
 the time they landed either; this section only closes the mux-specific gap
 that issue #426 asked for. A follow-up audit to re-baseline `default` size
 against the full feature history is out of scope here.
+
+## clap `default-features = false` (host-native build)
+
+Measured 2026-10-28 on macOS/Apple Silicon (`uname -m` = arm64, rustc host
+`aarch64-apple-darwin`, rustc 1.98.1) — a **host-native `cargo build`, not a
+musl cross-compile**, so these numbers are not comparable to the zigbuild
+musl rows above. Same release profile (`lto`, `strip`, `codegen-units=1`,
+`panic=abort`, `opt-level="z"`); feature set `default` (`full` bundle) for
+`meow`, workspace defaults for `meow-cli`.
+
+Build commands: before = `cargo build --release -p meow-app -p meow-cli` at
+base commit `4201881b`; after = `cargo build --locked --release -p meow-app
+-p meow-cli` on the same tree with clap's default features turned off
+(`derive` + `std` + `help` + `usage` + `error-context` kept, plus `env` for
+meow-cli via its member manifest).
+
+| Binary | Target triple | Before | After | Delta |
+|--------|---------------|--------|-------|-------|
+| `meow` | `aarch64-apple-darwin` | 9,967,584 B (~9.50 MiB) | 9,950,976 B (~9.49 MiB) | −16,608 B (~16.2 KiB) |
+| `meow-cli` | `aarch64-apple-darwin` | 1,337,952 B (~1.28 MiB) | 1,321,344 B (~1.26 MiB) | −16,608 B (~16.2 KiB) |
+
+The drop comes from clap's `color`/`suggestions` default features going off:
+`anstream`, `anstyle-parse`, `anstyle-query`, `anstyle-wincon`,
+`colorchoice`, `is_terminal_polyfill`, `once_cell_polyfill`, `strsim` and
+`utf8parse` leave `Cargo.lock` (9 packages, `cargo tree -p meow-app` line
+count 1103 → 1094). `anstyle` stays — referenced by `annotate-snippets`
+(via `serde-saphyr` → `meow-config`) and by `clap_builder`'s own
+unconditional dependency. `--help` output is byte-identical before/after
+(1,564 B for `meow`, 2,203 B for `meow-cli`); the behavior change is that
+help and error output are now *never* colorized (previously auto-colorized
+on a TTY) and mistyped flags lose "did you mean" hints — exit codes and
+usage text are unchanged.

@@ -186,7 +186,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 
 # Async traits
 async-trait = "0.1"
