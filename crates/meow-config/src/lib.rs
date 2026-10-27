@@ -29,6 +29,7 @@ pub mod subscription;
 pub mod subscription_userinfo;
 #[cfg(test)]
 mod test_support;
+mod yaml_tree;
 
 pub use dropped_providers::DroppedProviders;
 pub use geodata::GeoDataConfig;
@@ -810,7 +811,10 @@ pub(crate) fn yaml_within_depth(doc: &str) -> bool {
 ///   delivers as a plain string, matching norway.
 /// - `non_finite_float_policy: PassThrough`: `.inf`/`-.inf`/`.nan` map to
 ///   `null` inside `serde_json::Value` subtrees and to the IEEE values in
-///   typed `f64` fields — norway's exact behaviour.
+///   typed `f64` fields — norway's exact behaviour. Under `parse_raw_yaml`
+///   the span tree keeps them as `YamlNode::Float`, so `Option<u16>: .inf`
+///   is the same `invalid u16` the direct path reported rather than a
+///   silent `None` (PR #827 review).
 /// - `budget.max_depth`: saphyr's `serde_json::Value` deserializer
 ///   recurses one stack frame per nesting level, so the depth bound must
 ///   trip inside the parser before the descend overflows — the value is
@@ -880,33 +884,23 @@ fn yaml_ser_options() -> serde_saphyr::SerializerOptions {
 /// remotely-supplied document can't bypass the depth bound or silently
 /// lose merged fields (issue #648 review).
 ///
-/// Deserialization runs in two stages: `serde_saphyr` first parses the YAML
-/// event stream into [`serde_json::Value`] under `yaml_options` (enforcing
-/// `<<:` merge expansion, `DuplicateKeyPolicy::Error`,
+/// Deserialization is one pass over the `serde_saphyr` event stream: the
+/// parser (still enforcing `<<:` merge expansion, `DuplicateKeyPolicy::Error`,
 /// `reject_unsupported_tags`, `strict_booleans`,
-/// `NonFiniteFloatPolicy::PassThrough`, and `budget.max_depth`), and
-/// `serde_json::from_value` then populates [`raw::RawConfig`]. Routing the
-/// 19-struct `RawConfig` tree through `serde_json::Value` avoids
-/// monomorphizing `serde_saphyr`'s `YamlDeserializer::deserialize_map` state
-/// machine across every `Raw*` type, keeping the `minimal` binary within the
-/// ADR-0007 size budget. Because `serde_json::Value`'s default `BTreeMap`
-/// object backing sorts keys, a minimal `OrderedOverlays` pass over
-/// `serde_saphyr` runs when `hosts` or `dns.nameserver-policy` is present to
-/// preserve their YAML document order in [`raw::RawHosts`] and
-/// [`raw::RawNameserverPolicy`].
+/// `NonFiniteFloatPolicy::PassThrough`, and `budget.max_depth` via
+/// `yaml_options`) materializes a `yaml_tree::YamlNode` tree inside
+/// `yaml_tree::SpannedNode` wrappers — scalar type, document order and
+/// every node's `line:column` retained — and `yaml_tree`'s compact
+/// `serde::Deserializer` walks the tree into [`raw::RawConfig`]. Routing the
+/// 17-struct/2-enum `RawConfig` tree through that small handwritten
+/// deserializer, instead of `serde_saphyr`'s streaming
+/// `deserialize_map`/`deserialize_struct` state machines monomorphized
+/// across every `Raw*` type, keeps the `minimal` binary within the
+/// ADR-0007 size budget — while restoring the scalar coercions
+/// (`port: "7890"`, `secret: 123456`), `hosts`/`nameserver-policy` document
+/// order, and `line {l} column {c}`/`field.path` diagnostics a
+/// `serde_json::Value` intermediate had lost (PR #827).
 pub fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
-    #[derive(Deserialize)]
-    struct OrderedOverlays {
-        hosts: Option<raw::RawHosts>,
-        dns: Option<OrderedDns>,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "kebab-case")]
-    struct OrderedDns {
-        nameserver_policy: Option<raw::RawNameserverPolicy>,
-    }
-
     if !yaml_within_depth(content) {
         return Err(anyhow::anyhow!(
             "YAML document exceeds {MAX_YAML_DEPTH} levels of nesting"
@@ -919,38 +913,12 @@ pub fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
     // below the 32-level budget (migration review F1). The join is a
     // synchronous block on paths that already parsed inline — startup and
     // reload — so nothing downstream changes. See `meow_common::yaml`.
-    let (val, hosts, nsp) = meow_common::yaml::run_on_parse_stack(content, |doc| {
-        let mut v: serde_json::Value = serde_saphyr::from_str_with_options(doc, yaml_options())?;
-        if v.is_null() {
-            v = serde_json::Value::Object(Default::default());
-        }
-        let has_hosts = v.get("hosts").is_some_and(|x| !x.is_null());
-        let has_nsp = v
-            .get("dns")
-            .and_then(|d| d.get("nameserver-policy"))
-            .is_some_and(|x| !x.is_null());
-        let (hosts, nsp) = if has_hosts || has_nsp {
-            let overlays: OrderedOverlays =
-                serde_saphyr::from_str_with_options(doc, yaml_options())?;
-            (
-                overlays.hosts,
-                overlays.dns.and_then(|d| d.nameserver_policy),
-            )
-        } else {
-            (None, None)
-        };
-        Ok::<_, serde_saphyr::Error>((v, hosts, nsp))
+    meow_common::yaml::run_on_parse_stack(content, |doc| {
+        let root: yaml_tree::SpannedNode =
+            serde_saphyr::from_str_with_options(doc, yaml_options())?;
+        yaml_tree::deserialize_config(&root).map_err(Into::into)
     })
-    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))??;
-
-    let mut raw: raw::RawConfig = serde_json::from_value(val)?;
-    if let Some(hosts) = hosts {
-        raw.hosts = Some(hosts);
-    }
-    if let (Some(dns), Some(nsp)) = (raw.dns.as_mut(), nsp) {
-        dns.nameserver_policy = Some(nsp);
-    }
-    Ok(raw)
+    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))?
 }
 
 /// Unique-per-call scratch sibling for atomic write-then-rename saves —

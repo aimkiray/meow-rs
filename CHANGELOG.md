@@ -305,6 +305,24 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`parse_raw_yaml` keeps the ADR-0007 binary shrink without the
+  `serde_json::Value` intermediate** (PR #827 follow-up): the config
+  document still parses exactly once with `serde-saphyr`, but into a
+  span-carrying, document-ordered `yaml_tree::YamlNode` tree that a
+  compact handwritten `serde::Deserializer` walks into `RawConfig` —
+  instead of a `serde_json::Value` round-trip plus a second overlay
+  parse. That restores the direct-path behavior the intermediate had
+  lost: `hosts:` and `dns.nameserver-policy:` keep YAML document order
+  (the overlay could only re-read them for a narrow field list), scalar
+  coercions like `port: "7890"` and `secret: 123456` apply again, typed
+  errors carry `line N column M` plus a `dns.fallback-filter.geoip`-style
+  field path, non-finite floats reach typed `f64` fields instead of
+  collapsing to `null`, and a top-level sequence can no longer fill
+  `RawConfig` positionally. Merge expansion, duplicate-key rejection,
+  tag refusal, strict booleans and the depth budget stay with saphyr's
+  single event stream. Subscription, proxy-provider and rule-set
+  payloads keep the `serde_json::Value` ingest (`parse_yaml_value`),
+  whose `BTreeMap` key order is unchanged.
 - **`?proxy=` detection is now ASCII case-insensitive** —
   `?Proxy=`/`?PROXY=` on `tls://`/`https://` nameservers hard-error at
   config load instead of silently leaking the proxy name into the DoH
