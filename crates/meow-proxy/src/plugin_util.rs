@@ -31,7 +31,7 @@ pub(crate) fn sip003_opts(s: &str) -> impl Iterator<Item = (String, String)> + '
 /// SIP003 boolean convention: `1`/`true`/`yes`/`on` (case-insensitive).
 /// Unknown non-empty values warn and coerce to false — the lenient
 /// stance `v2ray-plugin`/`ech-tls-tunnel` have always taken; keep it
-/// there for compatibility and use [`parse_bool_strict`] for knobs
+/// there for compatibility and use `parse_bool_strict` for knobs
 /// where a typo would silently weaken security (enabling TLS,
 /// skipping verification).
 pub(crate) fn parse_bool(s: &str, plugin: &str, key: &str) -> bool {

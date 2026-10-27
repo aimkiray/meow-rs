@@ -241,9 +241,9 @@ cargo build --release --bin meow                                           # hos
 Dep-tree evidence (`cargo tree -p meow-proxy -e normal
 --no-default-features --features ss`, base vs branch): `ss`-only drops
 `curve25519-dalek` and `x25519-dalek` (the x25519 key-exchange chain used
-by the shadow-tls/restls/jls transports); identical at the `meow-app`
-level. `Cargo.lock` is unchanged — every plugin dep was already declared
-optional, so feature rewiring moves no packages.
+by the restls transport, also reached transitively via jls); identical
+at the `meow-app` level. `Cargo.lock` is unchanged — every plugin dep
+was already declared optional, so feature rewiring moves no packages.
 
 Behavior: a `plugin: gost-plugin` ss node under an `ss`-without-`gost-plugin`
 build reports `plugin 'gost-plugin' is not compiled into this build;

@@ -72,7 +72,9 @@ TLS and smux. Upstream defaults apply: `host` defaults to `bing.com` and
 `mux` to `true` (a fresh smux session per connection). It needs the
 `gost-plugin` Cargo feature: shipped in `full`/default builds, not in
 `minimal` (enable it with `--features gost-plugin`; without it the node
-fails to load with "not compiled into this build").
+fails to load with "not compiled into this build"). The `mux: true`
+option additionally requires the `mux` Cargo feature (also in `full`);
+set `mux: false` on builds without it.
 
 ```yaml
 - name: ss-gost
