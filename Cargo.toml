@@ -88,7 +88,7 @@ serde_json = "1"
 # `~2.0.0` floors the researched release and admits 2.0.x patches while
 # requiring a deliberate bump for a 2.1 that could alter scalar/tag
 # semantics (mirrors the `~0.9.42` precedent).
-serde-saphyr = "~2.0.0"
+serde-saphyr = { version = "~2.0.0", default-features = false, features = ["serialize", "deserialize"] }
 # Order-preserving map for `dns.nameserver-policy` — the YAML document
 # order IS the lookup priority (mihomo `parseNameServerPolicy` parity), so
 # a plain `HashMap` cannot carry it. `serde` deserializes in document order.

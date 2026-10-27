@@ -468,3 +468,117 @@ fn binary_tagged_scalar_delivers_as_string() {
         "a !!binary scalar must reach Value as a string, got: {v}"
     );
 }
+
+/// Pins the two-stage `parse_raw_yaml` (`serde_json::Value` +
+/// `OrderedOverlays`) contract: empty / null documents normalize to an
+/// empty root mapping, and a single document carrying both `hosts` and
+/// `dns.nameserver-policy` (each with reverse-lexicographical keys and
+/// mid-map `<<:` merges) alongside `tun`, `sniffer`, and `listeners`
+/// sub-tables preserves both `IndexMap`s' exact YAML key order and all
+/// sibling fields.
+#[test]
+fn parse_raw_yaml_two_stage_preserves_empty_doc_and_ordered_maps_together() {
+    for empty in ["", "null\n"] {
+        let raw = meow_config::parse_raw_yaml(empty)
+            .unwrap_or_else(|e| panic!("empty/null doc {empty:?} must parse: {e}"));
+        assert!(raw.mixed_port.is_none());
+        assert!(raw.hosts.is_none());
+        assert!(raw.dns.is_none());
+        assert!(raw.tun.is_none());
+        assert!(raw.sniffer.is_none());
+        assert!(raw.listeners.is_none());
+    }
+
+    let doc = r#"
+mixed-port: 7890
+mode: rule
+x-hosts-base: &hbase
+  "m-merged.example": 10.0.0.9
+  "k-shared.example": 10.0.0.8
+x-nsp-base: &nbase
+  "+.m-merged.example": 9.9.9.9
+  "+.k-shared.example": [4.4.4.4, 8.8.4.4]
+hosts:
+  "z-first.example": 10.0.0.1
+  <<: *hbase
+  "k-shared.example": [10.0.0.2, 10.0.0.3]
+  "a-last.example": 10.0.0.4
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver:
+    - 1.1.1.1
+  nameserver-policy:
+    "+.z-first.example": 1.0.0.1
+    <<: *nbase
+    "+.k-shared.example": 2.2.2.2
+    "+.a-last.example": [3.3.3.3, 8.8.8.8]
+tun:
+  enable: true
+  device: meow0
+  mtu: 1400
+sniffer:
+  enable: true
+  timeout: 150
+  override-destination: true
+listeners:
+  - name: in-mixed
+    type: mixed
+    port: 17890
+"#;
+    let raw = meow_config::parse_raw_yaml(doc).unwrap();
+    assert_eq!(raw.mixed_port, Some(7890));
+    assert_eq!(raw.mode.as_deref(), Some("rule"));
+
+    let hosts = raw.hosts.expect("hosts present");
+    let host_keys: Vec<&str> = hosts.keys().map(String::as_str).collect();
+    assert_eq!(
+        host_keys,
+        [
+            "z-first.example",
+            "k-shared.example",
+            "a-last.example",
+            "m-merged.example",
+        ],
+        "hosts must keep YAML order (not BTreeMap lexicographical order)"
+    );
+    assert_eq!(
+        hosts["k-shared.example"].as_slice(),
+        ["10.0.0.2", "10.0.0.3"]
+    );
+    assert_eq!(hosts["m-merged.example"].as_slice(), ["10.0.0.9"]);
+
+    let dns = raw.dns.expect("dns present");
+    assert_eq!(dns.enable, Some(true));
+    assert_eq!(dns.enhanced_mode.as_deref(), Some("fake-ip"));
+    let nsp = dns.nameserver_policy.expect("nameserver-policy present");
+    let nsp_keys: Vec<&str> = nsp.keys().map(String::as_str).collect();
+    assert_eq!(
+        nsp_keys,
+        [
+            "+.z-first.example",
+            "+.k-shared.example",
+            "+.a-last.example",
+            "+.m-merged.example",
+        ],
+        "nameserver-policy must keep YAML order (not BTreeMap lexicographical order)"
+    );
+    assert_eq!(nsp["+.k-shared.example"].as_urls(), ["2.2.2.2"]);
+    assert_eq!(nsp["+.a-last.example"].as_urls(), ["3.3.3.3", "8.8.8.8"]);
+
+    let tun = raw.tun.expect("tun present");
+    assert!(tun.enable);
+    assert_eq!(tun.device.as_deref(), Some("meow0"));
+    assert_eq!(tun.mtu, Some(1400));
+
+    let sniffer = raw.sniffer.expect("sniffer present");
+    assert_eq!(sniffer.enable, Some(true));
+    assert_eq!(sniffer.timeout, Some(150));
+    assert_eq!(sniffer.override_destination, Some(true));
+
+    let listeners = raw.listeners.expect("listeners present");
+    assert_eq!(listeners.len(), 1);
+    assert_eq!(listeners[0].name, "in-mixed");
+    assert_eq!(listeners[0].listener_type, "mixed");
+    assert_eq!(listeners[0].port, Some(17890));
+}

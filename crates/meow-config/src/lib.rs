@@ -873,12 +873,40 @@ fn yaml_ser_options() -> serde_saphyr::SerializerOptions {
 /// mapping with explicit keys taking precedence — the same expansion
 /// `serde_yaml::Value::apply_merge` used to perform. Upstream mihomo
 /// configs (e.g. `rule-anchor` patterns) rely on this — see meow-ios#112.
+///
 /// Shared YAML→[`raw::RawConfig`] entry — nesting-depth guard plus
 /// merge-key expansion. Every untrusted config ingest point (config file,
 /// subscription/provider payloads, and `PUT /configs`) must use this so a
 /// remotely-supplied document can't bypass the depth bound or silently
 /// lose merged fields (issue #648 review).
+///
+/// Deserialization runs in two stages: `serde_saphyr` first parses the YAML
+/// event stream into [`serde_json::Value`] under `yaml_options` (enforcing
+/// `<<:` merge expansion, `DuplicateKeyPolicy::Error`,
+/// `reject_unsupported_tags`, `strict_booleans`,
+/// `NonFiniteFloatPolicy::PassThrough`, and `budget.max_depth`), and
+/// `serde_json::from_value` then populates [`raw::RawConfig`]. Routing the
+/// 19-struct `RawConfig` tree through `serde_json::Value` avoids
+/// monomorphizing `serde_saphyr`'s `YamlDeserializer::deserialize_map` state
+/// machine across every `Raw*` type, keeping the `minimal` binary within the
+/// ADR-0007 size budget. Because `serde_json::Value`'s default `BTreeMap`
+/// object backing sorts keys, a minimal `OrderedOverlays` pass over
+/// `serde_saphyr` runs when `hosts` or `dns.nameserver-policy` is present to
+/// preserve their YAML document order in [`raw::RawHosts`] and
+/// [`raw::RawNameserverPolicy`].
 pub fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
+    #[derive(Deserialize)]
+    struct OrderedOverlays {
+        hosts: Option<raw::RawHosts>,
+        dns: Option<OrderedDns>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct OrderedDns {
+        nameserver_policy: Option<raw::RawNameserverPolicy>,
+    }
+
     if !yaml_within_depth(content) {
         return Err(anyhow::anyhow!(
             "YAML document exceeds {MAX_YAML_DEPTH} levels of nesting"
@@ -891,11 +919,38 @@ pub fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
     // below the 32-level budget (migration review F1). The join is a
     // synchronous block on paths that already parsed inline — startup and
     // reload — so nothing downstream changes. See `meow_common::yaml`.
-    let raw = meow_common::yaml::run_on_parse_stack(content, |doc| {
-        serde_saphyr::from_str_with_options(doc, yaml_options())
+    let (val, hosts, nsp) = meow_common::yaml::run_on_parse_stack(content, |doc| {
+        let mut v: serde_json::Value = serde_saphyr::from_str_with_options(doc, yaml_options())?;
+        if v.is_null() {
+            v = serde_json::Value::Object(Default::default());
+        }
+        let has_hosts = v.get("hosts").is_some_and(|x| !x.is_null());
+        let has_nsp = v
+            .get("dns")
+            .and_then(|d| d.get("nameserver-policy"))
+            .is_some_and(|x| !x.is_null());
+        let (hosts, nsp) = if has_hosts || has_nsp {
+            let overlays: OrderedOverlays =
+                serde_saphyr::from_str_with_options(doc, yaml_options())?;
+            (
+                overlays.hosts,
+                overlays.dns.and_then(|d| d.nameserver_policy),
+            )
+        } else {
+            (None, None)
+        };
+        Ok::<_, serde_saphyr::Error>((v, hosts, nsp))
     })
-    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))?;
-    Ok(raw?)
+    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))??;
+
+    let mut raw: raw::RawConfig = serde_json::from_value(val)?;
+    if let Some(hosts) = hosts {
+        raw.hosts = Some(hosts);
+    }
+    if let (Some(dns), Some(nsp)) = (raw.dns.as_mut(), nsp) {
+        dns.nameserver_policy = Some(nsp);
+    }
+    Ok(raw)
 }
 
 /// Unique-per-call scratch sibling for atomic write-then-rename saves —
