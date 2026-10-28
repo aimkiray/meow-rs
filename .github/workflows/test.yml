@@ -307,6 +307,14 @@ jobs:
       - name: API tests without listener-tun (TUN reconcile)
         run: cargo nextest run -p meow-api --test api_test --retries 2 --no-fail-fast
 
+      # `yaml_boundary_test` carries the PR #827 scalar/key/tag pins
+      # (source-spelling delivery, duplicate-key verdicts, tagged-key
+      # checks). It is not named by the workspace invocation above, so
+      # without this step a regression in those pins would only surface
+      # in the nightly coverage run.
+      - name: YAML boundary contract tests (meow-config)
+        run: cargo nextest run -p meow-config --test yaml_boundary_test --retries 2 --no-fail-fast
+
       # `minimal` leaves out `logbook`, which every run above unifies on;
       # `-p meow-common` alone builds the stub that stands in for it
       # (`meow-common/src/logbook/disabled.rs`).
