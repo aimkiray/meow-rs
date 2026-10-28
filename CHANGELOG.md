@@ -401,11 +401,11 @@ the canonical, in-repo source a release is cut from.
   misread) are now deserialized as `Option<String>`, so a plain numeric
   or boolean spelling (`secret: 012345`, `secret: 0x1F`,
   `secret: 000000`) reaches the CLI exactly as written — the same text
-  the daemon's `parse_raw_yaml` delivers into `RawApi::secret`.
+  the daemon's `parse_raw_yaml` delivers into `RawConfig::secret`.
   Previously the CLI read them through `serde_json::Value` and
   re-serialized the resolved number (`012345` → `12345.0`), sending a
   `Bearer` secret the daemon did not write and 401-ing every call.
-  Three collateral shifts, all toward the daemon's own verdicts:
+  Two collateral shifts, both toward the daemon's own verdicts:
   container-valued `secret:`/`external-controller:` keys now hard-error
   instead of silently dropping to `None`, and spellings the old read
   discarded — `secret: true`, f64 overflows like `123e4567` — are now

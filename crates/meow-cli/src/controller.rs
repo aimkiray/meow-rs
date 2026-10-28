@@ -220,7 +220,7 @@ fn parse_config(text: &str) -> anyhow::Result<ConfigKeys> {
     // Both keys are read as `Option<String>`: a `String` target gets the
     // scalar's *source* spelling on the direct path (`secret: 012345` →
     // "012345", `0x1F` → "0x1F"), which is exactly what the daemon's
-    // `parse_raw_yaml` delivers into `RawApi::secret` — the two front-ends
+    // `parse_raw_yaml` delivers into `RawConfig::secret` — the two front-ends
     // must agree byte for byte or the CLI sends a secret the API rejects.
     Ok(ConfigKeys {
         controller: doc
@@ -279,7 +279,7 @@ mod tests {
 
     /// Numbers and other non-string scalars keep their *source* spelling —
     /// the value the daemon's `parse_raw_yaml` delivers into
-    /// `RawApi::secret`. A canonicalized secret (`012345` → `12345`) would
+    /// `RawConfig::secret`. A canonicalized secret (`012345` → `12345`) would
     /// be sent as `Bearer 12345` and 401 against a daemon expecting
     /// `012345`, so these pins must match the daemon byte for byte.
     #[test]

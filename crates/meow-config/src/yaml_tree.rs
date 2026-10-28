@@ -337,19 +337,21 @@ impl<'de> Source<'de> {
 /// on the *event's* tag. Capturing the tag beside the node lets
 /// [`NodeDe`]/[`KeyDe`] re-enforce both.
 ///
-/// The set is limited by `reject_unsupported_tags` in `yaml_options`:
-/// `!!timestamp` and any other non-core tag already failed the parse
-/// before a node exists. What can still reach `from_raw`: the core
-/// schema tags, `!!binary` (delivered as its base64 text by the
-/// `ignore_binary_tag_for_string` option), the non-specific `!`/`!!`
-/// marks (untyped), and `!!value` on the exact `=` mapping key —
-/// admitted by the strict mode, reported to the tree, and behaving as
-/// an untagged string-compatible key ([`NodeTag::Permissive`]) — the
-/// same verdict the pre-tree direct path gave it. `!!merge` is consumed
-/// by merge expansion before a `<<` key becomes a node. A genuinely
-/// unrecognized tag string would land in [`NodeTag::Unknown`], which
-/// the tagged drive rejects loudly — unreachable under these options,
-/// pinned by the `from_raw` unit test.
+/// What can reach `from_raw` is bounded by saphyr itself: `!!timestamp`
+/// and any unrecognized tag are refused while the scalar node is
+/// materialized (the typeless string read), and `!!merge` is consumed
+/// by merge expansion before a `<<` key becomes a node. The reachable
+/// set is therefore: the core schema tags, `!!binary` (delivered as its
+/// base64 text by the `ignore_binary_tag_for_string` option), the
+/// non-specific `!`/`!!` marks (untyped), and `!!value` on the exact
+/// `=` mapping key — admitted by the strict mode, reported to the tree,
+/// and behaving as an untagged string-compatible key
+/// ([`NodeTag::Permissive`]) — the same verdict the pre-tree direct
+/// path gave it. The local `!merge`/`!value` spellings bucket as
+/// `SfTag::Other` upstream and never arrive here; the arm covers them
+/// defensively. A genuinely unrecognized tag string would land in
+/// [`NodeTag::Unknown`], which the tagged drive rejects loudly —
+/// unreachable under these options, pinned by the `from_raw` unit test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NodeTag {
     Str,
