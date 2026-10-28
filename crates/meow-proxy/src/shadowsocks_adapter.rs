@@ -213,14 +213,7 @@ impl ShadowsocksAdapter {
                 let ws = gost_plugin::build_ws_layer(&cfg)?;
                 PluginKind::Gost(cfg, tls, ws)
             }
-            #[cfg(not(feature = "gost-plugin"))]
-            Some("gost-plugin") => {
-                return Err(MeowError::Config(
-                    "plugin 'gost-plugin' is not compiled into this build; \
-                     rebuild with `--features gost-plugin`"
-                        .to_string(),
-                ));
-            }
+
             #[cfg(feature = "shadow-tls")]
             Some("shadow-tls") => {
                 let cfg = shadow_tls_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
@@ -231,14 +224,7 @@ impl ShadowsocksAdapter {
                 let tls = shadow_tls_plugin::build_tls_layer(&cfg, client_fingerprint)?;
                 PluginKind::ShadowTls(cfg, tls)
             }
-            #[cfg(not(feature = "shadow-tls"))]
-            Some("shadow-tls") => {
-                return Err(MeowError::Config(
-                    "plugin 'shadow-tls' is not compiled into this build; \
-                     rebuild with `--features shadow-tls`"
-                        .to_string(),
-                ));
-            }
+
             #[cfg(feature = "restls")]
             Some("restls") => {
                 let cfg = restls_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
@@ -253,14 +239,7 @@ impl ShadowsocksAdapter {
                 }
                 PluginKind::Restls(cfg)
             }
-            #[cfg(not(feature = "restls"))]
-            Some("restls") => {
-                return Err(MeowError::Config(
-                    "plugin 'restls' is not compiled into this build; \
-                     rebuild with `--features restls`"
-                        .to_string(),
-                ));
-            }
+
             #[cfg(feature = "jls")]
             Some("jls") => {
                 let cfg = jls_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
@@ -275,14 +254,7 @@ impl ShadowsocksAdapter {
                 }
                 PluginKind::Jls(cfg)
             }
-            #[cfg(not(feature = "jls"))]
-            Some("jls") => {
-                return Err(MeowError::Config(
-                    "plugin 'jls' is not compiled into this build; \
-                     rebuild with `--features jls`"
-                        .to_string(),
-                ));
-            }
+
             #[cfg(feature = "kcptun")]
             Some("kcptun") => {
                 let cfg = kcptun_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
@@ -297,14 +269,7 @@ impl ShadowsocksAdapter {
                     Arc::clone(&dialer),
                 )))
             }
-            #[cfg(not(feature = "kcptun"))]
-            Some("kcptun") => {
-                return Err(MeowError::Config(
-                    "plugin 'kcptun' is not compiled into this build; \
-                     rebuild with `--features kcptun`"
-                        .to_string(),
-                ));
-            }
+
             #[cfg(feature = "ech-tls-tunnel")]
             Some("ech-tls-tunnel") => {
                 let cfg = ech_tls_tunnel::parse_opts(plugin_opts.unwrap_or(""))?;
@@ -318,15 +283,14 @@ impl ShadowsocksAdapter {
                 let tls = ech_tls_tunnel::build_tls_layer(&cfg)?;
                 PluginKind::EchTlsTunnel(cfg, tls)
             }
-            #[cfg(not(feature = "ech-tls-tunnel"))]
-            Some("ech-tls-tunnel") => {
-                return Err(MeowError::Config(
-                    "plugin 'ech-tls-tunnel' is not compiled into this build; \
-                     rebuild with `--features ech-tls-tunnel`"
-                        .to_string(),
-                ));
-            }
+
             Some(pname) => {
+                if let Some(feature) = feature_gated_plugin_feature(pname) {
+                    return Err(MeowError::Config(format!(
+                        "plugin '{pname}' is not compiled into this build; \
+                         rebuild with `--features {feature}`"
+                    )));
+                }
                 // SIP003u: a `mode=tcp_and_udp` / `udp_only` token in plugin-opts
                 // selects whether UDP relay is tunneled through the plugin. The
                 // token is consumed here (not forwarded to the plugin process)
@@ -841,6 +805,28 @@ pub fn is_builtin_sip003_plugin(name: &str) -> bool {
                 | "kcptun"
                 | "ech-tls-tunnel"
         )
+}
+
+/// Every reserved built-in SIP003 name whose transport sits behind an
+/// opt-in cargo feature, paired with the feature that re-enables it.
+/// Single source for the "not compiled" fallback in `ShadowsocksAdapter::new`:
+/// a name listed here must never reach the external `Plugin::start` arm,
+/// whatever the feature set — the `plugin '` marker in the error message is
+/// what meow-config's offline-validate gate matches on.
+const FEATURE_GATED_PLUGINS: &[(&str, &str)] = &[
+    ("gost-plugin", "gost-plugin"),
+    ("shadow-tls", "shadow-tls"),
+    ("restls", "restls"),
+    ("jls", "jls"),
+    ("kcptun", "kcptun"),
+    ("ech-tls-tunnel", "ech-tls-tunnel"),
+];
+
+fn feature_gated_plugin_feature(name: &str) -> Option<&'static str> {
+    FEATURE_GATED_PLUGINS
+        .iter()
+        .find(|(reserved, _)| *reserved == name)
+        .map(|(_, feature)| *feature)
 }
 
 /// Parses `plugin-opts` (already serialized to SIP003 `key=value;...` form) for
@@ -1912,6 +1898,64 @@ mod tests {
     use super::*;
     use meow_common::atomic::Uint;
     use std::sync::Mutex;
+
+    #[test]
+    fn builtin_plugin_names_never_reach_the_external_spawn_path() {
+        // Every name `is_builtin_sip003_plugin` lists must be either
+        // constructible in-process or rejected with the "not compiled"
+        // Config error — never handed to the external `Plugin::start`
+        // spawn path, whatever the feature set.
+        for (name, opts) in [
+            ("obfs", "mode=http"),
+            ("simple-obfs", "mode=http"),
+            ("v2ray-plugin", "mode=websocket"),
+            (
+                "gost-plugin",
+                "mode=websocket;host=cdn.example.com;mux=false",
+            ),
+            ("shadow-tls", "host=cover.example.com;version=3"),
+            (
+                "restls",
+                "host=cover.example.com;password=pw;version-hint=tls13",
+            ),
+            ("jls", "host=cover.example.com;username=u;password=pw"),
+            ("kcptun", "key=k"),
+            (
+                "ech-tls-tunnel",
+                "mode=client;sni=cover.example.com;path=/ws;ech_config=AAAA",
+            ),
+        ] {
+            assert!(
+                is_builtin_sip003_plugin(name),
+                "is_builtin_sip003_plugin must list {name}"
+            );
+            match ShadowsocksAdapter::new(
+                "inv",
+                "127.0.0.1",
+                1,
+                "p",
+                "aes-128-gcm",
+                false,
+                Some(name),
+                Some(opts),
+                None,
+                std::sync::Arc::new(crate::dialer::DirectDialer),
+            ) {
+                Ok(_) => {}
+                Err(MeowError::Config(msg)) => {
+                    assert!(
+                        msg.contains("not compiled into this build"),
+                        "{name}: expected the not-compiled error, got: {msg}"
+                    );
+                    assert!(
+                        !msg.contains("failed to start ss plugin"),
+                        "{name}: leaked to the external spawn path: {msg}"
+                    );
+                }
+                Err(other) => panic!("{name}: unexpected error: {other}"),
+            }
+        }
+    }
 
     #[test]
     fn sip003u_mode_extraction() {
