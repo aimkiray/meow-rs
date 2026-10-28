@@ -20,8 +20,10 @@ the canonical, in-repo source a release is cut from.
   the four built-in SIP003 plugin transports — `restls`, `jls`,
   `shadow-tls` and `gost-plugin` — moved behind Cargo features of the
   same names (forwarded through `meow-config` and `meow-app`), narrowing
-  `ss` itself to Shadowsocks plus `simple-obfs` and `v2ray-plugin`, the
-  contract ADR-0007 wrote down for `minimal`. `full` and default builds
+  `ss` itself to Shadowsocks plus `simple-obfs` and `v2ray-plugin`,
+  matching the minimal rationale ADR-0007 §1 wrote down (SS +
+  `v2ray-plugin` + Trojan; `simple-obfs` ships inside `ss` and is not
+  named there). `full` and default builds
   still enable all four, so release binaries are unchanged; a `minimal`
   build measured 10,003,680 B on x86_64-musl, about 254 KiB smaller.
   On a build without a plugin, `plugin: <name>` on an ss node now fails

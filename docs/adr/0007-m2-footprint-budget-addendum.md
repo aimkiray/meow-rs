@@ -5,8 +5,10 @@
 - Authors: aimkiray
 - Amends: [ADR-0007](0007-m2-footprint-budget.md)
 - Trigger: M2 footprint work — the `ss` feature pulled all four heavier
-  built-in plugin transports into every `minimal` build even though the
-  minimal contract only promises `simple-obfs` + `v2ray-plugin`.
+  built-in plugin transports into every `minimal` build even though
+  ADR-0007 §1's minimal rationale only names the SS + `v2ray-plugin`
+  story (`simple-obfs` ships inside `ss` as the second transport; the
+  ADR itself does not name it).
 
 ## Context
 
