@@ -310,6 +310,13 @@ jobs:
             --test yaml_backend_test \
             --test smux_singbox_integration --retries 2 --no-fail-fast
 
+      # `ss`-only meow-config: the six `*_disabled_errors_cleanly` negative
+      # tests (reserved plugin names never fall back to the external spawn
+      # path) compile only under this feature set, and the trojan-fixture
+      # dialer/prefetch tests are cfg'd out of it.
+      - name: meow-config ss-only unit tests
+        run: cargo nextest run -p meow-config --no-default-features --features ss --lib --retries 2 --no-fail-fast
+
       # `-p meow-api` builds api_test WITHOUT `listener-tun` (meow-app's
       # `full` never enters the graph), so the `cfg(not(feature =
       # "listener-tun"))` TUN-reconcile tests actually execute — in the

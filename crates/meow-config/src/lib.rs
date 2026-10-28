@@ -5120,6 +5120,7 @@ mod dialer_proxy_tests {
     /// runtime publishes. Before this, the named node was re-parsed bare and
     /// the fetch bypassed the configured front hop entirely (silent egress).
     /// The observable is which listener the dial physically contacts.
+    #[cfg(all(feature = "ss", feature = "trojan"))]
     #[tokio::test]
     async fn prefetch_map_dials_through_the_chain() {
         async fn counting_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
@@ -5182,6 +5183,7 @@ mod dialer_proxy_tests {
     /// first member when the store holds nothing (D1: `map.get` is the
     /// whole answer, no leaf-stripping). The observable is which member's
     /// listener the dial physically contacts.
+    #[cfg(all(feature = "ss", feature = "trojan"))]
     #[tokio::test]
     async fn geodata_match_group_dials_persisted_selection() {
         let (port_b1, b1_hits) = counting_listener().await;
@@ -5327,6 +5329,7 @@ mod dialer_proxy_tests {
     /// End-to-end wiring: a provider's `proxy:` key resolves through the
     /// shared prefetch layer, so its HTTP fetch dials the chained front
     /// hop rather than the leaf's own (or a direct) egress.
+    #[cfg(all(feature = "ss", feature = "trojan"))]
     #[tokio::test]
     async fn prefetch_payloads_fetch_rides_the_chain() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5370,6 +5373,7 @@ mod dialer_proxy_tests {
     /// inside the layer, so the fetch still dials A's chained front hop B.
     /// Reverting the default to a bare re-parse (or never building the
     /// layer) would dial A's own listener or the provider URL direct.
+    #[cfg(all(feature = "ss", feature = "trojan"))]
     #[tokio::test]
     async fn build_config_prefetch_default_rides_the_chain() {
         let (port_a, a_hits) = counting_listener().await;
@@ -5444,6 +5448,7 @@ mod dialer_proxy_tests {
     /// B's. A `dialer-proxy` chain is a deliberate egress, so its failed
     /// dial is never retried direct (#800 review): the URL listener sees no
     /// hit at all.
+    #[cfg(all(feature = "ss", feature = "trojan"))]
     #[tokio::test]
     async fn geodata_download_rides_the_chain() {
         let (port_a, a_hits) = counting_listener().await;

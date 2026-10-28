@@ -178,6 +178,12 @@ cargo test -p meow-config --features trusttunnel-h3 --lib
 # then export TRUSTTUNNEL_SERVER_BIN=/tmp/meow-tt-peer/trusttunnel_endpoint.
 # MEOW_TRUSTTUNNEL_E2E_ALLOW_SKIP=1 prints a loud local-only skip; CI rejects it.
 
+# `ss`-only meow-config: locks the "reserved plugin names never fall back
+# to the external spawn path" contract (the six *_disabled_errors_cleanly
+# negative tests compile only in this feature set); mirrors the CI leg
+# "meow-config ss-only unit tests".
+cargo test -p meow-config --no-default-features --features ss --lib
+
 # Mirrors the "Unit + integration tests (default features)" CI step. `--lib`
 # alone is not enough: it skips every `--test` target, so a broken integration
 # test (e.g. the ADR-0001 guard in `crate_invariants_test`) passes locally and

@@ -5479,7 +5479,7 @@ tls: true
     }
 
     /// Built-in in-process plugins and non-ss nodes are untouched by the gate.
-    #[cfg(feature = "ss")]
+    #[cfg(all(feature = "ss", feature = "trojan"))]
     #[test]
     fn provider_node_allows_builtin_plugins_and_other_types() {
         let cfg = proxy_config(
