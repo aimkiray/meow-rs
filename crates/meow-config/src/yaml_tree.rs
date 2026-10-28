@@ -340,8 +340,12 @@ impl<'de> Source<'de> {
 /// The set is limited by `reject_unsupported_tags` in `yaml_options`:
 /// anything outside the core schema, `!!timestamp`, `!!binary`,
 /// `!!merge`/`!!value` or the non-specific `!`/`!!` marks already failed
-/// the parse before a node exists — those sit in `Permissive` for
-/// completeness but are unreachable in practice.
+/// the parse before a node exists — those never reach `from_raw`, with
+/// one *reachable* exception: `!!value` on the exact `=` mapping key is
+/// admitted by the strict mode, reported to the tree, and behaves as an
+/// untagged string-compatible key ([`NodeTag::Permissive`]) — the same
+/// verdict the pre-tree direct path gave it. An unrecognized tag string
+/// lands in [`NodeTag::Unknown`], which the tagged drive rejects loudly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NodeTag {
     Str,
@@ -356,9 +360,21 @@ pub(crate) enum NodeTag {
     /// `!` / `!!` — forces string resolution but skips the core-tag
     /// checks (it is not a core-schema tag).
     NonSpecific,
-    /// `!!merge`/`!!value` key marks and anything else saphyr let
-    /// through: non-core and string-compatible — behaves like untagged.
+    /// A tag the strict mode admits on its exact key but the tree treats
+    /// as *untagged*: `!!value` (`=` mapping key) is reachable and keeps
+    /// the pre-tree verdict (string-compatible, no core-schema check);
+    /// `!!merge` (`<<` mapping key) is normally consumed by saphyr's
+    /// merge expansion before a node exists, and the arm keeps a
+    /// merge-tagged key from turning into a hard tree error should that
+    /// ever change.
     Permissive,
+    /// An unrecognized tag string reached `from_raw` — a spelling the
+    /// tree has no arm for. The strict mode rejects every tag outside its
+    /// whitelist before a node exists, so this variant is unreachable for
+    /// a real document today; it exists so a 2.x core-tag *spelling*
+    /// change (e.g. `tag:yaml.org,2002:str` drifts) fails loudly at tree
+    /// build instead of silently skipping the `!!str`/`!!int` checks.
+    Unknown,
 }
 
 impl NodeTag {
@@ -416,7 +432,18 @@ impl NodeTag {
             | "tag:yaml.org,2002:time"
             | "tag:yaml.org,2002:!time" => NodeTag::Timestamp,
             "!binary" | "tag:yaml.org,2002:binary" | "tag:yaml.org,2002:!binary" => NodeTag::Binary,
-            _ => NodeTag::Permissive,
+            // The two non-core marks the strict mode admits on their exact
+            // keys (`<<`, `=`): both are string-compatible and carry no
+            // core-schema semantics here, so they bucket as untagged.
+            "!merge"
+            | "!!merge"
+            | "tag:yaml.org,2002:merge"
+            | "tag:yaml.org,2002:!merge"
+            | "!value"
+            | "!!value"
+            | "tag:yaml.org,2002:value"
+            | "tag:yaml.org,2002:!value" => NodeTag::Permissive,
+            _ => NodeTag::Unknown,
         }
     }
 }
@@ -635,10 +662,23 @@ impl<'de> serde::Deserialize<'de> for SpannedNode<'de> {
                 // `String` seed (an `Option` seed would ask it for
                 // `deserialize_option`, which a value deserializer can't
                 // answer).
-                let tag = seq
-                    .next_element::<String>()?
-                    .as_deref()
-                    .map(NodeTag::from_raw);
+                let tag_str = seq.next_element::<String>()?;
+                let tag = tag_str.as_deref().map(NodeTag::from_raw);
+                if matches!(tag, Some(NodeTag::Unknown)) {
+                    let raw = tag_str.as_deref().unwrap_or("");
+                    // Neutral wording: the strict-mode whitelist let this
+                    // through, so the tree just has no arm for the spelling
+                    // (a 2.x core-tag rename is the realistic cause). The
+                    // node's `referenced` line/column rides in the text —
+                    // `de::Error::custom` cannot carry a `Loc`.
+                    return Err(de::Error::custom(match core.loc.line {
+                        0 => format!("unknown YAML tag `{raw}`"),
+                        line => format!(
+                            "unknown YAML tag `{raw}` (line {line}, column {})",
+                            core.loc.column
+                        ),
+                    }));
+                }
                 Ok(SpannedNode {
                     node: core.node,
                     loc: core.loc,
@@ -2135,5 +2175,46 @@ mod tests {
     fn key_error_uses_key_location() {
         let err = parse_map::<String>("a: 1\n~: 2\n").expect_err("null key should fail");
         assert!(err.to_string().starts_with("line 2 column 1"), "{err}");
+    }
+
+    /// `!!merge`/`!!value` are the two non-core marks the strict mode
+    /// admits on their exact keys (`<<`, `=`); they reach `from_raw` and
+    /// must bucket as the untagged-compatible `Permissive`, not `Unknown`
+    /// (which would make `!!value =: x` a hard tree error the direct path
+    /// never raised).
+    #[test]
+    fn merge_and_value_tags_are_permissive() {
+        for raw in [
+            "!!merge",
+            "!merge",
+            "tag:yaml.org,2002:merge",
+            "tag:yaml.org,2002:!merge",
+        ] {
+            assert_eq!(NodeTag::from_raw(raw), NodeTag::Permissive, "{raw}");
+        }
+        for raw in [
+            "!!value",
+            "!value",
+            "tag:yaml.org,2002:value",
+            "tag:yaml.org,2002:!value",
+        ] {
+            assert_eq!(NodeTag::from_raw(raw), NodeTag::Permissive, "{raw}");
+        }
+    }
+
+    /// Any spelling without an arm stays `Unknown` — the arm
+    /// `TaggedVisitor` rejects loudly. (Unreachable through a document:
+    /// the strict mode rejects these at the parse layer first — see
+    /// `unknown_tag_fails_loudly` in `yaml_boundary_test`.)
+    #[test]
+    fn unrecognized_tag_stays_unknown() {
+        for raw in [
+            "!!bogus",
+            "!bogus",
+            "tag:yaml.org,2002:bogus",
+            "tag:yaml.org,2002:!bogus",
+        ] {
+            assert_eq!(NodeTag::from_raw(raw), NodeTag::Unknown, "{raw}");
+        }
     }
 }

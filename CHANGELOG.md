@@ -335,11 +335,16 @@ the canonical, in-repo source a release is cut from.
   pathological edges relative to the direct saphyr path, all
   intentional:
 
-  - Map keys that saphyr's resolved-value dedup tells apart but that
-    read as the same string (`{1: a, "1": b}`) are *rejected* with
-    `duplicate mapping key` instead of the second silently overwriting
-    the first in the `String`-keyed map. Distinct spellings
-    (`{TrUe: a, "true": b}`) stay two keys, as before.
+  - Duplicate map keys are refused in two layers. serde-saphyr rejects
+    them at *parse* time — integer keys by resolved value (`0x1F` and
+    `31` collide even though the spellings differ), every other scalar
+    kind by its de-quoted text (`true` and `"true"` collide, as do
+    `"a"` and `'a'`, while `TrUe`/`"true"` and `1.0`/`1.00` stay
+    distinct). Keys that survive the parser but would deliver identical
+    text to a `String`-keyed map (`{1: a, "1": b}` — an `Int` and a
+    `Str` saphyr keeps apart, both reading as `"1"`) are then rejected
+    by the tree's own duplicate check, also with `duplicate mapping
+    key`, instead of the second silently overwriting the first.
   - A negative-zero literal (`port: -0`) resolves to integer `0` before
     the tree sees it, so an unsigned field accepts it where the direct
     path's text parse rejected the `-` prefix.
@@ -347,11 +352,17 @@ the canonical, in-repo source a release is cut from.
     `Float` node the named `.inf`/`.nan` spellings produce, so a typed
     `f64` field could no longer reject just the overflow forms — latent
     only, since no `Raw*` field is float-typed.
-  - `!!timestamp` scalars fail where the direct path's text parse could
-    still feed an integer target (`port: !!timestamp 7890`), and
+  - `!!timestamp` scalars fail at *parse* time, before the tree exists:
+    the typeless read that materializes each node refuses a tag that
+    cannot parse into a string, so `port: !!timestamp 7890` fails with
+    `cannot deserialize tagged scalar into string` whatever target the
+    value would feed — the direct path's text parse had accepted it.
     `!!binary` scalars stay accepted as strings (the
     `ignore_binary_tag_for_string` option) but still have no byte-decode
-    path — as before, no `Raw*` field is byte-typed.
+    path — as before, no `Raw*` field is byte-typed. `!!value` on the
+    exact `=` mapping key is the one non-core tag a document can still
+    reach the tree with; it parses as an untagged, string-compatible
+    key, as it did before the tree.
 - **`?proxy=` detection is now ASCII case-insensitive** —
   `?Proxy=`/`?PROXY=` on `tls://`/`https://` nameservers hard-error at
   config load instead of silently leaking the proxy name into the DoH
