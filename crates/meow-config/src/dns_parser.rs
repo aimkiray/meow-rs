@@ -567,6 +567,21 @@ async fn build_nameserver_policy(
             // rest (`+.`), and a mid-string `*` (e.g. `a.*.b`) is a literal
             // label only an identical query matches (DR-B F4/F15 unchanged).
             if !key_lower.is_empty() {
+                if domain_key_has_dead_label(&key_lower) {
+                    // As in `hosts:` — the arm still gets the pattern (its
+                    // node is simply unreachable); the warn only surfaces
+                    // the dead key. Strict mirrors the prefixed-key rule.
+                    if strict {
+                        return Err(anyhow::anyhow!(
+                            "nameserver-policy: '{expanded_key}' contains an empty \
+                             label (strict mode)"
+                        ));
+                    }
+                    warn!(
+                        "nameserver-policy: key '{expanded_key}' contains an empty \
+                         label; the entry can never match"
+                    );
+                }
                 patterns.push(PolicyPattern::Domain(key_lower));
             }
         }
@@ -1069,7 +1084,19 @@ fn build_hosts_trie(
         };
         // Keys go in as written: `*.foo` is a single-label wildcard, `+.foo`
         // covers the apex plus any-depth subdomains, a bare key is exact.
-        if !trie.insert_overwrite(host.trim(), host_entry) {
+        let key = host.trim();
+        if domain_key_has_dead_label(key) {
+            // The insert "succeeds" yet builds a node no query can reach
+            // (queries never carry an empty label) — surface it instead of
+            // letting the entry sit silently dead (issue #822 shape).
+            if strict {
+                return Err(anyhow::anyhow!(
+                    "hosts: '{key}' contains an empty label (strict mode)"
+                ));
+            }
+            warn!("hosts: key '{key}' contains an empty label; the entry can never match");
+        }
+        if !trie.insert_overwrite(key, host_entry) {
             if strict {
                 return Err(anyhow::anyhow!(
                     "hosts: '{}' is not a valid domain pattern (strict mode)",
@@ -1081,6 +1108,24 @@ fn build_hosts_trie(
     }
     reject_host_alias_cycles(&trie, &aliases)?;
     Ok(trie)
+}
+
+/// A domain key whose body still holds an empty label after the trie's
+/// own normalization — `a..b`, `..x`, `+..x` — dead-ends: the insert
+/// "succeeds", but the node it builds is unreachable because no query
+/// name ever contains an empty label (issue #822's shape, one level up:
+/// the trailing-dot half is fixed at `DomainTrie::insert`). Callers warn
+/// or hard-error on it; the key is still handed to the trie either way so
+/// the check is observability only, never a semantic change.
+fn domain_key_has_dead_label(key: &str) -> bool {
+    let key = key.trim();
+    let body = key
+        .strip_prefix("+.")
+        .or_else(|| key.strip_prefix("*."))
+        .or_else(|| key.strip_prefix('.'))
+        .unwrap_or(key)
+        .trim_end_matches('.');
+    !body.is_empty() && body.split('.').any(str::is_empty)
 }
 
 fn parse_host_alias(value: &str, host: &str) -> Result<String, anyhow::Error> {
@@ -1750,6 +1795,34 @@ mod tests {
     }
 
     #[test]
+    fn domain_key_has_dead_label_matrix() {
+        // Mid/leading empty labels are unreachable nodes once inserted.
+        for key in ["a..b", "..x", "+..x", "+.a..b", "a...b", " a..b "] {
+            assert!(domain_key_has_dead_label(key), "{key:?} is dead");
+        }
+        // A trailing-dot run is stripped by the trie (live); prefix-only
+        // bodies are refused by insert's own false return, not this check;
+        // a mid `*` stays a literal label.
+        for key in ["x.com.", "x..", "+.", "*.", ".", "a.*.b", "a.b", "x.com"] {
+            assert!(!domain_key_has_dead_label(key), "{key:?} is not dead");
+        }
+    }
+
+    #[test]
+    fn build_hosts_trie_empty_label_key_warns_lenient_errors_strict() {
+        let mut map = RawHosts::new();
+        map.insert("a..b".to_string(), one("1.2.3.4"));
+        // Lenient: warns, still inserts the (unreachable) node — no query
+        // may ever see it, and `a.b` in particular must not leak to it.
+        let trie = build_hosts_trie(Some(&map), false).unwrap();
+        assert!(trie.search("a.b").is_none(), "a..b must not leak to a.b");
+        let err = build_hosts_trie(Some(&map), true)
+            .err()
+            .expect("strict must hard-error on an empty label");
+        assert!(err.to_string().contains("empty label"));
+    }
+
+    #[test]
     fn build_hosts_trie_rejects_domain_in_multi_value_list() {
         let mut map = RawHosts::new();
         map.insert(
@@ -2105,6 +2178,28 @@ mod tests {
             pol.lookup("anything.cn").is_none(),
             "skipped geosite entry must not match"
         );
+    }
+
+    /// A domain key with an empty label (`a..b`) is an unreachable trie
+    /// node: lenient mode warns and keeps the (dead) arm, strict mode
+    /// hard-errors like it does for unsupported prefixed keys.
+    #[tokio::test]
+    async fn parse_nameserver_policy_empty_label_key_warns_lenient_errors_strict() {
+        use crate::raw::RawNspValue;
+        let map = nsp_map(&[("a..b", RawNspValue::One("rcode://success".to_string()))]);
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
+            .await
+            .expect("empty-label key must stay lenient");
+        assert!(
+            pol.lookup("a.b").is_none(),
+            "the dead node must not leak to a.b"
+        );
+        let result =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), true).await;
+        let Err(err) = result else {
+            panic!("strict must hard-error on an empty-label key")
+        };
+        assert!(err.to_string().contains("empty label"));
     }
 
     #[tokio::test]
