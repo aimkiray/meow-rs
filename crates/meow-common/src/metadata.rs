@@ -356,6 +356,13 @@ pub fn metadata_ip_literal(s: &str) -> Option<IpAddr> {
 /// SRV/DKIM-style names use underscores), in dot-separated labels of 1-63
 /// bytes, at most 253 bytes in total plus one optional trailing dot.
 /// Punycode (`xn--`) IDNs pass as ordinary labels; raw non-ASCII does not.
+/// A name must also carry at least one non-numeric byte (`-` and `_`
+/// count): `2130706433`, `0177.0.0.1`, `123.456` are libc `inet_aton`
+/// spellings of addresses, not hostnames — on a libc dial path they fold
+/// into IPs the DOMAIN rules never saw (Go `net.isDomainName` makes the
+/// same call). Letter-bearing spellings like `0x7f000001` still pass, as
+/// they do under Go; they stay closed because the dial path resolves
+/// hostnames through the DNS resolver (NXDOMAIN), not libc.
 ///
 /// Everything else is refused — in particular `@`, `/`, `?`, `#`, `:`,
 /// `%`, whitespace, control bytes and NUL. Those bytes make the name the
@@ -376,13 +383,15 @@ pub fn is_valid_host(host: &str) -> bool {
     if name.is_empty() || name.len() > 253 {
         return false;
     }
+    let mut non_numeric = false;
     name.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    })
+            && label.bytes().all(|b| {
+                non_numeric |= !b.is_ascii_digit();
+                b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+            })
+    }) && non_numeric
 }
 
 #[cfg(test)]
@@ -465,6 +474,13 @@ mod tests {
             "_sip._tcp.example.com",
             "my_host-1.example",
             "-leading-hyphen.example",
+            // `-` counts as non-numeric, so a digits-and-hyphens name is a
+            // hostname, not an inet_aton spelling (Go isDomainName parity).
+            "123-456",
+            // Letter-bearing numeric spellings pass the gate under Go too;
+            // they stay closed only because the dial path resolves names
+            // through DNS (NXDOMAIN), never libc.
+            "0x7f000001",
             "1.2.3.4",
             "255.255.255.255",
             "::1",
@@ -523,6 +539,14 @@ mod tests {
             "[evil.com]",
             "fe80::1%eth0",
             "[fe80::1%25eth0]",
+            // Digits-and-dots spellings are inet_aton address forms a libc
+            // dial path would fold into IPs, not hostnames (Go parity:
+            // no non-numeric byte).
+            "2130706433",
+            "0177.0.0.1",
+            "123.456",
+            "1.2.3.4.5",
+            "999",
         ] {
             assert!(!is_valid_host(host), "{host:?} must be rejected");
         }
