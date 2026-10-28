@@ -966,3 +966,249 @@ fn visitor_error_points_at_the_value() {
         "expected `line 3 column 14: hosts.a.example: …`, got: {err}"
     );
 }
+
+/// `!!value` on the exact `=` mapping key is a *reachable* tagged key:
+/// the strict mode admits it there, reports the tag to the tree, and the
+/// direct path treated the node as an untagged, string-compatible key.
+/// `NodeTag::Permissive` keeps that verdict, so the document parses and
+/// the key's text is its source spelling (`=`).
+#[test]
+fn value_tagged_equals_key_is_accepted() {
+    for doc in [
+        "hosts:\n  !!value =: 1.1.1.1\n",
+        "hosts:\n  !!value '=': 1.1.1.1\n",
+        "hosts:\n  !!value =: 1.1.1.1\n  b.example: 2.2.2.2\n",
+    ] {
+        let raw = meow_config::parse_raw_yaml(doc).unwrap();
+        let hosts = raw.hosts.unwrap();
+        let keys: Vec<&str> = hosts.keys().map(String::as_str).collect();
+        assert!(
+            keys.contains(&"="),
+            "{doc:?} keeps the `=` key, got {keys:?}"
+        );
+        assert_eq!(
+            keys.iter().filter(|key| **key == "=").count(),
+            1,
+            "{doc:?} has exactly one `=` key"
+        );
+    }
+}
+
+/// `!!merge` on a `<<` key is consumed by saphyr's merge expansion, so
+/// the document parses exactly like an untagged `<<:` (direct-path
+/// parity); the `Permissive` arm covers a merge-tagged key should a
+/// future 2.x stop consuming it.
+#[test]
+fn merge_tagged_merge_key_expands() {
+    let raw =
+        meow_config::parse_raw_yaml("x-base: &b\n  secret: 012345\n!!merge <<: *b\n").unwrap();
+    assert_eq!(raw.secret.as_deref(), Some("012345"));
+}
+
+/// `!!timestamp` scalars fail in the *parse* layer, before the tree is
+/// built: the typeless read that materializes each node refuses any tag
+/// that cannot parse into a string, so the failure does not depend on
+/// the target field — an integer target fails exactly like a `String`
+/// one. Pinned because the CHANGELOG discloses it as a residual and the
+/// direct path accepted `port: !!timestamp 7890`.
+#[test]
+fn timestamp_scalar_fails_at_parse_regardless_of_target() {
+    for doc in [
+        "port: !!timestamp 7890\n",
+        "secret: !!timestamp 7890\n",
+        "tun:\n  mtu: !!timestamp 1500\n",
+        "x-unused: !!timestamp 7890\n",
+    ] {
+        let err = meow_config::parse_raw_yaml(doc).unwrap_err().to_string();
+        assert!(
+            err.contains("cannot deserialize tagged scalar into string"),
+            "{doc:?} must fail the parse-layer tag check, got: {err}"
+        );
+    }
+    // Without the tag the same documents parse: the failure is the tag,
+    // not the value or the field.
+    assert_eq!(
+        meow_config::parse_raw_yaml("port: 7890\n").unwrap().port,
+        Some(7890)
+    );
+    assert_eq!(
+        meow_config::parse_raw_yaml("secret: 7890\n")
+            .unwrap()
+            .secret
+            .as_deref(),
+        Some("7890")
+    );
+}
+
+/// The error-path key segment uses the key's *source* spelling: a `0x1F`
+/// key reports `hosts.0x1F`, not the canonical `hosts.31`.
+#[test]
+fn key_error_path_keeps_source_spelling() {
+    let err = meow_config::parse_raw_yaml("mixed-port: 7890\nhosts:\n  0x1F: [1,2]\n")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("line 3 column 9") && err.contains("hosts.0x1F:"),
+        "expected the source-spelling key segment, got: {err}"
+    );
+    assert!(
+        !err.contains("hosts.31:"),
+        "the canonical segment must not be rendered, got: {err}"
+    );
+}
+
+/// The typed-error `line N column M: path:` contract reaches a scalar
+/// nested under `tun:` and one inside a `proxy-groups:` sequence element
+/// — the legs `typed_errors_carry_line_column_and_field_path` and
+/// `top_level_scalar_error_reports_value_column` do not cover.
+#[test]
+fn typed_errors_reach_tun_mtu_and_group_interval() {
+    // `tun.mtu` typed error: a non-u16 spelling (`abc`) fails the typed
+    // u16 parse at the value node. (The <1280 business check lives in
+    // `parse_tun_config`, after `parse_raw_yaml`, so it is not exercised
+    // here — the typed-error position is what this pins.)
+    let err = meow_config::parse_raw_yaml("tun:\n  enable: true\n  mtu: abc\n")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("tun.mtu") && err.contains("invalid u16"),
+        "expected `tun.mtu: invalid u16`, got: {err}"
+    );
+
+    let err = meow_config::parse_raw_yaml(
+        "proxy-groups:\n  - name: g\n    type: url-test\n    interval: nope\n",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("proxy-groups[0].interval"),
+        "expected the `proxy-groups[0].interval` path, got: {err}"
+    );
+}
+
+/// An unrecognized YAML tag fails loudly — at the *parse* layer, before
+/// the tree exists: `reject_unsupported_tags` rejects any tag outside
+/// its whitelist inside saphyr, so the error is saphyr's `unsupported
+/// tag` message, not the tree's `NodeTag::Unknown` arm. The tree arm
+/// itself is covered by the `yaml_tree` unit test
+/// `unrecognized_tag_stays_unknown` (it is unreachable through a
+/// document, because saphyr rejects first).
+#[test]
+fn unknown_tag_fails_loudly() {
+    for doc in ["x: !!unknown 1", "x: !bogus 1"] {
+        let err = meow_config::parse_raw_yaml(doc).unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported tag"),
+            "an unknown YAML tag must fail at the parse layer, got: {err}"
+        );
+        // The tree-layer message proves the tag got past the whitelist;
+        // it must not appear for these spellings.
+        assert!(
+            !err.contains("unknown YAML tag"),
+            "the tree layer must not be reached for {doc:?}, got: {err}"
+        );
+    }
+}
+
+/// `0x1F` (an `Int`) and `"31"` (a `Str`) deliver different texts, so
+/// both keys survive: saphyr dedups integer keys by resolved value but
+/// never crosses the int/string line, and the tree's delivered-text
+/// check sees `"0x1F"` vs `"31"`. (`0x1F` + unquoted `31` would collide
+/// at the parse layer — both resolve to `Int(31)`.)
+#[test]
+fn int_key_and_quoted_int_spelling_coexist() {
+    let raw = meow_config::parse_raw_yaml("hosts:\n  0x1F: 1.1.1.1\n  \"31\": 2.2.2.2\n").unwrap();
+    let hosts = raw.hosts.unwrap();
+    let keys: Vec<&str> = hosts.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["0x1F", "31"]);
+}
+
+/// Map-level value pins: four keys whose delivered texts differ coexist
+/// (`0x1F`/`"31"`/`'true'`/`TrUe`) — the delivered-text dedup must not
+/// over-reject — and a `nameserver-policy` row keeps its written order,
+/// which is its lookup priority.
+#[test]
+fn value_diff_map_key_sets_pinned() {
+    let raw = meow_config::parse_raw_yaml(
+        "hosts:\n  0x1F: 1.1.1.1\n  \"31\": 2.2.2.2\n  'true': 3.3.3.3\n  TrUe: 4.4.4.4\n",
+    )
+    .unwrap();
+    let hosts = raw.hosts.unwrap();
+    let keys: Vec<&str> = hosts.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["0x1F", "31", "true", "TrUe"]);
+
+    let raw = meow_config::parse_raw_yaml(
+        "dns:\n  enable: true\n  nameserver-policy:\n    1.0: 1.1.1.1\n    \"1\": 2.2.2.2\n    +.example.com: 3.3.3.3\n",
+    )
+    .unwrap();
+    let policy = raw.dns.unwrap().nameserver_policy.unwrap();
+    let keys: Vec<&str> = policy.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["1.0", "1", "+.example.com"]);
+}
+
+/// A scalar defined inside an anchored mapping and merged into the root
+/// keeps its anchor's *source* spelling when it lands in a `String`
+/// field (`0x1F`'s canonical int text would be `31`). This is the
+/// `<<:`-replay leg of the alias contract
+/// `number_like_strings_keep_source_text` pins for `*n`.
+#[test]
+fn merge_replayed_scalar_keeps_anchor_spelling() {
+    let raw =
+        meow_config::parse_raw_yaml("x-base: &base\n  secret: 012345\n  mode: 0x1F\n<<: *base\n")
+            .unwrap();
+    assert_eq!(
+        raw.secret.as_deref(),
+        Some("012345"),
+        "merge replay of a scalar into a String field keeps source spelling"
+    );
+    assert_eq!(
+        raw.mode.as_deref(),
+        Some("0x1F"),
+        "merge replay of a second scalar keeps its anchor source spelling"
+    );
+}
+
+/// Source-spelling slicing survives non-ASCII text and CRLF line ends at
+/// the `RawConfig` boundary (`yaml_tree`'s `string_targets_get_source_
+/// spelling` pins the same shapes through `NodeDe` directly — this is
+/// the end-to-end leg): a multi-byte key keeps its spelling, and a CRLF
+/// document's scalars carry no `\r`.
+#[test]
+fn source_spelling_survives_non_ascii_and_crlf() {
+    let raw = meow_config::parse_raw_yaml("hosts:\n  \u{5bc6}\u{7801}.example: 1.1.1.1\n").unwrap();
+    let hosts = raw.hosts.unwrap();
+    assert_eq!(
+        hosts.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["\u{5bc6}\u{7801}.example"]
+    );
+
+    let raw = meow_config::parse_raw_yaml("secret: 0123\r\nhosts:\r\n  0x1F: 1.1.1.1\r\n").unwrap();
+    assert_eq!(raw.secret.as_deref(), Some("0123"));
+    assert_eq!(
+        raw.hosts
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["0x1F"]
+    );
+}
+
+/// A negative-zero literal resolves to integer `0` before the tree sees
+/// it, so an unsigned field accepts `port: -0` where the direct path's
+/// text parse rejected the `-` prefix — a disclosed residual (see
+/// CHANGELOG). A `String` field still gets the `-0` source spelling.
+#[test]
+fn negative_zero_literal_is_accepted_for_unsigned_targets() {
+    assert_eq!(
+        meow_config::parse_raw_yaml("port: -0\n").unwrap().port,
+        Some(0)
+    );
+    assert_eq!(
+        meow_config::parse_raw_yaml("secret: -0\n")
+            .unwrap()
+            .secret
+            .as_deref(),
+        Some("-0")
+    );
+}

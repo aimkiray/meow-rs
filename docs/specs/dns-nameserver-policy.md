@@ -124,10 +124,18 @@ detection — two `<<:` lines in one map expand both anchors) is a
 hard parse error (`duplicate mapping key: …`): every ingest path
 (`-f`/`-t`, `--config-string`, `PUT /configs`) funnels through
 `parse_raw_yaml`, whose serde-saphyr parser rejects the document before
-the policy map is built. The first-position/last-value fold
-(mihomo `orderedmap.Set`) only decides duplicates from non-literal
-sources — a programmatically built map, or the expanded segments of one
-comma-mixed key. serde-saphyr expands a `<<:` merge key in the event
+the policy map is built. That parse-layer check compares integer keys by
+resolved value (`0x1F` and `31` collide though spelled differently) and
+every other scalar kind by canonical tag plus de-quoted text — untagged
+keys share the `str` tag, so `1.0` and `"1.0"` collide while `TrUe` and
+`"true"` do not; keys that get past it still fail when they
+deliver identical text to the `String`-keyed map — `1:` and `"1":` both
+arrive as `"1"` — where the tree raises its own `duplicate mapping key`
+rather than let the second entry overwrite the first. The
+first-position/last-value fold (mihomo `orderedmap.Set`) only decides
+duplicates from non-literal sources — a programmatically built map, or
+the expanded segments of one comma-mixed key. serde-saphyr expands a
+`<<:` merge key in the event
 stream: the anchor's entries append at the END of the map no matter
 where the `<<:` line is written, and an explicit key keeps its written
 position and wins over a merged same-name key — merged entries are

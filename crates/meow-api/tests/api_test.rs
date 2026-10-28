@@ -5370,6 +5370,50 @@ async fn put_configs_swaps_running_dns_resolver() {
     );
 }
 
+/// A `PUT /configs` parse failure surfaces the tree error through the 400
+/// body: `{"message": "config parse error: line N column M: port: invalid
+/// u16"}`. The `line`/`column` prefix plus the dotted field path are the
+/// contract `-t` shares with the API, but only `yaml_tree`'s own tests
+/// asserted them — this pins the cross-crate body so a regression in the
+/// location/path plumbing shows up at the HTTP boundary.
+#[tokio::test]
+async fn put_configs_parse_error_reports_line_column_and_path() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let payload = base64::engine::general_purpose::STANDARD
+        .encode("mode: rule\nport: abc\nrules:\n  - MATCH,DIRECT\n");
+    let response = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    let message = json["message"]
+        .as_str()
+        .expect("a parse failure must carry a message");
+    assert!(
+        message.contains("config parse error"),
+        "expected the parse-error prefix, got: {message}"
+    );
+    assert!(
+        message.contains("line 2 column 7"),
+        "expected the value node's line/column, got: {message}"
+    );
+    assert!(
+        message.contains("port: invalid u16"),
+        "expected the field path and typed message, got: {message}"
+    );
+}
+
 /// Issue #561: a `PUT /configs` whose `proxy-groups:` declares a duplicate
 /// name hits the declaration-level check — 400 and neither the committed
 /// raw config nor the route table changes. `?force=true` cannot push it

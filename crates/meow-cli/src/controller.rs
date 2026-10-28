@@ -199,8 +199,8 @@ fn parse_config(text: &str) -> anyhow::Result<ConfigKeys> {
     #[derive(serde::Deserialize)]
     struct ConfigDoc {
         #[serde(rename = "external-controller")]
-        external_controller: Option<serde_json::Value>,
-        secret: Option<serde_json::Value>,
+        external_controller: Option<String>,
+        secret: Option<String>,
     }
     // `run_on_parse_stack` still wraps the descend — `IgnoredAny` recurses
     // too, and the guard keeps one defence shape across both front-ends.
@@ -217,15 +217,16 @@ fn parse_config(text: &str) -> anyhow::Result<ConfigKeys> {
         )
     })
     .map_err(|e| anyhow!("cannot spawn YAML parse thread: {e}"))??;
-    // A number is a valid YAML secret (`secret: 123456`); read scalars as text.
-    let scalar = |value: Option<serde_json::Value>| match value? {
-        serde_json::Value::String(text) => Some(text),
-        serde_json::Value::Number(number) => Some(number.to_string()),
-        _ => None,
-    };
+    // Both keys are read as `Option<String>`: a `String` target gets the
+    // scalar's *source* spelling on the direct path (`secret: 012345` →
+    // "012345", `0x1F` → "0x1F"), which is exactly what the daemon's
+    // `parse_raw_yaml` delivers into `RawConfig::secret` — the two front-ends
+    // must agree byte for byte or the CLI sends a secret the API rejects.
     Ok(ConfigKeys {
-        controller: scalar(doc.external_controller).filter(|address| !address.is_empty()),
-        secret: scalar(doc.secret),
+        controller: doc
+            .external_controller
+            .filter(|address| !address.is_empty()),
+        secret: doc.secret,
     })
 }
 
@@ -274,6 +275,34 @@ mod tests {
 
         let keys = parse_config("external-controller: ''\n").unwrap();
         assert!(keys.controller.is_none() && keys.secret.is_none());
+    }
+
+    /// Numbers and other non-string scalars keep their *source* spelling —
+    /// the value the daemon's `parse_raw_yaml` delivers into
+    /// `RawConfig::secret`. A canonicalized secret (`012345` → `12345`) would
+    /// be sent as `Bearer 12345` and 401 against a daemon expecting
+    /// `012345`, so these pins must match the daemon byte for byte.
+    #[test]
+    fn config_scalars_keep_their_source_spelling() {
+        for (document, expected) in [
+            ("secret: 012345\n", "012345"),
+            ("secret: 0x1F\n", "0x1F"),
+            ("secret: 000000\n", "000000"),
+            ("secret: 123e4567\n", "123e4567"),
+            ("secret: 123456\n", "123456"),
+            ("secret: \"012345\"\n", "012345"),
+        ] {
+            let keys = parse_config(document).unwrap();
+            assert_eq!(keys.secret.as_deref(), Some(expected), "{document}");
+        }
+        // `true` is untagged, so both front-ends deliver its source
+        // spelling; only an explicit `!!bool` tag fails the string request.
+        let keys = parse_config("secret: true\n").unwrap();
+        assert_eq!(keys.secret.as_deref(), Some("true"));
+        assert!(
+            parse_config("secret: !!bool true\n").is_err(),
+            "the daemon rejects a tagged bool secret; the CLI must too"
+        );
     }
 
     /// `strict_booleans` mirrors the daemon: YAML 1.1 spellings stay
