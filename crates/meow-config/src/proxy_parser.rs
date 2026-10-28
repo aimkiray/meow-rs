@@ -275,7 +275,7 @@ pub(crate) fn parse_proxy_with_identity(
             };
 
             #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
-            let mut adapter = ShadowsocksAdapter::new(
+            let mut adapter = ShadowsocksAdapter::new_with_plugin_status(
                 name,
                 server,
                 port,
@@ -286,11 +286,9 @@ pub(crate) fn parse_proxy_with_identity(
                 plugin_opts_str.as_deref(),
                 client_fingerprint,
                 Arc::clone(dialer),
+                plugin_missing,
             )
-            .map_err(|e| {
-                *plugin_missing = matches!(e, meow_common::MeowError::PluginNotCompiled { .. });
-                format!("ss: {e}")
-            })?;
+            .map_err(|e| format!("ss: {e}"))?;
             #[cfg(feature = "mux")]
             if let Some(mux_options) = parse_mux_options(name, config)? {
                 // muxcool rides VLESS CommandMux; shadowsocks has no

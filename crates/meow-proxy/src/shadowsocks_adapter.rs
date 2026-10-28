@@ -172,6 +172,41 @@ impl ShadowsocksAdapter {
         client_fingerprint: Option<&str>,
         dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Result<Self> {
+        Self::new_with_plugin_status(
+            name,
+            server,
+            port,
+            password,
+            cipher,
+            udp,
+            plugin_name,
+            plugin_opts,
+            client_fingerprint,
+            dialer,
+            &mut false,
+        )
+    }
+
+    /// Construct an adapter while reporting whether a built-in plugin is unavailable.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "same node fields as the public constructor"
+    )]
+    pub fn new_with_plugin_status(
+        name: &str,
+        server: &str,
+        port: u16,
+        password: &str,
+        cipher: &str,
+        udp: bool,
+        plugin_name: Option<&str>,
+        plugin_opts: Option<&str>,
+        client_fingerprint: Option<&str>,
+        dialer: Arc<dyn crate::dialer::TcpDialer>,
+        plugin_missing: &mut bool,
+    ) -> Result<Self> {
+        *plugin_missing = false;
         // Consumed only by the feature-gated plugin arms below (shadow-tls's
         // cover handshake; restls/jls warn-and-ignore) — under an `ss`-only
         // build every consumer is cfg'd out, so pin the binding.
@@ -286,10 +321,10 @@ impl ShadowsocksAdapter {
 
             Some(pname) => {
                 if let Some(feature) = feature_gated_plugin_feature(pname) {
-                    return Err(MeowError::PluginNotCompiled {
-                        name: pname.to_string(),
-                        feature,
-                    });
+                    *plugin_missing = true;
+                    return Err(MeowError::Config(format!(
+                        "plugin '{pname}' is not compiled into this build; rebuild with `--features {feature}`"
+                    )));
                 }
                 // SIP003u: a `mode=tcp_and_udp` / `udp_only` token in plugin-opts
                 // selects whether UDP relay is tunneled through the plugin. The
@@ -811,7 +846,7 @@ pub fn is_builtin_sip003_plugin(name: &str) -> bool {
 /// opt-in cargo feature, paired with the feature that re-enables it.
 /// Single source for the "not compiled" fallback in `ShadowsocksAdapter::new`:
 /// a name listed here must never reach the external `Plugin::start` arm,
-/// whatever the feature set — the typed error lets callers distinguish it.
+/// whatever the feature set — the constructor reports its identity separately.
 const FEATURE_GATED_PLUGINS: &[(&str, &str)] = &[
     ("gost-plugin", "gost-plugin"),
     ("shadow-tls", "shadow-tls"),
@@ -1928,6 +1963,15 @@ mod tests {
                 is_builtin_sip003_plugin(name),
                 "is_builtin_sip003_plugin must list {name}"
             );
+            let disabled = match name {
+                "gost-plugin" => !cfg!(feature = "gost-plugin"),
+                "shadow-tls" => !cfg!(feature = "shadow-tls"),
+                "restls" => !cfg!(feature = "restls"),
+                "jls" => !cfg!(feature = "jls"),
+                "kcptun" => !cfg!(feature = "kcptun"),
+                "ech-tls-tunnel" => !cfg!(feature = "ech-tls-tunnel"),
+                _ => false,
+            };
             match ShadowsocksAdapter::new(
                 "inv",
                 "127.0.0.1",
@@ -1940,13 +1984,9 @@ mod tests {
                 None,
                 std::sync::Arc::new(crate::dialer::DirectDialer),
             ) {
-                Ok(_) => {}
-                Err(MeowError::PluginNotCompiled {
-                    name: actual,
-                    feature,
-                }) => {
-                    assert_eq!(actual, name);
-                    assert_eq!(feature, name);
+                Ok(_) => assert!(!disabled, "disabled {name} unexpectedly constructed"),
+                Err(MeowError::Config(message)) if disabled => {
+                    assert_eq!(message, format!("plugin '{name}' is not compiled into this build; rebuild with `--features {name}`"));
                 }
                 Err(other) => panic!("{name}: unexpected error: {other}"),
             }
