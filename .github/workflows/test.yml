@@ -311,7 +311,8 @@ jobs:
       # (source-spelling delivery, duplicate-key verdicts, tagged-key
       # checks). It is not named by the workspace invocation above, so
       # without this step a regression in those pins would only surface
-      # in the nightly coverage run.
+      # in the nightly coverage run. The windows/macos curated lists
+      # name it directly, so all three test jobs run the suite.
       - name: YAML boundary contract tests (meow-config)
         run: cargo nextest run -p meow-config --test yaml_boundary_test --retries 2 --no-fail-fast
 
@@ -500,7 +501,8 @@ jobs:
             --test tls_test \
             --test boring_tls_test \
             --test ws_test \
-            --test crate_publish_metadata_test --test yaml_backend_test --retries 2 --no-fail-fast
+            --test crate_publish_metadata_test --test yaml_backend_test \
+            --test yaml_boundary_test --retries 2 --no-fail-fast
 
       # TUN inbound tests: `listener-tun` is not a default feature, so the
       # workspace --lib leg above never compiles or runs the tun module's
@@ -571,7 +573,8 @@ jobs:
             --test tls_test \
             --test boring_tls_test \
             --test ws_test \
-            --test crate_publish_metadata_test --test yaml_backend_test --retries 2 --no-fail-fast
+            --test crate_publish_metadata_test --test yaml_backend_test \
+            --test yaml_boundary_test --retries 2 --no-fail-fast
 
       # `listener-tun` is not a default feature; this leg runs the tun
       # module's tests — notably the macOS regression guard that an unset

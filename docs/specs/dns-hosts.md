@@ -148,8 +148,9 @@ has, refused in two layers. serde-saphyr rejects a YAML-literal duplicate
 key (other than `<<`, a merge directive that may repeat) at *parse* time
 (`duplicate mapping key: …`) — integer keys by resolved value (`0x1F` and
 `31` collide though spelled differently), every other scalar kind by its
-de-quoted text (`true` and `"true"` collide, while `TrUe`/`"true"` and
-`1.0`/`1.00` stay distinct). Keys that survive the parser but deliver
+canonical tag plus de-quoted text (untagged keys share the `str` tag, so
+`true` and `"true"` collide while `TrUe`/`"true"` and `1.0`/`1.00` stay
+distinct on spelling). Keys that survive the parser but deliver
 identical text to the `String`-keyed hosts map — `1:` and `"1":` both
 arrive as `"1"` — are then rejected by the tree's own duplicate check,
 again `duplicate mapping key`: every ingest path (`-f`/`-t`,

@@ -126,8 +126,9 @@ hard parse error (`duplicate mapping key: …`): every ingest path
 `parse_raw_yaml`, whose serde-saphyr parser rejects the document before
 the policy map is built. That parse-layer check compares integer keys by
 resolved value (`0x1F` and `31` collide though spelled differently) and
-every other scalar kind by de-quoted text (`1.0` and `"1.0"` collide,
-`TrUe` and `"true"` do not); keys that get past it still fail when they
+every other scalar kind by canonical tag plus de-quoted text — untagged
+keys share the `str` tag, so `1.0` and `"1.0"` collide while `TrUe` and
+`"true"` do not; keys that get past it still fail when they
 deliver identical text to the `String`-keyed map — `1:` and `"1":` both
 arrive as `"1"` — where the tree raises its own `duplicate mapping key`
 rather than let the second entry overwrite the first. The

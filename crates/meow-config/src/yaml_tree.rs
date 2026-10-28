@@ -371,9 +371,11 @@ pub(crate) enum NodeTag {
     /// An unrecognized tag string reached `from_raw` — a spelling the
     /// tree has no arm for. The strict mode rejects every tag outside its
     /// whitelist before a node exists, so this variant is unreachable for
-    /// a real document today; it exists so a 2.x core-tag *spelling*
-    /// change (e.g. `tag:yaml.org,2002:str` drifts) fails loudly at tree
-    /// build instead of silently skipping the `!!str`/`!!int` checks.
+    /// a real document today (only `from_raw`'s bucketing is test-covered;
+    /// the `TaggedVisitor` rejection itself stays unexercised); it exists
+    /// so a 2.x core-tag *spelling* change (e.g. `tag:yaml.org,2002:str`
+    /// drifts) fails loudly at tree build instead of silently skipping
+    /// the `!!str`/`!!int` checks.
     Unknown,
 }
 

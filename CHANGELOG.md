@@ -338,13 +338,17 @@ the canonical, in-repo source a release is cut from.
   - Duplicate map keys are refused in two layers. serde-saphyr rejects
     them at *parse* time — integer keys by resolved value (`0x1F` and
     `31` collide even though the spellings differ), every other scalar
-    kind by its de-quoted text (`true` and `"true"` collide, as do
-    `"a"` and `'a'`, while `TrUe`/`"true"` and `1.0`/`1.00` stay
-    distinct). Keys that survive the parser but would deliver identical
-    text to a `String`-keyed map (`{1: a, "1": b}` — an `Int` and a
-    `Str` saphyr keeps apart, both reading as `"1"`) are then rejected
-    by the tree's own duplicate check, also with `duplicate mapping
-    key`, instead of the second silently overwriting the first.
+    kind by its canonical tag plus de-quoted text. Untagged scalars all
+    carry the `str` tag, so `true` and `"true"` collide, as do `"a"`
+    and `'a'`, while `TrUe`/`"true"` and `1.0`/`1.00` stay distinct on
+    spelling alone; an explicit non-string tag keeps its own tag, so
+    `!!bool true:` does not parse-collide with `true:` (the key's tag
+    check rejects it later instead). Keys that survive the parser but
+    would deliver identical text to a `String`-keyed map
+    (`{1: a, "1": b}` — an `Int` and a `Str` saphyr keeps apart, both
+    reading as `"1"`) are then rejected by the tree's own duplicate
+    check, also with `duplicate mapping key`, instead of the second
+    silently overwriting the first.
   - A negative-zero literal (`port: -0`) resolves to integer `0` before
     the tree sees it, so an unsigned field accepts it where the direct
     path's text parse rejected the `-` prefix.
@@ -359,10 +363,11 @@ the canonical, in-repo source a release is cut from.
     value would feed — the direct path's text parse had accepted it.
     `!!binary` scalars stay accepted as strings (the
     `ignore_binary_tag_for_string` option) but still have no byte-decode
-    path — as before, no `Raw*` field is byte-typed. `!!value` on the
-    exact `=` mapping key is the one non-core tag a document can still
-    reach the tree with; it parses as an untagged, string-compatible
-    key, as it did before the tree.
+    path — as before, no `Raw*` field is byte-typed. The non-specific
+    `!`/`!!` marks aside (they reach the tree untyped, forcing string
+    resolution), `!!value` on the exact `=` mapping key is the one
+    non-core tag a document can still reach the tree with; it parses as
+    an untagged, string-compatible key, as it did before the tree.
 - **`?proxy=` detection is now ASCII case-insensitive** —
   `?Proxy=`/`?PROXY=` on `tls://`/`https://` nameservers hard-error at
   config load instead of silently leaking the proxy name into the DoH
@@ -390,14 +395,20 @@ the canonical, in-repo source a release is cut from.
   order-insensitive — the DNS-rebuild comparison in meow-api compares
   it pairwise.
 - **meow-cli reads a plain-scalar `secret` as its source spelling**:
-  the controller file's `secret:`/`external-controller:` are now
-  deserialized as `Option<String>`, so a plain numeric or boolean
-  spelling (`secret: 012345`, `secret: 0x1F`, `secret: 000000`) reaches
-  the CLI exactly as written — the same text the daemon's
-  `parse_raw_yaml` delivers into `RawApi::secret`. Previously the CLI
-  read them through `serde_json::Value` and re-serialized the resolved
-  number (`012345` → `12345.0`), sending a `Bearer` secret the daemon
-  did not write and 401-ing every call.
+  the `secret:`/`external-controller:` keys of the config file meow-cli
+  loads (`-f`/`--config`; the daemon-published controller file was never
+  misread) are now deserialized as `Option<String>`, so a plain numeric
+  or boolean spelling (`secret: 012345`, `secret: 0x1F`,
+  `secret: 000000`) reaches the CLI exactly as written — the same text
+  the daemon's `parse_raw_yaml` delivers into `RawApi::secret`.
+  Previously the CLI read them through `serde_json::Value` and
+  re-serialized the resolved number (`012345` → `12345.0`), sending a
+  `Bearer` secret the daemon did not write and 401-ing every call.
+  Three collateral shifts, all toward the daemon's own verdicts:
+  container-valued `secret:`/`external-controller:` keys now hard-error
+  instead of silently dropping to `None`, and spellings the old read
+  discarded — `secret: true`, f64 overflows like `123e4567` — are now
+  delivered, matching what the daemon accepted all along.
 
 ### Security
 
