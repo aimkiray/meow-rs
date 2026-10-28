@@ -2085,6 +2085,19 @@ fn insert_parsed_leaves(
                 );
                 unavailable_placeholder(name, &e, meow_common::AdapterType::TrustTunnel)
             }
+            Err(e) if crate::is_offline_validate() && proxy_parser::plugin_not_compiled(&e) => {
+                // Offline validate (`meow -t`): a node that only failed
+                // because this build lacks the plugin's cargo feature must
+                // fail the config check — warn-dropping it here would let
+                // `-t` pass and the node's group/rules silently fall back.
+                let name = raw_proxy
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unnamed>");
+                return Err(anyhow::anyhow!(
+                    "proxies: failed to parse '{name}' (offline validate): {e}"
+                ));
+            }
             Err(e) => {
                 warn!("Failed to parse proxy: {}", e);
                 continue;
@@ -4857,6 +4870,91 @@ pub async fn build_config(
         geodata,
         geo_needs,
     })
+}
+
+#[cfg(test)]
+mod offline_gate_tests {
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    use super::*;
+
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    fn raw_gost_node() -> HashMap<String, serde_json::Value> {
+        let mut m = HashMap::new();
+        m.insert(
+            "name".to_string(),
+            serde_json::Value::String("s-gost".to_string()),
+        );
+        m.insert(
+            "type".to_string(),
+            serde_json::Value::String("ss".to_string()),
+        );
+        m.insert(
+            "server".to_string(),
+            serde_json::Value::String("1.2.3.4".to_string()),
+        );
+        m.insert("port".to_string(), serde_json::Value::from(8388u16));
+        m.insert(
+            "password".to_string(),
+            serde_json::Value::String("p".to_string()),
+        );
+        m.insert(
+            "cipher".to_string(),
+            serde_json::Value::String("aes-128-gcm".to_string()),
+        );
+        m.insert(
+            "plugin".to_string(),
+            serde_json::Value::String("gost-plugin".to_string()),
+        );
+        m
+    }
+
+    /// Offline validate OFF (the live-serving default): the node is
+    /// warn-dropped and load proceeds — unchanged runtime behaviour.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[test]
+    fn offline_gate_off_keeps_warn_drop() {
+        let mut proxies = HashMap::new();
+        let mut names = std::collections::HashSet::new();
+        insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, false).unwrap();
+        assert!(!proxies.contains_key("s-gost"), "node must be dropped");
+    }
+
+    /// Offline validate ON (`meow -t`): the same node must be fatal. The
+    /// flag is process-global and never reset, so the ON state is pinned
+    /// in a child process (same pattern as rule_provider's
+    /// `MEOW_OFFLINE_VALIDATE_CHILD`).
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[test]
+    fn offline_gate_on_fails_the_config_load() {
+        const CHILD: &str = "MEOW_OFFLINE_GATE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            crate::set_offline_validate(true);
+            let mut proxies = HashMap::new();
+            let mut names = std::collections::HashSet::new();
+            let Err(err) =
+                insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, false)
+            else {
+                panic!("offline validate must make the disabled-plugin node fatal");
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("offline validate"), "msg: {msg}");
+            assert!(
+                msg.contains("plugin 'gost-plugin' is not compiled into this build"),
+                "msg: {msg}"
+            );
+            assert!(msg.contains("`--features gost-plugin`"), "msg: {msg}");
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("offline_gate_tests::offline_gate_on_fails_the_config_load")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "child gate run failed: {status:?}");
+    }
 }
 
 #[cfg(test)]

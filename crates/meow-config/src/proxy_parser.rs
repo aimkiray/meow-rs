@@ -418,6 +418,17 @@ fn is_external_sip003_plugin(plugin: Option<&str>) -> bool {
         .is_some_and(|p| !meow_proxy::shadowsocks_adapter::is_builtin_sip003_plugin(p))
 }
 
+/// True when `err` is `ShadowsocksAdapter::new`'s "builtin SIP003 plugin not
+/// compiled into this build" error. The adapter's `MeowError::Config` is
+/// stringified at the `format!("ss: {e}")` boundary in
+/// [`parse_proxy_with_dialer`], so the stable marker substrings — not a
+/// typed variant — are the only signal that reaches the config layer.
+/// `plugin '` keeps the proxy-type and trusttunnel-quic "not compiled"
+/// variants out; they describe compiled-out protocols, not plugins.
+pub(crate) fn plugin_not_compiled(err: &str) -> bool {
+    err.contains("plugin '") && err.contains("is not compiled into this build")
+}
+
 /// Reject a `ProxyDialer` for adapter types that do not thread it through.
 ///
 /// `anytls` dials via `meow_common::connect_tcp_host` internally and

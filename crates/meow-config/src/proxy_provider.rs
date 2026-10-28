@@ -914,6 +914,16 @@ impl ProxyProvider {
                 if strict && self.is_file_vehicle() {
                     return Err(anyhow::anyhow!("proxy-provider '{}': {e}", self.name));
                 }
+                // Offline validate (`meow -t`): `ingest`'s
+                // plugin-not-compiled gate must stay fatal here too —
+                // this warn-and-start-empty path is what `-t` walks for
+                // a `file:` provider, and swallowing the error would
+                // let the config check pass with the provider silently
+                // empty (its groups falling back).
+                if crate::is_offline_validate() && proxy_parser::plugin_not_compiled(&e.to_string())
+                {
+                    return Err(e);
+                }
                 warn_initial_load_failure(self, &e.to_string());
                 Ok(false)
             }
@@ -1147,6 +1157,16 @@ impl ProxyProvider {
                         label,
                         &e,
                         meow_common::AdapterType::TrustTunnel,
+                    ));
+                }
+                Err(e) if crate::is_offline_validate() && proxy_parser::plugin_not_compiled(&e) => {
+                    // Same offline-validate gate as `insert_parsed_leaves`:
+                    // a provider node needing a feature this build lacks
+                    // must fail `meow -t`, not warn-drop (which would empty
+                    // a group and silently reroute its traffic).
+                    return Err(anyhow::anyhow!(
+                        "proxy-provider '{}': node '{raw_name}' failed to parse (offline validate): {e}",
+                        self.name
                     ));
                 }
                 Err(e) => {

@@ -42,7 +42,7 @@ The `ss` built-in-plugin contract is narrowed to `simple-obfs`/`obfs` +
 `v2ray-plugin`; the four heavier SIP003 transports above are opt-in and
 re-bundled into `default`/`full`. All built-in plugin names (including
 `kcptun` and `ech-tls-tunnel`) stay *reserved* even when compiled out — a
-`plugin:` line naming one fails config load with "not compiled into this
+`plugin:` line naming one fails the config check (`meow -t`, exit 1) with "not compiled into this
 build" instead of falling through to the external SIP003 subprocess path.
 
 ### Transport features
