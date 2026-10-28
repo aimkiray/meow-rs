@@ -363,11 +363,12 @@ the canonical, in-repo source a release is cut from.
     value would feed — the direct path's text parse had accepted it.
     `!!binary` scalars stay accepted as strings (the
     `ignore_binary_tag_for_string` option) but still have no byte-decode
-    path — as before, no `Raw*` field is byte-typed. The non-specific
-    `!`/`!!` marks aside (they reach the tree untyped, forcing string
-    resolution), `!!value` on the exact `=` mapping key is the one
-    non-core tag a document can still reach the tree with; it parses as
-    an untagged, string-compatible key, as it did before the tree.
+    path — as before, no `Raw*` field is byte-typed. Setting aside the
+    non-specific `!`/`!!` marks (they reach the tree untyped, forcing
+    string resolution) and `!!binary` above, `!!value` on the exact `=`
+    mapping key is the remaining non-core tag a document can reach the
+    tree with; it parses as an untagged, string-compatible key, as it
+    did before the tree.
 - **`?proxy=` detection is now ASCII case-insensitive** —
   `?Proxy=`/`?PROXY=` on `tls://`/`https://` nameservers hard-error at
   config load instead of silently leaking the proxy name into the DoH

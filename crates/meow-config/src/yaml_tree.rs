@@ -338,14 +338,18 @@ impl<'de> Source<'de> {
 /// [`NodeDe`]/[`KeyDe`] re-enforce both.
 ///
 /// The set is limited by `reject_unsupported_tags` in `yaml_options`:
-/// anything outside the core schema, `!!timestamp`, `!!binary`,
-/// `!!merge`/`!!value` or the non-specific `!`/`!!` marks already failed
-/// the parse before a node exists — those never reach `from_raw`, with
-/// one *reachable* exception: `!!value` on the exact `=` mapping key is
-/// admitted by the strict mode, reported to the tree, and behaves as an
-/// untagged string-compatible key ([`NodeTag::Permissive`]) — the same
-/// verdict the pre-tree direct path gave it. An unrecognized tag string
-/// lands in [`NodeTag::Unknown`], which the tagged drive rejects loudly.
+/// `!!timestamp` and any other non-core tag already failed the parse
+/// before a node exists. What can still reach `from_raw`: the core
+/// schema tags, `!!binary` (delivered as its base64 text by the
+/// `ignore_binary_tag_for_string` option), the non-specific `!`/`!!`
+/// marks (untyped), and `!!value` on the exact `=` mapping key —
+/// admitted by the strict mode, reported to the tree, and behaving as
+/// an untagged string-compatible key ([`NodeTag::Permissive`]) — the
+/// same verdict the pre-tree direct path gave it. `!!merge` is consumed
+/// by merge expansion before a `<<` key becomes a node. A genuinely
+/// unrecognized tag string would land in [`NodeTag::Unknown`], which
+/// the tagged drive rejects loudly — unreachable under these options,
+/// pinned by the `from_raw` unit test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NodeTag {
     Str,
