@@ -286,10 +286,10 @@ impl ShadowsocksAdapter {
 
             Some(pname) => {
                 if let Some(feature) = feature_gated_plugin_feature(pname) {
-                    return Err(MeowError::Config(format!(
-                        "plugin '{pname}' is not compiled into this build; \
-                         rebuild with `--features {feature}`"
-                    )));
+                    return Err(MeowError::PluginNotCompiled {
+                        name: pname.to_string(),
+                        feature,
+                    });
                 }
                 // SIP003u: a `mode=tcp_and_udp` / `udp_only` token in plugin-opts
                 // selects whether UDP relay is tunneled through the plugin. The
@@ -811,8 +811,7 @@ pub fn is_builtin_sip003_plugin(name: &str) -> bool {
 /// opt-in cargo feature, paired with the feature that re-enables it.
 /// Single source for the "not compiled" fallback in `ShadowsocksAdapter::new`:
 /// a name listed here must never reach the external `Plugin::start` arm,
-/// whatever the feature set — the `plugin '` marker in the error message is
-/// what meow-config's offline-validate gate matches on.
+/// whatever the feature set — the typed error lets callers distinguish it.
 const FEATURE_GATED_PLUGINS: &[(&str, &str)] = &[
     ("gost-plugin", "gost-plugin"),
     ("shadow-tls", "shadow-tls"),
@@ -1942,15 +1941,12 @@ mod tests {
                 std::sync::Arc::new(crate::dialer::DirectDialer),
             ) {
                 Ok(_) => {}
-                Err(MeowError::Config(msg)) => {
-                    assert!(
-                        msg.contains("not compiled into this build"),
-                        "{name}: expected the not-compiled error, got: {msg}"
-                    );
-                    assert!(
-                        !msg.contains("failed to start ss plugin"),
-                        "{name}: leaked to the external spawn path: {msg}"
-                    );
+                Err(MeowError::PluginNotCompiled {
+                    name: actual,
+                    feature,
+                }) => {
+                    assert_eq!(actual, name);
+                    assert_eq!(feature, name);
                 }
                 Err(other) => panic!("{name}: unexpected error: {other}"),
             }

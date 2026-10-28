@@ -24,6 +24,8 @@ pub enum MeowError {
     Io(#[from] std::io::Error),
     #[error("Config error: {0}")]
     Config(String),
+    #[error("Config error: plugin '{name}' is not compiled into this build; rebuild with `--features {feature}`")]
+    PluginNotCompiled { name: String, feature: &'static str },
     #[error("DNS error: {0}")]
     Dns(String),
     #[error("Proxy error: {0}")]

@@ -166,6 +166,17 @@ pub fn parse_proxy_provider_node(
     allow_external_plugin: bool,
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
+    parse_proxy_provider_node_with_identity(config, ipv6, allow_external_plugin, dialer, &mut false)
+}
+
+pub(crate) fn parse_proxy_provider_node_with_identity(
+    config: &HashMap<String, serde_json::Value>,
+    ipv6: bool,
+    allow_external_plugin: bool,
+    dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
+    plugin_missing: &mut bool,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
+    *plugin_missing = false;
     if !allow_external_plugin && node_selects_external_plugin(config) {
         let name = config.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         let plugin = config.get("plugin").and_then(|v| v.as_str()).unwrap_or("");
@@ -177,7 +188,7 @@ pub fn parse_proxy_provider_node(
         ));
     }
     let _ = allow_external_plugin;
-    parse_proxy_with_dialer(config, dialer, ipv6)
+    parse_proxy_with_identity(config, dialer, ipv6, plugin_missing)
 }
 
 /// Like [parse_proxy] but injects a custom [meow_proxy::dialer::TcpDialer]
@@ -190,6 +201,16 @@ pub fn parse_proxy_with_dialer(
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
     ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
+    parse_proxy_with_identity(config, dialer, ipv6, &mut false)
+}
+
+pub(crate) fn parse_proxy_with_identity(
+    config: &HashMap<String, serde_json::Value>,
+    dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
+    ipv6: bool,
+    plugin_missing: &mut bool,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
+    let _ = &plugin_missing;
     let name = config
         .get("name")
         .and_then(|v| v.as_str())
@@ -266,7 +287,10 @@ pub fn parse_proxy_with_dialer(
                 client_fingerprint,
                 Arc::clone(dialer),
             )
-            .map_err(|e| format!("ss: {e}"))?;
+            .map_err(|e| {
+                *plugin_missing = matches!(e, meow_common::MeowError::PluginNotCompiled { .. });
+                format!("ss: {e}")
+            })?;
             #[cfg(feature = "mux")]
             if let Some(mux_options) = parse_mux_options(name, config)? {
                 // muxcool rides VLESS CommandMux; shadowsocks has no
@@ -418,16 +442,15 @@ fn is_external_sip003_plugin(plugin: Option<&str>) -> bool {
         .is_some_and(|p| !meow_proxy::shadowsocks_adapter::is_builtin_sip003_plugin(p))
 }
 
-/// True when `err` is `ShadowsocksAdapter::new`'s "builtin SIP003 plugin not
-/// compiled into this build" error. The adapter's `MeowError::Config` is
-/// stringified at the `format!("ss: {e}")` boundary in
-/// [`parse_proxy_with_dialer`], so the stable marker substrings — not a
-/// typed variant — are the only signal that reaches the config layer.
-/// `plugin '` keeps the proxy-type and trusttunnel-quic "not compiled"
-/// variants out; they describe compiled-out protocols, not plugins.
-pub(crate) fn plugin_not_compiled(err: &str) -> bool {
-    err.contains("plugin '") && err.contains("is not compiled into this build")
+/// Preserved through anyhow context wrappers during provider ingest.
+#[derive(Debug)]
+pub(crate) struct PluginNotCompiled(pub String);
+impl std::fmt::Display for PluginNotCompiled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
+impl std::error::Error for PluginNotCompiled {}
 
 /// Reject a `ProxyDialer` for adapter types that do not thread it through.
 ///

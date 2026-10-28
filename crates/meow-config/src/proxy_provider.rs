@@ -920,7 +920,9 @@ impl ProxyProvider {
                 // a `file:` provider, and swallowing the error would
                 // let the config check pass with the provider silently
                 // empty (its groups falling back).
-                if crate::is_offline_validate() && proxy_parser::plugin_not_compiled(&e.to_string())
+                if crate::is_offline_validate()
+                    && e.downcast_ref::<proxy_parser::PluginNotCompiled>()
+                        .is_some()
                 {
                     return Err(e);
                 }
@@ -1131,7 +1133,8 @@ impl ProxyProvider {
                 continue;
             }
 
-            match self.parse_node(raw_map, raw_name, &mut declared) {
+            let mut plugin_missing = false;
+            match self.parse_node(raw_map, raw_name, &mut declared, &mut plugin_missing) {
                 Ok(proxy) => result.push(proxy),
                 Err(e) if strict => {
                     return Err(anyhow::anyhow!(
@@ -1159,15 +1162,15 @@ impl ProxyProvider {
                         meow_common::AdapterType::TrustTunnel,
                     ));
                 }
-                Err(e) if crate::is_offline_validate() && proxy_parser::plugin_not_compiled(&e) => {
+                Err(e) if crate::is_offline_validate() && plugin_missing => {
                     // Same offline-validate gate as `insert_parsed_leaves`:
                     // a provider node needing a feature this build lacks
                     // must fail `meow -t`, not warn-drop (which would empty
                     // a group and silently reroute its traffic).
-                    return Err(anyhow::anyhow!(
+                    return Err(proxy_parser::PluginNotCompiled(format!(
                         "proxy-provider '{}': node '{raw_name}' failed to parse (offline validate): {e}",
                         self.name
-                    ));
+                    )).into());
                 }
                 Err(e) => {
                     warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
@@ -1227,6 +1230,7 @@ impl ProxyProvider {
         raw_map: &HashMap<String, serde_json::Value>,
         raw_name: &str,
         declared: &mut Vec<String>,
+        plugin_missing: &mut bool,
     ) -> Result<Arc<dyn Proxy>, String> {
         let direct: Arc<dyn meow_proxy::dialer::TcpDialer> =
             Arc::new(meow_proxy::dialer::DirectDialer);
@@ -1258,22 +1262,24 @@ impl ProxyProvider {
             .or(self.provider_dialer.as_deref())
             .or(node_dialer)
         else {
-            return proxy_parser::parse_proxy_provider_node(
+            return proxy_parser::parse_proxy_provider_node_with_identity(
                 raw_map,
                 self.ipv6,
                 self.allow_external_plugin,
                 &direct,
+                plugin_missing,
             );
         };
         // `override.dialer-proxy: ""` is the upstream "clear the chain"
         // knob — the override wrote over both lower levels, so the node
         // dials direct by operator intent, not by a missing field.
         if dialer_name.is_empty() {
-            return proxy_parser::parse_proxy_provider_node(
+            return proxy_parser::parse_proxy_provider_node_with_identity(
                 raw_map,
                 self.ipv6,
                 self.allow_external_plugin,
                 &direct,
+                plugin_missing,
             );
         }
         if dialer_name == raw_name {
@@ -1283,22 +1289,24 @@ impl ProxyProvider {
         let target = meow_proxy::dialer::DialerTarget::new(dialer_name, &self.dialer_registry);
         let chained: Arc<dyn meow_proxy::dialer::TcpDialer> =
             Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()).owned_by(raw_name));
-        let proxy = match proxy_parser::parse_proxy_provider_node(
+        let proxy = match proxy_parser::parse_proxy_provider_node_with_identity(
             raw_map,
             self.ipv6,
             self.allow_external_plugin,
             &chained,
+            plugin_missing,
         ) {
             Ok(proxy) => proxy,
             Err(e) => {
                 // The adapter type cannot carry an injected dialer — or the
                 // node is unparseable, in which case the direct re-parse
                 // surfaces the real error.
-                let inner = proxy_parser::parse_proxy_provider_node(
+                let inner = proxy_parser::parse_proxy_provider_node_with_identity(
                     raw_map,
                     self.ipv6,
                     self.allow_external_plugin,
                     &direct,
+                    plugin_missing,
                 )?;
                 warn!(
                     provider = %self.name,

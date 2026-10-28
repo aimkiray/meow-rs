@@ -2063,7 +2063,15 @@ fn insert_parsed_leaves(
     strict: bool,
 ) -> Result<(), anyhow::Error> {
     for raw_proxy in raw_proxies {
-        let proxy = match proxy_parser::parse_proxy(raw_proxy, ipv6) {
+        let mut plugin_missing = false;
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(meow_proxy::dialer::DirectDialer);
+        let proxy = match proxy_parser::parse_proxy_with_identity(
+            raw_proxy,
+            &dialer,
+            ipv6,
+            &mut plugin_missing,
+        ) {
             Ok(proxy) => proxy,
             Err(e) if strict => {
                 let name = raw_proxy
@@ -2085,7 +2093,7 @@ fn insert_parsed_leaves(
                 );
                 unavailable_placeholder(name, &e, meow_common::AdapterType::TrustTunnel)
             }
-            Err(e) if crate::is_offline_validate() && proxy_parser::plugin_not_compiled(&e) => {
+            Err(e) if crate::is_offline_validate() && plugin_missing => {
                 // Offline validate (`meow -t`): a node that only failed
                 // because this build lacks the plugin's cargo feature must
                 // fail the config check — warn-dropping it here would let
@@ -4943,6 +4951,44 @@ mod offline_gate_tests {
                 "msg: {msg}"
             );
             assert!(msg.contains("`--features gost-plugin`"), "msg: {msg}");
+            let err =
+                insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, true)
+                    .unwrap_err();
+            assert!(err.to_string().contains("strict mode"));
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("config.yml");
+            let nodes = dir.path().join("nodes.yml");
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let load = |body: &str| {
+                std::fs::write(&config, body).unwrap();
+                rt.block_on(load_config(config.to_str().unwrap()))
+            };
+            let marker = "plugin 'x' is not compiled into this build";
+            let local = format!(
+                "proxies:\n  - name: other\n    type: \"{marker}\"\nrules: [MATCH,DIRECT]\n"
+            );
+            assert!(load(&local).is_ok(), "non-SS type is warn-dropped");
+            let provider = "proxy-providers:\n  pv:\n    type: file\n    path: nodes.yml\nrules: [MATCH,DIRECT]\n";
+            std::fs::write(
+                &nodes,
+                format!("proxies:\n  - name: other\n    type: \"{marker}\"\n"),
+            )
+            .unwrap();
+            assert!(
+                load(provider).is_ok(),
+                "provider non-SS type is warn-dropped"
+            );
+            std::fs::write(&nodes, format!("proxies: \"{marker}\"\n")).unwrap();
+            assert!(load(provider).is_ok(), "malformed provider is warn-dropped");
+            std::fs::write(&nodes, "proxies:\n  - {name: disabled, type: ss, server: 1.2.3.4, port: 8388, password: p, cipher: aes-128-gcm, plugin: gost-plugin}\n").unwrap();
+            let err = load(provider)
+                .err()
+                .expect("disabled provider plugin must fail");
+            assert!(
+                err.downcast_ref::<proxy_parser::PluginNotCompiled>()
+                    .is_some(),
+                "typed identity survives provider wrapping: {err:?}"
+            );
             return;
         }
         let exe = std::env::current_exe().unwrap();
