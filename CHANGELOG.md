@@ -16,6 +16,23 @@ the canonical, in-repo source a release is cut from.
   default options requires; set `mux: false` (or `mux=0` in SIP003
   `plugin-opts`) for a server started with `mux=0`. A number counts as
   on unless it is 0, as upstream reads it.
+- **The `ss` outbound keeps only the plugins `minimal` always promised**:
+  the four built-in SIP003 plugin transports — `restls`, `jls`,
+  `shadow-tls` and `gost-plugin` — moved behind Cargo features of the
+  same names (forwarded through `meow-config` and `meow-app`), narrowing
+  `ss` itself to Shadowsocks plus `simple-obfs` and `v2ray-plugin`, the
+  contract ADR-0007 wrote down for `minimal`. `full` and default builds
+  still enable all four, so release binaries are unchanged; a `minimal`
+  build measured 10,003,680 B on x86_64-musl, about 254 KiB smaller.
+  On a build without a plugin, `plugin: <name>` on an ss node now fails
+  the config check with `plugin '<name>' is not compiled into this
+  build; rebuild with \`--features <name>\`` — and because the reserved
+  names still count as built-in, the node can never fall through to
+  spawning an external SIP003 binary of the same name. The same guard
+  closes that fallthrough for `kcptun` and `ech-tls-tunnel`, whose
+  disabled builds previously could reach the external-plugin path.
+  `gost-plugin`'s `mux: true` additionally requires the `mux` Cargo
+  feature; set `mux: false` on builds without it.
 
 ### Fixed
 
