@@ -192,3 +192,92 @@ async fn socks5_domain_with_non_hostname_bytes_is_refused_and_undialed() {
         "no non-hostname SOCKS5 target may reach the upstream"
     );
 }
+
+/// Origin-form (`GET /path`) carries no authority in the request line — the
+/// `Host:` header is the destination. `Host: 127.0.0.1:<port>` must relay
+/// to that literal and that port.
+#[tokio::test]
+async fn http_origin_form_ip_literal_host_relays() {
+    let tunnel = common::direct_tunnel();
+    let backend = common::spawn_http_ok_server().await;
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        backend.port()
+    );
+    let response = http_exchange(&tunnel, request.as_bytes()).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "origin-form + literal Host must relay: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+/// Same shape through the rule engine: a domain `Host:` must pass the
+/// hostname gate and reach `MATCH,proxy` — refused only by a dead
+/// upstream, never by a 400.
+#[tokio::test]
+async fn http_origin_form_domain_host_reaches_upstream() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let response = http_exchange(&tunnel, b"GET / HTTP/1.1\r\nHost: good.example\r\n\r\n").await;
+    assert!(
+        !response.starts_with(b"HTTP/1.1 400"),
+        "domain Host must not be refused: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "the origin-form request must reach the upstream"
+    );
+}
+
+/// The Host header becomes the authority, so a non-hostname value is
+/// refused with 400 exactly like a bad absolute-form authority.
+#[tokio::test]
+async fn http_origin_form_bad_host_is_400() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    for host in ["a@evil.com", "evil.com/x", "evil%2ecom"] {
+        let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        let response = http_exchange(&tunnel, request.as_bytes()).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+            "{host:?}: {:?}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+    settle().await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+}
+
+/// HTTP/1.1 requires `Host:` on origin-form; without it the gate still
+/// refuses, exactly as a request with a bad authority.
+#[tokio::test]
+async fn http_origin_form_missing_host_is_400() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let response = http_exchange(&tunnel, b"GET / HTTP/1.1\r\n\r\n").await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+}
+
+/// Asterisk-form keeps its own refusal: `OPTIONS *` names no host and the
+/// Host header does not rescue it — the authority slot is only restored
+/// when the request-target's authority is empty, and `*` is non-empty.
+#[tokio::test]
+async fn http_asterisk_form_is_400() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let response =
+        http_exchange(&tunnel, b"OPTIONS * HTTP/1.1\r\nHost: good.example\r\n\r\n").await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+}

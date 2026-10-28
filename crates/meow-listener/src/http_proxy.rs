@@ -215,6 +215,20 @@ async fn handle_http_inner(
         // Plain HTTP proxy (GET/POST/etc via proxy)
         let url = target;
         let (host, port) = parse_url_host_port(url);
+        // An origin-form request target carries no authority: RFC 9112
+        // §3.2.2 names the Host header the effective destination. Restore
+        // it before the hostname gate so `GET /` + `Host: example.com` —
+        // the shape every browser sends a plain-HTTP proxy — reaches the
+        // gate instead of dying on the empty authority (the #734 gate
+        // predates this case and refused every such request with 400).
+        let (host, port) = if host.is_empty() {
+            match host_header(&request) {
+                Some(authority) => parse_host_port(authority, 80),
+                None => (host, port),
+            }
+        } else {
+            (host, port)
+        };
         if !meow_common::is_valid_host(host) {
             write_bad_request(stream).await?;
             return Err(format!("request target {url:?} has no valid host").into());
@@ -1908,6 +1922,20 @@ fn parse_host_port(target: &str, default_port: u16) -> (&str, u16) {
         }
     }
     (target, default_port)
+}
+
+/// First `Host:` header of a plain request — the authority an origin-form
+/// request target omits (RFC 9112 §3.2.2). Only UTF-8, non-empty values
+/// count; anything else falls through to the caller's hostname gate,
+/// which refuses the request as before.
+fn host_header<'a>(request: &'a RequestHead<'_>) -> Option<&'a str> {
+    request
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(b"host"))
+        .and_then(|h| std::str::from_utf8(h.value).ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
 }
 
 /// Parse host and port from an absolute HTTP or WebSocket URL.
