@@ -276,8 +276,11 @@ pub fn parse_proxy_with_dialer(
             // A present-but-non-string `plugin:` is a malformed node, not
             // "no plugin": silently treating it as absent would dial a
             // plain SS while the operator asked for a transport plugin.
+            // `null` is the exception — Go's `Plugin string` field
+            // unmarshals null to the zero value, so `plugin: null` means
+            // unset exactly like an absent key (mihomo parity).
             let plugin = match config.get("plugin") {
-                None => None,
+                None | Some(serde_json::Value::Null) => None,
                 Some(value) => Some(value.as_str().ok_or("ss: `plugin` must be a string")?),
             };
             let plugin_opts_str = config.get("plugin-opts").and_then(serialize_plugin_opts);
@@ -5696,11 +5699,13 @@ tls: true
 
     /// A `plugin:` value that is not a string is a malformed node — never
     /// silently treated as "no plugin" (that would dial plain SS while the
-    /// operator configured a transport plugin).
+    /// operator configured a transport plugin). `null` is the exception:
+    /// Go's `Plugin string` unmarshals it to the zero value, so the key
+    /// counts as unset exactly like an absent one (mihomo parity).
     #[cfg(feature = "ss")]
     #[test]
     fn non_string_plugin_value_is_a_parse_error() {
-        for plugin in ["123", "true", "null", "{mode: http}", "[obfs]"] {
+        for plugin in ["123", "true", "{mode: http}", "[obfs]"] {
             let cfg = proxy_config(&format!(
                 "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
                  plugin: {plugin}\n"
@@ -5713,6 +5718,19 @@ tls: true
                 "plugin: {plugin}: {err}"
             );
         }
+    }
+
+    /// `plugin: null` is Go's zero value — the node parses as plain SS
+    /// with no plugin, exactly like an absent `plugin:` key.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn null_plugin_value_means_no_plugin() {
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: null\n",
+        );
+        let proxy = parse_proxy(&cfg).expect("plugin: null parses as plain ss");
+        assert_eq!(proxy.name(), "s");
     }
 
     /// The dispatch is exact (`"ss"` only, like mihomo) while
