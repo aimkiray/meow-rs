@@ -16,7 +16,10 @@ ss = ["meow-proxy/ss"]
 shadow-tls = ["ss", "meow-proxy/shadow-tls"]
 restls = ["ss", "meow-proxy/restls"]
 jls = ["ss", "meow-proxy/jls"]
-gost-plugin = ["ss", "meow-proxy/gost-plugin"]
+# gost-plugin's `mux:` plugin-opt defaults to true and rides the `mux`
+# feature (same shape as kcptun below): keep the config-layer `smux:`/
+# `mux:` node blocks usable on any build that carries the plugin.
+gost-plugin = ["ss", "mux", "meow-proxy/gost-plugin"]
 trojan = ["meow-proxy/trojan"]
 # `meow-transport/reality` rides along with vless: `reality-opts` is only
 # reachable from the vless parser, and REALITY must not depend on boring-tls
