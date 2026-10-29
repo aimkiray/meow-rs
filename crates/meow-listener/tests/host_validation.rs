@@ -320,3 +320,114 @@ async fn http_origin_form_duplicate_host_is_400() {
     settle().await;
     assert_eq!(accepts.load(Ordering::SeqCst), 0);
 }
+
+/// `Host: x.com.` is accepted at the gate (the predicate strips one
+/// trailing dot) and routed verbatim — `DOMAIN,evil.com` does NOT match
+/// the literal trailing-dot spelling, so the flow falls to `MATCH,proxy`.
+#[tokio::test]
+async fn http_origin_form_trailing_dot_host_routes() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let response = http_exchange(&tunnel, b"GET / HTTP/1.1\r\nHost: evil.com.\r\n\r\n").await;
+    assert!(
+        !response.starts_with(b"HTTP/1.1 400"),
+        "trailing-dot Host must pass the gate: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "DOMAIN,evil.com must not match the verbatim `evil.com.` — MATCH,proxy owns it"
+    );
+}
+
+/// A bracketed IPv6 `Host` is a valid literal: `Host: [::1]` folds into
+/// `dst_ip`, falls through `DOMAIN,evil.com` to `MATCH,proxy`, and the
+/// flow reaches the upstream — refused there, never at the gate.
+#[tokio::test]
+async fn http_origin_form_bracketed_v6_host_is_not_400() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let response = http_exchange(&tunnel, b"GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n").await;
+    assert!(
+        !response.starts_with(b"HTTP/1.1 400"),
+        "bracketed v6 literal must pass the gate: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "the literal falls to MATCH,proxy — the gate may not refuse it"
+    );
+}
+
+/// A `Host` with a non-numeric port (`x.com:badport`) keeps the colon in
+/// the host (`parse_host_port` only splits a valid u16) and fails
+/// validation — same 400 as any bad authority.
+#[tokio::test]
+async fn http_origin_form_malformed_host_port_is_400() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let response = http_exchange(&tunnel, b"GET / HTTP/1.1\r\nHost: x.com:badport\r\n\r\n").await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+}
+
+/// The Host fallback only fires for `/`-leading targets: an absolute-form
+/// request routes by its own authority, and a conflicting Host header is
+/// ignored. `GET http://evil.com/` + `Host: good.example` must hit
+/// DOMAIN,evil.com → REJECT, never the proxy arm.
+#[tokio::test]
+async fn http_absolute_form_authority_beats_conflicting_host() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let response = http_exchange(
+        &tunnel,
+        b"GET http://evil.com/ HTTP/1.1\r\nHost: good.example\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"),
+        "DOMAIN,evil.com must REJECT via the target authority: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+}
+
+/// The literal fold is pinned end-to-end at rule level: `Host: 127.0.0.1`
+/// must reach the IP rules as `dst_ip` — `IP-CIDR,...,no-resolve` reads
+/// `dst_ip` only and never resolves `host`, so a mere `host` string would
+/// slip to `MATCH,proxy` and dial. Both the listener (`host_to_ip`) and
+/// `pre_handle_metadata` fold literals; this pins the visible outcome.
+#[tokio::test]
+async fn http_origin_form_literal_host_populates_dst_ip_for_ipcidr() {
+    let (upstream, accepts) = common::spawn_counting_http_upstream().await;
+    let yaml = format!(
+        "proxies:\n  - name: proxy\n    type: http\n    server: 127.0.0.1\n    port: {}\n\
+         rules:\n  - IP-CIDR,127.0.0.0/8,REJECT,no-resolve\n  - MATCH,proxy\n",
+        upstream.port()
+    );
+    let raw = meow_config::parse_raw_yaml(&yaml).unwrap();
+    let res = meow_config::rebuild_from_raw(&raw).unwrap();
+    let tunnel = common::direct_tunnel();
+    tunnel.set_mode(meow_common::TunnelMode::Rule);
+    tunnel.update_proxies(res.proxies, res.dialer_registry);
+    tunnel.update_rules(res.rules);
+
+    let response = http_exchange(&tunnel, b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+    assert!(
+        !response.starts_with(b"HTTP/1.1 200"),
+        "IP-CIDR must see the folded literal, got: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        0,
+        "the literal must never reach the proxy — dst_ip gates it upstream"
+    );
+}
