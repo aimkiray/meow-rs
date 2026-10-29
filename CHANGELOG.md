@@ -19,19 +19,33 @@ the canonical, in-repo source a release is cut from.
   IP literal folds into `dst_ip`, an explicit `:port` is honoured, and a
   non-hostname or duplicated `Host` value is refused with 400 like any
   bad authority.
-- **Numeric address spellings no longer pass `is_valid_host`.** A name
+- **All-digit address spellings no longer pass `is_valid_host`.** A name
   made only of digits and dots (`2130706433`, `0177.0.0.1`, `123.456`)
   is an `inet_aton` address form a libc dial path would fold into an IP —
   not a hostname the DOMAIN rules checked. Go's `isDomainName` parity: at
   least one byte must be non-numeric (`-`/`_` count, so `123-456` still
-  passes). Letter-bearing spellings (`0x7f000001`) still pass, as under
-  Go — they stay closed on resolver-injected dial paths only.
+  passes). Letter-bearing `inet_aton` spellings (`0x7f000001`,
+  `0x7f.0.0.1`) still pass, as under Go — a known residual on dial paths
+  that never touch the injected resolver: a user-built `type: direct`
+  node with no `dns:` section still folds them through libc.
+- **A trailing-dot destination now hits its DOMAIN rules.** A client
+  naming `evil.com.` — the fully-qualified spelling — used to slip past
+  `DOMAIN,evil.com,REJECT` because rule matching compared the host
+  verbatim. `Metadata::rule_host()` now strips trailing dots on both the
+  `host` and `sniff_host` paths, on the origin-form `Host:`, CONNECT, and
+  absolute-form targets alike; the stored `host` keeps its verbatim form,
+  so dialing and upstream CONNECT lines are unchanged.
 - **Dead domain entries in static config are surfaced.** An empty-label
-  key (`a..b`, `..x`) builds a `DomainTrie` node no query can reach.
-  `hosts:`, `nameserver-policy`, `fallback-filter.domain`,
-  `fake-ip-filter`, and sniffer `skip-domain`/`force-domain` now warn
-  naming the entry in lenient mode and error in strict mode — the entry
-  itself still loads (observability, not a semantics change).
+  key (`a..b`, `..x`) builds a `DomainTrie` node no query can reach, a
+  `DOMAIN`/`DOMAIN-SUFFIX` rule payload with an empty label or a trailing
+  dot (`x.com.`) can never equal the normalized rule host it is compared
+  against, and an all-dots or prefix-only key (`"."`, `"+."`) is refused
+  by the trie outright. `hosts:`, `nameserver-policy`,
+  `fallback-filter.domain`, `fake-ip-filter`, sniffer
+  `skip-domain`/`force-domain`, and `rules:` `DOMAIN`/`DOMAIN-SUFFIX`
+  payloads now warn naming the entry in lenient mode and error in strict
+  mode — where the entry loads, it still does (observability, not a
+  semantics change).
 
 ## [0.28.0] - 2026-10-30
 
@@ -176,6 +190,42 @@ the canonical, in-repo source a release is cut from.
   the HTTP and TrustTunnel outbounds refuse to send one. A raw non-ASCII
   name, such as UTF-8 `bücher.de` over SOCKS5, is refused rather than
   converted to punycode.
+- **Plain-HTTP origin-form requests work again.** `GET /path` + a `Host:`
+  header — the request shape every browser sends a plain-HTTP proxy —
+  was refused with 400 by the #734 hostname gate, which only looked at
+  the request target's (empty) authority. The listener now takes the
+  authority from the `Host:` header for `/`-leading request targets and
+  runs it through the same gate: `Host: example.com` routes by rules, an
+  IP literal folds into `dst_ip`, an explicit `:port` is honoured, and a
+  non-hostname or duplicated `Host` value is refused with 400 like any
+  bad authority.
+- **All-digit address spellings no longer pass `is_valid_host`.** A name
+  made only of digits and dots (`2130706433`, `0177.0.0.1`, `123.456`)
+  is an `inet_aton` address form a libc dial path would fold into an IP —
+  not a hostname the DOMAIN rules checked. Go's `isDomainName` parity: at
+  least one byte must be non-numeric (`-`/`_` count, so `123-456` still
+  passes). Letter-bearing `inet_aton` spellings (`0x7f000001`,
+  `0x7f.0.0.1`) still pass, as under Go — a known residual on dial paths
+  that never touch the injected resolver: a user-built `type: direct`
+  node with no `dns:` section still folds them through libc.
+- **A trailing-dot destination now hits its DOMAIN rules.** A client
+  naming `evil.com.` — the fully-qualified spelling — used to slip past
+  `DOMAIN,evil.com,REJECT` because rule matching compared the host
+  verbatim. `Metadata::rule_host()` now strips trailing dots on both the
+  `host` and `sniff_host` paths, on the origin-form `Host:`, CONNECT, and
+  absolute-form targets alike; the stored `host` keeps its verbatim form,
+  so dialing and upstream CONNECT lines are unchanged.
+- **Dead domain entries in static config are surfaced.** An empty-label
+  key (`a..b`, `..x`) builds a `DomainTrie` node no query can reach, a
+  `DOMAIN`/`DOMAIN-SUFFIX` rule payload with an empty label or a trailing
+  dot (`x.com.`) can never equal the normalized rule host it is compared
+  against, and an all-dots or prefix-only key (`"."`, `"+."`) is refused
+  by the trie outright. `hosts:`, `nameserver-policy`,
+  `fallback-filter.domain`, `fake-ip-filter`, sniffer
+  `skip-domain`/`force-domain`, and `rules:` `DOMAIN`/`DOMAIN-SUFFIX`
+  payloads now warn naming the entry in lenient mode and error in strict
+  mode — where the entry loads, it still does (observability, not a
+  semantics change).
 
 ## [0.27.0] - 2026-10-28
 

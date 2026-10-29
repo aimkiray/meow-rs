@@ -554,6 +554,17 @@ the same trie slot (`x` vs `+.x`, `.x` vs `+.x`, or spellings that
 normalize together), the document-last writer wins — mihomo's `setData`
 parity — and the document order round-trips through config saves.
 
+Dead keys are surfaced, not rejected outright: a key whose body still holds
+an empty label (`a..b`, `..x`, `+..x`) builds a trie node no query can
+reach, and an all-dots or prefix-only body (`"."`, `"+."`) is refused by
+the insert — meow warns naming the key in lenient mode and fails the load
+under `strict: true`, where mihomo's `ValidAndSplitDomain` rejects both
+classes outright. Trailing-dot spellings (`x.com.`, `x.com..`) stay legal:
+they normalize onto the same slot as `x.com`. The check covers config
+`hosts:` keys only — the system hosts file merged in by `use-system-hosts`
+is out of scope: it is parsed leniently line-by-line and its entries never
+pass through the dead-key validation.
+
 ---
 
 ## Inbound authentication
