@@ -40,11 +40,31 @@ async fn loopback_pair() -> (TcpStream, TcpStream) {
 /// Drive one HTTP proxy request; returns the response head the listener
 /// wrote (or whatever arrived before it closed).
 async fn http_exchange(tunnel: &meow_tunnel::Tunnel, request: &[u8]) -> Vec<u8> {
+    http_exchange_with(tunnel, None, request).await
+}
+
+/// Same drive with a `SnifferRuntime` installed. The caller owns the
+/// sniffer as `'static` (a test may `Box::leak` it) so the handler can
+/// live in `tokio::spawn` like every other request here.
+async fn http_exchange_sniffed(
+    tunnel: &meow_tunnel::Tunnel,
+    sniffer: &'static meow_listener::sniffer::SnifferRuntime,
+    request: &[u8],
+) -> Vec<u8> {
+    http_exchange_with(tunnel, Some(sniffer), request).await
+}
+
+async fn http_exchange_with(
+    tunnel: &meow_tunnel::Tunnel,
+    sniffer: Option<&'static meow_listener::sniffer::SnifferRuntime>,
+    request: &[u8],
+) -> Vec<u8> {
     let (server, mut client) = loopback_pair().await;
     let tunnel = tunnel.clone();
     let src: SocketAddr = "127.0.0.1:1".parse().unwrap();
     tokio::spawn(async move {
-        meow_listener::http_proxy::handle_http(&tunnel, server, src, None, None, "http", 0).await;
+        meow_listener::http_proxy::handle_http(&tunnel, server, src, sniffer, None, "http", 0)
+            .await;
     });
     client.write_all(request).await.unwrap();
     let mut response = Vec::new();
@@ -321,24 +341,69 @@ async fn http_origin_form_duplicate_host_is_400() {
     assert_eq!(accepts.load(Ordering::SeqCst), 0);
 }
 
-/// `Host: x.com.` is accepted at the gate (the predicate strips one
-/// trailing dot) and routed verbatim — `DOMAIN,evil.com` does NOT match
-/// the literal trailing-dot spelling, so the flow falls to `MATCH,proxy`.
+/// `Host: x.com.` passes the gate (the predicate strips one trailing
+/// dot) and — with `rule_host()` normalizing trailing dots too — now
+/// hits `DOMAIN,evil.com` exactly as `evil.com` would: REJECT owns the
+/// flow and no upstream dial ever happens. The stored host keeps the
+/// verbatim `evil.com.` for dialing.
 #[tokio::test]
-async fn http_origin_form_trailing_dot_host_routes() {
+async fn http_origin_form_trailing_dot_host_normalizes_for_rules() {
     let (tunnel, accepts) = common::issue_734_tunnel().await;
     let response = http_exchange(&tunnel, b"GET / HTTP/1.1\r\nHost: evil.com.\r\n\r\n").await;
     assert!(
-        !response.starts_with(b"HTTP/1.1 400"),
-        "trailing-dot Host must pass the gate: {:?}",
+        response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"),
+        "trailing-dot Host must hit DOMAIN,evil.com,REJECT: {:?}",
         String::from_utf8_lossy(&response)
     );
     settle().await;
     assert_eq!(
         accepts.load(Ordering::SeqCst),
-        1,
-        "DOMAIN,evil.com must not match the verbatim `evil.com.` — MATCH,proxy owns it"
+        0,
+        "DOMAIN,evil.com must own the normalized `evil.com.` — REJECT, no upstream"
     );
+}
+
+/// Same normalization through CONNECT: `evil.com.:443` hits the DOMAIN
+/// arm, not the tunnel. CONNECT pre-acks `200 Connection established`
+/// before routing, so the observable proof REJECT (not MATCH,proxy) owns
+/// the flow is that no upstream CONNECT is ever attempted — the tunnel
+/// drops it after the ack.
+#[tokio::test]
+async fn http_connect_trailing_dot_target_hits_domain_reject() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let response = http_exchange(&tunnel, b"CONNECT evil.com.:443 HTTP/1.1\r\n\r\n").await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "the pre-routing ack is unchanged: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        0,
+        "DOMAIN,evil.com must own the normalized `evil.com.` — REJECT, no upstream CONNECT"
+    );
+}
+
+/// Absolute-form authority with a trailing dot normalizes the same way:
+/// `GET http://evil.com./` hits `DOMAIN,evil.com` → REJECT even though a
+/// conflicting `Host: good.example` is present (the target authority
+/// always wins the routing name).
+#[tokio::test]
+async fn http_absolute_form_trailing_dot_authority_hits_domain_reject() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let response = http_exchange(
+        &tunnel,
+        b"GET http://evil.com./ HTTP/1.1\r\nHost: good.example\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"),
+        "DOMAIN,evil.com must REJECT via the normalized authority: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
 }
 
 /// A bracketed IPv6 `Host` is a valid literal: `Host: [::1]` folds into
@@ -398,6 +463,46 @@ async fn http_absolute_form_authority_beats_conflicting_host() {
     assert_eq!(accepts.load(Ordering::SeqCst), 0);
 }
 
+/// Sniffer-enabled counterpart of `http_absolute_form_authority_beats_conflicting_host`.
+/// With the sniffer on, the plain-HTTP path extracts the `Host:` header
+/// into `metadata.sniff_host`, and `rule_host()` prefers the sniffed name
+/// over `host`: `GET http://evil.com/` + `Host: good.example` is routed
+/// by `good.example` (MATCH,proxy), not by the request target — while
+/// `metadata.host` still carries `evil.com` as the dial destination.
+///
+/// The routing pin is the upstream accept count, not the status line:
+/// the mock echoes bytes (`GET / HTTP/1.1…`) that are not a valid HTTP
+/// response head, so the relay's status-line check converts the exchange
+/// to a 502 *after* the dial. A REJECT-502 never dials — `accepts == 1`
+/// proves which arm owned the flow.
+#[tokio::test]
+async fn http_absolute_form_sniffed_host_beats_target_authority() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let sniffer: &'static _ = Box::leak(Box::new(meow_listener::sniffer::SnifferRuntime::new(
+        meow_common::sniffer::SnifferConfig {
+            enable: true,
+            ..Default::default()
+        },
+    )));
+    let response = http_exchange_sniffed(
+        &tunnel,
+        sniffer,
+        b"GET http://evil.com/ HTTP/1.1\r\nHost: good.example\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"),
+        "the echo is not a response head — the relay closes with 502: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "sniff_host `good.example` routes via MATCH,proxy — DOMAIN,evil.com never sees it"
+    );
+}
+
 /// The literal fold is pinned end-to-end at rule level: `Host: 127.0.0.1`
 /// must reach the IP rules as `dst_ip` — `IP-CIDR,...,no-resolve` reads
 /// `dst_ip` only and never resolves `host`, so a mere `host` string would
@@ -429,5 +534,81 @@ async fn http_origin_form_literal_host_populates_dst_ip_for_ipcidr() {
         accepts.load(Ordering::SeqCst),
         0,
         "the literal must never reach the proxy — dst_ip gates it upstream"
+    );
+}
+
+/// Origin-form with a declared body: `POST /submit` + `Content-Length`
+/// takes the Host fallback like any `/`-leading target, and the body
+/// relays — a pinned 200 round-trip.
+#[tokio::test]
+async fn http_origin_form_post_with_content_length_body_relays() {
+    let tunnel = common::direct_tunnel();
+    let backend = common::spawn_http_ok_server().await;
+    let request = format!(
+        "POST /submit HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 3\r\n\r\nabc",
+        backend.port()
+    );
+    let response = http_exchange(&tunnel, request.as_bytes()).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "POST + Content-Length must relay: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+/// A `//path` request-target is network-path form on paper, but it is
+/// still `/`-leading: the Host fallback fires and the target's own
+/// `//authority` slot is never consulted — pinned as a 200 relay.
+#[tokio::test]
+async fn http_origin_form_network_path_target_uses_host_header() {
+    let tunnel = common::direct_tunnel();
+    let backend = common::spawn_http_ok_server().await;
+    let request = format!(
+        "GET //path HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        backend.port()
+    );
+    let response = http_exchange(&tunnel, request.as_bytes()).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "//path must route by the Host header: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+/// Header names are case-insensitive: `HOST:` supplies the authority for
+/// an origin-form target exactly like `Host:` — a pinned 200.
+#[tokio::test]
+async fn http_origin_form_uppercase_host_header_relays() {
+    let tunnel = common::direct_tunnel();
+    let backend = common::spawn_http_ok_server().await;
+    let request = format!(
+        "GET / HTTP/1.1\r\nHOST: 127.0.0.1:{}\r\n\r\n",
+        backend.port()
+    );
+    let response = http_exchange(&tunnel, request.as_bytes()).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "uppercase HOST: must supply the authority: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+/// `Connection: upgrade` + `Upgrade: websocket` on an origin-form
+/// request: the Host fallback still supplies the authority, and when the
+/// origin declines the upgrade (a plain 200) the response relays
+/// untouched — a pinned 200.
+#[tokio::test]
+async fn http_origin_form_upgrade_websocket_declined_relays() {
+    let tunnel = common::direct_tunnel();
+    let backend = common::spawn_http_ok_server().await;
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+        backend.port()
+    );
+    let response = http_exchange(&tunnel, request.as_bytes()).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "an upgrade-nominated request must still relay: {:?}",
+        String::from_utf8_lossy(&response)
     );
 }

@@ -258,11 +258,17 @@ impl Metadata {
         }
     }
 
+    /// The hostname the rule engine sees: `sniff_host` when the sniffer
+    /// produced one, else `host` — with trailing dots stripped on both
+    /// paths, so a client-supplied `evil.com.` (the fully-qualified
+    /// spelling) still reads as `evil.com` to DOMAIN rules. The stored
+    /// `host`/`sniff_host` keep their verbatim form, so dialing and
+    /// CONNECT lines are unaffected.
     pub fn rule_host(&self) -> &str {
         if self.sniff_host.is_empty() {
-            &self.host
+            self.host.trim_end_matches('.')
         } else {
-            &self.sniff_host
+            self.sniff_host.trim_end_matches('.')
         }
     }
 
