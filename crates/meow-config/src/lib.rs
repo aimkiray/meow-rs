@@ -2087,20 +2087,21 @@ fn insert_parsed_leaves(
             // cannot fix a missing protocol or a missing built-in plugin
             // transport by editing the config, so `-t`, boot, `PUT /configs`
             // and refreshes all read identically here.
-            Err(e) if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_proxy) => {
-                let name = raw_proxy
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<unnamed>");
-                warn!(
-                    "proxies: '{name}' failed to parse ({e}); keeping the name bound \
-                     to an unavailable node so no dial can fall back past it"
-                );
-                unavailable_placeholder(name, &e, declared)
-            }
             Err(e) => {
-                warn!("Failed to parse proxy: {}", e);
-                continue;
+                if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_proxy) {
+                    let name = raw_proxy
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<unnamed>");
+                    warn!(
+                        "proxies: '{name}' failed to parse ({e}); keeping the name bound \
+                         to an unavailable node so no dial can fall back past it"
+                    );
+                    unavailable_placeholder(name, &e, declared)
+                } else {
+                    warn!("Failed to parse proxy: {}", e);
+                    continue;
+                }
             }
         };
         // Prefer the YAML `name:` as the registry key. `proxy.name()`

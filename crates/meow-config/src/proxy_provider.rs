@@ -1139,17 +1139,18 @@ impl ProxyProvider {
                 // registry on every refresh — and, for a protocol or
                 // built-in plugin transport missing from this build, stop
                 // the daemon from starting at all.
-                Err(e) if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_map) => {
-                    let label = if raw_name.is_empty() {
-                        "<unnamed>"
-                    } else {
-                        raw_name
-                    };
-                    warn!(provider = %self.name, proxy = label, error = %e, "keeping an unavailable node so nothing can dial past it");
-                    result.push(crate::unavailable_placeholder(label, &e, declared));
-                }
                 Err(e) => {
-                    warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
+                    if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_map) {
+                        let label = if raw_name.is_empty() {
+                            "<unnamed>"
+                        } else {
+                            raw_name
+                        };
+                        warn!(provider = %self.name, proxy = label, error = %e, "keeping an unavailable node so nothing can dial past it");
+                        result.push(crate::unavailable_placeholder(label, &e, declared));
+                    } else {
+                        warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
+                    }
                 }
             }
         }
