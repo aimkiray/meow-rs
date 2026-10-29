@@ -50,9 +50,10 @@ jobs:
     # Scheduled workflows also fire on forks that enable Actions — the
     # powerset is the heaviest job in the repo; skip it on forks.
     if: github.event.repository.fork == false
-    # Per-crate cap at the hosted-runner maximum — the grouped meow-proxy
-    # powerset needs ~2.5-5h warm (leg budgets in the header comment).
-    timeout-minutes: 360
+    # ~2.59s per leg on the GitHub runner: grouped meow-proxy is 1788 legs
+    # ≈ 77 min, and even ungrouped (3676 legs ≈ 159 min) still fits 180 —
+    # keep the margin for machine variance, not for leg count.
+    timeout-minutes: 180
     strategy:
       # One crate failing must not cancel the others: the point of the daily
       # run is to report every broken combination.

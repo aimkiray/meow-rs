@@ -211,6 +211,12 @@ aarch64-apple-darwin`). A/B against the unit base commit `4201881b` (built in a
 scratch checkout with the identical recipe). Release profile unchanged:
 `lto=fat, strip=true, codegen-units=1, panic=abort, opt-level="z"`.
 
+Attribution caveat: the A/B spans `4201881b..f5a1b4ca` — 25 `main`
+commits, not this PR alone — so the −254 KiB delta below is the
+*cumulative* effect of everything that landed in the window (this split
+plus upstream work such as the BoringSSL record layer, splice relay and
+v2ray-plugin Mux.Cool framing); it is not a clean per-PR measurement.
+
 The change splits the four heavier built-in SIP003 transports
 (`gost-plugin`, `shadow-tls`, `restls`, `jls`) out of `ss` into their own
 opt-in features. `minimal`'s `ss` contract narrows to simple-obfs +
