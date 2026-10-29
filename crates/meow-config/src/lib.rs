@@ -4940,9 +4940,8 @@ mod missing_plugin_placeholder_tests {
         insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, false).unwrap();
         let bound = proxies
             .get("s-gost")
-            .expect("a missing-plugin node must stay bound, not dropped")
-            .clone();
-        assert_dead_ss_placeholder(&bound).await;
+            .expect("a missing-plugin node must stay bound, not dropped");
+        assert_dead_ss_placeholder(bound).await;
     }
 
     /// `strict: true` still hard-errors first — the placeholder arm only
