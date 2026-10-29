@@ -170,10 +170,11 @@ Feature prerequisites: `obfs`/`simple-obfs` and `v2ray-plugin` are
 bundled with `ss` itself (so they are in `minimal`); `gost-plugin`,
 `shadow-tls`, `restls` and `jls` each sit behind a same-named Cargo
 feature, all re-bundled into `default`/`full` but absent from `minimal`
-— a `plugin:` line naming a compiled-out built-in fails at load with a
-"not compiled into this build" error (it is never handed to the
-external-plugin spawn path). `kcptun` and `ech-tls-tunnel` were already
-separate features and behave the same way.
+— a `plugin:` line naming a compiled-out built-in keeps the node bound
+as an unavailable placeholder whose dials fail with a "not compiled
+into this build" error (it is never handed to the external-plugin spawn
+path). `kcptun` and `ech-tls-tunnel` were already separate features and
+behave the same way.
 
 ### Trojan
 

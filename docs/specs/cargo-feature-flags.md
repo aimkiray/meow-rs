@@ -29,7 +29,7 @@ exist yet.
 | `shadow-tls` | `meow-proxy` | Built-in `ss` plugin: shadow-tls v1/v2/v3 cover-TLS transport (implies `ss`; in `default`/`full`, not `minimal`) |
 | `restls` | `meow-proxy` | Built-in `ss` plugin: restls record-level TLS transport (implies `ss`; in `default`/`full`, not `minimal`) |
 | `jls` | `meow-proxy` | Built-in `ss` plugin: jls TLS 1.3 record transport (implies `ss`; in `default`/`full`, not `minimal`) |
-| `gost-plugin` | `meow-proxy` | Built-in `ss` plugin: gost-plugin WebSocket(+TLS/smux) transport (implies `ss`; in `default`/`full`, not `minimal`) |
+| `gost-plugin` | `meow-proxy` | Built-in `ss` plugin: gost-plugin WebSocket(+TLS/smux) transport (implies `ss` and `mux`; in `default`/`full`, not `minimal`) |
 | `trojan` | `meow-proxy` | Trojan adapter (TLS via `meow-transport`'s `tls` layer) |
 | `vless` | `meow-proxy` | VLESS adapter (M1.B-2) |
 | `http-outbound` | `meow-proxy` | HTTP CONNECT outbound |
@@ -42,8 +42,12 @@ The `ss` built-in-plugin contract is narrowed to `simple-obfs`/`obfs` +
 `v2ray-plugin`; the four heavier SIP003 transports above are opt-in and
 re-bundled into `default`/`full`. All built-in plugin names (including
 `kcptun` and `ech-tls-tunnel`) stay *reserved* even when compiled out — a
-`plugin:` line naming one fails the config check (`meow -t`, exit 1) with "not compiled into this
-build" instead of falling through to the external SIP003 subprocess path.
+`plugin:` line naming one keeps the node bound as an unavailable
+placeholder (`meow -t`, boot and provider refresh all read it
+identically), and every dial through it fails with "not compiled into
+this build; rebuild with `--features <name>`" instead of the node
+silently dropping — and the name can never fall through to the external
+SIP003 subprocess path.
 
 ### Transport features
 

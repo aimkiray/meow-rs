@@ -26,15 +26,19 @@ the canonical, in-repo source a release is cut from.
   named there). `full` and default builds
   still enable all four, so release binaries are unchanged; a `minimal`
   build measured 10,003,680 B on x86_64-musl, about 254 KiB smaller.
-  On a build without a plugin, `plugin: <name>` on an ss node now fails
-  the config check with `plugin '<name>' is not compiled into this
-  build; rebuild with \`--features <name>\`` — and because the reserved
-  names still count as built-in, the node can never fall through to
-  spawning an external SIP003 binary of the same name. The same guard
-  closes that fallthrough for `kcptun` and `ech-tls-tunnel`, whose
-  disabled builds previously could reach the external-plugin path.
-  `gost-plugin`'s `mux: true` additionally requires the `mux` Cargo
-  feature; set `mux: false` on builds without it.
+  On a build without a plugin, `plugin: <name>` on an ss node keeps the
+  node bound as an unavailable placeholder — `meow -t`, boot,
+  `PUT /configs` and provider refreshes all read it identically, and
+  every dial through the node (or through a group that selects it)
+  fails with `plugin '<name>' is not compiled into this
+  build; rebuild with \`--features <name>\`` instead of the node
+  silently dropping and letting the group slide to a sibling or
+  DIRECT. Because the reserved names still count as built-in, the node
+  can never fall through to spawning an external SIP003 binary of the
+  same name; the same guard closes that fallthrough for `kcptun` and
+  `ech-tls-tunnel`, whose disabled builds previously could reach the
+  external-plugin path. `gost-plugin` implies the `mux` Cargo feature,
+  so its `mux: true` default always works.
 
 ### Fixed
 

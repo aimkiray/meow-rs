@@ -246,8 +246,9 @@ at the `meow-app` level. `Cargo.lock` is unchanged — every plugin dep
 was already declared optional, so feature rewiring moves no packages.
 
 Behavior: a `plugin: gost-plugin` ss node under an `ss`-without-`gost-plugin`
-build reports `plugin 'gost-plugin' is not compiled into this build;
-rebuild with \`--features gost-plugin\`` (verified via `meow -f <yml> -t`
-in both directions); all built-in names stay reserved in
+build stays bound as an unavailable placeholder — `meow -f <yml> -t`
+accepts the config (verified in both directions) and every dial through
+the node reports `plugin 'gost-plugin' is not compiled into this build;
+rebuild with \`--features gost-plugin\``; all built-in names stay reserved in
 `is_builtin_sip003_plugin` so they can never fall through to the external
 SIP003 subprocess path.
