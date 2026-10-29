@@ -1129,14 +1129,16 @@ impl ProxyProvider {
                     ));
                 }
                 // Keep the slot entry as a dead placeholder instead of
-                // dropping it, so a group that lists this node can neither
-                // shift its traffic onto a sibling member nor degrade to a
-                // direct dial. Scoped to the node on purpose: this payload
-                // is third-party and refetched on a timer, so rejecting the
-                // whole feed would let its operator empty the registry on
-                // every refresh — and, for a protocol or built-in plugin
-                // transport missing from this build, stop the daemon from
-                // starting at all.
+                // dropping it: a `select` group, an explicit `MATCH` target
+                // or a `dialer-proxy` chain that names this node fails the
+                // dial rather than shifting the traffic to a sibling member
+                // or DIRECT (liveness-checked groups skip it like any
+                // unavailable member). Scoped to the node on purpose: this
+                // payload is third-party and refetched on a timer, so
+                // rejecting the whole feed would let its operator empty the
+                // registry on every refresh — and, for a protocol or
+                // built-in plugin transport missing from this build, stop
+                // the daemon from starting at all.
                 Err(e) if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_map) => {
                     let label = if raw_name.is_empty() {
                         "<unnamed>"

@@ -2029,8 +2029,12 @@ fn has_unresolved_group_dependency(
 /// dropping it from the registry (see [`meow_proxy::UnavailableAdapter`]).
 ///
 /// Used for the protocols where a *missing* member is worse than a broken one:
-/// a group that lists the name can neither quietly shift that traffic onto a
-/// sibling member nor, once no member survives, degrade to a direct dial.
+/// a `select` group, an explicit `MATCH`/rule target or a `dialer-proxy`
+/// chain that names the node fails its dials instead of quietly shifting
+/// that traffic to a sibling member or, once no member survives, degrading
+/// to a direct dial. Liveness-checked groups (`fallback`, `url-test`,
+/// `load-balance`) skip the dead entry exactly like any unavailable member —
+/// the placeholder deliberately does not pin those.
 /// Rejecting the enclosing `proxies:` block or provider payload closes the
 /// same hole, but it also fires for a protocol the running binary simply does
 /// not contain — which the operator cannot repair by editing anything — and on
@@ -2075,11 +2079,13 @@ fn insert_parsed_leaves(
                 ));
             }
             // Keep the slot entry as a dead placeholder instead of dropping
-            // it, so a group that lists the node can neither shift its
-            // traffic onto a sibling member nor degrade to a direct dial —
-            // the same contract a compiled-out `type:` gets: the operator
-            // cannot fix a missing protocol (or a missing built-in plugin
-            // transport) by editing the config, so `-t`, boot, `PUT /configs`
+            // it: a `select` group, an explicit `MATCH` target or a
+            // `dialer-proxy` chain that names the node fails the dial rather
+            // than shifting the traffic to a sibling member or DIRECT —
+            // the same contract the compiled-out `trusttunnel` type gets
+            // (other compiled-out types stay warn-and-drop). The operator
+            // cannot fix a missing protocol or a missing built-in plugin
+            // transport by editing the config, so `-t`, boot, `PUT /configs`
             // and refreshes all read identically here.
             Err(e) if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_proxy) => {
                 let name = raw_proxy
@@ -4902,12 +4908,13 @@ mod missing_plugin_placeholder_tests {
         m
     }
 
-    /// Every assertion below is the placeholder contract a compiled-out
-    /// `type:` already keeps: the node stays bound under its own name as a
-    /// permanently dead `Shadowsocks` entry — never dropped, so a group
-    /// listing it can neither shift that traffic to a sibling nor degrade
-    /// to a direct dial — and its dial reason is the adapter's
-    /// "not compiled into this build" error.
+    /// Every assertion below is the placeholder contract the compiled-out
+    /// `trusttunnel` type already keeps: the node stays bound under its own
+    /// name as a permanently dead `Shadowsocks` entry — never dropped, so a
+    /// `select` group or explicit reference to it fails the dial instead of
+    /// shifting the traffic to a sibling or DIRECT (liveness-checked groups
+    /// skip it like any unavailable member) — and its dial reason is the
+    /// adapter's "not compiled into this build" error.
     #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
     async fn assert_dead_ss_placeholder(proxy: &Arc<dyn Proxy>) {
         assert!(!proxy.alive(), "a placeholder must never look usable");
@@ -4961,8 +4968,9 @@ mod missing_plugin_placeholder_tests {
 
     /// End-to-end at `load_config` level: a `select` group listing only the
     /// dead node must keep it selected — dialing through the group fails
-    /// with the plugin-gate error instead of sliding to DIRECT, and a
-    /// sibling DIRECT member is only used when actually selected.
+    /// with the plugin-gate error instead of sliding to DIRECT. (A
+    /// `url-test`/`fallback` group would still skip the dead member by
+    /// liveness — the placeholder pins references, not health probes.)
     #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
     #[tokio::test]
     async fn group_listing_dead_node_cannot_slide_to_direct() {

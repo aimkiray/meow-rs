@@ -129,15 +129,24 @@ pub(crate) fn node_is_trusttunnel(config: &HashMap<String, serde_json::Value>) -
 /// Whether `config` describes an `ss` node whose reserved built-in `plugin:`
 /// names a cargo feature this build lacks — same class of failure as
 /// [`node_is_trusttunnel`]: the node can never parse, but dropping it would
-/// let its group shift that traffic to a sibling or DIRECT, so callers keep
-/// it bound to a dead placeholder instead. The adapter's "not compiled into
-/// this build" error becomes the placeholder's reason. This check
+/// let a `select` group or an explicit `MATCH`/`dialer-proxy` reference
+/// shift that traffic to a sibling or DIRECT, so callers keep it bound to a
+/// dead placeholder instead (liveness-checked groups skip the dead entry
+/// like any unavailable member). The adapter's "not compiled into this
+/// build" error becomes the placeholder's reason. This check
 /// deliberately remains available when the feature is disabled — it reads
 /// the raw node, so it needs no error identity across the `String` boundary.
 pub(crate) fn node_needs_missing_plugin(config: &HashMap<String, serde_json::Value>) -> bool {
     #[cfg(feature = "ss")]
     {
-        config.get("type").and_then(serde_json::Value::as_str) == Some("ss")
+        // `type` is lenient like `node_is_trusttunnel`'s — the dispatch is
+        // exact, so a `"Ss "`/`"SS"` node fails parsing anyway; keeping the
+        // classifier forgiving lets the placeholder still cover the group
+        // fallback hole instead of warn-dropping the node.
+        config
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("ss"))
             && config
                 .get("plugin")
                 .and_then(serde_json::Value::as_str)
@@ -264,7 +273,13 @@ pub fn parse_proxy_with_dialer(
                 .get("udp")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let plugin = config.get("plugin").and_then(|v| v.as_str());
+            // A present-but-non-string `plugin:` is a malformed node, not
+            // "no plugin": silently treating it as absent would dial a
+            // plain SS while the operator asked for a transport plugin.
+            let plugin = match config.get("plugin") {
+                None => None,
+                Some(value) => Some(value.as_str().ok_or("ss: `plugin` must be a string")?),
+            };
             let plugin_opts_str = config.get("plugin-opts").and_then(serialize_plugin_opts);
             let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
 
@@ -5677,5 +5692,49 @@ tls: true
                 }
             }
         }
+    }
+
+    /// A `plugin:` value that is not a string is a malformed node — never
+    /// silently treated as "no plugin" (that would dial plain SS while the
+    /// operator configured a transport plugin).
+    #[cfg(feature = "ss")]
+    #[test]
+    fn non_string_plugin_value_is_a_parse_error() {
+        for plugin in ["123", "true", "null", "{mode: http}", "[obfs]"] {
+            let cfg = proxy_config(&format!(
+                "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+                 plugin: {plugin}\n"
+            ));
+            let Err(err) = parse_proxy(&cfg) else {
+                panic!("plugin: {plugin} must not parse as plain ss")
+            };
+            assert!(
+                err.contains("`plugin` must be a string"),
+                "plugin: {plugin}: {err}"
+            );
+        }
+    }
+
+    /// The dispatch is exact (`"ss"` only, like mihomo) while
+    /// [`node_needs_missing_plugin`] is forgiving like
+    /// [`node_is_trusttunnel`]: a misspelled `type` plus a compiled-out
+    /// plugin still classifies for the dead placeholder, so a group that
+    /// names the node keeps it bound instead of warn-dropping.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[test]
+    fn misspelled_ss_type_with_missing_plugin_still_classifies() {
+        let cfg = proxy_config(
+            "name: s\ntype: 'Ss '\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: gost-plugin\n",
+        );
+        assert!(
+            parse_proxy(&cfg).is_err(),
+            "the exact dispatch still rejects the misspelled type"
+        );
+        assert_eq!(
+            placeholder_adapter_type(&cfg),
+            Some(meow_common::AdapterType::Shadowsocks),
+            "the lenient classifier still lands the node on the placeholder arm"
+        );
     }
 }

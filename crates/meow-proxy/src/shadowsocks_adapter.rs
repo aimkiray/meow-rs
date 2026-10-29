@@ -866,9 +866,10 @@ fn feature_gated_plugin_feature(name: &str) -> Option<&'static str> {
 /// lacks it — `None` for unreserved names and for plugins that are compiled
 /// in. Drives `FEATURE_GATED_PLUGINS`, so a new reserved name needs only a
 /// table row. Config parsing uses this to keep a node whose plugin cannot be
-/// constructed bound to a dead placeholder (same contract as a compiled-out
-/// `type:` such as trusttunnel) instead of dropping it and letting its group
-/// slide to a sibling or DIRECT.
+/// constructed bound to a dead placeholder (same contract as the
+/// compiled-out `trusttunnel` type) instead of dropping it and letting a
+/// `select` group or explicit reference slide that traffic to a sibling or
+/// DIRECT; liveness-checked groups still skip the dead entry.
 pub fn missing_plugin_feature(name: &str) -> Option<&'static str> {
     FEATURE_GATED_PLUGINS
         .iter()
