@@ -464,19 +464,18 @@ async fn http_absolute_form_authority_beats_conflicting_host() {
 }
 
 /// Sniffer-enabled counterpart of `http_absolute_form_authority_beats_conflicting_host`.
-/// With the sniffer on, the plain-HTTP path extracts the `Host:` header
-/// into `metadata.sniff_host`, and `rule_host()` prefers the sniffed name
-/// over `host`: `GET http://evil.com/` + `Host: good.example` is routed
-/// by `good.example` (MATCH,proxy), not by the request target — while
-/// `metadata.host` still carries `evil.com` as the dial destination.
+/// With the sniffer on, the plain-HTTP path still routes by the request
+/// target's authority when it is a domain: `GET http://evil.com/` +
+/// `Host: good.example` must hit DOMAIN,evil.com → REJECT. The sniffed
+/// `good.example` is NOT adopted into `sniff_host` — rules read
+/// `sniff_host` while the dial reads `host`, so adopting it would route
+/// by `good.example` yet still dial `evil.com`, slipping past the REJECT
+/// (the regression this pins).
 ///
-/// The routing pin is the upstream accept count, not the status line:
-/// the mock echoes bytes (`GET / HTTP/1.1…`) that are not a valid HTTP
-/// response head, so the relay's status-line check converts the exchange
-/// to a 502 *after* the dial. A REJECT-502 never dials — `accepts == 1`
-/// proves which arm owned the flow.
+/// The routing pin is the upstream accept count: a REJECT-502 never
+/// dials, and `accepts == 0` proves the DOMAIN arm owned the flow.
 #[tokio::test]
-async fn http_absolute_form_sniffed_host_beats_target_authority() {
+async fn http_absolute_form_authority_beats_conflicting_sniffed_host() {
     let (tunnel, accepts) = common::issue_734_tunnel().await;
     let sniffer: &'static _ = Box::leak(Box::new(meow_listener::sniffer::SnifferRuntime::new(
         meow_common::sniffer::SnifferConfig {
@@ -492,15 +491,101 @@ async fn http_absolute_form_sniffed_host_beats_target_authority() {
     .await;
     assert!(
         response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"),
-        "the echo is not a response head — the relay closes with 502: {:?}",
+        "DOMAIN,evil.com must REJECT via the target authority: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        0,
+        "the explicit authority wins — a conflicting sniffed name must not reroute the dial"
+    );
+}
+
+/// The flip side of the authority priority: an IP-literal authority
+/// carries no routing name, so the sniffed `Host:` IS still adopted —
+/// `GET http://127.0.0.1/` + `Host: good.example` hits
+/// `DOMAIN-SUFFIX,good.example,REJECT` even though the bare literal
+/// would fall through to MATCH,proxy (the control request proves it by
+/// dialing on a name the rule does not cover). Losing this would break
+/// the sniffer's design purpose: recovering a routing name for
+/// IP-literal flows.
+#[tokio::test]
+async fn http_ip_literal_authority_still_adopts_sniffed_host() {
+    let (upstream, accepts) = common::spawn_counting_http_upstream().await;
+    let yaml = format!(
+        "proxies:\n  - name: proxy\n    type: http\n    server: 127.0.0.1\n    port: {}\n\
+         rules:\n  - DOMAIN-SUFFIX,good.example,REJECT\n  - MATCH,proxy\n",
+        upstream.port()
+    );
+    let raw = meow_config::parse_raw_yaml(&yaml).unwrap();
+    let res = meow_config::rebuild_from_raw(&raw).unwrap();
+    let tunnel = common::direct_tunnel();
+    tunnel.set_mode(meow_common::TunnelMode::Rule);
+    tunnel.update_proxies(res.proxies, res.dialer_registry);
+    tunnel.update_rules(res.rules);
+
+    let sniffer: &'static _ = Box::leak(Box::new(meow_listener::sniffer::SnifferRuntime::new(
+        meow_common::sniffer::SnifferConfig {
+            enable: true,
+            ..Default::default()
+        },
+    )));
+
+    // Control: a sniffed name the suffix rule does not cover falls to
+    // MATCH,proxy and dials — proves the REJECT below is the sniffed-name
+    // arm, not something the IP literal itself triggers.
+    let control = http_exchange_sniffed(
+        &tunnel,
+        sniffer,
+        b"GET http://127.0.0.1/ HTTP/1.1\r\nHost: other.example\r\n\r\n",
+    )
+    .await;
+    assert!(
+        !control.starts_with(b"HTTP/1.1 400"),
+        "control must pass the gate: {:?}",
+        String::from_utf8_lossy(&control)
+    );
+    settle().await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "control must reach the upstream via MATCH,proxy"
+    );
+
+    let response = http_exchange_sniffed(
+        &tunnel,
+        sniffer,
+        b"GET http://127.0.0.1/ HTTP/1.1\r\nHost: good.example\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"),
+        "DOMAIN-SUFFIX,good.example must REJECT via the sniffed name: {:?}",
         String::from_utf8_lossy(&response)
     );
     settle().await;
     assert_eq!(
         accepts.load(Ordering::SeqCst),
         1,
-        "sniff_host `good.example` routes via MATCH,proxy — DOMAIN,evil.com never sees it"
+        "the sniffed `good.example` must own the flow — REJECT, no dial"
     );
+}
+
+/// `Host: 127.0.0.1:0` restores port 0 — no socket can dial it — so the
+/// listener refuses with 400 like any other unusable authority instead
+/// of routing an undialable port.
+#[tokio::test]
+async fn http_origin_form_zero_port_host_is_400() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let response = http_exchange(&tunnel, b"GET / HTTP/1.1\r\nHost: 127.0.0.1:0\r\n\r\n").await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
 }
 
 /// The literal fold is pinned end-to-end at rule level: `Host: 127.0.0.1`

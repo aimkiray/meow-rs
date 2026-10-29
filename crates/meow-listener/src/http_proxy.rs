@@ -225,7 +225,13 @@ async fn handle_http_inner(
         // `?x`, `*` and other non-authority targets keep their 400.
         let (host, port) = if host.is_empty() && url.starts_with('/') {
             match host_header(&request) {
-                Some(authority) => parse_host_port(authority, 80),
+                Some(authority) => match parse_host_port(authority, 80) {
+                    // Port 0 names no socket (`Host: x:0`) — hand the
+                    // empty authority back so the hostname gate below
+                    // refuses it like any other bad Host value.
+                    (_, 0) => (host, port),
+                    parsed => parsed,
+                },
                 None => (host, port),
             }
         } else {

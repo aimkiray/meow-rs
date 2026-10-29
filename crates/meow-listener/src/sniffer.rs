@@ -127,11 +127,31 @@ impl SnifferRuntime {
     /// Apply a pre-extracted hostname to `metadata`, honouring `skip-domain`
     /// and `override-destination`. Used for the HTTP proxy plain-request path
     /// where headers are already read into a buffer rather than peeked.
+    ///
+    /// Priority: an explicit domain authority already in `metadata.host` —
+    /// a CONNECT target, an absolute-form URI authority, a SOCKS5 domain,
+    /// anything that is neither empty nor an IP literal — outranks a
+    /// conflicting sniffed name, so the sniff is not adopted then. Rules
+    /// match on `sniff_host` while the dial uses `host`, so adopting a
+    /// different name would route by one host and dial the other:
+    /// `GET http://evil.com/` + `Host: good.example` would slip past
+    /// `DOMAIN,evil.com,REJECT` yet still dial evil.com. The sniff is
+    /// adopted only when the flow has no routing name of its own — an
+    /// empty `host` or an IP literal — which is what sniffing exists
+    /// for. With `override-destination: true` the sniffed name rewrites
+    /// `host` too, so rules and dial stay consistent and adoption is
+    /// unconditional.
     pub fn maybe_apply_sniff(&self, host: &str, metadata: &mut Metadata) {
         if !self.cfg.enable {
             return;
         }
         if self.skip.search(host).is_some() {
+            return;
+        }
+        if !self.cfg.override_destination
+            && !metadata.host.is_empty()
+            && meow_common::metadata_ip_literal(&metadata.host).is_none()
+        {
             return;
         }
         debug!("sniffer: {} → {}", metadata, host);
@@ -251,9 +271,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sniffer_force_domain_overrides_pure_ip() {
+    async fn sniffer_force_domain_gate_opens_but_authority_wins() {
         // host is a subdomain matched by "+.example.com" in force_domain →
-        // parse_pure_ip short-circuit is bypassed and the sniffer runs.
+        // the parse_pure_ip short-circuit is bypassed and the sniffer
+        // runs — the peek happens and the SNI is extracted. But applying
+        // it is a separate step: an explicit domain `host` outranks a
+        // conflicting sniffed name without `override-destination`, so
+        // `sniff_host` stays empty (rules would read it while the dial
+        // still uses `host`).
         let cfg = SnifferConfig {
             enable: true,
             parse_pure_ip: true,
@@ -263,24 +288,38 @@ mod tests {
         };
         let rt = make_runtime(cfg);
         let (mut client, server) = make_stream_pair().await;
-        let hello = build_client_hello("www.example.com");
+        let hello = build_client_hello("cdn.other.example");
         client.write_all(&hello).await.unwrap();
 
-        // host is already a domain, but "+.example.com" covers it → sniff runs
         let mut meta = make_metadata("www.example.com", 443);
         rt.sniff(&server, &mut meta).await;
-        assert_eq!(meta.sniff_host, "www.example.com");
+        assert_eq!(
+            meta.sniff_host, "",
+            "a domain authority beats a conflicting sniffed name"
+        );
+        assert_eq!(meta.host, "www.example.com");
 
-        // The apex is covered by "+.example.com" too (upstream `+.`
-        // semantics include the root) — the same gate bypass applies to the
-        // bare domain.
+        // With `override-destination` the sniffed name rewrites `host`
+        // too, keeping rules and dial consistent — the force-domain
+        // bypass then lands as before, even on the apex (upstream `+.`
+        // semantics include the root).
+        let cfg = SnifferConfig {
+            enable: true,
+            parse_pure_ip: true,
+            override_destination: true,
+            tls_ports: vec![443],
+            force_domain: vec!["+.example.com".into()],
+            ..Default::default()
+        };
+        let rt = make_runtime(cfg);
         let (mut client, server) = make_stream_pair().await;
-        let hello = build_client_hello("example.com");
+        let hello = build_client_hello("cdn.other.example");
         client.write_all(&hello).await.unwrap();
         let mut meta = make_metadata("example.com", 443);
         rt.sniff(&server, &mut meta).await;
+        assert_eq!(meta.sniff_host, "cdn.other.example");
         assert_eq!(
-            meta.sniff_host, "example.com",
+            meta.host, "cdn.other.example",
             "+.example.com must force-sniff the apex itself"
         );
     }
@@ -465,10 +504,13 @@ mod tests {
     #[tokio::test]
     async fn sniffer_parse_pure_ip_disabled_runs_on_domain_host() {
         // parse_pure_ip = false → the host-already-a-domain short-circuit is
-        // skipped and sniffing runs normally.
+        // skipped and sniffing runs normally. With `override-destination`
+        // the sniffed name lands on both fields; without it the apply
+        // step would refuse — an explicit domain authority wins.
         let cfg = SnifferConfig {
             enable: true,
             parse_pure_ip: false,
+            override_destination: true,
             tls_ports: vec![443],
             ..Default::default()
         };
@@ -480,6 +522,7 @@ mod tests {
         let mut meta = make_metadata("placeholder.example.com", 443);
         rt.sniff(&server, &mut meta).await;
         assert_eq!(meta.sniff_host, "real-sni.example.com");
+        assert_eq!(meta.host, "real-sni.example.com");
     }
 
     #[test]
@@ -557,6 +600,62 @@ mod tests {
                 sniffed: "example.com",
                 expected_sniff_host: "example.com",
                 expected_host: "1.2.3.4",
+            },
+            // Priority rule: an explicit domain authority in `host` beats a
+            // conflicting sniffed name — rules read `sniff_host` while the
+            // dial uses `host`, so adopting here would route by one name
+            // and dial the other. Nothing is adopted.
+            Case {
+                name: "domain_host_beats_conflicting_sniff",
+                enable: true,
+                override_destination: false,
+                skip_domain: &[],
+                meta_host: "evil.com",
+                meta_port: 80,
+                sniffed: "good.example",
+                expected_sniff_host: "",
+                expected_host: "evil.com",
+            },
+            // An empty `host` carries no routing name — the sniffed name
+            // is adopted; recovering that name is what sniffing is for.
+            Case {
+                name: "empty_host_adopts_sniff",
+                enable: true,
+                override_destination: false,
+                skip_domain: &[],
+                meta_host: "",
+                meta_port: 80,
+                sniffed: "good.example",
+                expected_sniff_host: "good.example",
+                expected_host: "",
+            },
+            // A bracketed IPv6 literal is still an IP literal (the HTTP
+            // listeners keep the brackets in `host`), so the sniff is
+            // adopted like for a plain literal.
+            Case {
+                name: "bracketed_v6_host_adopts_sniff",
+                enable: true,
+                override_destination: false,
+                skip_domain: &[],
+                meta_host: "[::1]",
+                meta_port: 80,
+                sniffed: "good.example",
+                expected_sniff_host: "good.example",
+                expected_host: "[::1]",
+            },
+            // `override-destination` rewrites `host` with the sniffed
+            // name, keeping rules and dial consistent — adoption is
+            // unconditional even against a domain authority.
+            Case {
+                name: "override_destination_beats_domain_host",
+                enable: true,
+                override_destination: true,
+                skip_domain: &[],
+                meta_host: "evil.com",
+                meta_port: 80,
+                sniffed: "good.example",
+                expected_sniff_host: "good.example",
+                expected_host: "good.example",
             },
         ];
 
