@@ -195,7 +195,7 @@ pub async fn parse_dns(
     // silently fall back to the upstream resolver, which is a user-surprising
     // privacy regression.
     if mode == DnsMode::FakeIp {
-        install_fakeip(&mut resolver, dns, cache_dir, prior).await?;
+        install_fakeip(&mut resolver, dns, cache_dir, prior, strict).await?;
     }
 
     let resolver = Arc::new(resolver);
@@ -213,6 +213,7 @@ async fn install_fakeip(
     dns: &crate::raw::RawDns,
     cache_dir: Option<&std::path::Path>,
     prior: Option<&Resolver>,
+    strict: bool,
 ) -> Result<(), anyhow::Error> {
     let range_str = dns
         .fake_ip_range
@@ -288,6 +289,16 @@ async fn install_fakeip(
 
     // Skipper: fake-ip-filter patterns + optional fake-ip-filter-mode.
     let patterns = dns.fake_ip_filter.clone().unwrap_or_default();
+    for p in &patterns {
+        if domain_key_has_dead_label(p) {
+            // Dead trie node by the same shape as `hosts:` — an empty label
+            // can never match a query name (issue #822 shape).
+            if strict {
+                anyhow::bail!("dns.fake-ip-filter: '{p}' contains an empty label (strict mode)");
+            }
+            warn!("dns.fake-ip-filter: '{p}' contains an empty label; it can never match");
+        }
+    }
     let skipper_mode = match dns.fake_ip_filter_mode.as_deref() {
         Some("whitelist") | Some("white-list") => SkipperMode::WhiteList,
         Some("blacklist") | Some("black-list") | None => SkipperMode::BlackList,
@@ -976,7 +987,20 @@ fn build_fallback_filter(
 
     let mut domain: DomainTrie<()> = DomainTrie::new();
     for s in domain_strs {
-        domain.insert(s, ());
+        if domain_key_has_dead_label(s) {
+            // Same dead-node shape as `hosts:` — the entry inserts but can
+            // never match a query name (empty labels never occur on the
+            // wire); surface it rather than swallow it (issue #822 shape).
+            if strict {
+                return Err(anyhow::anyhow!(
+                    "fallback-filter.domain: '{s}' contains an empty label (strict mode)"
+                ));
+            }
+            warn!("fallback-filter.domain: '{s}' contains an empty label; it can never match");
+        }
+        if !domain.insert(s, ()) {
+            warn!("fallback-filter.domain: failed to insert '{s}' into trie");
+        }
     }
 
     // Attempt to load GeoIP MMDB for the geoip gate.
@@ -1117,7 +1141,7 @@ fn build_hosts_trie(
 /// the trailing-dot half is fixed at `DomainTrie::insert`). Callers warn
 /// or hard-error on it; the key is still handed to the trie either way so
 /// the check is observability only, never a semantic change.
-fn domain_key_has_dead_label(key: &str) -> bool {
+pub(crate) fn domain_key_has_dead_label(key: &str) -> bool {
     let key = key.trim();
     let body = key
         .strip_prefix("+.")
@@ -1814,7 +1838,13 @@ mod tests {
         map.insert("a..b".to_string(), one("1.2.3.4"));
         // Lenient: warns, still inserts the (unreachable) node — no query
         // may ever see it, and `a.b` in particular must not leak to it.
+        let cap = WarnCapture::start();
         let trie = build_hosts_trie(Some(&map), false).unwrap();
+        let warns = cap.take();
+        assert!(
+            warns.contains("a..b") && warns.contains("empty label"),
+            "the dead key must be surfaced, got: {warns}"
+        );
         assert!(trie.search("a.b").is_none(), "a..b must not leak to a.b");
         let err = build_hosts_trie(Some(&map), true)
             .err()
@@ -2187,9 +2217,15 @@ mod tests {
     async fn parse_nameserver_policy_empty_label_key_warns_lenient_errors_strict() {
         use crate::raw::RawNspValue;
         let map = nsp_map(&[("a..b", RawNspValue::One("rcode://success".to_string()))]);
+        let cap = WarnCapture::start();
         let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
             .await
             .expect("empty-label key must stay lenient");
+        let warns = cap.take();
+        assert!(
+            warns.contains("a..b") && warns.contains("empty label"),
+            "the dead key must be surfaced, got: {warns}"
+        );
         assert!(
             pol.lookup("a.b").is_none(),
             "the dead node must not leak to a.b"
@@ -2818,6 +2854,77 @@ mod tests {
             !ff.domain_gated("a.b.fb.test"),
             "deep subdomain must not match *.fb.test"
         );
+    }
+
+    // An empty-label `fallback-filter.domain` entry inserts a trie node no
+    // query name can ever match — the same dead-node shape as `hosts:`
+    // (issue #822). Lenient surfaces it; strict rejects it.
+    #[test]
+    fn build_fallback_filter_empty_label_domain_warns_lenient_errors_strict() {
+        use crate::raw::RawFallbackFilter;
+        let raw = RawFallbackFilter {
+            geoip: Some(false),
+            geoip_code: None,
+            ipcidr: None,
+            domain: Some(vec!["a..b".to_string(), "fine.example".to_string()]),
+        };
+        let cap = WarnCapture::start();
+        let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
+        let warns = cap.take();
+        assert!(
+            warns.contains("a..b") && warns.contains("empty label"),
+            "the dead entry must be surfaced, got: {warns}"
+        );
+        assert!(
+            ff.domain_gated("fine.example"),
+            "the good entry must still gate"
+        );
+        assert!(!ff.domain_gated("a.b"), "a..b must not leak to a.b");
+        let err = build_fallback_filter(Some(&raw), None, true)
+            .err()
+            .expect("strict must hard-error on an empty label");
+        assert!(err.to_string().contains("empty label"));
+    }
+
+    // Same dead-node observability for `dns.fake-ip-filter`: lenient warns,
+    // strict hard-errors — both through the `parse_dns` fake-IP path.
+    #[tokio::test]
+    async fn install_fakeip_empty_label_pattern_warns_lenient_errors_strict() {
+        let lenient_yaml = "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver:\n    - 1.1.1.1\n  fake-ip-filter:\n    - a..b\n    - fine.example\n";
+        let raw: RawConfig = serde_saphyr::from_str(lenient_yaml).unwrap();
+        let cap = WarnCapture::start();
+        parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .expect("lenient fake-ip-filter dead label must still load");
+        let warns = cap.take();
+        assert!(
+            warns.contains("a..b") && warns.contains("empty label"),
+            "the dead entry must be surfaced, got: {warns}"
+        );
+
+        let strict_yaml = format!("strict: true\n{lenient_yaml}");
+        let raw: RawConfig = serde_saphyr::from_str(&strict_yaml).unwrap();
+        let err = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .err()
+        .expect("strict must hard-error on an empty label");
+        assert!(err.to_string().contains("empty label"), "got: {err}");
     }
 
     // --- nameserver-policy `#PROXY` fragments -----------------------------

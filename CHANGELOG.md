@@ -14,19 +14,24 @@ the canonical, in-repo source a release is cut from.
   header — the request shape every browser sends a plain-HTTP proxy —
   was refused with 400 by the #734 hostname gate, which only looked at
   the request target's (empty) authority. The listener now takes the
-  authority from the `Host:` header for origin-form requests and runs it
-  through the same gate: `Host: example.com` routes by rules, an IP
-  literal folds into `dst_ip`, an explicit `:port` is honoured, and a
-  non-hostname value is refused with 400 like any bad authority.
+  authority from the `Host:` header for `/`-leading request targets and
+  runs it through the same gate: `Host: example.com` routes by rules, an
+  IP literal folds into `dst_ip`, an explicit `:port` is honoured, and a
+  non-hostname or duplicated `Host` value is refused with 400 like any
+  bad authority.
 - **Numeric address spellings no longer pass `is_valid_host`.** A name
   made only of digits and dots (`2130706433`, `0177.0.0.1`, `123.456`)
   is an `inet_aton` address form a libc dial path would fold into an IP —
   not a hostname the DOMAIN rules checked. Go's `isDomainName` parity: at
   least one byte must be non-numeric (`-`/`_` count, so `123-456` still
-  passes).
-- **Dead `hosts:`/`nameserver-policy` keys are surfaced.** A domain key
-  with an empty label (`a..b`, `..x`) builds a trie node no query can
-  reach; lenient mode now warns naming the key, strict mode errors.
+  passes). Letter-bearing spellings (`0x7f000001`) still pass, as under
+  Go — they stay closed on resolver-injected dial paths only.
+- **Dead domain entries in static config are surfaced.** An empty-label
+  key (`a..b`, `..x`) builds a `DomainTrie` node no query can reach.
+  `hosts:`, `nameserver-policy`, `fallback-filter.domain`,
+  `fake-ip-filter`, and sniffer `skip-domain`/`force-domain` now warn
+  naming the entry in lenient mode and error in strict mode — the entry
+  itself still loads (observability, not a semantics change).
 
 ## [0.28.0] - 2026-10-30
 
