@@ -1536,6 +1536,13 @@ const MALFORMED_DIALER_PREFIX: &str = "__malformed_dialer_proxy__";
 /// gives a dialer name that resolves to nothing — rather than silently
 /// egressing direct.
 ///
+/// `placeholder_names` carries the leaf names [`insert_parsed_leaves`] bound
+/// as unavailable placeholders: those entries skip the relay-based wrapper
+/// below, since `DialerProxyAdapter::support_udp()` is always `false` and
+/// would hide the placeholder's `true` guard that keeps a UDP rule from
+/// sliding to DIRECT — the node is dead either way, so the chain adds
+/// nothing for TCP.
+///
 /// Returns the applied `(proxy, dialer)` edges so the caller can re-validate
 /// dialer targets once groups have been built (a *declared* group that failed
 /// to build satisfies `dialable` but never enters the registry) and run
@@ -1547,6 +1554,7 @@ fn apply_dialer_proxies(
     registry: &meow_proxy::dialer::ProxyRegistry,
     ipv6: bool,
     strict: bool,
+    placeholder_names: &std::collections::HashSet<SmolStr>,
 ) -> Result<Vec<(SmolStr, SmolStr)>, anyhow::Error> {
     // Collect proxy -> dialer edges from the raw config.
     //
@@ -1694,16 +1702,27 @@ fn apply_dialer_proxies(
                 // SIP003) — never silently dialing direct and leaking past
                 // the chain.
                 //
-                // The inner outbound may itself have failed to parse earlier,
-                // in which case there is nothing to wrap.
+                // A node already bound as an unavailable placeholder keeps it
+                // instead of the wrapper: `DialerProxyAdapter::support_udp()`
+                // is always `false`, so wrapping would hide the placeholder's
+                // `true` guard that fails UDP loudly — a UDP rule could then
+                // slide to DIRECT. The chain adds nothing for TCP either way,
+                // since every dial through the dead node already fails.
                 if let Some(inner) = proxies.get(name).cloned() {
-                    warn!(
-                        "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
-                         ({e}); falling back to the relay-based wrapper"
-                    );
-                    let wrapped: Arc<dyn Proxy> =
-                        Arc::new(meow_proxy::DialerProxyAdapter::new(inner, target));
-                    proxies.insert(name.clone(), wrapped);
+                    if placeholder_names.contains(name) {
+                        debug!(
+                            "proxy '{name}': dialer-proxy '{dialer}' not applied; \
+                             the node is an unavailable placeholder ({e})"
+                        );
+                    } else {
+                        warn!(
+                            "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
+                             ({e}); falling back to the relay-based wrapper"
+                        );
+                        let wrapped: Arc<dyn Proxy> =
+                            Arc::new(meow_proxy::DialerProxyAdapter::new(inner, target));
+                        proxies.insert(name.clone(), wrapped);
+                    }
                 } else {
                     warn!(
                         "proxy '{name}': dialer-proxy '{dialer}' not applied \
@@ -2029,8 +2048,12 @@ fn has_unresolved_group_dependency(
 /// dropping it from the registry (see [`meow_proxy::UnavailableAdapter`]).
 ///
 /// Used for the protocols where a *missing* member is worse than a broken one:
-/// a group that lists the name can neither quietly shift that traffic onto a
-/// sibling member nor, once no member survives, degrade to a direct dial.
+/// a `select` group, an explicit `MATCH`/rule target or a `dialer-proxy`
+/// chain that names the node fails its dials instead of quietly shifting
+/// that traffic to a sibling member or, once no member survives, degrading
+/// to a direct dial. Liveness-checked groups (`fallback`, `url-test`,
+/// `load-balance`) skip the dead entry exactly like any unavailable member —
+/// the placeholder deliberately does not pin those.
 /// Rejecting the enclosing `proxies:` block or provider payload closes the
 /// same hole, but it also fires for a protocol the running binary simply does
 /// not contain — which the operator cannot repair by editing anything — and on
@@ -2055,16 +2078,20 @@ pub(crate) fn unavailable_placeholder(
 /// distinguish static leaves from group/provider members when modelling
 /// `include-all-proxies` and membership cycles. Factored out of
 /// `build_proxy_layer` so the key derivation lives in exactly one place.
+///
+/// Returns the names this pass bound as unavailable placeholders, for
+/// [`apply_dialer_proxies`] to leave unwrapped.
 fn insert_parsed_leaves(
     proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
     static_proxy_names: &mut std::collections::HashSet<SmolStr>,
     raw_proxies: &[HashMap<String, serde_json::Value>],
     ipv6: bool,
     strict: bool,
-) -> Result<(), anyhow::Error> {
+) -> Result<std::collections::HashSet<SmolStr>, anyhow::Error> {
+    let mut placeholder_names = std::collections::HashSet::new();
     for raw_proxy in raw_proxies {
-        let proxy = match proxy_parser::parse_proxy(raw_proxy, ipv6) {
-            Ok(proxy) => proxy,
+        let (proxy, placeholder_bound) = match proxy_parser::parse_proxy(raw_proxy, ipv6) {
+            Ok(proxy) => (proxy, false),
             Err(e) if strict => {
                 let name = raw_proxy
                     .get("name")
@@ -2074,20 +2101,30 @@ fn insert_parsed_leaves(
                     "proxies: failed to parse '{name}' (strict mode): {e}"
                 ));
             }
-            Err(e) if proxy_parser::node_is_trusttunnel(raw_proxy) => {
-                let name = raw_proxy
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<unnamed>");
-                warn!(
-                    "proxies: '{name}' failed to parse ({e}); keeping the name bound \
-                     to an unavailable node so no dial can fall back past it"
-                );
-                unavailable_placeholder(name, &e, meow_common::AdapterType::TrustTunnel)
-            }
+            // Keep the slot entry as a dead placeholder instead of dropping
+            // it: a `select` group, an explicit `MATCH` target or a
+            // `dialer-proxy` chain that names the node fails the dial rather
+            // than shifting the traffic to a sibling member or DIRECT —
+            // the same contract the compiled-out `trusttunnel` type gets
+            // (other compiled-out types stay warn-and-drop). The operator
+            // cannot fix a missing protocol or a missing built-in plugin
+            // transport by editing the config, so `-t`, boot, `PUT /configs`
+            // and refreshes all read identically here.
             Err(e) => {
-                warn!("Failed to parse proxy: {}", e);
-                continue;
+                if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_proxy) {
+                    let name = raw_proxy
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<unnamed>");
+                    warn!(
+                        "proxies: '{name}' failed to parse ({e}); keeping the name bound \
+                         to an unavailable node so no dial can fall back past it"
+                    );
+                    (unavailable_placeholder(name, &e, declared), true)
+                } else {
+                    warn!("Failed to parse proxy: {}", e);
+                    continue;
+                }
             }
         };
         // Prefer the YAML `name:` as the registry key. `proxy.name()`
@@ -2118,12 +2155,33 @@ fn insert_parsed_leaves(
         // leaves settle before any group captures members, so they
         // cannot split the registry the way group duplicates did
         // (#561). Warn so a typo doesn't silently rebind (#625).
-        if !static_proxy_names.insert(key.clone()) {
-            warn!("duplicate proxy name '{key}': the later entry replaces the earlier one");
+        let repeated = !static_proxy_names.insert(key.clone());
+        if placeholder_bound {
+            // Upstream dropped the unparseable duplicate outright, so it
+            // never shadowed a same-named good entry; keep that contract
+            // here — a dead placeholder fills only an empty slot and
+            // leaves an earlier live binding alone.
+            if let std::collections::hash_map::Entry::Vacant(slot) = proxies.entry(key.clone()) {
+                slot.insert(proxy);
+                placeholder_names.insert(key);
+            } else if repeated {
+                warn!(
+                    "duplicate proxy name '{key}': the unparseable later \
+                     entry leaves the earlier binding untouched"
+                );
+            }
+        } else {
+            if repeated {
+                warn!("duplicate proxy name '{key}': the later entry replaces the earlier one");
+            }
+            // A *live* duplicate still wins over an earlier placeholder —
+            // the normal insert replaces it, so unmark the name first or
+            // `apply_dialer_proxies` would skip wrapping a working node.
+            placeholder_names.remove(&key);
+            proxies.insert(key, proxy);
         }
-        proxies.insert(key, proxy);
     }
-    Ok(())
+    Ok(placeholder_names)
 }
 
 /// Materialize the proxy-provider set for one candidate build (issue #533
@@ -2319,7 +2377,7 @@ fn build_proxy_layer(
         ))),
     );
 
-    insert_parsed_leaves(
+    let placeholder_names = insert_parsed_leaves(
         &mut proxies,
         &mut static_proxy_names,
         raw.proxies.as_deref().unwrap_or(&[]),
@@ -2380,6 +2438,7 @@ fn build_proxy_layer(
         registry,
         ipv6,
         strict,
+        &placeholder_names,
     )?;
 
     // Mihomo expands `include-all-proxies` from the top-level `proxies:`
@@ -4860,6 +4919,306 @@ pub async fn build_config(
 }
 
 #[cfg(test)]
+mod missing_plugin_placeholder_tests {
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    use super::*;
+
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    fn raw_gost_node() -> HashMap<String, serde_json::Value> {
+        let mut m = HashMap::new();
+        m.insert(
+            "name".to_string(),
+            serde_json::Value::String("s-gost".to_string()),
+        );
+        m.insert(
+            "type".to_string(),
+            serde_json::Value::String("ss".to_string()),
+        );
+        m.insert(
+            "server".to_string(),
+            serde_json::Value::String("1.2.3.4".to_string()),
+        );
+        m.insert("port".to_string(), serde_json::Value::from(8388u16));
+        m.insert(
+            "password".to_string(),
+            serde_json::Value::String("p".to_string()),
+        );
+        m.insert(
+            "cipher".to_string(),
+            serde_json::Value::String("aes-128-gcm".to_string()),
+        );
+        m.insert(
+            "plugin".to_string(),
+            serde_json::Value::String("gost-plugin".to_string()),
+        );
+        m
+    }
+
+    /// Every assertion below is the placeholder contract the compiled-out
+    /// `trusttunnel` type already keeps: the node stays bound under its own
+    /// name as a permanently dead `Shadowsocks` entry — never dropped, so a
+    /// `select` group or explicit reference to it fails the dial instead of
+    /// shifting the traffic to a sibling or DIRECT (liveness-checked groups
+    /// skip it like any unavailable member) — and its dial reason is the
+    /// adapter's "not compiled into this build" error.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    async fn assert_dead_ss_placeholder(proxy: &Arc<dyn Proxy>) {
+        assert!(!proxy.alive(), "a placeholder must never look usable");
+        assert_eq!(
+            proxy.adapter_type(),
+            meow_common::AdapterType::Shadowsocks,
+            "a placeholder must keep the node's own type"
+        );
+        let error = proxy
+            .dial_tcp(&meow_common::Metadata::default())
+            .await
+            .err()
+            .expect("a placeholder must fail the dial, not leak it direct")
+            .to_string();
+        assert!(error.contains(proxy.name()), "{error}");
+        assert!(
+            error.contains("not compiled into this build"),
+            "the placeholder's reason must be the plugin gate error: {error}"
+        );
+    }
+
+    /// The node keeps its slot instead of warn-dropping — under offline
+    /// validate (`-t`) and boot alike, since the arm does not distinguish
+    /// them: the whole point is `-t` and boot reading the file identically.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[tokio::test]
+    async fn missing_plugin_node_binds_a_dead_placeholder() {
+        let mut proxies = HashMap::new();
+        let mut names = std::collections::HashSet::new();
+        insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, false).unwrap();
+        let bound = proxies
+            .get("s-gost")
+            .expect("a missing-plugin node must stay bound, not dropped");
+        assert_dead_ss_placeholder(bound).await;
+    }
+
+    /// `strict: true` still hard-errors first — the placeholder arm only
+    /// covers lenient parsing, so a bad local file keeps failing loudly.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[test]
+    fn missing_plugin_node_still_hard_errors_under_strict() {
+        let mut proxies = HashMap::new();
+        let mut names = std::collections::HashSet::new();
+        let err = insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, true)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("strict mode"),
+            "strict must still hard-error: {err}"
+        );
+    }
+
+    /// End-to-end at `load_config` level: a `select` group listing only the
+    /// dead node must keep it selected — dialing through the group fails
+    /// with the plugin-gate error instead of sliding to DIRECT. (A
+    /// `url-test`/`fallback` group would still skip the dead member by
+    /// liveness — the placeholder pins references, not health probes.)
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[tokio::test]
+    async fn group_listing_dead_node_cannot_slide_to_direct() {
+        let raw: raw::RawConfig = serde_saphyr::from_str(
+            "proxies:\n\
+            \x20 - name: s-gost\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    \
+             password: p\n    cipher: aes-128-gcm\n    plugin: gost-plugin\n\
+             proxy-groups:\n\
+            \x20 - name: G\n    type: select\n    proxies: [s-gost]\n\
+             rules:\n  - MATCH,G\n",
+        )
+        .unwrap();
+        let config = build_config(raw, None)
+            .await
+            .expect("a missing-plugin node must not reject the config");
+        let group = config
+            .proxies
+            .get("G")
+            .expect("group G must build around the dead node");
+        let err = group
+            .dial_tcp(&meow_common::Metadata::default())
+            .await
+            .err()
+            .expect("a dial through G must fail — never fall back to DIRECT");
+        assert!(
+            err.to_string().contains("not compiled into this build"),
+            "the group dial must surface the plugin-gate reason: {err}"
+        );
+    }
+
+    /// `meow -t` reads the file exactly like boot does: the load succeeds
+    /// (exit 0 equivalent) with the node bound dead. The flag is
+    /// process-global and never reset, so the assertion runs in a child
+    /// process (same pattern as rule_provider's
+    /// `MEOW_OFFLINE_VALIDATE_CHILD`).
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[test]
+    fn offline_validate_passes_with_the_node_bound_dead() {
+        const CHILD: &str = "MEOW_OFFLINE_PLACEHOLDER_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            crate::set_offline_validate(true);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let raw: raw::RawConfig = serde_saphyr::from_str(
+                "proxies:\n\
+                \x20 - name: s-gost\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    \
+                 password: p\n    cipher: aes-128-gcm\n    plugin: gost-plugin\n\
+                 proxy-groups:\n\
+                \x20 - name: G\n    type: select\n    proxies: [s-gost]\n\
+                 rules:\n  - MATCH,G\n",
+            )
+            .unwrap();
+            let config = rt
+                .block_on(build_config(raw, None))
+                .expect("offline validate must pass with the node bound dead");
+            let bound = config
+                .proxies
+                .get("s-gost")
+                .expect("the node must stay bound under -t");
+            assert!(!bound.alive(), "a placeholder must never look usable");
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("missing_plugin_placeholder_tests::offline_validate_passes_with_the_node_bound_dead")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "child gate run failed: {status:?}");
+    }
+
+    /// An explicit `MATCH,<node>` rule is the other reference a dead
+    /// placeholder must pin: the name resolves to the bound entry, so the
+    /// dial fails with the plugin-gate error instead of the rule pointing
+    /// at nothing — the same contract `select` gets above.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[tokio::test]
+    async fn match_rule_to_dead_node_still_fails_the_dial() {
+        let raw: raw::RawConfig = serde_saphyr::from_str(
+            "proxies:\n\
+            \x20 - name: s-gost\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    \
+             password: p\n    cipher: aes-128-gcm\n    plugin: gost-plugin\n\
+             rules:\n  - MATCH,s-gost\n",
+        )
+        .unwrap();
+        let config = build_config(raw, None)
+            .await
+            .expect("a missing-plugin node must not reject the config");
+        let bound = config
+            .proxies
+            .get("s-gost")
+            .expect("the MATCH target must stay bound, not vanish");
+        assert_dead_ss_placeholder(bound).await;
+    }
+
+    /// A `dialer-proxy:` edge on a missing-plugin node must NOT be wrapped
+    /// in `DialerProxyAdapter`: that wrapper reports `support_udp() ==
+    /// false`, hiding `UnavailableAdapter`'s `true` guard that keeps a UDP
+    /// rule from sliding to DIRECT. The node is dead either way, so the
+    /// chain adds nothing for TCP — the placeholder stays as it is.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[tokio::test]
+    async fn missing_plugin_node_with_dialer_proxy_keeps_the_udp_guard() {
+        let raw: raw::RawConfig = serde_saphyr::from_str(
+            "proxies:\n\
+            \x20 - name: front\n    type: direct\n    udp: true\n\
+            \x20 - name: s-gost\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    \
+             password: p\n    cipher: aes-128-gcm\n    plugin: gost-plugin\n    \
+             dialer-proxy: front\n\
+             rules:\n  - MATCH,s-gost\n",
+        )
+        .unwrap();
+        let config = build_config(raw, None)
+            .await
+            .expect("a missing-plugin node must not reject the config");
+        let bound = config
+            .proxies
+            .get("s-gost")
+            .expect("the node must stay bound, not dropped");
+        assert!(
+            bound.support_udp(),
+            "the UDP guard must survive — a DialerProxyAdapter wrap reports false"
+        );
+        assert_dead_ss_placeholder(bound).await;
+    }
+
+    /// A same-named unparseable duplicate must not shadow the live entry
+    /// that came first — upstream dropped it, so it could never displace a
+    /// working node; the placeholder fills only an empty slot. (A live
+    /// duplicate still replaces an earlier placeholder, via the normal
+    /// insert — and the placeholder set must forget the name so
+    /// `apply_dialer_proxies` wraps it normally.)
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[test]
+    fn placeholder_duplicate_never_shadows_a_live_binding() {
+        let raw_direct_dup = || {
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    serde_json::Value::String("dup".to_string()),
+                ),
+                (
+                    "type".to_string(),
+                    serde_json::Value::String("direct".to_string()),
+                ),
+            ])
+        };
+        let raw_dead_dup = || {
+            let mut dead = raw_gost_node();
+            dead.insert(
+                "name".to_string(),
+                serde_json::Value::String("dup".to_string()),
+            );
+            dead
+        };
+
+        let mut proxies = HashMap::new();
+        let mut names = std::collections::HashSet::new();
+        let placeholders = insert_parsed_leaves(
+            &mut proxies,
+            &mut names,
+            &[raw_direct_dup(), raw_dead_dup()],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            proxies["dup"].adapter_type(),
+            meow_common::AdapterType::Direct,
+            "the earlier live binding must survive the unparseable duplicate"
+        );
+        assert!(
+            !placeholders.contains("dup"),
+            "a live-bound name must not read as a placeholder"
+        );
+
+        // The reverse order — placeholder first, live block second — keeps
+        // last-wins for the live entry and unmarks the name.
+        let mut proxies = HashMap::new();
+        let mut names = std::collections::HashSet::new();
+        let placeholders = insert_parsed_leaves(
+            &mut proxies,
+            &mut names,
+            &[raw_dead_dup(), raw_direct_dup()],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            proxies["dup"].adapter_type(),
+            meow_common::AdapterType::Direct,
+            "a live duplicate still replaces an earlier placeholder"
+        );
+        assert!(
+            !placeholders.contains("dup"),
+            "the replaced name must not read as a placeholder"
+        );
+    }
+}
+
+#[cfg(test)]
 mod dialer_proxy_tests {
     use super::*;
 
@@ -4948,7 +5307,15 @@ mod dialer_proxy_tests {
         raw_groups: &[raw::RawProxyGroup],
     ) -> Result<meow_proxy::dialer::ProxyRegistry, anyhow::Error> {
         let registry = meow_proxy::dialer::ProxyRegistry::default();
-        let edges = apply_dialer_proxies(proxies, raw_proxies, raw_groups, &registry, true, false)?;
+        let edges = apply_dialer_proxies(
+            proxies,
+            raw_proxies,
+            raw_groups,
+            &registry,
+            true,
+            false,
+            &std::collections::HashSet::new(),
+        )?;
         for group in raw_groups {
             proxies
                 .entry(SmolStr::from(group.name.as_str()))
@@ -5022,6 +5389,7 @@ mod dialer_proxy_tests {
     /// runtime publishes. Before this, the named node was re-parsed bare and
     /// the fetch bypassed the configured front hop entirely (silent egress).
     /// The observable is which listener the dial physically contacts.
+    #[cfg(all(feature = "ss", feature = "trojan"))]
     #[tokio::test]
     async fn prefetch_map_dials_through_the_chain() {
         async fn counting_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
@@ -5084,6 +5452,7 @@ mod dialer_proxy_tests {
     /// first member when the store holds nothing (D1: `map.get` is the
     /// whole answer, no leaf-stripping). The observable is which member's
     /// listener the dial physically contacts.
+    #[cfg(all(feature = "ss", feature = "trojan"))]
     #[tokio::test]
     async fn geodata_match_group_dials_persisted_selection() {
         let (port_b1, b1_hits) = counting_listener().await;
@@ -5229,6 +5598,7 @@ mod dialer_proxy_tests {
     /// End-to-end wiring: a provider's `proxy:` key resolves through the
     /// shared prefetch layer, so its HTTP fetch dials the chained front
     /// hop rather than the leaf's own (or a direct) egress.
+    #[cfg(all(feature = "ss", feature = "trojan"))]
     #[tokio::test]
     async fn prefetch_payloads_fetch_rides_the_chain() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5272,6 +5642,7 @@ mod dialer_proxy_tests {
     /// inside the layer, so the fetch still dials A's chained front hop B.
     /// Reverting the default to a bare re-parse (or never building the
     /// layer) would dial A's own listener or the provider URL direct.
+    #[cfg(all(feature = "ss", feature = "trojan"))]
     #[tokio::test]
     async fn build_config_prefetch_default_rides_the_chain() {
         let (port_a, a_hits) = counting_listener().await;
@@ -5346,6 +5717,7 @@ mod dialer_proxy_tests {
     /// B's. A `dialer-proxy` chain is a deliberate egress, so its failed
     /// dial is never retried direct (#800 review): the URL listener sees no
     /// hit at all.
+    #[cfg(all(feature = "ss", feature = "trojan"))]
     #[tokio::test]
     async fn geodata_download_rides_the_chain() {
         let (port_a, a_hits) = counting_listener().await;
@@ -5578,6 +5950,7 @@ mod dialer_proxy_tests {
             &meow_proxy::dialer::ProxyRegistry::default(),
             true,
             true,
+            &std::collections::HashSet::new(),
         )
         .map(|_| ())
         .expect_err("malformed dialer-proxy must fail under strict");

@@ -16,6 +16,31 @@ the canonical, in-repo source a release is cut from.
   default options requires; set `mux: false` (or `mux=0` in SIP003
   `plugin-opts`) for a server started with `mux=0`. A number counts as
   on unless it is 0, as upstream reads it.
+- **The `ss` outbound keeps only the plugins `minimal` always promised**:
+  the four built-in SIP003 plugin transports — `restls`, `jls`,
+  `shadow-tls` and `gost-plugin` — moved behind Cargo features of the
+  same names (forwarded through `meow-config` and `meow-app`), narrowing
+  `ss` itself to Shadowsocks plus `simple-obfs` and `v2ray-plugin`,
+  matching the minimal rationale ADR-0007 §1 wrote down (SS +
+  `v2ray-plugin` + Trojan; `simple-obfs` ships inside `ss` and is not
+  named there). `full` and default builds
+  still enable all four, so release binaries are unchanged; a `minimal`
+  build measured 10,003,680 B on x86_64-musl, about 254 KiB smaller.
+  On a build without a plugin, `plugin: <name>` on an ss node keeps the
+  node bound as an unavailable placeholder — `meow -t`, boot,
+  `PUT /configs` and provider refreshes all read it identically, and
+  a `select` group, an explicit `MATCH` target or a `dialer-proxy`
+  chain naming it fails the dial with `plugin '<name>' is not compiled
+  into this build; rebuild with \`--features <name>\`` instead of the
+  node silently dropping and letting that reference slide to a sibling
+  or DIRECT (`fallback`/`url-test`/`load-balance` still skip the dead
+  member by liveness). Because the reserved names still count as
+  built-in, the node can never fall through to spawning an external
+  SIP003 binary of the same name; the same guard closes that
+  fallthrough for `kcptun` and `ech-tls-tunnel`, whose disabled builds
+  previously could reach the external-plugin path. `gost-plugin`
+  implies the `mux` Cargo feature, so its `mux: true` default always
+  works.
 
 ### Fixed
 

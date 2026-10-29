@@ -126,6 +126,58 @@ pub(crate) fn node_is_trusttunnel(config: &HashMap<String, serde_json::Value>) -
         .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("trusttunnel"))
 }
 
+/// Whether `config` describes an `ss` node whose reserved built-in `plugin:`
+/// names a cargo feature this build lacks — same class of failure as
+/// [`node_is_trusttunnel`]: the node can never parse, but dropping it would
+/// let a `select` group or an explicit `MATCH`/`dialer-proxy` reference
+/// shift that traffic to a sibling or DIRECT, so callers keep it bound to a
+/// dead placeholder instead (liveness-checked groups skip the dead entry
+/// like any unavailable member). The adapter's "not compiled into this
+/// build" error becomes the placeholder's reason. This check
+/// deliberately remains available when the feature is disabled — it reads
+/// the raw node, so it needs no error identity across the `String` boundary.
+pub(crate) fn node_needs_missing_plugin(config: &HashMap<String, serde_json::Value>) -> bool {
+    #[cfg(feature = "ss")]
+    {
+        // `type` is lenient like `node_is_trusttunnel`'s — the dispatch is
+        // exact, so a `"Ss "`/`"SS"` node fails parsing anyway; keeping the
+        // classifier forgiving lets the placeholder still cover the group
+        // fallback hole instead of warn-dropping the node.
+        config
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("ss"))
+            && config
+                .get("plugin")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|plugin| {
+                    meow_proxy::shadowsocks_adapter::missing_plugin_feature(plugin).is_some()
+                })
+    }
+    #[cfg(not(feature = "ss"))]
+    {
+        let _ = config;
+        false
+    }
+}
+
+/// The [`AdapterType`] a failed node's dead placeholder must keep, when
+/// dropping the node would silently reroute its group's traffic: trusttunnel
+/// nodes ([`node_is_trusttunnel`]) and `ss` nodes whose built-in plugin's
+/// cargo feature is compiled out ([`node_needs_missing_plugin`]). `None`
+/// for ordinary parse failures, which stay warn-and-drop.
+pub(crate) fn placeholder_adapter_type(
+    config: &HashMap<String, serde_json::Value>,
+) -> Option<AdapterType> {
+    if node_is_trusttunnel(config) {
+        Some(AdapterType::TrustTunnel)
+    } else if node_needs_missing_plugin(config) {
+        Some(AdapterType::Shadowsocks)
+    } else {
+        None
+    }
+}
+
 /// Whether `config` describes an `ss` node whose `plugin:` names an external
 /// SIP003 executable — i.e. one that would reach `Command::new` during
 /// adapter construction. Gates untrusted node sources (proxy-providers,
@@ -151,7 +203,10 @@ pub fn node_selects_external_plugin(config: &HashMap<String, serde_json::Value>)
 /// binary (issue #513). Built-in/in-process plugins (`obfs`,
 /// `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`,
 /// `kcptun`, `ech-tls-tunnel`) stay allowed — mihomo
-/// implements those in-process too, so gating them would diverge.
+/// implements those in-process too, so gating them would diverge.  A built-in
+/// name whose cargo feature is compiled out still counts as built-in here
+/// (reserved name): the adapter then fails construction with a clean
+/// "not compiled into this build" error instead of spawning an executable.
 ///
 /// `dialer` is the pluggable TCP dialer the node's adapter dials its server
 /// through — [`meow_proxy::dialer::DirectDialer`] for an unchained node, or a
@@ -218,7 +273,16 @@ pub fn parse_proxy_with_dialer(
                 .get("udp")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let plugin = config.get("plugin").and_then(|v| v.as_str());
+            // A present-but-non-string `plugin:` is a malformed node, not
+            // "no plugin": silently treating it as absent would dial a
+            // plain SS while the operator asked for a transport plugin.
+            // `null` is the exception — Go's `Plugin string` field
+            // unmarshals null to the zero value, so `plugin: null` means
+            // unset exactly like an absent key (mihomo parity).
+            let plugin = match config.get("plugin") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => Some(value.as_str().ok_or("ss: `plugin` must be a string")?),
+            };
             let plugin_opts_str = config.get("plugin-opts").and_then(serialize_plugin_opts);
             let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
 
@@ -3725,7 +3789,7 @@ tls: true
     /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
     /// the in-process shadow-tls parser → adapter construction, incl.
     /// the `alpn` sequence and node-level `client-fingerprint` plumbing.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "shadow-tls")]
     #[test]
     fn test_shadow_tls_node_parse_e2e() {
         let cfg = proxy_config(
@@ -3756,7 +3820,7 @@ tls: true
 
     /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
     /// the in-process restls parser → adapter construction.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "restls")]
     #[test]
     fn test_restls_node_parse_e2e() {
         let cfg = proxy_config(
@@ -3788,7 +3852,7 @@ tls: true
 
     /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
     /// the in-process jls parser → adapter construction.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "jls")]
     #[test]
     fn test_jls_node_parse_e2e() {
         let cfg = proxy_config(
@@ -5465,7 +5529,7 @@ tls: true
     }
 
     /// Built-in in-process plugins and non-ss nodes are untouched by the gate.
-    #[cfg(feature = "ss")]
+    #[cfg(all(feature = "ss", feature = "trojan"))]
     #[test]
     fn provider_node_allows_builtin_plugins_and_other_types() {
         let cfg = proxy_config(
@@ -5498,7 +5562,7 @@ tls: true
     /// reject it on provider nodes, and `is_external_sip003_plugin` must
     /// agree (a misclassification would silently drop subscription nodes).
     /// `mux: false` keeps the fixture valid under a `ss`-without-`mux` build.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "gost-plugin")]
     #[test]
     fn provider_node_allows_gost_plugin() {
         assert!(!is_external_sip003_plugin(Some("gost-plugin")));
@@ -5518,7 +5582,7 @@ tls: true
 
     /// shadow-tls is a built-in in-process plugin too — the provider gate
     /// must route it through without `allow-external-plugin`.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "shadow-tls")]
     #[test]
     fn provider_node_allows_shadow_tls_plugin() {
         assert!(!is_external_sip003_plugin(Some("shadow-tls")));
@@ -5566,5 +5630,129 @@ tls: true
             .filter_map(|p| p.get("name").and_then(|v| v.as_str()))
             .collect();
         assert_eq!(names, ["ok", "plain"], "dropped: {names:?}");
+    }
+
+    // ─── feature-gated built-in plugins: disabled names fail cleanly ─────────
+    //
+    // Every name `is_builtin_sip003_plugin` lists is reserved: when its
+    // feature is compiled out the adapter must return a clean Config error
+    // ("not compiled into this build" — the same message that becomes the
+    // runtime placeholder's dial reason), never fall through to the external
+    // SIP003 `Plugin::start` spawn path. `is_external_sip003_plugin` must
+    // agree — a misclassified reserved name would be treated as external
+    // (spawned, or rejected/dropped by the provider gates).
+    #[cfg(feature = "ss")]
+    #[test]
+    fn disabled_builtin_plugins_error_cleanly_and_stay_reserved() {
+        for name in [
+            "gost-plugin",
+            "shadow-tls",
+            "restls",
+            "jls",
+            "kcptun",
+            "ech-tls-tunnel",
+        ] {
+            assert!(
+                !is_external_sip003_plugin(Some(name)),
+                "{name} stays a reserved built-in name when its feature is off"
+            );
+            let cfg = proxy_config(&format!(
+                "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+                 plugin: {name}\n"
+            ));
+            match meow_proxy::shadowsocks_adapter::missing_plugin_feature(name) {
+                Some(feature) => {
+                    // Compiled out: the parse itself errors — that message is
+                    // what the runtime placeholder renders into every dial —
+                    // and the raw node must classify for the placeholder arm.
+                    let Err(err) = parse_proxy(&cfg) else {
+                        panic!("compiled-out {name} must not parse")
+                    };
+                    assert!(
+                        err.contains("not compiled into this build"),
+                        "{name}: msg: {err}"
+                    );
+                    assert!(err.contains(name), "{name}: msg: {err}");
+                    assert!(err.contains(feature), "{name}: msg: {err}");
+                    assert_eq!(
+                        placeholder_adapter_type(&cfg),
+                        Some(meow_common::AdapterType::Shadowsocks),
+                        "a missing-plugin node must classify as an ss placeholder"
+                    );
+                }
+                None => {
+                    // Compiled in: construction may succeed outright (kcptun
+                    // defaults suffice) or fail on the plugin's own opts
+                    // validation — either way it must never report the
+                    // missing-feature error or classify for the placeholder.
+                    assert_eq!(placeholder_adapter_type(&cfg), None);
+                    if let Err(err) = parse_proxy(&cfg) {
+                        assert!(
+                            !err.contains("not compiled into this build"),
+                            "compiled-in {name} must not report the missing-feature error: {err}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A `plugin:` value that is not a string is a malformed node — never
+    /// silently treated as "no plugin" (that would dial plain SS while the
+    /// operator configured a transport plugin). `null` is the exception:
+    /// Go's `Plugin string` unmarshals it to the zero value, so the key
+    /// counts as unset exactly like an absent one (mihomo parity).
+    #[cfg(feature = "ss")]
+    #[test]
+    fn non_string_plugin_value_is_a_parse_error() {
+        for plugin in ["123", "true", "{mode: http}", "[obfs]"] {
+            let cfg = proxy_config(&format!(
+                "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+                 plugin: {plugin}\n"
+            ));
+            let Err(err) = parse_proxy(&cfg) else {
+                panic!("plugin: {plugin} must not parse as plain ss")
+            };
+            assert!(
+                err.contains("`plugin` must be a string"),
+                "plugin: {plugin}: {err}"
+            );
+        }
+    }
+
+    /// `plugin: null` is Go's zero value — the node parses as plain SS
+    /// with no plugin, exactly like an absent `plugin:` key.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn null_plugin_value_means_no_plugin() {
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: null\n",
+        );
+        let proxy = parse_proxy(&cfg).expect("plugin: null parses as plain ss");
+        assert_eq!(proxy.name(), "s");
+    }
+
+    /// The dispatch is exact (`"ss"` only, like mihomo) while
+    /// [`node_needs_missing_plugin`] is forgiving like
+    /// [`node_is_trusttunnel`]: a misspelled `type` plus a compiled-out
+    /// plugin still classifies for the dead placeholder, so a group that
+    /// names the node keeps it bound instead of warn-dropping.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[test]
+    fn misspelled_ss_type_with_missing_plugin_still_classifies() {
+        let cfg = proxy_config(
+            "name: s\ntype: 'Ss '\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: gost-plugin\n",
+        );
+        assert!(
+            parse_proxy(&cfg).is_err(),
+            "the exact dispatch still rejects the misspelled type"
+        );
+        assert_eq!(
+            placeholder_adapter_type(&cfg),
+            Some(meow_common::AdapterType::Shadowsocks),
+            "the lenient classifier still lands the node on the placeholder arm"
+        );
     }
 }
