@@ -221,7 +221,9 @@ async fn handle_http_inner(
         // the shape every browser sends a plain-HTTP proxy — reaches the
         // gate instead of dying on the empty authority (the #734 gate
         // predates this case and refused every such request with 400).
-        let (host, port) = if host.is_empty() {
+        // The `/` guard keeps the fallback to genuine origin-form targets:
+        // `?x`, `*` and other non-authority targets keep their 400.
+        let (host, port) = if host.is_empty() && url.starts_with('/') {
             match host_header(&request) {
                 Some(authority) => parse_host_port(authority, 80),
                 None => (host, port),
@@ -1924,16 +1926,22 @@ fn parse_host_port(target: &str, default_port: u16) -> (&str, u16) {
     (target, default_port)
 }
 
-/// First `Host:` header of a plain request — the authority an origin-form
-/// request target omits (RFC 9112 §3.2.2). Only UTF-8, non-empty values
-/// count; anything else falls through to the caller's hostname gate,
-/// which refuses the request as before.
+/// The `Host:` header of a plain request — the authority an origin-form
+/// request target omits (RFC 9112 §3.2.2). Only a single UTF-8, non-empty
+/// value counts: a duplicated header makes the authority ambiguous (RFC
+/// 9110 §5.4 permits refusing it outright), and anything else falls
+/// through to the caller's hostname gate, which refuses as before.
 fn host_header<'a>(request: &'a RequestHead<'_>) -> Option<&'a str> {
-    request
+    let mut hosts = request
         .headers
         .iter()
-        .find(|h| h.name.eq_ignore_ascii_case(b"host"))
-        .and_then(|h| std::str::from_utf8(h.value).ok())
+        .filter(|h| h.name.eq_ignore_ascii_case(b"host"));
+    let first = hosts.next()?;
+    if hosts.next().is_some() {
+        return None;
+    }
+    std::str::from_utf8(first.value)
+        .ok()
         .map(str::trim)
         .filter(|v| !v.is_empty())
 }

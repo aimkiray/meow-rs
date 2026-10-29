@@ -16,7 +16,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// The bypass hosts from the issue plus the other non-hostname bytes.
+/// The bypass hosts from the issue plus the other non-hostname bytes —
+/// including `inet_aton` spellings a libc dial path would fold into IPs.
 const BAD_HOSTS: &[&str] = &[
     "a@evil.com",
     "user:pass@evil.com",
@@ -24,6 +25,9 @@ const BAD_HOSTS: &[&str] = &[
     "evil.com?q=1",
     "evil.com#f",
     "evil%2ecom",
+    "123.456",
+    "2130706433",
+    "0177.0.0.1",
 ];
 
 async fn loopback_pair() -> (TcpStream, TcpStream) {
@@ -273,6 +277,41 @@ async fn http_asterisk_form_is_400() {
     let (tunnel, accepts) = common::issue_734_tunnel().await;
     let response =
         http_exchange(&tunnel, b"OPTIONS * HTTP/1.1\r\nHost: good.example\r\n\r\n").await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+}
+
+/// Only `/`-leading request-targets are origin-form. `?x` is neither
+/// origin-form nor a parseable authority — the Host header must not
+/// rescue it either.
+#[tokio::test]
+async fn http_query_form_target_is_400() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let response = http_exchange(&tunnel, b"GET ?x HTTP/1.1\r\nHost: good.example\r\n\r\n").await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+}
+
+/// RFC 9110 §5.4: a duplicated Host field makes the authority ambiguous —
+/// the listener refuses rather than silently picking the first.
+#[tokio::test]
+async fn http_origin_form_duplicate_host_is_400() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let response = http_exchange(
+        &tunnel,
+        b"GET / HTTP/1.1\r\nHost: good.example\r\nHost: evil.com\r\n\r\n",
+    )
+    .await;
     assert!(
         response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
         "{:?}",
