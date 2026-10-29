@@ -126,6 +126,49 @@ pub(crate) fn node_is_trusttunnel(config: &HashMap<String, serde_json::Value>) -
         .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("trusttunnel"))
 }
 
+/// Whether `config` describes an `ss` node whose reserved built-in `plugin:`
+/// names a cargo feature this build lacks — same class of failure as
+/// [`node_is_trusttunnel`]: the node can never parse, but dropping it would
+/// let its group shift that traffic to a sibling or DIRECT, so callers keep
+/// it bound to a dead placeholder instead. The adapter's "not compiled into
+/// this build" error becomes the placeholder's reason. This check
+/// deliberately remains available when the feature is disabled — it reads
+/// the raw node, so it needs no error identity across the `String` boundary.
+pub(crate) fn node_needs_missing_plugin(config: &HashMap<String, serde_json::Value>) -> bool {
+    #[cfg(feature = "ss")]
+    {
+        config.get("type").and_then(serde_json::Value::as_str) == Some("ss")
+            && config
+                .get("plugin")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|plugin| {
+                    meow_proxy::shadowsocks_adapter::missing_plugin_feature(plugin).is_some()
+                })
+    }
+    #[cfg(not(feature = "ss"))]
+    {
+        let _ = config;
+        false
+    }
+}
+
+/// The [`AdapterType`] a failed node's dead placeholder must keep, when
+/// dropping the node would silently reroute its group's traffic: trusttunnel
+/// nodes ([`node_is_trusttunnel`]) and `ss` nodes whose built-in plugin's
+/// cargo feature is compiled out ([`node_needs_missing_plugin`]). `None`
+/// for ordinary parse failures, which stay warn-and-drop.
+pub(crate) fn placeholder_adapter_type(
+    config: &HashMap<String, serde_json::Value>,
+) -> Option<AdapterType> {
+    if node_is_trusttunnel(config) {
+        Some(AdapterType::TrustTunnel)
+    } else if node_needs_missing_plugin(config) {
+        Some(AdapterType::Shadowsocks)
+    } else {
+        None
+    }
+}
+
 /// Whether `config` describes an `ss` node whose `plugin:` names an external
 /// SIP003 executable — i.e. one that would reach `Command::new` during
 /// adapter construction. Gates untrusted node sources (proxy-providers,
@@ -166,17 +209,6 @@ pub fn parse_proxy_provider_node(
     allow_external_plugin: bool,
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
-    parse_proxy_provider_node_with_identity(config, ipv6, allow_external_plugin, dialer, &mut false)
-}
-
-pub(crate) fn parse_proxy_provider_node_with_identity(
-    config: &HashMap<String, serde_json::Value>,
-    ipv6: bool,
-    allow_external_plugin: bool,
-    dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
-    plugin_missing: &mut bool,
-) -> std::result::Result<Arc<dyn Proxy>, String> {
-    *plugin_missing = false;
     if !allow_external_plugin && node_selects_external_plugin(config) {
         let name = config.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         let plugin = config.get("plugin").and_then(|v| v.as_str()).unwrap_or("");
@@ -188,7 +220,7 @@ pub(crate) fn parse_proxy_provider_node_with_identity(
         ));
     }
     let _ = allow_external_plugin;
-    parse_proxy_with_identity(config, dialer, ipv6, plugin_missing)
+    parse_proxy_with_dialer(config, dialer, ipv6)
 }
 
 /// Like [parse_proxy] but injects a custom [meow_proxy::dialer::TcpDialer]
@@ -201,16 +233,6 @@ pub fn parse_proxy_with_dialer(
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
     ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
-    parse_proxy_with_identity(config, dialer, ipv6, &mut false)
-}
-
-pub(crate) fn parse_proxy_with_identity(
-    config: &HashMap<String, serde_json::Value>,
-    dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
-    ipv6: bool,
-    plugin_missing: &mut bool,
-) -> std::result::Result<Arc<dyn Proxy>, String> {
-    let _ = &plugin_missing;
     let name = config
         .get("name")
         .and_then(|v| v.as_str())
@@ -275,7 +297,7 @@ pub(crate) fn parse_proxy_with_identity(
             };
 
             #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
-            let mut adapter = ShadowsocksAdapter::new_with_plugin_status(
+            let mut adapter = ShadowsocksAdapter::new(
                 name,
                 server,
                 port,
@@ -286,7 +308,6 @@ pub(crate) fn parse_proxy_with_identity(
                 plugin_opts_str.as_deref(),
                 client_fingerprint,
                 Arc::clone(dialer),
-                plugin_missing,
             )
             .map_err(|e| format!("ss: {e}"))?;
             #[cfg(feature = "mux")]
@@ -439,16 +460,6 @@ fn is_external_sip003_plugin(plugin: Option<&str>) -> bool {
         .filter(|p| !p.is_empty())
         .is_some_and(|p| !meow_proxy::shadowsocks_adapter::is_builtin_sip003_plugin(p))
 }
-
-/// Preserved through anyhow context wrappers during provider ingest.
-#[derive(Debug)]
-pub(crate) struct PluginNotCompiled(pub String);
-impl std::fmt::Display for PluginNotCompiled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-impl std::error::Error for PluginNotCompiled {}
 
 /// Reject a `ProxyDialer` for adapter types that do not thread it through.
 ///
@@ -5607,116 +5618,64 @@ tls: true
     //
     // Every name `is_builtin_sip003_plugin` lists is reserved: when its
     // feature is compiled out the adapter must return a clean Config error
-    // ("not compiled into this build"), never fall through to the external
+    // ("not compiled into this build" — the same message that becomes the
+    // runtime placeholder's dial reason), never fall through to the external
     // SIP003 `Plugin::start` spawn path. `is_external_sip003_plugin` must
     // agree — a misclassified reserved name would be treated as external
     // (spawned, or rejected/dropped by the provider gates).
-
-    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[cfg(feature = "ss")]
     #[test]
-    fn gost_plugin_disabled_errors_cleanly() {
-        assert!(
-            !is_external_sip003_plugin(Some("gost-plugin")),
-            "gost-plugin stays a reserved built-in name when its feature is off"
-        );
-        let cfg = proxy_config(
-            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
-             plugin: gost-plugin\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("disabled gost-plugin must fail at construction");
-        };
-        assert!(err.contains("not compiled into this build"), "msg: {err}");
-        assert!(err.contains("gost-plugin"), "msg: {err}");
-    }
-
-    #[cfg(all(feature = "ss", not(feature = "shadow-tls")))]
-    #[test]
-    fn shadow_tls_plugin_disabled_errors_cleanly() {
-        assert!(
-            !is_external_sip003_plugin(Some("shadow-tls")),
-            "shadow-tls stays a reserved built-in name when its feature is off"
-        );
-        let cfg = proxy_config(
-            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
-             plugin: shadow-tls\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("disabled shadow-tls must fail at construction");
-        };
-        assert!(err.contains("not compiled into this build"), "msg: {err}");
-        assert!(err.contains("shadow-tls"), "msg: {err}");
-    }
-
-    #[cfg(all(feature = "ss", not(feature = "restls")))]
-    #[test]
-    fn restls_plugin_disabled_errors_cleanly() {
-        assert!(
-            !is_external_sip003_plugin(Some("restls")),
-            "restls stays a reserved built-in name when its feature is off"
-        );
-        let cfg = proxy_config(
-            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
-             plugin: restls\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("disabled restls must fail at construction");
-        };
-        assert!(err.contains("not compiled into this build"), "msg: {err}");
-        assert!(err.contains("restls"), "msg: {err}");
-    }
-
-    #[cfg(all(feature = "ss", not(feature = "jls")))]
-    #[test]
-    fn jls_plugin_disabled_errors_cleanly() {
-        assert!(
-            !is_external_sip003_plugin(Some("jls")),
-            "jls stays a reserved built-in name when its feature is off"
-        );
-        let cfg = proxy_config(
-            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
-             plugin: jls\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("disabled jls must fail at construction");
-        };
-        assert!(err.contains("not compiled into this build"), "msg: {err}");
-        assert!(err.contains("jls"), "msg: {err}");
-    }
-
-    #[cfg(all(feature = "ss", not(feature = "kcptun")))]
-    #[test]
-    fn kcptun_plugin_disabled_errors_cleanly() {
-        assert!(
-            !is_external_sip003_plugin(Some("kcptun")),
-            "kcptun stays a reserved built-in name when its feature is off"
-        );
-        let cfg = proxy_config(
-            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
-             plugin: kcptun\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("disabled kcptun must fail at construction");
-        };
-        assert!(err.contains("not compiled into this build"), "msg: {err}");
-        assert!(err.contains("kcptun"), "msg: {err}");
-    }
-
-    #[cfg(all(feature = "ss", not(feature = "ech-tls-tunnel")))]
-    #[test]
-    fn ech_tls_tunnel_plugin_disabled_errors_cleanly() {
-        assert!(
-            !is_external_sip003_plugin(Some("ech-tls-tunnel")),
-            "ech-tls-tunnel stays a reserved built-in name when its feature is off"
-        );
-        let cfg = proxy_config(
-            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
-             plugin: ech-tls-tunnel\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("disabled ech-tls-tunnel must fail at construction");
-        };
-        assert!(err.contains("not compiled into this build"), "msg: {err}");
-        assert!(err.contains("ech-tls-tunnel"), "msg: {err}");
+    fn disabled_builtin_plugins_error_cleanly_and_stay_reserved() {
+        for name in [
+            "gost-plugin",
+            "shadow-tls",
+            "restls",
+            "jls",
+            "kcptun",
+            "ech-tls-tunnel",
+        ] {
+            assert!(
+                !is_external_sip003_plugin(Some(name)),
+                "{name} stays a reserved built-in name when its feature is off"
+            );
+            let cfg = proxy_config(&format!(
+                "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+                 plugin: {name}\n"
+            ));
+            match meow_proxy::shadowsocks_adapter::missing_plugin_feature(name) {
+                Some(feature) => {
+                    // Compiled out: the parse itself errors — that message is
+                    // what the runtime placeholder renders into every dial —
+                    // and the raw node must classify for the placeholder arm.
+                    let Err(err) = parse_proxy(&cfg) else {
+                        panic!("compiled-out {name} must not parse")
+                    };
+                    assert!(
+                        err.contains("not compiled into this build"),
+                        "{name}: msg: {err}"
+                    );
+                    assert!(err.contains(name), "{name}: msg: {err}");
+                    assert!(err.contains(feature), "{name}: msg: {err}");
+                    assert_eq!(
+                        placeholder_adapter_type(&cfg),
+                        Some(meow_common::AdapterType::Shadowsocks),
+                        "a missing-plugin node must classify as an ss placeholder"
+                    );
+                }
+                None => {
+                    // Compiled in: construction may succeed outright (kcptun
+                    // defaults suffice) or fail on the plugin's own opts
+                    // validation — either way it must never report the
+                    // missing-feature error or classify for the placeholder.
+                    assert_eq!(placeholder_adapter_type(&cfg), None);
+                    if let Err(err) = parse_proxy(&cfg) {
+                        assert!(
+                            !err.contains("not compiled into this build"),
+                            "compiled-in {name} must not report the missing-feature error: {err}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -172,7 +172,7 @@ impl ShadowsocksAdapter {
         client_fingerprint: Option<&str>,
         dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Result<Self> {
-        Self::new_with_plugin_status(
+        Self::build(
             name,
             server,
             port,
@@ -183,17 +183,14 @@ impl ShadowsocksAdapter {
             plugin_opts,
             client_fingerprint,
             dialer,
-            &mut false,
         )
     }
 
-    /// Construct an adapter while reporting whether a built-in plugin is unavailable.
-    #[doc(hidden)]
     #[allow(
         clippy::too_many_arguments,
-        reason = "same node fields as the public constructor"
+        reason = "SS node params are flat config fields; a builder adds indirection without fewer call-site args"
     )]
-    pub fn new_with_plugin_status(
+    fn build(
         name: &str,
         server: &str,
         port: u16,
@@ -204,9 +201,7 @@ impl ShadowsocksAdapter {
         plugin_opts: Option<&str>,
         client_fingerprint: Option<&str>,
         dialer: Arc<dyn crate::dialer::TcpDialer>,
-        plugin_missing: &mut bool,
     ) -> Result<Self> {
-        *plugin_missing = false;
         // Consumed only by the feature-gated plugin arms below (shadow-tls's
         // cover handshake; restls/jls warn-and-ignore) — under an `ss`-only
         // build every consumer is cfg'd out, so pin the binding.
@@ -321,7 +316,6 @@ impl ShadowsocksAdapter {
 
             Some(pname) => {
                 if let Some(feature) = feature_gated_plugin_feature(pname) {
-                    *plugin_missing = true;
                     return Err(MeowError::Config(format!(
                         "plugin '{pname}' is not compiled into this build; rebuild with `--features {feature}`"
                     )));
@@ -843,24 +837,43 @@ pub fn is_builtin_sip003_plugin(name: &str) -> bool {
 }
 
 /// Every reserved built-in SIP003 name whose transport sits behind an
-/// opt-in cargo feature, paired with the feature that re-enables it.
+/// opt-in cargo feature, paired with the feature that re-enables it and a
+/// compile-time flag recording whether this build carries it.
 /// Single source for the "not compiled" fallback in `ShadowsocksAdapter::new`:
 /// a name listed here must never reach the external `Plugin::start` arm,
 /// whatever the feature set — the constructor reports its identity separately.
-const FEATURE_GATED_PLUGINS: &[(&str, &str)] = &[
-    ("gost-plugin", "gost-plugin"),
-    ("shadow-tls", "shadow-tls"),
-    ("restls", "restls"),
-    ("jls", "jls"),
-    ("kcptun", "kcptun"),
-    ("ech-tls-tunnel", "ech-tls-tunnel"),
+const FEATURE_GATED_PLUGINS: &[(&str, &str, bool)] = &[
+    ("gost-plugin", "gost-plugin", cfg!(feature = "gost-plugin")),
+    ("shadow-tls", "shadow-tls", cfg!(feature = "shadow-tls")),
+    ("restls", "restls", cfg!(feature = "restls")),
+    ("jls", "jls", cfg!(feature = "jls")),
+    ("kcptun", "kcptun", cfg!(feature = "kcptun")),
+    (
+        "ech-tls-tunnel",
+        "ech-tls-tunnel",
+        cfg!(feature = "ech-tls-tunnel"),
+    ),
 ];
 
 fn feature_gated_plugin_feature(name: &str) -> Option<&'static str> {
     FEATURE_GATED_PLUGINS
         .iter()
-        .find(|(reserved, _)| *reserved == name)
-        .map(|(_, feature)| *feature)
+        .find(|(reserved, _, _)| *reserved == name)
+        .map(|(_, feature, _)| *feature)
+}
+
+/// The cargo feature a reserved built-in plugin name needs, when this build
+/// lacks it — `None` for unreserved names and for plugins that are compiled
+/// in. Drives `FEATURE_GATED_PLUGINS`, so a new reserved name needs only a
+/// table row. Config parsing uses this to keep a node whose plugin cannot be
+/// constructed bound to a dead placeholder (same contract as a compiled-out
+/// `type:` such as trusttunnel) instead of dropping it and letting its group
+/// slide to a sibling or DIRECT.
+pub fn missing_plugin_feature(name: &str) -> Option<&'static str> {
+    FEATURE_GATED_PLUGINS
+        .iter()
+        .find(|(reserved, _, compiled)| *reserved == name && !compiled)
+        .map(|(_, feature, _)| *feature)
 }
 
 /// Parses `plugin-opts` (already serialized to SIP003 `key=value;...` form) for
@@ -1963,15 +1976,7 @@ mod tests {
                 is_builtin_sip003_plugin(name),
                 "is_builtin_sip003_plugin must list {name}"
             );
-            let disabled = match name {
-                "gost-plugin" => !cfg!(feature = "gost-plugin"),
-                "shadow-tls" => !cfg!(feature = "shadow-tls"),
-                "restls" => !cfg!(feature = "restls"),
-                "jls" => !cfg!(feature = "jls"),
-                "kcptun" => !cfg!(feature = "kcptun"),
-                "ech-tls-tunnel" => !cfg!(feature = "ech-tls-tunnel"),
-                _ => false,
-            };
+            let disabled = missing_plugin_feature(name).is_some();
             match ShadowsocksAdapter::new(
                 "inv",
                 "127.0.0.1",

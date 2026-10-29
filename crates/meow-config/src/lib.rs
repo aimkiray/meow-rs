@@ -2063,15 +2063,7 @@ fn insert_parsed_leaves(
     strict: bool,
 ) -> Result<(), anyhow::Error> {
     for raw_proxy in raw_proxies {
-        let mut plugin_missing = false;
-        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
-            Arc::new(meow_proxy::dialer::DirectDialer);
-        let proxy = match proxy_parser::parse_proxy_with_identity(
-            raw_proxy,
-            &dialer,
-            ipv6,
-            &mut plugin_missing,
-        ) {
+        let proxy = match proxy_parser::parse_proxy(raw_proxy, ipv6) {
             Ok(proxy) => proxy,
             Err(e) if strict => {
                 let name = raw_proxy
@@ -2082,7 +2074,14 @@ fn insert_parsed_leaves(
                     "proxies: failed to parse '{name}' (strict mode): {e}"
                 ));
             }
-            Err(e) if proxy_parser::node_is_trusttunnel(raw_proxy) => {
+            // Keep the slot entry as a dead placeholder instead of dropping
+            // it, so a group that lists the node can neither shift its
+            // traffic onto a sibling member nor degrade to a direct dial —
+            // the same contract a compiled-out `type:` gets: the operator
+            // cannot fix a missing protocol (or a missing built-in plugin
+            // transport) by editing the config, so `-t`, boot, `PUT /configs`
+            // and refreshes all read identically here.
+            Err(e) if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_proxy) => {
                 let name = raw_proxy
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -2091,20 +2090,7 @@ fn insert_parsed_leaves(
                     "proxies: '{name}' failed to parse ({e}); keeping the name bound \
                      to an unavailable node so no dial can fall back past it"
                 );
-                unavailable_placeholder(name, &e, meow_common::AdapterType::TrustTunnel)
-            }
-            Err(e) if crate::is_offline_validate() && plugin_missing => {
-                // Offline validate (`meow -t`): a node that only failed
-                // because this build lacks the plugin's cargo feature must
-                // fail the config check — warn-dropping it here would let
-                // `-t` pass and the node's group/rules silently fall back.
-                let name = raw_proxy
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<unnamed>");
-                return Err(anyhow::anyhow!(
-                    "proxies: failed to parse '{name}' (offline validate): {e}"
-                ));
+                unavailable_placeholder(name, &e, declared)
             }
             Err(e) => {
                 warn!("Failed to parse proxy: {}", e);
@@ -4881,7 +4867,7 @@ pub async fn build_config(
 }
 
 #[cfg(test)]
-mod offline_gate_tests {
+mod missing_plugin_placeholder_tests {
     #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
     use super::*;
 
@@ -4916,85 +4902,133 @@ mod offline_gate_tests {
         m
     }
 
-    /// Offline validate OFF (the live-serving default): the node is
-    /// warn-dropped and load proceeds — unchanged runtime behaviour.
+    /// Every assertion below is the placeholder contract a compiled-out
+    /// `type:` already keeps: the node stays bound under its own name as a
+    /// permanently dead `Shadowsocks` entry — never dropped, so a group
+    /// listing it can neither shift that traffic to a sibling nor degrade
+    /// to a direct dial — and its dial reason is the adapter's
+    /// "not compiled into this build" error.
     #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
-    #[test]
-    fn offline_gate_off_keeps_warn_drop() {
+    async fn assert_dead_ss_placeholder(proxy: &Arc<dyn Proxy>) {
+        assert!(!proxy.alive(), "a placeholder must never look usable");
+        assert_eq!(
+            proxy.adapter_type(),
+            meow_common::AdapterType::Shadowsocks,
+            "a placeholder must keep the node's own type"
+        );
+        let error = proxy
+            .dial_tcp(&meow_common::Metadata::default())
+            .await
+            .err()
+            .expect("a placeholder must fail the dial, not leak it direct")
+            .to_string();
+        assert!(error.contains(proxy.name()), "{error}");
+        assert!(
+            error.contains("not compiled into this build"),
+            "the placeholder's reason must be the plugin gate error: {error}"
+        );
+    }
+
+    /// The node keeps its slot instead of warn-dropping — under offline
+    /// validate (`-t`) and boot alike, since the arm does not distinguish
+    /// them: the whole point is `-t` and boot reading the file identically.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[tokio::test]
+    async fn missing_plugin_node_binds_a_dead_placeholder() {
         let mut proxies = HashMap::new();
         let mut names = std::collections::HashSet::new();
         insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, false).unwrap();
-        assert!(!proxies.contains_key("s-gost"), "node must be dropped");
+        let bound = proxies
+            .get("s-gost")
+            .expect("a missing-plugin node must stay bound, not dropped")
+            .clone();
+        assert_dead_ss_placeholder(&bound).await;
     }
 
-    /// Offline validate ON (`meow -t`): the same node must be fatal. The
-    /// flag is process-global and never reset, so the ON state is pinned
-    /// in a child process (same pattern as rule_provider's
+    /// `strict: true` still hard-errors first — the placeholder arm only
+    /// covers lenient parsing, so a bad local file keeps failing loudly.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[test]
+    fn missing_plugin_node_still_hard_errors_under_strict() {
+        let mut proxies = HashMap::new();
+        let mut names = std::collections::HashSet::new();
+        let err = insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, true)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("strict mode"),
+            "strict must still hard-error: {err}"
+        );
+    }
+
+    /// End-to-end at `load_config` level: a `select` group listing only the
+    /// dead node must keep it selected — dialing through the group fails
+    /// with the plugin-gate error instead of sliding to DIRECT, and a
+    /// sibling DIRECT member is only used when actually selected.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[tokio::test]
+    async fn group_listing_dead_node_cannot_slide_to_direct() {
+        let raw: raw::RawConfig = serde_saphyr::from_str(
+            "proxies:\n\
+            \x20 - name: s-gost\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    \
+             password: p\n    cipher: aes-128-gcm\n    plugin: gost-plugin\n\
+             proxy-groups:\n\
+            \x20 - name: G\n    type: select\n    proxies: [s-gost]\n\
+             rules:\n  - MATCH,G\n",
+        )
+        .unwrap();
+        let config = build_config(raw, None)
+            .await
+            .expect("a missing-plugin node must not reject the config");
+        let group = config
+            .proxies
+            .get("G")
+            .expect("group G must build around the dead node");
+        let err = group
+            .dial_tcp(&meow_common::Metadata::default())
+            .await
+            .err()
+            .expect("a dial through G must fail — never fall back to DIRECT");
+        assert!(
+            err.to_string().contains("not compiled into this build"),
+            "the group dial must surface the plugin-gate reason: {err}"
+        );
+    }
+
+    /// `meow -t` reads the file exactly like boot does: the load succeeds
+    /// (exit 0 equivalent) with the node bound dead. The flag is
+    /// process-global and never reset, so the assertion runs in a child
+    /// process (same pattern as rule_provider's
     /// `MEOW_OFFLINE_VALIDATE_CHILD`).
     #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
     #[test]
-    fn offline_gate_on_fails_the_config_load() {
-        const CHILD: &str = "MEOW_OFFLINE_GATE_CHILD";
+    fn offline_validate_passes_with_the_node_bound_dead() {
+        const CHILD: &str = "MEOW_OFFLINE_PLACEHOLDER_CHILD";
         if std::env::var_os(CHILD).is_some() {
             crate::set_offline_validate(true);
-            let mut proxies = HashMap::new();
-            let mut names = std::collections::HashSet::new();
-            let Err(err) =
-                insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, false)
-            else {
-                panic!("offline validate must make the disabled-plugin node fatal");
-            };
-            let msg = err.to_string();
-            assert!(msg.contains("offline validate"), "msg: {msg}");
-            assert!(
-                msg.contains("plugin 'gost-plugin' is not compiled into this build"),
-                "msg: {msg}"
-            );
-            assert!(msg.contains("`--features gost-plugin`"), "msg: {msg}");
-            let err =
-                insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, true)
-                    .unwrap_err();
-            assert!(err.to_string().contains("strict mode"));
-            let dir = tempfile::tempdir().unwrap();
-            let config = dir.path().join("config.yml");
-            let nodes = dir.path().join("nodes.yml");
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let load = |body: &str| {
-                std::fs::write(&config, body).unwrap();
-                rt.block_on(load_config(config.to_str().unwrap()))
-            };
-            let marker = "plugin 'x' is not compiled into this build";
-            let local = format!(
-                "proxies:\n  - name: other\n    type: \"{marker}\"\nrules: [MATCH,DIRECT]\n"
-            );
-            assert!(load(&local).is_ok(), "non-SS type is warn-dropped");
-            let provider = "proxy-providers:\n  pv:\n    type: file\n    path: nodes.yml\nrules: [MATCH,DIRECT]\n";
-            std::fs::write(
-                &nodes,
-                format!("proxies:\n  - name: other\n    type: \"{marker}\"\n"),
+            let raw: raw::RawConfig = serde_saphyr::from_str(
+                "proxies:\n\
+                \x20 - name: s-gost\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    \
+                 password: p\n    cipher: aes-128-gcm\n    plugin: gost-plugin\n\
+                 proxy-groups:\n\
+                \x20 - name: G\n    type: select\n    proxies: [s-gost]\n\
+                 rules:\n  - MATCH,G\n",
             )
             .unwrap();
-            assert!(
-                load(provider).is_ok(),
-                "provider non-SS type is warn-dropped"
-            );
-            std::fs::write(&nodes, format!("proxies: \"{marker}\"\n")).unwrap();
-            assert!(load(provider).is_ok(), "malformed provider is warn-dropped");
-            std::fs::write(&nodes, "proxies:\n  - {name: disabled, type: ss, server: 1.2.3.4, port: 8388, password: p, cipher: aes-128-gcm, plugin: gost-plugin}\n").unwrap();
-            let err = load(provider)
-                .err()
-                .expect("disabled provider plugin must fail");
-            assert!(
-                err.downcast_ref::<proxy_parser::PluginNotCompiled>()
-                    .is_some(),
-                "typed identity survives provider wrapping: {err:?}"
-            );
+            let config = rt
+                .block_on(build_config(raw, None))
+                .expect("offline validate must pass with the node bound dead");
+            let bound = config
+                .proxies
+                .get("s-gost")
+                .expect("the node must stay bound under -t");
+            assert!(!bound.alive(), "a placeholder must never look usable");
             return;
         }
         let exe = std::env::current_exe().unwrap();
         let status = std::process::Command::new(exe)
             .arg("--exact")
-            .arg("offline_gate_tests::offline_gate_on_fails_the_config_load")
+            .arg("missing_plugin_placeholder_tests::offline_validate_passes_with_the_node_bound_dead")
             .arg("--nocapture")
             .env(CHILD, "1")
             .status()

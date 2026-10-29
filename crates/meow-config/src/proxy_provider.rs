@@ -914,18 +914,6 @@ impl ProxyProvider {
                 if strict && self.is_file_vehicle() {
                     return Err(anyhow::anyhow!("proxy-provider '{}': {e}", self.name));
                 }
-                // Offline validate (`meow -t`): `ingest`'s
-                // plugin-not-compiled gate must stay fatal here too —
-                // this warn-and-start-empty path is what `-t` walks for
-                // a `file:` provider, and swallowing the error would
-                // let the config check pass with the provider silently
-                // empty (its groups falling back).
-                if crate::is_offline_validate()
-                    && e.downcast_ref::<proxy_parser::PluginNotCompiled>()
-                        .is_some()
-                {
-                    return Err(e);
-                }
                 warn_initial_load_failure(self, &e.to_string());
                 Ok(false)
             }
@@ -1133,8 +1121,7 @@ impl ProxyProvider {
                 continue;
             }
 
-            let mut plugin_missing = false;
-            match self.parse_node(raw_map, raw_name, &mut declared, &mut plugin_missing) {
+            match self.parse_node(raw_map, raw_name, &mut declared) {
                 Ok(proxy) => result.push(proxy),
                 Err(e) if strict => {
                     return Err(anyhow::anyhow!(
@@ -1147,30 +1134,17 @@ impl ProxyProvider {
                 // direct dial. Scoped to the node on purpose: this payload
                 // is third-party and refetched on a timer, so rejecting the
                 // whole feed would let its operator empty the registry on
-                // every refresh — and, for a protocol missing from this
-                // build, stop the daemon from starting at all.
-                Err(e) if proxy_parser::node_is_trusttunnel(raw_map) => {
+                // every refresh — and, for a protocol or built-in plugin
+                // transport missing from this build, stop the daemon from
+                // starting at all.
+                Err(e) if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_map) => {
                     let label = if raw_name.is_empty() {
                         "<unnamed>"
                     } else {
                         raw_name
                     };
-                    warn!(provider = %self.name, proxy = label, error = %e, "keeping an unavailable trusttunnel node so nothing can dial past it");
-                    result.push(crate::unavailable_placeholder(
-                        label,
-                        &e,
-                        meow_common::AdapterType::TrustTunnel,
-                    ));
-                }
-                Err(e) if crate::is_offline_validate() && plugin_missing => {
-                    // Same offline-validate gate as `insert_parsed_leaves`:
-                    // a provider node needing a feature this build lacks
-                    // must fail `meow -t`, not warn-drop (which would empty
-                    // a group and silently reroute its traffic).
-                    return Err(proxy_parser::PluginNotCompiled(format!(
-                        "proxy-provider '{}': node '{raw_name}' failed to parse (offline validate): {e}",
-                        self.name
-                    )).into());
+                    warn!(provider = %self.name, proxy = label, error = %e, "keeping an unavailable node so nothing can dial past it");
+                    result.push(crate::unavailable_placeholder(label, &e, declared));
                 }
                 Err(e) => {
                     warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
@@ -1230,7 +1204,6 @@ impl ProxyProvider {
         raw_map: &HashMap<String, serde_json::Value>,
         raw_name: &str,
         declared: &mut Vec<String>,
-        plugin_missing: &mut bool,
     ) -> Result<Arc<dyn Proxy>, String> {
         let direct: Arc<dyn meow_proxy::dialer::TcpDialer> =
             Arc::new(meow_proxy::dialer::DirectDialer);
@@ -1262,24 +1235,22 @@ impl ProxyProvider {
             .or(self.provider_dialer.as_deref())
             .or(node_dialer)
         else {
-            return proxy_parser::parse_proxy_provider_node_with_identity(
+            return proxy_parser::parse_proxy_provider_node(
                 raw_map,
                 self.ipv6,
                 self.allow_external_plugin,
                 &direct,
-                plugin_missing,
             );
         };
         // `override.dialer-proxy: ""` is the upstream "clear the chain"
         // knob — the override wrote over both lower levels, so the node
         // dials direct by operator intent, not by a missing field.
         if dialer_name.is_empty() {
-            return proxy_parser::parse_proxy_provider_node_with_identity(
+            return proxy_parser::parse_proxy_provider_node(
                 raw_map,
                 self.ipv6,
                 self.allow_external_plugin,
                 &direct,
-                plugin_missing,
             );
         }
         if dialer_name == raw_name {
@@ -1289,24 +1260,22 @@ impl ProxyProvider {
         let target = meow_proxy::dialer::DialerTarget::new(dialer_name, &self.dialer_registry);
         let chained: Arc<dyn meow_proxy::dialer::TcpDialer> =
             Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()).owned_by(raw_name));
-        let proxy = match proxy_parser::parse_proxy_provider_node_with_identity(
+        let proxy = match proxy_parser::parse_proxy_provider_node(
             raw_map,
             self.ipv6,
             self.allow_external_plugin,
             &chained,
-            plugin_missing,
         ) {
             Ok(proxy) => proxy,
             Err(e) => {
                 // The adapter type cannot carry an injected dialer — or the
                 // node is unparseable, in which case the direct re-parse
                 // surfaces the real error.
-                let inner = proxy_parser::parse_proxy_provider_node_with_identity(
+                let inner = proxy_parser::parse_proxy_provider_node(
                     raw_map,
                     self.ipv6,
                     self.allow_external_plugin,
                     &direct,
-                    plugin_missing,
                 )?;
                 warn!(
                     provider = %self.name,
@@ -3288,6 +3257,58 @@ header:
             .to_string();
         assert!(error.contains("bad"), "{error}");
         assert!(!error.contains("test-only"), "{error}");
+    }
+
+    /// Same contract as the trusttunnel placeholder above, for an `ss` node
+    /// whose reserved built-in plugin's cargo feature is compiled out: the
+    /// payload still loads, the node keeps its slot bound dead as
+    /// `Shadowsocks`, and its dial reason is the "not compiled into this
+    /// build" error — no warn-drop, no feed rejection.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[tokio::test]
+    async fn missing_plugin_node_becomes_a_dead_ss_placeholder_not_a_payload_rejection() {
+        let url = spawn_payload_server(
+            "proxies:\n  - {name: good, type: direct}\n  - {name: dead-ss, type: ss, server: 1.2.3.4, port: 8388, password: p, cipher: aes-128-gcm, plugin: gost-plugin}\n",
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ProxyProvider::new(
+            "p",
+            &raw_http_provider(&url, None),
+            Some(dir.path()),
+            false,
+            false,
+            ProxyRegistry::default(),
+        )
+        .unwrap();
+        provider
+            .acquire_initial()
+            .await
+            .expect("a missing-plugin node must not reject the whole payload");
+
+        let nodes = provider.proxies();
+        assert_eq!(nodes.len(), 2, "the dead node keeps its slot entry");
+        let dead = nodes
+            .iter()
+            .find(|proxy| proxy.name() == "dead-ss")
+            .expect("the unbuildable node stays addressable by name");
+        assert!(!dead.alive(), "a placeholder must never look usable");
+        assert_eq!(
+            dead.adapter_type(),
+            meow_common::AdapterType::Shadowsocks,
+            "a placeholder must keep the node's own type"
+        );
+        let error = dead
+            .dial_tcp(&meow_common::Metadata::default())
+            .await
+            .err()
+            .expect("a placeholder must fail the dial, not leak it direct")
+            .to_string();
+        assert!(error.contains("dead-ss"), "{error}");
+        assert!(
+            error.contains("not compiled into this build"),
+            "the placeholder's reason must be the plugin gate error: {error}"
+        );
     }
 
     /// `proxy: <name>` routes the provider fetch through that registry
