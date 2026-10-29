@@ -3314,6 +3314,54 @@ header:
         );
     }
 
+    /// The placeholder is not a one-shot of the initial load: a `refresh`
+    /// re-parses the same payload through the same arm, so the dead node
+    /// must still be bound dead after the second ingest — never dropped on
+    /// the refresh path (which would let a `use:` group quietly shrink).
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[tokio::test]
+    async fn missing_plugin_placeholder_survives_a_second_ingest() {
+        let url = spawn_payload_server(
+            "proxies:\n  - {name: good, type: direct}\n  - {name: dead-ss, type: ss, server: 1.2.3.4, port: 8388, password: p, cipher: aes-128-gcm, plugin: gost-plugin}\n",
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ProxyProvider::new(
+            "p",
+            &raw_http_provider(&url, None),
+            Some(dir.path()),
+            false,
+            false,
+            ProxyRegistry::default(),
+        )
+        .unwrap();
+        provider
+            .acquire_initial()
+            .await
+            .expect("a missing-plugin node must not reject the whole payload");
+        provider
+            .refresh()
+            .await
+            .expect("a refresh re-parsing the same payload must keep succeeding");
+
+        let nodes = provider.proxies();
+        assert_eq!(nodes.len(), 2, "the dead node keeps its slot on refresh");
+        let dead = nodes
+            .iter()
+            .find(|proxy| proxy.name() == "dead-ss")
+            .expect("the unbuildable node stays addressable after a refresh");
+        let error = dead
+            .dial_tcp(&meow_common::Metadata::default())
+            .await
+            .err()
+            .expect("the refreshed placeholder must still fail the dial")
+            .to_string();
+        assert!(
+            error.contains("not compiled into this build"),
+            "the second ingest binds the same placeholder: {error}"
+        );
+    }
+
     /// `proxy: <name>` routes the provider fetch through that registry
     /// entry — the dial lands on the named hop, not on a direct socket.
     #[tokio::test]
