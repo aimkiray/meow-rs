@@ -433,11 +433,14 @@ the external `Plugin::start` subprocess path. `kcptun` and
 `ech-tls-tunnel` get the same explicit error arm, closing their
 pre-existing fallthrough (a disabled `kcptun`/`ech-tls-tunnel` used to
 reach the external SIP003 spawn path). At config load the failing node
-keeps its slot as an unavailable placeholder — the same contract a
-compiled-out `type:` such as TrustTunnel already keeps — so `-t`, boot,
+keeps its slot as an unavailable placeholder — the same contract the
+compiled-out `trusttunnel` type already keeps — so `-t`, boot,
 `PUT /configs` and provider refreshes all read the file identically, and
-a group listing the node fails its dials with the feature-named error
-rather than sliding traffic to a sibling or DIRECT.
+a `select` group, an explicit `MATCH` target or a `dialer-proxy` chain
+naming the node fails its dials with the feature-named error rather than
+sliding traffic to a sibling or DIRECT. Liveness-checked groups
+(`fallback`, `url-test`, `load-balance`) skip the dead entry like any
+unavailable member — the placeholder deliberately does not pin those.
 
 Consequences:
 

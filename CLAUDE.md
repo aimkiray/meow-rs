@@ -181,8 +181,10 @@ cargo test -p meow-config --features trusttunnel-h3 --lib
 # `ss`-only meow-config: locks the "reserved plugin names never fall back
 # to the external spawn path" contract and the compiled-out-name dead-
 # placeholder pins (they compile only in this feature set); mirrors the
-# CI leg "meow-config ss-only unit tests" in the features job.
+# CI leg "meow-config ss-only unit tests" in the features job. The
+# meow-proxy leg underneath pins the adapter-side reserved-name guard.
 cargo test -p meow-config --no-default-features --features ss --lib
+cargo test -p meow-proxy --no-default-features --features ss --lib
 
 # Mirrors the "Unit + integration tests (default features)" CI step. `--lib`
 # alone is not enough: it skips every `--test` target, so a broken integration

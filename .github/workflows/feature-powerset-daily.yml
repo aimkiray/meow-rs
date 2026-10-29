@@ -61,10 +61,13 @@ jobs:
         include:
           - crate: meow-proxy
             # The four opt-in ss plugin features are independent on/off
-            # knobs by design, but they never interact — each only gates
-            # its own `PluginKind` arm — so treat them as one unit:
-            # grouping cuts the depth-4 leg count 3676 -> 1788 (~2x) while
-            # still covering every (plugin group, other feature) combo.
+            # knobs by design, and no pair of them gates shared code —
+            # each only gates its own `PluginKind` arm (they do share the
+            # `plugin_util`/adapter cfg cluster with `ss` and `mux`, which
+            # the ungrouped legs still explore). Treating them as one unit
+            # drops the inter-plugin Cartesian product: the depth-4 leg
+            # count falls 3676 -> 1788 (~2x) while still covering every
+            # (plugin group, other feature) combination.
             hack_args: --depth 4 --group-features shadow-tls,restls,jls,gost-plugin
           - crate: meow-transport
             # `boring-tls` is a no-op alias of `tls` (BoringSSL is the only

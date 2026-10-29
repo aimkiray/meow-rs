@@ -29,16 +29,18 @@ the canonical, in-repo source a release is cut from.
   On a build without a plugin, `plugin: <name>` on an ss node keeps the
   node bound as an unavailable placeholder — `meow -t`, boot,
   `PUT /configs` and provider refreshes all read it identically, and
-  every dial through the node (or through a group that selects it)
-  fails with `plugin '<name>' is not compiled into this
-  build; rebuild with \`--features <name>\`` instead of the node
-  silently dropping and letting the group slide to a sibling or
-  DIRECT. Because the reserved names still count as built-in, the node
-  can never fall through to spawning an external SIP003 binary of the
-  same name; the same guard closes that fallthrough for `kcptun` and
-  `ech-tls-tunnel`, whose disabled builds previously could reach the
-  external-plugin path. `gost-plugin` implies the `mux` Cargo feature,
-  so its `mux: true` default always works.
+  a `select` group, an explicit `MATCH` target or a `dialer-proxy`
+  chain naming it fails the dial with `plugin '<name>' is not compiled
+  into this build; rebuild with \`--features <name>\`` instead of the
+  node silently dropping and letting that reference slide to a sibling
+  or DIRECT (`fallback`/`url-test`/`load-balance` still skip the dead
+  member by liveness). Because the reserved names still count as
+  built-in, the node can never fall through to spawning an external
+  SIP003 binary of the same name; the same guard closes that
+  fallthrough for `kcptun` and `ech-tls-tunnel`, whose disabled builds
+  previously could reach the external-plugin path. `gost-plugin`
+  implies the `mux` Cargo feature, so its `mux: true` default always
+  works.
 
 ### Fixed
 
