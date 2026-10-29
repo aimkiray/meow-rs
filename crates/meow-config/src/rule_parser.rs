@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use meow_common::Rule;
+use meow_common::{Rule, RuleType};
 use meow_rules::{parse_rule_flags, ParserContext, RuleSet, RuleSetBehavior, RuleSetRule};
 use tracing::warn;
 
@@ -50,7 +50,28 @@ pub fn parse_rules_full(
             continue;
         }
         match parse_one_rule_or_subrule(line, providers, ctx, sub_rules) {
-            Ok(rule) => rules.push(rule),
+            Ok(rule) => {
+                // A DOMAIN / DOMAIN-SUFFIX payload that can never equal
+                // the normalized `Metadata::rule_host()` it is compared
+                // against — an empty label (`a..b`), a trailing dot
+                // (`x.com.`), or an all-dots/prefix-only body — is dead
+                // config, the same dead-key concept the DNS-side trie
+                // surfaces flag (issue #822 shape). Lenient warns and
+                // keeps the rule; strict fails the load.
+                if matches!(rule.rule_type(), RuleType::Domain | RuleType::DomainSuffix)
+                    && meow_rules::domain_rule_payload_is_dead(rule.payload())
+                {
+                    let message = format!(
+                        "rules: '{line}' has a dead domain payload — it can never \
+                         match a normalized host"
+                    );
+                    if strict {
+                        return Err(anyhow::anyhow!("{message} (strict mode)"));
+                    }
+                    warn!("{message}");
+                }
+                rules.push(rule);
+            }
             Err(e) if strict => {
                 return Err(anyhow::anyhow!(
                     "rules: failed to parse '{line}' (strict mode): {e}"
@@ -192,6 +213,54 @@ mod tests {
                 "{line}: unexpected error {err}"
             );
         }
+    }
+
+    /// Dead `DOMAIN`/`DOMAIN-SUFFIX` payloads — an empty label, a trailing
+    /// dot, or an all-dots/prefix-only body — can never equal the
+    /// normalized `rule_host()` they are compared against. Lenient warns
+    /// and keeps the rule; `strict: true` fails the load.
+    #[test]
+    fn dead_domain_rule_payload_warns_lenient_errors_strict() {
+        use crate::test_support::WarnCapture;
+        let ctx = ParserContext::default();
+        for line in [
+            "DOMAIN,a..b,REJECT",
+            "DOMAIN-SUFFIX,a..b,REJECT",
+            "DOMAIN,x.com.,REJECT",
+            "DOMAIN-SUFFIX,x.com.,REJECT",
+            "DOMAIN,.,REJECT",
+        ] {
+            let raw = vec![line.to_string()];
+            let cap = WarnCapture::start();
+            let rules = parse_rules(&raw, &ctx, false).expect("lenient mode keeps the dead rule");
+            let warns = cap.take();
+            assert_eq!(rules.len(), 1, "{line}: lenient mode must keep the rule");
+            assert!(
+                warns.contains("dead domain payload") && warns.contains(line),
+                "{line}: the dead payload must be surfaced, got: {warns}"
+            );
+            let err = parse_rules(&raw, &ctx, true)
+                .err()
+                .expect("strict mode must reject a dead domain payload");
+            assert!(
+                err.to_string().contains("dead domain payload"),
+                "{line}: unexpected error {err}"
+            );
+        }
+    }
+
+    /// The payload check must not false-positive: legal `DOMAIN` and
+    /// `DOMAIN-SUFFIX` payloads load in strict mode without a warning.
+    #[test]
+    fn live_domain_rule_payloads_load_in_strict_mode() {
+        let ctx = ParserContext::default();
+        let raw = vec![
+            "DOMAIN,x.com,REJECT".to_string(),
+            "DOMAIN-SUFFIX,example.com,PROXY".to_string(),
+            "DOMAIN,*.wild.example,DIRECT".to_string(),
+        ];
+        let rules = parse_rules(&raw, &ctx, true).expect("legal payloads must load");
+        assert_eq!(rules.len(), 3);
     }
 
     /// `RULE-SET,...,src` (issue #625 item 11, upstream `isSrc`): the set

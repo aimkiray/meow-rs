@@ -410,3 +410,31 @@ sniffer:
         );
     }
 }
+
+// ─── S21: refused-shape skip-domain / force-domain ───────────────────────
+//
+// An all-dots or prefix-only entry (`.`, `+.`) is refused by the sniffer
+// runtime's `DomainTrie::insert` outright — no node is built at all — so
+// it takes the same lenient-warn / strict-error path as an empty label
+// rather than silently dropping.
+#[tokio::test]
+async fn s21_refused_domain_lists_lenient_loads_strict_errors() {
+    for field in ["skip-domain", "force-domain"] {
+        for dead in [".", "+.", "*.", ".."] {
+            let lenient = format!(
+                "sniffer:\n  enable: true\n  {field}: ['{dead}', fine.example]\n  sniff:\n    TLS:\n      ports: [443]\n"
+            );
+            load_config_from_str(&lenient)
+                .await
+                .unwrap_or_else(|_| panic!("{field}={dead:?} must load in lenient mode"));
+            let strict = format!(
+                "strict: true\nsniffer:\n  enable: true\n  {field}: ['{dead}']\n  sniff:\n    TLS:\n      ports: [443]\n"
+            );
+            let err = expect_load_err(&strict).await;
+            assert!(
+                err.contains("not a valid domain pattern") && err.contains(field),
+                "{field}={dead:?}: strict must name the refused entry, got: {err}"
+            );
+        }
+    }
+}

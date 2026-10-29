@@ -3286,20 +3286,16 @@ fn parse_sniffer_config(
             }
 
             // skip-domain / force-domain feed `DomainTrie`s in the sniffer
-            // runtime; an empty-label entry inserts but can never match a
-            // query name — the same dead-node shape as `hosts:` (issue
-            // #822). Surface it rather than swallow it.
+            // runtime; a dead key — an empty label that can never match a
+            // query name, or an all-dots/prefix-only body the runtime's
+            // insert silently refuses — is the same dead-key shape as
+            // `hosts:` (issue #822). Surface it rather than swallow it.
             for (field, list) in [
                 ("sniffer.skip-domain", &rs.skip_domain),
                 ("sniffer.force-domain", &rs.force_domain),
             ] {
                 for s in list.iter().flatten() {
-                    if crate::dns_parser::domain_key_has_dead_label(s) {
-                        if strict {
-                            anyhow::bail!("{field}: '{s}' contains an empty label (strict mode)");
-                        }
-                        warn!("{field}: '{s}' contains an empty label; it can never match");
-                    }
+                    crate::dns_parser::check_domain_key(field, s, strict)?;
                 }
             }
 
