@@ -563,7 +563,9 @@ classes outright. Trailing-dot spellings (`x.com.`, `x.com..`) stay legal:
 they normalize onto the same slot as `x.com`. The check covers config
 `hosts:` keys only — the system hosts file merged in by `use-system-hosts`
 is out of scope: it is parsed leniently line-by-line and its entries never
-pass through the dead-key validation.
+pass through the dead-key validation. Before turning on `strict: true`,
+run `meow -t` once in lenient mode — the warnings name every dead key the
+strict load would refuse, so you can fix the list first.
 
 The same dead-key concept reaches the `rules:` list per rule type, judged
 against the normalized host rules compare with: `DOMAIN`/`DOMAIN-SUFFIX`

@@ -224,14 +224,11 @@ async fn handle_http_inner(
         // The `/` guard keeps the fallback to genuine origin-form targets:
         // `?x`, `*` and other non-authority targets keep their 400.
         let (host, port) = if host.is_empty() && url.starts_with('/') {
+            // `parse_host_port` hands a port-0 authority (`Host: x:0`)
+            // back with an empty host, so it dies on the hostname gate
+            // like any other bad Host value.
             match host_header(&request) {
-                Some(authority) => match parse_host_port(authority, 80) {
-                    // Port 0 names no socket (`Host: x:0`) — hand the
-                    // empty authority back so the hostname gate below
-                    // refuses it like any other bad Host value.
-                    (_, 0) => (host, port),
-                    parsed => parsed,
-                },
+                Some(authority) => parse_host_port(authority, 80),
                 None => (host, port),
             }
         } else {
@@ -1926,6 +1923,12 @@ fn host_to_ip(host: &str) -> Option<IpAddr> {
 fn parse_host_port(target: &str, default_port: u16) -> (&str, u16) {
     if let Some((host, port_str)) = target.rsplit_once(':') {
         if let Ok(port) = port_str.parse::<u16>() {
+            // Port 0 names no socket — return an empty host so every
+            // caller's hostname gate refuses the authority (`CONNECT x:0`,
+            // `http://x:0/`, `Host: x:0`) instead of dialing port 0.
+            if port == 0 {
+                return ("", 0);
+            }
             return (host, port);
         }
     }

@@ -588,6 +588,51 @@ async fn http_origin_form_zero_port_host_is_400() {
     assert_eq!(accepts.load(Ordering::SeqCst), 0);
 }
 
+/// `CONNECT x:0` names the same unusable port-0 authority — it must be
+/// refused with 400 at the shared authority parse, not pre-acked with
+/// `200 Connection established` and left to fail on the dial.
+#[tokio::test]
+async fn http_connect_zero_port_target_is_400() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    for target in [
+        &b"CONNECT good.example:0 HTTP/1.1\r\n\r\n"[..],
+        &b"CONNECT 127.0.0.1:0 HTTP/1.1\r\n\r\n"[..],
+    ] {
+        let response = http_exchange(&tunnel, target).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+            "{:?}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+    settle().await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        0,
+        "no port-0 CONNECT may reach the upstream"
+    );
+}
+
+/// Absolute-form `http://x:0/` goes through the same authority parse as
+/// CONNECT — the explicit `:0` port is refused with 400, not carried to
+/// the dial like a valid host:port pair.
+#[tokio::test]
+async fn http_absolute_form_zero_port_authority_is_400() {
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let response = http_exchange(
+        &tunnel,
+        b"GET http://good.example:0/ HTTP/1.1\r\nHost: good.example:0\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&response)
+    );
+    settle().await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+}
+
 /// The literal fold is pinned end-to-end at rule level: `Host: 127.0.0.1`
 /// must reach the IP rules as `dst_ip` — `IP-CIDR,...,no-resolve` reads
 /// `dst_ip` only and never resolves `host`, so a mere `host` string would

@@ -2,7 +2,6 @@ use meow_common::sniffer::{sniff_http, sniff_tls, SnifferConfig};
 use meow_common::Metadata;
 use meow_trie::DomainTrie;
 use std::collections::HashMap;
-use std::net::IpAddr;
 use tokio::net::TcpStream;
 use tracing::debug;
 
@@ -58,10 +57,13 @@ impl SnifferRuntime {
         }
 
         // parse-pure-ip gate: skip if host is already a non-IP domain name,
-        // unless that domain is in the force list.
+        // unless that domain is in the force list. The IP test is the same
+        // `metadata_ip_literal` the apply side uses — a `IpAddr::parse`
+        // check would miss bracketed IPv6 (`[::1]` reads as a "domain" and
+        // the destination would never be sniffed).
         if self.cfg.parse_pure_ip
             && !metadata.host.is_empty()
-            && metadata.host.parse::<IpAddr>().is_err()
+            && meow_common::metadata_ip_literal(&metadata.host).is_none()
             && self.force.search(&metadata.host).is_none()
         {
             return;
@@ -517,6 +519,29 @@ mod tests {
         let mut meta = make_metadata("93.184.216.34", 443);
         rt.sniff(&server, &mut meta).await;
         assert_eq!(meta.sniff_host, "example.com");
+    }
+
+    #[tokio::test]
+    async fn sniffer_parse_pure_ip_runs_on_bracketed_ipv6_host() {
+        // A bracketed literal `[::1]` is an IP literal for the gate just
+        // as it is for the apply side (both use `metadata_ip_literal`) —
+        // a plain `IpAddr::parse` check would misread it as a domain and
+        // skip sniffing entirely.
+        let cfg = SnifferConfig {
+            enable: true,
+            parse_pure_ip: true,
+            tls_ports: vec![443],
+            ..Default::default()
+        };
+        let rt = make_runtime(cfg);
+        let (mut client, server) = make_stream_pair().await;
+        let hello = build_client_hello("v6.example.com");
+        client.write_all(&hello).await.unwrap();
+
+        let mut meta = make_metadata("[::1]", 443);
+        rt.sniff(&server, &mut meta).await;
+        assert_eq!(meta.sniff_host, "v6.example.com");
+        assert_eq!(meta.host, "[::1]");
     }
 
     #[tokio::test]
