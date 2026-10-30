@@ -567,14 +567,17 @@ pass through the dead-key validation.
 
 The same dead-key concept reaches the `rules:` list per rule type, judged
 against the normalized host rules compare with: `DOMAIN`/`DOMAIN-SUFFIX`
-flag an empty label, a trailing dot, or a verbatim-dead `*`/`+` spelling
-(`DOMAIN,*.x.com` can never equal a host — `*` belongs on
+flag an empty label, a leading or trailing dot, or a verbatim-dead `*`/`+`
+spelling (`DOMAIN,*.x.com` can never equal a host — `*` belongs on
 `DOMAIN-WILDCARD`, and `DOMAIN-SUFFIX,x.com` already covers apex plus
 subdomains, so `+.` adds nothing);
-`DOMAIN-WILDCARD` flags dead literal labels only — its `*` segments are
-globs; `DOMAIN-KEYWORD` flags `..` only (a `foo.` needle still matches
-`foo.bar` as a substring). `DOMAIN-REGEX` is not checked: an arbitrary
-pattern's reachability is not decidable by label inspection.
+`DOMAIN-WILDCARD` flags a literal `+` — its matcher globs `*` only, so
+`+.x.com` is dead there too — plus dead literal labels; `DOMAIN-KEYWORD`
+flags `..` only (a `foo.` needle still matches `foo.bar` as a substring,
+though it no longer hits the bare `foo` under trailing-dot
+normalization — the same residual applies to an anchored
+`DOMAIN-REGEX` like `^foo\.$`, which is otherwise not checked: an
+arbitrary pattern's reachability is not decidable by label inspection).
 
 ---
 

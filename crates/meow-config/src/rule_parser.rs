@@ -57,10 +57,11 @@ pub fn parse_rules_full(
                 // DNS-side trie surfaces flag (issue #822 shape). Scope
                 // per rule type (meow-rules/src/domain_key.rs):
                 //   DOMAIN/DOMAIN-SUFFIX — an empty label (`a..b`), a
-                //     trailing dot (`x.com.`), or a verbatim-dead `*`/`+`
-                //     spelling (`DOMAIN,*.x.com`);
-                //   DOMAIN-WILDCARD — dead literal labels only; its `*`
-                //     segments are globs, not literals;
+                //     leading/trailing dot (`.x.com`, `x.com.`), or a
+                //     verbatim-dead `*`/`+` spelling (`DOMAIN,*.x.com`);
+                //   DOMAIN-WILDCARD — a literal `+` (the matcher globs
+                //     `*` only) or a dead literal label (`*.foo.`,
+                //     `a..b`);
                 //   DOMAIN-KEYWORD — `..` only (a substring needle like
                 //     `foo.` still matches `foo.bar`);
                 //   DOMAIN-REGEX — not checked (arbitrary pattern).
@@ -234,10 +235,11 @@ mod tests {
 
     /// Dead domain payloads can never equal/match the normalized
     /// `rule_host()` they are compared against: an empty label, a
-    /// trailing dot, an all-dots/prefix-only body, a verbatim-dead
-    /// `*`/`+` spelling on `DOMAIN`/`DOMAIN-SUFFIX`, a dead literal
-    /// label on `DOMAIN-WILDCARD`, or `..` on `DOMAIN-KEYWORD`. Lenient
-    /// warns and keeps the rule; `strict: true` fails the load.
+    /// leading/trailing dot, an all-dots/prefix-only body, a
+    /// verbatim-dead `*`/`+` spelling on `DOMAIN`/`DOMAIN-SUFFIX`, a
+    /// literal `+` or dead literal label on `DOMAIN-WILDCARD`, or `..`
+    /// on `DOMAIN-KEYWORD`. Lenient warns and keeps the rule;
+    /// `strict: true` fails the load.
     #[test]
     fn dead_domain_rule_payload_warns_lenient_errors_strict() {
         use crate::test_support::WarnCapture;
@@ -249,15 +251,20 @@ mod tests {
             "DOMAIN-SUFFIX,x.com.,REJECT",
             "DOMAIN,.,REJECT",
             // `*`/`+` are verbatim-dead spellings on these rule types —
-            // no normalized host carries either byte.
+            // no normalized host carries either byte — and so is a
+            // leading dot (no host leads with `.` or contains `..`).
             "DOMAIN,*.x.com,REJECT",
             "DOMAIN-SUFFIX,+.x.com,REJECT",
             "DOMAIN,a.*.b,REJECT",
+            "DOMAIN-SUFFIX,.x.com,REJECT",
+            "DOMAIN,.x.com,REJECT",
             // DOMAIN-WILDCARD: dead literal labels (`*` segments are
-            // globs and never count).
+            // globs and never count), and any `+` — the matcher globs
+            // `*` only, so `+.` is a literal byte run, not a wildcard.
             "DOMAIN-WILDCARD,*.foo.,REJECT",
             "DOMAIN-WILDCARD,a..b,REJECT",
             "DOMAIN-WILDCARD,foo.,REJECT",
+            "DOMAIN-WILDCARD,+.wild.example,REJECT",
             // DOMAIN-KEYWORD: `..` can never appear in a host.
             "DOMAIN-KEYWORD,a..b,REJECT",
         ] {
@@ -282,8 +289,9 @@ mod tests {
 
     /// The payload check must not false-positive: legal payloads on every
     /// domain rule type load in strict mode without a warning —
-    /// including `DOMAIN-WILDCARD`'s glob segments, a `DOMAIN-KEYWORD`
-    /// needle that ends in a dot (substring match still hits `foo.bar`),
+    /// including `DOMAIN-WILDCARD`'s glob segments (but not `+.`, which
+    /// the matcher treats as a literal), a `DOMAIN-KEYWORD` needle that
+    /// ends or leads with a dot (substring match still hits `foo.bar`),
     /// and `DOMAIN-REGEX`, which the check leaves alone entirely.
     #[test]
     fn live_domain_rule_payloads_load_in_strict_mode() {
@@ -291,17 +299,15 @@ mod tests {
         let raw = vec![
             "DOMAIN,x.com,REJECT".to_string(),
             "DOMAIN-SUFFIX,example.com,PROXY".to_string(),
-            "DOMAIN-SUFFIX,.x.com,PROXY".to_string(),
             "DOMAIN-WILDCARD,*.wild.example,DIRECT".to_string(),
             "DOMAIN-WILDCARD,a.*.b,DIRECT".to_string(),
-            "DOMAIN-WILDCARD,+.wild.example,DIRECT".to_string(),
             "DOMAIN-KEYWORD,foo.,DIRECT".to_string(),
             "DOMAIN-KEYWORD,.foo,DIRECT".to_string(),
             "DOMAIN-REGEX,^a\\.\\.b$,DIRECT".to_string(),
             "DOMAIN-REGEX,x.*$,DIRECT".to_string(),
         ];
         let rules = parse_rules(&raw, &ctx, true).expect("legal payloads must load");
-        assert_eq!(rules.len(), 10);
+        assert_eq!(rules.len(), 8);
     }
 
     /// `RULE-SET,...,src` (issue #625 item 11, upstream `isSrc`): the set

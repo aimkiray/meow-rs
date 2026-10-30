@@ -51,18 +51,21 @@ the canonical, in-repo source a release is cut from.
   so dialing and upstream CONNECT lines are unchanged.
 - **Dead domain entries in static config are surfaced.** An empty-label
   key (`a..b`, `..x`) builds a `DomainTrie` node no query can reach, a
-  `DOMAIN`/`DOMAIN-SUFFIX` rule payload with an empty label, a trailing
-  dot (`x.com.`), or a `*`/`+` byte (`DOMAIN,*.x.com` compares verbatim
-  and can never equal a host) can never match the normalized rule host
-  it is compared against, a `DOMAIN-WILDCARD` payload's dead literal
-  label (`*.foo.`, `a..b`) anchors a match no host satisfies, and a
-  `DOMAIN-KEYWORD` needle containing `..` names a substring no host
-  holds — while an all-dots or prefix-only key (`"."`, `"+."`) is refused
-  by the trie outright. `hosts:`, `nameserver-policy`,
-  `fallback-filter.domain`, `fake-ip-filter`, sniffer
-  `skip-domain`/`force-domain`, and `rules:` domain payloads now warn
-  naming the entry in lenient mode and error in strict mode — where the
-  entry loads, it still does (observability, not a semantics change).
+  `DOMAIN`/`DOMAIN-SUFFIX` rule payload with an empty label, a leading or
+  trailing dot (`.x.com`, `x.com.`), or a `*`/`+` byte (`DOMAIN,*.x.com`
+  compares verbatim and can never equal a host) can never match the
+  normalized rule host it is compared against, a `DOMAIN-WILDCARD`
+  payload with a literal `+` (its matcher globs `*` only, so `+.x.com`
+  is dead there too) or a dead literal label (`*.foo.`, `a..b`) anchors
+  a match no host satisfies, and a `DOMAIN-KEYWORD` needle containing
+  `..` names a substring no host holds — while an all-dots or
+  prefix-only key (`"."`, `"+."`) is refused by the trie outright.
+  `hosts:`, `nameserver-policy`, `fallback-filter.domain`,
+  `fake-ip-filter`, sniffer `skip-domain`/`force-domain`, and `rules:`
+  domain payloads now warn naming the entry in lenient mode and hard
+  error in strict mode; a flagged entry that still loads matches
+  exactly as before — the check changes the load outcome (lenient
+  warning vs strict refusal), not what the entry matches.
   `DOMAIN-REGEX` stays unchecked: whether an arbitrary pattern can match
   a normalized host is not decidable by label inspection.
 

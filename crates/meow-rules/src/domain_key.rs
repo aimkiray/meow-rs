@@ -20,13 +20,14 @@
 //!
 //! Coverage on the `rules:` surface, per rule type: `DOMAIN` and
 //! `DOMAIN-SUFFIX` get [`domain_rule_payload_is_dead`] (dead label,
-//! trailing dot, a verbatim-dead `*`/`+` spelling); `DOMAIN-WILDCARD`
-//! gets [`domain_wildcard_payload_is_dead`] (dead labels only — its
-//! `*` segments are globs, not literals); `DOMAIN-KEYWORD` gets
-//! [`domain_keyword_payload_is_dead`] (`..` only — a substring needle
-//! like `foo.` still matches `foo.bar`). `DOMAIN-REGEX` is not
-//! checked: its payload is an arbitrary pattern, so whether it can
-//! match a normalized host is not decidable by label inspection.
+//! leading/trailing dot, a verbatim-dead `*`/`+` spelling);
+//! `DOMAIN-WILDCARD` gets [`domain_wildcard_payload_is_dead`] (a
+//! literal `+` — the matcher globs `*` only — or a dead literal
+//! label); `DOMAIN-KEYWORD` gets [`domain_keyword_payload_is_dead`]
+//! (`..` only — a `foo.` needle still matches `foo.bar` as a
+//! substring). `DOMAIN-REGEX` is not checked: its payload is an
+//! arbitrary pattern, so whether it can match a normalized host is
+//! not decidable by label inspection.
 
 /// The defect a domain key carries on a `DomainTrie` surface, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +91,10 @@ pub fn domain_key_is_dead(key: &str) -> bool {
 ///
 /// - a trailing dot — `rule_host()` strips trailing dots, so `x.com.` can
 ///   only ever name `x.com`, which no `DOMAIN,x.com.` payload matches;
+/// - a leading dot — `DomainRule` compares verbatim and
+///   `DomainSuffixRule` matches `host == suffix` or `.{suffix}` at a
+///   label boundary, so `.x.com` would need a host starting with `.`
+///   (or containing `..x.com`) — impossible on a normalized host;
 /// - a `*` or `+` anywhere — `DomainRule`/`DomainSuffixRule` compare the
 ///   payload verbatim, and no normalized host contains either byte, so
 ///   wildcard spellings (`DOMAIN,*.x.com`, `DOMAIN-SUFFIX,+.x.com`) are
@@ -103,39 +108,49 @@ pub fn domain_rule_payload_is_dead(payload: &str) -> bool {
     let payload = payload.trim();
     payload.is_empty()
         || payload.ends_with('.')
+        || payload.starts_with('.')
         || payload.contains(['*', '+'])
         || domain_key_is_dead(payload)
 }
 
 /// True when a `DOMAIN-WILDCARD` `rules:` payload can never match the
-/// normalized [`Metadata::rule_host`]: after one `*.`/`+.` wildcard
-/// prefix is normalized away (a pure prefix does not count as a literal
-/// label), any remaining label that is empty names a byte run no
-/// normalized host produces — `a..b`, `.foo`, `foo.`, `*.foo.`.
-/// `*`-bearing segments are globs (`[^.]+`), never empty labels.
+/// normalized [`Metadata::rule_host`]:
 ///
-/// Scope: only the dead-label shapes are checked — an `x*` glob or a
-/// literal byte a host never carries (e.g. `?`) is a legal, if
-/// narrow, pattern and stays outside this check.
+/// - a `+` anywhere — the matcher globs `*` only, so `regex::escape`
+///   leaves `+` a literal byte no host carries (`+.wild.example` reads
+///   like the mihomo DOMAIN-SUFFIX spelling but is dead here); or
+/// - after one `*.` glob prefix is normalized away (a pure prefix does
+///   not count as a literal label), any remaining label that is empty
+///   names a byte run no normalized host produces — `a..b`, `.foo`,
+///   `foo.`, `*.foo.`. `*`-bearing segments are globs (`[^.]+`), never
+///   empty labels.
+///
+/// Scope: only the dead shapes above are checked — an `x*` glob or a
+/// literal byte a host never carries (e.g. `?`) is a legal, if narrow,
+/// pattern and stays outside this check.
 ///
 /// [`Metadata::rule_host`]: meow_common::Metadata::rule_host
 pub fn domain_wildcard_payload_is_dead(payload: &str) -> bool {
     let payload = payload.trim();
-    if payload.is_empty() {
+    if payload.is_empty() || payload.contains('+') {
         return true;
     }
-    let body = payload
-        .strip_prefix("+.")
-        .or_else(|| payload.strip_prefix("*."))
-        .unwrap_or(payload);
+    let body = payload.strip_prefix("*.").unwrap_or(payload);
     body.is_empty() || body.split('.').any(str::is_empty)
 }
 
 /// True when a `DOMAIN-KEYWORD` `rules:` payload can never match: the
 /// keyword is a substring probe against `rule_host()`, and no normalized
-/// host contains an empty label, so only `..` is dead. A trailing-dot
-/// keyword (`foo.`) is *live* — it still matches `foo.bar` as a
-/// substring — so it must not be flagged.
+/// host contains an empty label, so only `..` is dead.
+///
+/// A trailing-dot keyword (`evil.com.`) is *live* and must not be
+/// flagged — it still matches superstrings like `evil.com.au` where the
+/// dot survives — but note it can no longer hit the bare `evil.com`
+/// itself: `rule_host()` strips the host's trailing dots before the
+/// substring probe, so the needle's own trailing dot only ever matches
+/// inside a longer name. The same holds for an anchored
+/// `DOMAIN-REGEX` like `^foo\.$`, which the check does not cover at
+/// all — a documented residual of the trailing-dot normalization.
 ///
 /// [`Metadata::rule_host`]: meow_common::Metadata::rule_host
 pub fn domain_keyword_payload_is_dead(payload: &str) -> bool {
@@ -174,10 +189,11 @@ mod tests {
         }
     }
 
-    /// The `rules:` surface additionally treats a trailing dot and any
-    /// `*`/`+` spelling as dead: `rule_host()` normalizes dots away and
-    /// no normalized host carries a `*`/`+` byte, so `DOMAIN,x.com.` and
-    /// `DOMAIN,*.x.com` can never equal a rule host.
+    /// The `rules:` surface additionally treats a leading/trailing dot
+    /// and any `*`/`+` spelling as dead: `rule_host()` normalizes dots
+    /// away and no normalized host carries a `*`/`+` byte, so
+    /// `DOMAIN,.x.com`, `DOMAIN,x.com.` and `DOMAIN,*.x.com` can never
+    /// equal a rule host.
     #[test]
     fn domain_rule_payload_is_dead_matrix() {
         for payload in [
@@ -190,6 +206,8 @@ mod tests {
             "",
             "  ",
             "evil.com.",
+            ".x.com",
+            ".foo",
             "*.x.com",
             "+.x.com",
             "a.*.b",
@@ -200,7 +218,7 @@ mod tests {
                 "{payload:?} is a dead rule payload"
             );
         }
-        for payload in ["x.com", "evil.com", ".x.com"] {
+        for payload in ["x.com", "evil.com"] {
             assert!(
                 !domain_rule_payload_is_dead(payload),
                 "{payload:?} is a live rule payload"
@@ -208,16 +226,31 @@ mod tests {
         }
     }
 
-    /// DOMAIN-WILDCARD dead-label matrix: `*` segments are globs, but a
-    /// literal empty label (`..`, leading or trailing dot) can never
-    /// appear in a normalized host. A bare `*.`/`+.` prefix is the
-    /// wildcard spelling and is normalized away — which also means a
-    /// payload that is *only* the prefix (`*.`, `+.`) reduces to a glob
-    /// plus a literal trailing dot and is dead.
+    /// DOMAIN-WILDCARD dead-shape matrix: the matcher globs `*` only, so
+    /// any `+` is a literal byte no host carries — `+.wild.example` reads
+    /// like the DOMAIN-SUFFIX spelling but is dead here. A literal empty
+    /// label (`..`, leading or trailing dot) can never appear in a
+    /// normalized host; a `*` segment is a glob, never an empty label,
+    /// though `*.` alone reduces to a glob plus a literal trailing dot.
     #[test]
     fn domain_wildcard_payload_is_dead_matrix() {
         for payload in [
-            "*.foo.", "a..b", "a.*..b", ".foo", "foo.", ".", "", "  ", "*..", "*.", "+.",
+            "*.foo.",
+            "a..b",
+            "a.*..b",
+            ".foo",
+            "foo.",
+            ".",
+            "",
+            "  ",
+            "*..",
+            "*.",
+            // `+` is literal on DOMAIN-WILDCARD — always dead.
+            "+.",
+            "+.foo",
+            "+.wild.example",
+            "a+b",
+            "x+*",
         ] {
             assert!(
                 domain_wildcard_payload_is_dead(payload),
@@ -225,7 +258,14 @@ mod tests {
             );
         }
         for payload in [
-            "*.foo", "*.x.com", "+.foo", "*", "*.*", "a.*.b", "f*o.com", "x*",
+            "*.foo",
+            "*.x.com",
+            "*.wild.example",
+            "*",
+            "*.*",
+            "a.*.b",
+            "f*o.com",
+            "x*",
         ] {
             assert!(
                 !domain_wildcard_payload_is_dead(payload),
