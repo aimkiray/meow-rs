@@ -27,11 +27,12 @@ the canonical, in-repo source a release is cut from.
   a `DOMAIN,evil.com,REJECT` rule was bypassed. A sniffed name is now
   adopted only when the destination carries no routing name of its own —
   an empty host or an IP literal; an explicit domain authority (CONNECT
-  target, absolute-form URI, SOCKS5 domain) always wins.
-  `override-destination: true` still rewrites the destination with the
-  sniffed name, keeping rules and dial consistent — that also means a
-  `force-domain` hit against a domain destination now needs
-  `override-destination` to take effect.
+  target, absolute-form URI, SOCKS5 domain) always wins. Two opt-ins
+  override the priority: `override-destination: true` rewrites the
+  destination with the sniffed name, keeping rules and dial consistent,
+  and a `force-domain` entry matching the destination adopts the sniffed
+  name into `sniff_host` anyway — the CDN-front contract, routing by the
+  name on the wire while dialing the authority.
 - **All-digit address spellings no longer pass `is_valid_host`.** A name
   made only of digits and dots (`2130706433`, `0177.0.0.1`, `123.456`)
   is an `inet_aton` address form a libc dial path would fold into an IP —

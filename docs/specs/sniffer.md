@@ -145,11 +145,16 @@ wins and the sniff is discarded: rule matching reads `sniff_host` while
 the dial uses `host`, so adopting a conflicting name would route by one
 host yet dial the other — `GET http://evil.com/` + `Host: good.example`
 would miss `DOMAIN,evil.com,REJECT` and still dial evil.com.
-`override-destination: true` is unaffected: it rewrites `host` itself
-with the sniffed name, keeping rules and dial consistent, and remains
-unconditional. One consequence: a `force-domain` hit against a domain
-`host` without `override-destination` no longer lands — the gate opens
-and the peek runs, but the explicit authority wins at apply time.
+
+Two opt-ins beat that priority. `override-destination: true` rewrites
+`host` itself with the sniffed name, keeping rules and dial consistent,
+and stays unconditional. And a `force-domain` entry matching
+`metadata.host` adopts the sniffed name into `sniff_host` even against a
+domain authority — that is exactly what the list is for: "route this
+authority by the name on the wire" (a CDN front whose real SNI the
+authority hides). `force-domain` therefore still does something under
+`override-destination: false`: rules see the sniffed name, the dial
+keeps the authority — the CDN-front contract.
 
 ### Trojan cert-validation gotcha (documented loudly)
 
