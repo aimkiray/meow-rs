@@ -52,6 +52,15 @@ Always end the list with a catch-all `MATCH` rule so every connection has a dest
 | `DOMAIN-REGEX` | `DOMAIN-REGEX,^ads?\.,Proxy` | Hostname matches a Rust regex |
 | `DOMAIN-WILDCARD` | `DOMAIN-WILDCARD,*.example.com,Proxy` | Glob where `*` spans one DNS label |
 
+A domain payload that can never match a normalized hostname is logged as a
+warning (and fails the load under `strict: true`): an empty label (`a..b`),
+a trailing dot (`x.com.`), or a `*`/`+` spelling on `DOMAIN`/`DOMAIN-SUFFIX`
+— `DOMAIN,*.x.com` compares verbatim and can never equal a host, so use
+`DOMAIN-WILDCARD` instead. `DOMAIN-WILDCARD` is flagged only on dead literal
+labels (its `*` segments are globs); `DOMAIN-KEYWORD` only on `..` (a `foo.`
+needle still matches `foo.bar` as a substring). `DOMAIN-REGEX` is not
+checked.
+
 ## IP rules
 
 All IP rules accept `no-resolve`. `IP-CIDR` and `IP-CIDR6` are interchangeable.

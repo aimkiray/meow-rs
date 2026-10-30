@@ -51,16 +51,33 @@ pub fn parse_rules_full(
         }
         match parse_one_rule_or_subrule(line, providers, ctx, sub_rules) {
             Ok(rule) => {
-                // A DOMAIN / DOMAIN-SUFFIX payload that can never equal
-                // the normalized `Metadata::rule_host()` it is compared
-                // against — an empty label (`a..b`), a trailing dot
-                // (`x.com.`), or an all-dots/prefix-only body — is dead
-                // config, the same dead-key concept the DNS-side trie
-                // surfaces flag (issue #822 shape). Lenient warns and
-                // keeps the rule; strict fails the load.
-                if matches!(rule.rule_type(), RuleType::Domain | RuleType::DomainSuffix)
-                    && meow_rules::domain_rule_payload_is_dead(rule.payload())
-                {
+                // A domain rule payload that can never equal/match the
+                // normalized `Metadata::rule_host()` it is compared
+                // against is dead config — the same dead-key concept the
+                // DNS-side trie surfaces flag (issue #822 shape). Scope
+                // per rule type (meow-rules/src/domain_key.rs):
+                //   DOMAIN/DOMAIN-SUFFIX — an empty label (`a..b`), a
+                //     trailing dot (`x.com.`), or a verbatim-dead `*`/`+`
+                //     spelling (`DOMAIN,*.x.com`);
+                //   DOMAIN-WILDCARD — dead literal labels only; its `*`
+                //     segments are globs, not literals;
+                //   DOMAIN-KEYWORD — `..` only (a substring needle like
+                //     `foo.` still matches `foo.bar`);
+                //   DOMAIN-REGEX — not checked (arbitrary pattern).
+                // Lenient warns and keeps the rule; strict fails the load.
+                let dead = match rule.rule_type() {
+                    RuleType::Domain | RuleType::DomainSuffix => {
+                        meow_rules::domain_rule_payload_is_dead(rule.payload())
+                    }
+                    RuleType::DomainWildcard => {
+                        meow_rules::domain_wildcard_payload_is_dead(rule.payload())
+                    }
+                    RuleType::DomainKeyword => {
+                        meow_rules::domain_keyword_payload_is_dead(rule.payload())
+                    }
+                    _ => false,
+                };
+                if dead {
                     let message = format!(
                         "rules: '{line}' has a dead domain payload — it can never \
                          match a normalized host"
@@ -215,10 +232,12 @@ mod tests {
         }
     }
 
-    /// Dead `DOMAIN`/`DOMAIN-SUFFIX` payloads — an empty label, a trailing
-    /// dot, or an all-dots/prefix-only body — can never equal the
-    /// normalized `rule_host()` they are compared against. Lenient warns
-    /// and keeps the rule; `strict: true` fails the load.
+    /// Dead domain payloads can never equal/match the normalized
+    /// `rule_host()` they are compared against: an empty label, a
+    /// trailing dot, an all-dots/prefix-only body, a verbatim-dead
+    /// `*`/`+` spelling on `DOMAIN`/`DOMAIN-SUFFIX`, a dead literal
+    /// label on `DOMAIN-WILDCARD`, or `..` on `DOMAIN-KEYWORD`. Lenient
+    /// warns and keeps the rule; `strict: true` fails the load.
     #[test]
     fn dead_domain_rule_payload_warns_lenient_errors_strict() {
         use crate::test_support::WarnCapture;
@@ -229,6 +248,18 @@ mod tests {
             "DOMAIN,x.com.,REJECT",
             "DOMAIN-SUFFIX,x.com.,REJECT",
             "DOMAIN,.,REJECT",
+            // `*`/`+` are verbatim-dead spellings on these rule types —
+            // no normalized host carries either byte.
+            "DOMAIN,*.x.com,REJECT",
+            "DOMAIN-SUFFIX,+.x.com,REJECT",
+            "DOMAIN,a.*.b,REJECT",
+            // DOMAIN-WILDCARD: dead literal labels (`*` segments are
+            // globs and never count).
+            "DOMAIN-WILDCARD,*.foo.,REJECT",
+            "DOMAIN-WILDCARD,a..b,REJECT",
+            "DOMAIN-WILDCARD,foo.,REJECT",
+            // DOMAIN-KEYWORD: `..` can never appear in a host.
+            "DOMAIN-KEYWORD,a..b,REJECT",
         ] {
             let raw = vec![line.to_string()];
             let cap = WarnCapture::start();
@@ -249,18 +280,28 @@ mod tests {
         }
     }
 
-    /// The payload check must not false-positive: legal `DOMAIN` and
-    /// `DOMAIN-SUFFIX` payloads load in strict mode without a warning.
+    /// The payload check must not false-positive: legal payloads on every
+    /// domain rule type load in strict mode without a warning —
+    /// including `DOMAIN-WILDCARD`'s glob segments, a `DOMAIN-KEYWORD`
+    /// needle that ends in a dot (substring match still hits `foo.bar`),
+    /// and `DOMAIN-REGEX`, which the check leaves alone entirely.
     #[test]
     fn live_domain_rule_payloads_load_in_strict_mode() {
         let ctx = ParserContext::default();
         let raw = vec![
             "DOMAIN,x.com,REJECT".to_string(),
             "DOMAIN-SUFFIX,example.com,PROXY".to_string(),
-            "DOMAIN,*.wild.example,DIRECT".to_string(),
+            "DOMAIN-SUFFIX,.x.com,PROXY".to_string(),
+            "DOMAIN-WILDCARD,*.wild.example,DIRECT".to_string(),
+            "DOMAIN-WILDCARD,a.*.b,DIRECT".to_string(),
+            "DOMAIN-WILDCARD,+.wild.example,DIRECT".to_string(),
+            "DOMAIN-KEYWORD,foo.,DIRECT".to_string(),
+            "DOMAIN-KEYWORD,.foo,DIRECT".to_string(),
+            "DOMAIN-REGEX,^a\\.\\.b$,DIRECT".to_string(),
+            "DOMAIN-REGEX,x.*$,DIRECT".to_string(),
         ];
         let rules = parse_rules(&raw, &ctx, true).expect("legal payloads must load");
-        assert_eq!(rules.len(), 3);
+        assert_eq!(rules.len(), 10);
     }
 
     /// `RULE-SET,...,src` (issue #625 item 11, upstream `isSrc`): the set

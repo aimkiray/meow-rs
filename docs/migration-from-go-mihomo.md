@@ -565,6 +565,17 @@ they normalize onto the same slot as `x.com`. The check covers config
 is out of scope: it is parsed leniently line-by-line and its entries never
 pass through the dead-key validation.
 
+The same dead-key concept reaches the `rules:` list per rule type, judged
+against the normalized host rules compare with: `DOMAIN`/`DOMAIN-SUFFIX`
+flag an empty label, a trailing dot, or a verbatim-dead `*`/`+` spelling
+(`DOMAIN,*.x.com` can never equal a host — `*` belongs on
+`DOMAIN-WILDCARD`, and `DOMAIN-SUFFIX,x.com` already covers apex plus
+subdomains, so `+.` adds nothing);
+`DOMAIN-WILDCARD` flags dead literal labels only — its `*` segments are
+globs; `DOMAIN-KEYWORD` flags `..` only (a `foo.` needle still matches
+`foo.bar` as a substring). `DOMAIN-REGEX` is not checked: an arbitrary
+pattern's reachability is not decidable by label inspection.
+
 ---
 
 ## Inbound authentication
